@@ -164,8 +164,8 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
            -it \\
            -e HOME=\$HOME \\
-           -e PATH="\$HOME/$mock_home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/.morloc:\$HOME/.morloc \\
+           -e PATH="\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
+           -v \$HOME/.morloc/$tag:\$HOME/.morloc \\
            -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
@@ -333,7 +333,7 @@ cmd_install() {
 
     # get Morloc version from container
     # filter out the carriage return that podman helpfully provided
-    detected_version=$(podman run -it $CONTAINER_BASE_FULL:edge morloc --version | tr -d '\r\n')
+    detected_version=$($CONTAINER_ENGINE run -it $CONTAINER_BASE_FULL:edge morloc --version | tr -d '\r\n')
     if [ $? -ne 0 ]
     then
         print_error "Failed to detect version from morloc container"
@@ -410,6 +410,14 @@ cmd_install() {
     script_morloc_shell "$local_bin/morloc-shell" $version
     script_menv_dev "$local_bin/menv-dev"
     script_morloc_dev_shell "$local_bin/morloc-shell-dev"
+
+    print_info "Initializing morloc libraries"
+    menv morloc init -f
+    if [ $? -ne 0 ]
+    then
+        print_error "Failed to build morloc libraries"
+        exit 1
+    fi
 
     print_success "Morloc v$version installed successfully"
 }
