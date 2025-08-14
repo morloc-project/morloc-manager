@@ -30,10 +30,10 @@ CONTAINER_BASE_TINY=ghcr.io/morloc-project/morloc/morloc-tiny
 CONTAINER_BASE_TEST=ghcr.io/morloc-project/morloc/morloc-test
 
 if command -v podman >/dev/null 2>&1; then
-    CONTAINER_ENGINE_VERSION=$(podman --version 2>/dev/null)
+    CONTAINER_ENGINE_VERSION=$(podman --version 2>/dev/null | sed 's/.* //')
     CONTAINER_ENGINE="podman"
 elif command -v docker >/dev/null 2>&1; then
-    CONTAINER_ENGINE_VERSION=$(docker --version 2>/dev/null)
+    CONTAINER_ENGINE_VERSION=$(docker --version 2>/dev/null | sed 's/.* //')
     CONTAINER_ENGINE="docker"
 fi
 
