@@ -29,6 +29,8 @@ CONTAINER_BASE_FULL=ghcr.io/morloc-project/morloc/morloc-full
 CONTAINER_BASE_TINY=ghcr.io/morloc-project/morloc/morloc-tiny
 CONTAINER_BASE_TEST=ghcr.io/morloc-project/morloc/morloc-test
 
+THIS_SCRIPT_URL="https://raw.githubusercontent.com/morloc-project/morloc-manager/refs/heads/main/morloc-manager.sh"
+
 if command -v podman >/dev/null 2>&1; then
     CONTAINER_ENGINE_VERSION=$(podman --version 2>/dev/null | sed 's/.* //')
     CONTAINER_ENGINE="podman"
@@ -192,6 +194,7 @@ OPTIONS:
 COMMANDS:
   install    Install morloc containers, scripts, and home
   uninstall  Remove morloc containers, scripts, and home
+  update     Pull the latest version of this script
 
 EXAMPLES:
   $0 install
@@ -593,6 +596,70 @@ cmd_uninstall() {
 }
 
 # }}}
+# {{{ update subcommand
+cmd_update() {
+
+    old_version=$($0 --version)
+
+    tmp_script="/tmp/morloc-manager"
+
+    web_getter=""
+
+    if command -v wget > /dev/null 2>&1
+    then
+        print_info "Checking for latest morloc-manager script with wget"
+        web_getter="wget"
+    elif command -v curl > /dev/null 2>&1
+    then
+        print_info "Checking for  latest morloc-manager script with curl"
+        web_getter="curl"
+    else
+        print_error "Please install either wget or curl"
+        rm -f $tmp_script
+        exit 1
+    fi
+
+    $web_getter -o $tmp_script $THIS_SCRIPT_URL
+    if [ $? -ne 0 ]
+    then
+        print_error "Failed to retrieve script from '$THIS_SCRIPT_URL'"
+        rm -f $tmp_script
+        exit 1
+    fi
+
+    nlinesdiff=$(diff $tmp_script $0 | wc -l)
+    if [ $nlinesdiff -ne 0 ]
+    then
+        print_info "Successfully pulled '$THIS_SCRIPT_URL'"
+    else
+        print_info "You are already using the latest version"
+        rm -f $tmp_script
+        exit 0
+    fi
+
+    print_info "Making script executable"
+    chmod 755 $tmp_script
+    if [ $? -ne 0 ]
+    then
+        print_exit "Failed to make new script executable, exiting"
+        rm -f $tmp_script
+        exit 1
+    fi
+
+    print_info "Replacing current script at '$0'"
+    mv $tmp_script $0
+    if [ $? -ne 0 ]
+    then
+        print_exit "Failed to replace current script, exiting"
+        rm -f $tmp_script
+        exit 1
+    fi
+
+    new_version=$($0 --version)
+
+    print_success "Updated from $old_version to $new_version"
+}
+# }}}
 # {{{ main
 
 # Main argument parsing
@@ -613,6 +680,10 @@ main() {
         uninstall)
             shift
             cmd_uninstall "$@"
+            ;;
+        update)
+            shift
+            cmd_update "$@"
             ;;
         "")
             print_error "No command specified"
