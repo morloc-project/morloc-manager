@@ -19,6 +19,8 @@ else
     BLUE=""; GREEN=""; YELLOW=""; RED=""; NC=""
 fi
 
+DEFAULT_LOCAL_BIN="$HOME/.local/bin"
+
 # no container found
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
@@ -61,6 +63,38 @@ print_error() {
 }
 
 # }}}
+# {{{ helper functions
+
+handle_local_bin() {
+    local_bin=$1
+
+    # check if a local path for storing exectuables is has been given
+    # if not, define a default
+    if [[ $local_bin = "undefined" ]]
+    then
+        local_bin=$DEFAULT_LOCAL_BIN
+        print_info "No local path for executables given, defaulting to '$DEFAULT_LOCAL_BIN'"
+    fi
+
+    # check if local executable path is present, if not create it
+    if [[ -d "$local_bin" ]]
+    then
+        print_info "Local path '$local_bin' found"
+    else
+        print_error "Local path '$local_bin' not found, please create and add to PATH or choose a different path with option -b/--local-bin"
+        exit 1
+    fi
+
+    # check if local executable path is in PATH, if not die
+    if [[ ":$PATH:" == *":$local_bin:"* ]]; then
+        print_info "'$local_bin' found in PATH."
+    else
+        print_error "'$local_bin' not found in PATH."
+        exit 1
+    fi
+}
+
+# }}}
 # {{{ define scripts
 script_menv() {
     script_path=$1
@@ -81,7 +115,7 @@ EOF
 
     if [ $? -ne 0 ]
     then
-        print_error "Failed to get run `menv morloc --version`"
+        print_error "Failed to get run 'menv morloc --version'"
     fi
 
     observed_version=$(menv morloc --version)
@@ -195,6 +229,8 @@ COMMANDS:
   install    Install morloc containers, scripts, and home
   uninstall  Remove morloc containers, scripts, and home
   update     Pull the latest version of this script
+  select     Choose a new Morloc version
+  info       Print info about manager, installs and containers
 
 EXAMPLES:
   $0 install
@@ -236,8 +272,9 @@ Creates four executable scripts:
  4. morloc-shell-dev: enter the dev shell
 
 OPTIONS:
-  -h, --help     Show this help message
-  -f, --force    Force installation (overwrite existing)
+  -h, --help           Show this help message
+  -f, --force          Force installation (overwrite existing)
+  -b, --local-bin DIR  Directory on PATH for scripts [$DEFAULT_LOCAL_BIN]
 
 ARGUMENTS:
   version        Version to install
@@ -336,51 +373,23 @@ cmd_install() {
 
     # get Morloc version from container
     # filter out the carriage return that podman helpfully provided
-    detected_version=$($CONTAINER_ENGINE run -it $CONTAINER_BASE_FULL:edge morloc --version | tr -d '\r\n')
-    if [ $? -ne 0 ]
+    if [ $version = "edge" ]
     then
-        print_error "Failed to detect version from morloc container"
-        exit 1
+        detected_version=$($CONTAINER_ENGINE run -it $CONTAINER_BASE_FULL:edge morloc --version | tr -d '\r\n')
+        if [ $? -ne 0 ]
+        then
+            print_error "Failed to detect version from morloc container"
+            exit 1
+        fi
+
+        if [ $detected_version = "" ]
+        then
+            print_error "No Morloc version found - something went wrong"
+        fi
+        version=$detected_version
     fi
 
-    if [ $detected_version = "" ]
-    then
-        print_error "No Morloc version found - something went wrong"
-    fi
-
-    if [ $version -ne "" && $version -ne $detected_version ]
-    then
-        print_error "Expected the retrieved morloc version to '${version}', found '${detected_version}'"
-    else
-        print_success "Retrieved containers for Morloc version ${version}"
-    fi
-
-    version=$detected_version
-
-    # check if a local path for storing exectuables is has been given
-    # if not, define a default
-    if [ $local_bin = "undefined" ]
-    then
-        local_bin="$HOME/.local/bin"
-        print_info "No local path for executables given, defaulting to '${local_bin}'"
-    fi
-
-    # check if local executable path is present, if not create it
-    if [ -d "$local_bin" ]
-    then
-        print_info "Local path '$local_bin' found"
-    else
-        print_error "Local path '$local_bin' not found, please create and add to PATH or choose a different path with option -b/--local-bin"
-        exit 1
-    fi
-
-    # check if local executable path is in PATH, if not die
-    if [[ ":$PATH:" == *":$local_bin:"* ]]; then
-        print_info "'$local_bin' found in PATH."
-    else
-        print_error "'$local_bin' not found in PATH."
-        exit 1
-    fi
+    handle_local_bin "$local_bin"
 
     morloc_home="$HOME/.morloc/$version"
 
@@ -592,12 +601,43 @@ cmd_uninstall() {
         remove_containers_for_version $CONTAINER_BASE_FULL:$version
     fi
 
-    print_success "Removed containers and Morloc home, scripts in ~/.local/bin remain"
+    print_success "Removed containers and Morloc home, scripts remain"
 }
 
 # }}}
 # {{{ update subcommand
+
+# Help for install subcommand
+show_update_help() {
+    cat << EOF
+USAGE: $0 update
+
+Update this install sccript
+
+OPTIONS:
+  -h, --help           Show this help message
+
+EXAMPLES:
+  $0 update 
+EOF
+}
+
+
 cmd_update() {
+    # Parse install subcommand arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                show_update_help
+                exit 0
+                ;;
+            *)
+                print_error "Unexpected argument"
+                show_update_help
+                exit 1
+                ;;
+        esac
+    done
 
     old_version=$($0 --version)
 
@@ -657,6 +697,85 @@ cmd_update() {
     print_success "Updated from $old_version to $new_version"
 }
 # }}}
+# {{{ select subcommand
+
+# Help for install subcommand
+show_select_help() {
+    cat << EOF
+USAGE: $0 select <version>
+
+Set Morloc version.
+
+OPTIONS:
+  -h, --help           Show this help message
+  -b, --local-bin DIR  Directory on PATH for scripts [$DEFAULT_LOCAL_BIN]
+
+ARGUMENTS:
+  version        Version to install
+
+EXAMPLES:
+  $0 select 0.54.2
+EOF
+}
+
+cmd_select() {
+
+    version="undefined"
+    local_bin=$DEFAULT_LOCAL_BIN
+
+    # Parse install subcommand arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                show_select_help
+                exit 0
+                ;;
+            -b|--local-bin)
+                shift
+                local_bin="$1"
+                shift
+                ;;
+            *)
+                if [ $version = "undefined" ]; then
+                    version="$1"
+                else
+                    print_error "Multiple version installation not supported: $1"
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ $version = "local" ]]
+    then
+        print_error "Cannot set to 'local' version, please use dev containers"
+        exit 1
+    fi
+
+    if [[ $version = "undefined" ]]
+    then
+        print_error "Please select a version"
+        show_select_help
+        exit 1
+    fi
+
+    handle_local_bin "$local_bin"
+
+    if [[ -d $HOME/.morloc/$version ]]
+    then
+        script_menv "$local_bin/menv" $version
+        script_morloc_shell "$local_bin/morloc-shell" $version
+    else
+        print_error "Morloc version '$version' does not exist, install first"
+        exit 1
+    fi
+
+    print_success "Swicted to Morloc version '$version'"
+    exit 0
+}
+
+# }}}
 # {{{ main
 
 # Main argument parsing
@@ -681,6 +800,10 @@ main() {
         update)
             shift
             cmd_update "$@"
+            ;;
+        select)
+            shift
+            cmd_select "$@"
             ;;
         "")
             print_error "No command specified"
