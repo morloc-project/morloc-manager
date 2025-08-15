@@ -5,7 +5,7 @@
 # {{{ constants and system info
 
 PROGRAM_NAME="morloc-manager"
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # Only print in color if we are attached to a tty
 if [ -t 2 ]; then
@@ -603,23 +603,20 @@ cmd_update() {
 
     tmp_script="/tmp/morloc-manager"
 
-    web_getter=""
-
     if command -v wget > /dev/null 2>&1
     then
-        print_info "Checking for latest morloc-manager script with wget"
-        web_getter="wget"
+        print_info "Checking for latest morloc-manager script (using curl)"
+        curl -o $tmp_script $THIS_SCRIPT_URL 2> /dev/null
     elif command -v curl > /dev/null 2>&1
     then
-        print_info "Checking for  latest morloc-manager script with curl"
-        web_getter="curl"
+        print_info "Checking for latest morloc-manager script (using wget)"
+        wget -O $tmp_script $THIS_SCRIPT_URL 2> /dev/null
     else
         print_error "Please install either wget or curl"
         rm -f $tmp_script
         exit 1
     fi
 
-    $web_getter -o $tmp_script $THIS_SCRIPT_URL
     if [ $? -ne 0 ]
     then
         print_error "Failed to retrieve script from '$THIS_SCRIPT_URL'"
@@ -646,6 +643,8 @@ cmd_update() {
         exit 1
     fi
 
+    new_version=$($tmp_script --version)
+
     print_info "Replacing current script at '$0'"
     mv $tmp_script $0
     if [ $? -ne 0 ]
@@ -654,8 +653,6 @@ cmd_update() {
         rm -f $tmp_script
         exit 1
     fi
-
-    new_version=$($0 --version)
 
     print_success "Updated from $old_version to $new_version"
 }
