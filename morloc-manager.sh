@@ -110,7 +110,8 @@ $CONTAINER_ENGINE run --rm \\
            -v \$HOME/.morloc/$tag:\$HOME/.morloc \\
            -v \$PWD:\$HOME \\
            -w \$HOME \\
-           ghcr.io/morloc-project/morloc/morloc-full:$tag "\$@"
+           $CONTAINER_BASE_FULL:$tag "\$@"
+
 EOF
 
     if [ $? -ne 0 ]
@@ -143,7 +144,7 @@ $CONTAINER_ENGINE run --rm \\
            -v \$HOME/.morloc/$tag:\$HOME/.morloc \\
            -v \$PWD:\$HOME \\
            -w \$HOME \\
-           ghcr.io/morloc-project/morloc/morloc-full:$tag /bin/bash
+           $CONTAINER_BASE_FULL::$tag /bin/bash
 EOF
 
     observed_version=$(menv morloc --version)
@@ -180,7 +181,8 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
-           ghcr.io/morloc-project/morloc/morloc-test "\$@"
+           $CONTAINER_BASE_TEST "\$@"
+
 EOF
     chmod 755 $script_path
 }
@@ -206,7 +208,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
-           ghcr.io/morloc-project/morloc/morloc-test /bin/bash
+           $CONTAINER_BASE_TEST /bin/bash
 EOF
     chmod 755 $script_path
 }
@@ -776,6 +778,87 @@ cmd_select() {
 }
 
 # }}}
+# {{{ info subcommand
+
+# Help for install subcommand
+show_info_help() {
+    cat << EOF
+USAGE: $0 info
+
+Print info on Morloc versions and check containers
+
+OPTIONS:
+  -h, --help   Show this help message
+
+EXAMPLES:
+  $0 info
+EOF
+}
+
+cmd_info() {
+
+    # Parse install subcommand arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                show_info_help
+                exit 0
+                ;;
+            *)
+                print_error "Unexpected argument"
+                show_info_help
+                exit 1
+                ;;
+        esac
+    done
+
+    versions=$(ls $HOME/.morloc | grep -v "local")
+
+    current_version=$(menv morloc --version)
+    if [ $? -ne 0 ]
+    then
+        print_error "No current Morloc version set"
+    fi
+
+    dev_container=${CONTAINER_BASE_TEST}
+    if $CONTAINER_ENGINE images --format '{{.Repository}}' | grep -q "^${dev_container}$"
+    then
+        printf "dev             ${GREEN}container exists${NC}\n"
+    else
+        printf "dev             ${RED}container missing${NC}\n"
+    fi
+
+    for version in $versions
+    do
+        selection="         "
+        if [ $version = $current_version ]
+        then
+            selection=" selected"
+        fi
+
+        $0 "select" $version > /dev/null 2>&1
+        if [ $? -ne 0 ]
+        then
+            print_error "Failed to switch to $version"
+        fi
+
+        version_container=${CONTAINER_BASE_FULL}:${version}
+
+        if $CONTAINER_ENGINE images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${version_container}$"
+        then
+            printf "${version}${selection} ${GREEN}container exists${NC}\n"
+        else
+            printf "${version}${selection} ${RED}container missing${NC}\n"
+        fi
+
+    done
+
+    # switch back to original version
+    $0 "select" $current_version > /dev/null 2>&1
+
+    exit 0
+}
+# }}}
 # {{{ main
 
 # Main argument parsing
@@ -804,6 +887,10 @@ main() {
         select)
             shift
             cmd_select "$@"
+            ;;
+        info)
+            shift
+            cmd_info "$@"
             ;;
         "")
             print_error "No command specified"
