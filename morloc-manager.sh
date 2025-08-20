@@ -872,7 +872,6 @@ Creates four executable scripts:
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help           Show this help message
-  -f, --force          Force installation (overwrite existing)
 
 ${BOLD}ARGUMENTS${RESET}:
   version        Version to install
@@ -880,13 +879,11 @@ ${BOLD}ARGUMENTS${RESET}:
 ${BOLD}EXAMPLES${RESET}:
   $(basename $0) install
   $(basename $0) install 0.54.2
-  $(basename $0) install --force
 EOF
 }
 
 # Install subcommand
 cmd_install() {
-    force=false
     verbose=false
 
     # calling these "undefined" instead of empty strings for better debugging
@@ -899,10 +896,6 @@ cmd_install() {
             -h|--help)
                 show_install_help
                 exit 0
-                ;;
-            -f|--force)
-                force=true
-                shift
                 ;;
             -*)
                 print_error "Unknown option for install: $1"
@@ -920,8 +913,6 @@ cmd_install() {
                 ;;
         esac
     done
-
-    [ "$force" = true ] && print_info "Force mode enabled"
 
     if [ $version = "undefined" ]; then
         print_info "Installing latest Morloc version"
@@ -1010,18 +1001,6 @@ cmd_install() {
     morloc_home="$HOME/${MORLOC_INSTALL_DIR}/$version"
 
     print_info "Setting Morloc home to '${morloc_home}'"
-
-    # check to see if this morloc version is already installed
-    if [ -d "$HOME/${MORLOC_INSTALL_DIR}/$version" ]
-    then
-        if [ "$force" = false ]
-        then
-            print_success "Morloc v$version is already installed, exiting"
-            exit 0
-        else
-            print_info "Morloc v$version is already installed, overwriting"
-        fi
-    fi
 
     # create .morloc/version/$version folder
     create_directory $morloc_home
