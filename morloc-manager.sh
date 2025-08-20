@@ -705,8 +705,8 @@ $CONTAINER_ENGINE run --rm \\
            --shm-size=$SHARED_MEMORY_SIZE \\
            -e HOME=\$HOME \\
            -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/.morloc \\
-           -v \$PWD:\$HOME \\
-           -w \$HOME \\
+           -v \$PWD:\$HOME/work \\
+           -w \$HOME/work \\
            $CONTAINER_BASE_FULL:$tag "\$@"
 
 EOF
@@ -739,9 +739,9 @@ $CONTAINER_ENGINE run --rm \\
            -it \\
            -e HOME=\$HOME \\
            -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/.morloc \\
-           -v \$PWD:\$HOME \\
-           -w \$HOME \\
-           $CONTAINER_BASE_FULL::$tag /bin/bash
+           -v \$PWD:\$HOME/work \\
+           -w \$HOME/work \\
+           $CONTAINER_BASE_FULL:$tag /bin/bash
 EOF
 
     observed_version=$(menv morloc --version)
@@ -955,7 +955,12 @@ cmd_install() {
         print_info "Using $CONTAINER_ENGINE $CONTAINER_ENGINE_VERSION as a container engine"
     fi
 
-    print_info "Attempting to pull containers for Morloc version $version"
+    if [ "$version" = "undefined" ]
+    then
+        print_info "Attempting to pull containers for Morloc tag '$tag'"
+    else
+        print_info "Attempting to pull containers for Morloc version $version"
+    fi
 
     $CONTAINER_ENGINE pull $CONTAINER_BASE_TINY:${tag}
     if [ $? -ne 0 ]
@@ -984,7 +989,7 @@ cmd_install() {
 
     # get Morloc version from container
     # filter out the carriage return that podman helpfully provided
-    if [ $version = "edge" ]
+    if [ "$version" = "undefined" ]
     then
         detected_version=$($CONTAINER_ENGINE run -it $CONTAINER_BASE_FULL:edge morloc --version | tr -d '\r\n')
         if [ $? -ne 0 ]
@@ -996,7 +1001,9 @@ cmd_install() {
         if [ $detected_version = "" ]
         then
             print_error "No Morloc version found - something went wrong"
+            exit 1
         fi
+        print_info "Detected Morloc v$detected_version in retrieved container"
         version=$detected_version
     fi
 
