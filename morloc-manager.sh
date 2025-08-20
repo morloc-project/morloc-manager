@@ -932,6 +932,10 @@ cmd_install() {
     fi
 
     add_morloc_bin_to_path
+    if [ $? -ne 0 ]
+    then
+        exit 1
+    fi
 
     print_info "Copying this install script to $MORLOC_BIN"
     if [ $(normalize_path $MORLOC_BIN/morloc-manager) = $(normalize_path $0) ]
