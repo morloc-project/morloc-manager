@@ -7,7 +7,6 @@
 PROGRAM_NAME="morloc-manager"
 VERSION="0.3.0"
 
-# no container found
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
 
@@ -28,6 +27,7 @@ elif command -v docker >/dev/null 2>&1; then
 fi
 
 MORLOC_INSTALL_DIR=".morloc/versions"
+MORLOC_STDLIB_GITHUB_ORG="morloclib"
 
 # Configuration for setting up executable folder
 MORLOC_BIN_BASENAME=".morloc/bin"
@@ -813,7 +813,7 @@ EOF
 # }}}
 # {{{ main help and version
 
-# Help function
+# Help functions
 show_help() {
     cat << EOF
 ${BOLD}$(basename $0)${RESET} ${VERSION} - manage morloc containerized installation
@@ -824,16 +824,15 @@ ${BOLD}OPTIONS${RESET}:
   -h, --help     Show this help message
   -v, --version  Show version information
 
-${BOLD}COMMANDS${RESET}:
-  ${BOLD}${GREEN}install${RESET}    Install morloc containers, scripts, and home
-  ${BOLD}${GREEN}uninstall${RESET}  Remove morloc containers, scripts, and home
-  ${BOLD}${GREEN}update${RESET}     Pull the latest version of this script
-  ${BOLD}${GREEN}select${RESET}     Choose a new Morloc version
-  ${BOLD}${GREEN}info${RESET}       Print info about manager, installs and containers
+${BOLD}SUB-COMMANDS${RESET}:
+  ${BOLD}${GREEN}env${RESET}  Functions for managing morloc environments
+  ${BOLD}${GREEN}mod${RESET}  Functions for managing morloc modules
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) install
-  $(basename $0) uninstall
+  $(basename $0) env install
+  $(basename $0) env install 0.55.1
+  $(basename $0) env uninstall
+  $(basename $0) mod install internal root root-py
   $(basename $0) --help
 EOF
 }
@@ -844,7 +843,33 @@ show_version() {
 }
 
 # }}}
-# {{{ install subcommand
+# {{{ env help
+
+show_env_help() {
+    cat << EOF
+${BOLD}$(basename $0) env${RESET} ${VERSION} - manage morloc containerized installation
+
+${BOLD}USAGE${RESET}: $(basename $0) env [OPTIONS] COMMAND [ARGS...]
+
+${BOLD}OPTIONS${RESET}:
+  -h, --help     Show this help message
+
+${BOLD}COMMANDS${RESET}:
+  ${BOLD}${GREEN}install${RESET}    Install morloc containers, scripts, and home
+  ${BOLD}${GREEN}uninstall${RESET}  Remove morloc containers, scripts, and home
+  ${BOLD}${GREEN}update${RESET}     Pull the latest version of this script
+  ${BOLD}${GREEN}select${RESET}     Choose a new Morloc version
+  ${BOLD}${GREEN}info${RESET}       Print info about manager, installs and containers
+
+${BOLD}EXAMPLES${RESET}:
+  $(basename $0) env install
+  $(basename $0) env uninstall
+  $(basename $0) env --help
+EOF
+}
+
+# }}}
+# {{{ env install subcommand
 
 # Help for install subcommand
 show_install_help() {
@@ -883,7 +908,7 @@ EOF
 }
 
 # Install subcommand
-cmd_install() {
+cmd_env_install() {
     verbose=false
 
     # calling these "undefined" instead of empty strings for better debugging
@@ -1030,7 +1055,7 @@ cmd_install() {
 }
 
 # }}}
-# {{{ uninstall subcommand
+# {{{ env uninstall subcommand
 
 # Function to remove all containers for a given image
 # Usage: remove_containers_for "image_name"
@@ -1131,7 +1156,7 @@ ${BOLD}EXAMPLES${RESET}:
 EOF
 }
 
-cmd_uninstall() {
+cmd_env_uninstall() {
     version=""
 
     # Parse remove subcommand arguments
@@ -1200,7 +1225,7 @@ cmd_uninstall() {
 }
 
 # }}}
-# {{{ update subcommand
+# {{{ env update subcommand
 
 # Help for install subcommand
 show_update_help() {
@@ -1218,7 +1243,7 @@ EOF
 }
 
 
-cmd_update() {
+cmd_env_update() {
     # Parse install subcommand arguments
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1292,7 +1317,7 @@ cmd_update() {
     print_success "Updated from $old_version to $new_version"
 }
 # }}}
-# {{{ select subcommand
+# {{{ env select subcommand
 
 # Help for install subcommand
 show_select_help() {
@@ -1312,7 +1337,7 @@ ${BOLD}EXAMPLES${RESET}:
 EOF
 }
 
-cmd_select() {
+cmd_env_select() {
 
     version="undefined"
 
@@ -1364,7 +1389,7 @@ cmd_select() {
 }
 
 # }}}
-# {{{ info subcommand
+# {{{ env info subcommand
 
 # Help for install subcommand
 show_info_help() {
@@ -1381,7 +1406,7 @@ ${BOLD}EXAMPLES${RESET}:
 EOF
 }
 
-cmd_info() {
+cmd_env_info() {
 
     # Parse install subcommand arguments
     while [ $# -gt 0 ]; do
@@ -1445,9 +1470,375 @@ cmd_info() {
     exit 0
 }
 # }}}
+# {{{ mod install dispatch
+
+# Detect if a string is hash (7+ hex chars), version, or branch
+detect_reference_type() {
+    ver="$1"
+
+    if [ -z "$ver" ]; then
+        printf ""
+        return
+    fi
+
+    # handle explicitly typed terms
+    case "$ver" in
+        version:*)
+            printf "version"
+            return
+            ;;
+        hash:*)
+            printf "hash"
+            return
+            ;;
+        branch:*)
+            printf "branch"
+            return
+            ;;
+        *:*)
+            print_error "Unknown reference type in: '$ver'. Choose one of [version|hash|branch]."
+            exit 1
+            ;;
+    esac
+
+    # Check length (must be 7+ for hash)
+    len=$(printf '%s' "$ver" | wc -c)
+    if [ "$len" -lt 7 ]; then
+        printf "version"
+        return
+    fi
+    
+    # Check if it contains only hex characters (0-9, a-f, A-F)
+    ver_lower=$(printf '%s' "$ver" | tr '[:upper:]' '[:lower:]')
+    
+    # Remove all valid hex characters and see if anything remains
+    non_hex=$(printf '%s' "$ver_lower" | tr -d '0-9a-f')
+    
+    if [ -z "$non_hex" ]; then
+        printf "hash"
+    else
+        printf "version"
+    fi
+}
+
+install_module_from_url() {
+  ref="$1"
+  ref_type="$2"
+  url="$3"
+  printf "installing module from URL\n"
+}
+
+install_module_from_local_source() {
+  ref="$1"
+  ref_type="$2"
+  path="$3"
+  printf "installing module from local source '%s'\n" "$3"
+}
+
+install_module_from_github(){
+  ref="$1"
+  ref_type="$2"
+  user="$3"
+  repo="$4"
+
+  printf "installing module from github '%s' with reference '%s'\n" "$user/$repo" "$ref_type:$ref"
+}
+
+install_module_from_gitlab(){
+  ref="$1"
+  ref_type="$2"
+  user="$3"
+  repo="$4"
+
+  printf "installing module from gitlab '%s' with reference '%s'\n" "$user/$repo" "$ref_type:$ref"
+}
+
+install_module_from_bitbucket(){
+  ref="$1"
+  ref_type="$2"
+  user="$3"
+  repo="$4"
+
+  printf "installing module from bitbucket '%s' with reference '%s'\n" "$user/$repo" "$ref_type:$ref"
+}
+
+install_module_from_remote() {
+  ref="$1"
+  ref_type="$2"
+  remote_form="$3"
+  remote_spec="$4"
+
+  user=${remote_spec%%/*}
+  repo=${remote_spec##*/}
+
+  case "$remote_form" in
+    github)
+      install_module_from_github "$ref" "$ref_type" "$user" "$repo"
+      ;;
+    gitlab)
+      install_module_from_gitlab "$ref" "$ref_type" "$user" "$repo"
+      ;;
+    bitbucket)
+      install_module_from_bitbucket "$ref" "$ref_type" "$user" "$repo"
+      ;;
+    *)
+      print_error "Unknown remote type: $remote_form"
+      exit 1
+      ;;
+  esac
+}
+
+install_module_from_core() {
+  ref="$1"
+  ref_type="$2"
+  remote_spec="$3"
+  repo="${MORLOC_STDLIB_GITHUB_ORG}/$remote_spec"
+  install_module_from_remote "$ref" "$ref_type" github $repo
+}
+
+install_module() {
+    # module spec of format: [source:]<package>[@version-or-hash]
+    unclean_spec="$1"
+
+    # the reference with optional type labels (hash|version|branch)
+    unclean_ref="${unclean_spec##*@}"
+
+    # reference type: hash | version | branch
+    ref_type_or_error=$(detect_reference_type "$unclean_ref")
+    if [ $? != 0 ]; then
+        printf "$ref_type_or_error\n"
+        exit 1
+    else
+        ref_type="$ref_type_or_error"
+    fi
+
+    # the ref with any ref type labels removed
+    case "$unclean_ref" in
+      *:*)
+        ref="${unclean_ref#*:}"
+        ;;
+      *)
+        ref="$unclean_ref"
+        ;;
+    esac
+
+    # the module spec with reference info removed
+    spec="${unclean_spec%%@*}"
+
+    printf "spec=$spec ref_type=$ref_type ref=$ref\n"
+    
+    case "$spec" in
+        # Install from HTTP/HTTPS URLs
+        http://*|https://*)
+            install_module_from_url "$ref" "$ref_type" "$spec"
+            ;;
+        # Install from a file path
+        file:*)
+            install_module_from_local_source "$ref" "$ref_type" "${spec#file:}"
+            ;;
+        # Check for local paths (. or ./ or / or ~/)
+        .|~/*|./*|/*)
+            install_module_from_local_source "$ref" "$ref_type" "$spec"
+            ;;
+        # Extract source prefix if present (github:, gitlab:, etc.)
+        *:*)
+            install_module_from_remote "$ref" "$ref_type" "${spec%%:*}" "${spec#*:}"
+            ;;
+        # Install from the core library
+        *)
+            install_module_from_core "$ref" "$ref_type" "$spec"
+            ;;
+    esac
+}
+
+# }}}
+# {{{ mod help
+
+show_mod_help() {
+    cat << EOF
+${BOLD}$(basename $0) env${RESET} ${VERSION} - manage morloc modules
+
+${BOLD}USAGE${RESET}: $(basename $0) mod [OPTIONS] COMMAND [ARGS...]
+
+${BOLD}OPTIONS${RESET}:
+  -h, --help     Show this help message
+
+${BOLD}COMMANDS${RESET}:
+  ${BOLD}${GREEN}install${RESET}    Install morloc modules
+  ${BOLD}${GREEN}uninstall${RESET}  Uninstall morloc modules
+  ${BOLD}${GREEN}update${RESET}     Update morloc modules
+  ${BOLD}${GREEN}list${RESET}       List morloc modules
+
+${BOLD}EXAMPLES${RESET}:
+  $(basename $0) mod install root
+  $(basename $0) mod uninstall
+  $(basename $0) mod list
+  $(basename $0) mod --help
+EOF
+}
+
+# }}}
+# {{{ mod install
+
+# Help for install subcommand
+show_mod_install_help() {
+    cat << EOF
+${BOLD}USAGE${RESET}: $(basename $0) mod install [OPTIONS] [<module>...]
+
+Install morloc modules
+
+Each package has the format: [source:]<package>[@version-or-hash]
+
+${BOLD}OPTIONS${RESET}:
+  -h, --help           Show this help message
+
+${BOLD}ARGUMENTS${RESET}:
+  module        module to install
+
+${BOLD}EXAMPLES${RESET}:
+  ${BOLD}standard library${RESET}:
+    morloc-manager install root
+    morloc-manager install root root-py math
+    morloc-manager install root@0.2.0 root-py@abcdef12
+  ${BOLD}install from remote${RESET}:
+    morloc-manager install github:user/repo
+    morloc-manager install github:user/repo@1.0.0
+    morloc-manager install github:user/repo@a1b2c3d4
+    morloc-manager install gitlab:org/project@2.1.0
+    morloc-manager install bitbucket:team/repo@deadbeef12345678
+  ${BOLD}install from other URL${RESET}:
+    morloc-manager install https://example.com/package.tar.gz
+  ${BOLD}local install${RESET}:
+    morloc-manager install .
+    morloc-manager install ./relative/path
+    morloc-manager install /absolute/path
+    morloc-manager install file:./local
+EOF
+}
+
+# Install subcommand
+cmd_mod_install() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                show_mod_install_help
+                exit 0
+                ;;
+            -*)
+                print_error "Unknown option for mod install: $1"
+                show_mod_install_help
+                exit 1
+                ;;
+            *)
+                install_module "$1"
+                ;;
+        esac
+        shift
+    done
+}
+
+# }}}
+# {{{ mod uninstall
+
+cmd_mod_uninstall() {
+  echo stub
+}
+
+# }}}
+# {{{ mod update
+
+cmd_mod_update() {
+  echo stub
+}
+
+# }}}
+# {{{ mod list
+
+cmd_mod_list() {
+  echo stub
+}
+
+# }}}
 # {{{ main
 
 # Main argument parsing
+
+subcommand_env() {
+    case "$1" in
+        -h|--help)
+            show_env_help
+            exit 0
+            ;;
+        install)
+            shift
+            cmd_env_install "$@"
+            ;;
+        uninstall)
+            shift
+            cmd_env_uninstall "$@"
+            ;;
+        update)
+            shift
+            cmd_env_update "$@"
+            ;;
+        select)
+            shift
+            cmd_env_select "$@"
+            ;;
+        info)
+            shift
+            cmd_env_info "$@"
+            ;;
+        "")
+            print_error "No command specified"
+            show_env_help
+            exit 1
+            ;;
+        *)
+            print_error "Unknown command: $1"
+            show_env_help
+            exit 1
+            ;;
+    esac
+
+}
+
+subcommand_mod() {
+    case "$1" in
+        -h|--help)
+            show_mod_help
+            exit 0
+            ;;
+        install)
+            shift
+            cmd_mod_install "$@"
+            ;;
+        uninstall)
+            shift
+            cmd_mod_uninstall "$@"
+            ;;
+        update)
+            shift
+            cmd_mod_update "$@"
+            ;;
+        list)
+            shift
+            cmd_mod_list "$@"
+            ;;
+        "")
+            print_error "No command specified"
+            show_help
+            exit 1
+            ;;
+        *)
+            print_error "Unknown command: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+
+}
+
 main() {
     case "$1" in
         -h|--help)
@@ -1458,25 +1849,13 @@ main() {
             show_version
             exit 0
             ;;
-        install)
+        env)
             shift
-            cmd_install "$@"
+            subcommand_env "$@"
             ;;
-        uninstall)
+        mod)
             shift
-            cmd_uninstall "$@"
-            ;;
-        update)
-            shift
-            cmd_update "$@"
-            ;;
-        select)
-            shift
-            cmd_select "$@"
-            ;;
-        info)
-            shift
-            cmd_info "$@"
+            subcommand_mod "$@"
             ;;
         "")
             print_error "No command specified"
