@@ -26,14 +26,29 @@ elif command -v docker >/dev/null 2>&1; then
     CONTAINER_ENGINE="docker"
 fi
 
-MORLOC_INSTALL_DIR=".morloc/versions"
+# location of modules and other data will be stored for all morloc versions
+MORLOC_DATA_HOME=${XDG_DATA_HOME:-~/.local/share}/morloc
+
+# location of global morloc config and version specific configs will be stored
+MORLOC_CONFIG_HOME=${XDG_CONFIG_HOME:-~/.config}/morloc
+
+# location of all program state may be stored (may always be safely deleted
+# when programs are not running)
+MORLOC_STATE_HOME=${XDG_STATE_HOME:-~/.local/state}/morloc
+
+# location of all cached data for morloc programs
+MORLOC_CACHE_HOME=${XDG_CACHE_HOME:-~/.cache}/morloc
+
+MORLOC_INSTALL_DIR="${MORLOC_DATA_HOME#$HOME/}/versions"
 MORLOC_STDLIB_GITHUB_ORG="morloclib"
 
 # Configuration for setting up executable folder
-MORLOC_BIN_BASENAME=".morloc/bin"
+MORLOC_BIN_BASENAME=".local/bin"
 MORLOC_BIN="$HOME/$MORLOC_BIN_BASENAME"
-PATH_EXPORT_LINE="export PATH=\"\$HOME/${MORLOC_BIN_BASENAME}:\$PATH\""
+PATH_EXPORT_LINE="export PATH=\"${MORLOC_BIN_HOME}:\$PATH\""
 COMMENT_LINE="# For Morloc support"
+
+LOCAL_VERSION="local"
 
 
 # }}}
@@ -704,7 +719,7 @@ script_menv() {
 $CONTAINER_ENGINE run --rm \\
            --shm-size=$SHARED_MEMORY_SIZE \\
            -e HOME=\$HOME \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/.morloc \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_INSTALL_DIR} \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            $CONTAINER_BASE_FULL:$tag "\$@"
@@ -738,7 +753,7 @@ $CONTAINER_ENGINE run --rm \\
            --shm-size=$SHARED_MEMORY_SIZE \\
            -it \\
            -e HOME=\$HOME \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/.morloc \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_INSTALL_DIR} \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            $CONTAINER_BASE_FULL:$tag /bin/bash
@@ -760,7 +775,7 @@ EOF
 
 script_menv_dev() {
     script_path=$1
-    tag="local"
+    tag=${LOCAL_VERSION}
 
     print_info "Creating menv-dev at '$script_path'"
 
@@ -773,7 +788,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
            -e HOME=\$HOME \\
            -e PATH="\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/.morloc \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_INSTALL_DIR} \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
            -v \$PWD:\$HOME/work \\
@@ -786,7 +801,7 @@ EOF
 
 script_morloc_dev_shell() {
     script_path=$1
-    tag="local"
+    tag=${LOCAL_VERSION}
     mock_home="${MORLOC_INSTALL_DIR}/$tag/home"
 
     print_info "Creating dev shell at '$script_path'"
@@ -800,7 +815,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -it \\
            -e HOME=\$HOME \\
            -e PATH="\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/.morloc \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_INSTALL_DIR} \\
            -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
@@ -1360,9 +1375,9 @@ cmd_env_select() {
         esac
     done
 
-    if [[ $version = "local" ]]
+    if [[ $version = ${LOCAL_VERSION} ]]
     then
-        print_error "Cannot set to 'local' version, please use dev containers"
+        print_error "Cannot set to '${LOCAL_VERSION}' version, please use dev containers"
         exit 1
     fi
 
@@ -1423,7 +1438,7 @@ cmd_env_info() {
         esac
     done
 
-    versions=$(ls $HOME/${MORLOC_INSTALL_DIR} | grep -v "local")
+    versions=$(ls $HOME/${MORLOC_INSTALL_DIR} | grep -v "${LOCAL_VERSION}")
 
     current_version=$(menv morloc --version)
     if [ $? -ne 0 ]
@@ -1476,11 +1491,6 @@ cmd_env_info() {
 detect_reference_type() {
     ver="$1"
 
-    if [ -z "$ver" ]; then
-        printf ""
-        return
-    fi
-
     # handle explicitly typed terms
     case "$ver" in
         version:*)
@@ -1522,131 +1532,133 @@ detect_reference_type() {
 }
 
 install_module_from_url() {
-  ref="$1"
-  ref_type="$2"
-  url="$3"
-  printf "installing module from URL\n"
+  install_path="$1"
+  ref="$2"
+  ref_type="$3"
+  url="$4"
+  printf "installing module from URL to '$install_path'\n"
 }
 
 install_module_from_local_source() {
-  ref="$1"
-  ref_type="$2"
-  path="$3"
-  printf "installing module from local source '%s'\n" "$3"
+  install_path="$1"
+  ref="$2"
+  ref_type="$3"
+  path="$4"
+  printf "installing module from local source '%s' to '$install_path'\n" "$3"
 }
 
 install_module_from_github(){
-  ref="$1"
-  ref_type="$2"
-  user="$3"
-  repo="$4"
+  install_path="$1"
+  ref="$2"
+  ref_type="$3"
+  user="$4"
+  repo="$5"
 
-  printf "installing module from github '%s' with reference '%s'\n" "$user/$repo" "$ref_type:$ref"
+  printf "installing module from github '%s' with reference '%s' to '%s'\n" "$user/$repo" "$ref_type:$ref" "$install_path"
 }
 
 install_module_from_gitlab(){
-  ref="$1"
-  ref_type="$2"
-  user="$3"
-  repo="$4"
+  install_path="$1"
+  ref="$2"
+  ref_type="$3"
+  user="$4"
+  repo="$5"
 
-  printf "installing module from gitlab '%s' with reference '%s'\n" "$user/$repo" "$ref_type:$ref"
+  printf "installing module from gitlab '%s' with reference '%s' to '%s'\n" "$user/$repo" "$ref_type:$ref" "$install_path"
 }
 
 install_module_from_bitbucket(){
-  ref="$1"
-  ref_type="$2"
-  user="$3"
-  repo="$4"
+  install_path="$1"  # fold to install the module in
+  ref="$2"           # ref string, version, hash, or branch
+  ref_type="$3"      # version | hash | branch
+  user="$4"          # bitbucket user name
+  repo="$5"          # bitbucket repo name
 
-  printf "installing module from bitbucket '%s' with reference '%s'\n" "$user/$repo" "$ref_type:$ref"
+  printf "installing module from bitbucket '%s' with reference '%s' to '%s'\n" "$user/$repo" "$ref_type:$ref" "$install_path"
 }
 
 install_module_from_remote() {
-  ref="$1"
-  ref_type="$2"
-  remote_form="$3"
-  remote_spec="$4"
+  install_path="$1"
+  ref="$2"
+  ref_type="$3"
+  remote_form="$4" # github | gitlab | bitbucket
+  remote_spec="$5"
 
   user=${remote_spec%%/*}
   repo=${remote_spec##*/}
 
-  case "$remote_form" in
-    github)
-      install_module_from_github "$ref" "$ref_type" "$user" "$repo"
-      ;;
-    gitlab)
-      install_module_from_gitlab "$ref" "$ref_type" "$user" "$repo"
-      ;;
-    bitbucket)
-      install_module_from_bitbucket "$ref" "$ref_type" "$user" "$repo"
-      ;;
-    *)
+  install_module_from_${remote_form} "$install_path" "$ref" "$ref_type" "$user" "$repo"
+  if [ $? != 0 ]; then
       print_error "Unknown remote type: $remote_form"
       exit 1
-      ;;
-  esac
+  fi
 }
 
 install_module_from_core() {
-  ref="$1"
-  ref_type="$2"
-  remote_spec="$3"
+  install_path="$1"
+  ref="$2"
+  ref_type="$3"
+  remote_spec="$4"
   repo="${MORLOC_STDLIB_GITHUB_ORG}/$remote_spec"
-  install_module_from_remote "$ref" "$ref_type" github $repo
+  install_module_from_remote "$install_path" "$ref" "$ref_type" github "$repo"
 }
 
 install_module() {
+    # choose location to write the installed module to
+    morloc_version="$1"
+    install_path="${MORLOC_INSTALL_DIR}/$morloc_version"
+
     # module spec of format: [source:]<package>[@version-or-hash]
-    unclean_spec="$1"
+    spec="$2"
+    ref=""
 
-    # the reference with optional type labels (hash|version|branch)
-    unclean_ref="${unclean_spec##*@}"
+    # handle version info and remove version string
+    case "$spec" in
+      *@*)
+          # the reference with optional type labels (hash|version|branch)
+          ref="${spec##*@}"
 
-    # reference type: hash | version | branch
-    ref_type_or_error=$(detect_reference_type "$unclean_ref")
-    if [ $? != 0 ]; then
-        printf "$ref_type_or_error\n"
-        exit 1
-    else
-        ref_type="$ref_type_or_error"
-    fi
+          # reference type: hash | version | branch
+          ref_type_or_error=$(detect_reference_type "$ref")
+          if [ $? != 0 ]; then
+              printf "%s\n" "$ref_type_or_error"
+              exit 1
+          fi
+          ref_type=${ref_type_or_error}
+          
+          # the ref with any ref type labels removed
+          case "$ref" in
+            *:*)
+              ref="${ref#*:}"
+              ;;
+          esac
 
-    # the ref with any ref type labels removed
-    case "$unclean_ref" in
-      *:*)
-        ref="${unclean_ref#*:}"
-        ;;
-      *)
-        ref="$unclean_ref"
-        ;;
+          # the module spec with reference info removed
+          spec="${spec%%@*}"
+          ;;
     esac
 
-    # the module spec with reference info removed
-    spec="${unclean_spec%%@*}"
-
-    printf "spec=$spec ref_type=$ref_type ref=$ref\n"
-    
+    # handle source and module label
     case "$spec" in
         # Install from HTTP/HTTPS URLs
         http://*|https://*)
-            install_module_from_url "$ref" "$ref_type" "$spec"
+            install_module_from_url "$install_path" "$ref" "$ref_type" "$spec"
             ;;
         # Install from a file path
         file:*)
-            install_module_from_local_source "$ref" "$ref_type" "${spec#file:}"
+            install_module_from_local_source "$install_path" "$ref" "$ref_type" "${spec#file:}"
             ;;
         # Check for local paths (. or ./ or / or ~/)
         .|~/*|./*|/*)
-            install_module_from_local_source "$ref" "$ref_type" "$spec"
+            install_module_from_local_source "$install_path" "$ref" "$ref_type" "$spec"
             ;;
         # Extract source prefix if present (github:, gitlab:, etc.)
         *:*)
-            install_module_from_remote "$ref" "$ref_type" "${spec%%:*}" "${spec#*:}"
+            install_module_from_remote "$install_path" "$ref" "$ref_type" "${spec%%:*}" "${spec#*:}"
             ;;
         # Install from the core library
         *)
-            install_module_from_core "$ref" "$ref_type" "$spec"
+            install_module_from_core "$install_path" "$ref" "$ref_type" "$spec"
             ;;
     esac
 }
@@ -1718,11 +1730,31 @@ EOF
 
 # Install subcommand
 cmd_mod_install() {
+
+    morloc_version=""
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)
                 show_mod_install_help
                 exit 0
+                ;;
+            --morloc-version)
+                if [ -z "$morloc_version" ]; then
+                    shift
+                    morloc_version="$1"
+                else
+                    print_error "Illegal usage of contradicting arguments '--dev' and '--morloc-version'"
+                    exit 1
+                fi
+                ;;
+            --dev)
+                if [ -z "$morloc_version" ]; then
+                    shift
+                    morloc_version="${LOCAL_VERSION}"
+                else
+                    print_error "Illegal usage of contradicting arguments '--dev' and '--morloc-version'"
+                    exit 1
+                fi
                 ;;
             -*)
                 print_error "Unknown option for mod install: $1"
@@ -1730,7 +1762,16 @@ cmd_mod_install() {
                 exit 1
                 ;;
             *)
-                install_module "$1"
+                if [ -z "$morloc_version" ]; then
+                    morloc_version=$(menv morloc --version)
+                    if [ $? -ne 0 ]
+                    then
+                        print_error "No current Morloc version set. Please install morloc before installing modules. You may install the latest version of Morloc with the command 'morloc-manager install'."
+                        exit 1
+                    fi
+                fi
+
+                install_module "$morloc_version" "$1"
                 ;;
         esac
         shift
