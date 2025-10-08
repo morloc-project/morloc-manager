@@ -5,9 +5,8 @@
 # {{{ constants and system info
 
 PROGRAM_NAME="morloc-manager"
-VERSION="0.3.0"
+VERSION="0.4.0"
 
-# no container found
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
 
@@ -27,14 +26,31 @@ elif command -v docker >/dev/null 2>&1; then
     CONTAINER_ENGINE="docker"
 fi
 
-MORLOC_INSTALL_DIR=".morloc/versions"
+# location of modules and other data will be stored for all morloc versions
+MORLOC_DATA_HOME=${XDG_DATA_HOME:-~/.local/share}/morloc
+
+# location of global morloc config and version specific configs will be stored
+MORLOC_CONFIG_HOME=${XDG_CONFIG_HOME:-~/.config}/morloc
+
+# location of all program state may be stored (may always be safely deleted
+# when programs are not running)
+MORLOC_STATE_HOME=${XDG_STATE_HOME:-~/.local/state}/morloc
+
+# location of all cached data for morloc programs
+MORLOC_CACHE_HOME=${XDG_CACHE_HOME:-~/.cache}/morloc
+
+MORLOC_INSTALL_DIR="${MORLOC_DATA_HOME#$HOME/}/versions"
+MORLOC_LIBRARY_RELDIR="src/modules"
+MORLOC_DEFAULT_PLANE="default"
+MORLOC_DEFAULT_PLANE_GITHUB_ORG="morloclib"
 
 # Configuration for setting up executable folder
-MORLOC_BIN_BASENAME=".morloc/bin"
+MORLOC_BIN_BASENAME=".local/bin"
 MORLOC_BIN="$HOME/$MORLOC_BIN_BASENAME"
-PATH_EXPORT_LINE="export PATH=\"\$HOME/${MORLOC_BIN_BASENAME}:\$PATH\""
+PATH_EXPORT_LINE="export PATH=\"${MORLOC_BIN}:\$PATH\""
 COMMENT_LINE="# For Morloc support"
 
+LOCAL_VERSION="local"
 
 # }}}
 # {{{ printing functions
@@ -50,14 +66,14 @@ if [ -t 1 ]; then
         BLUE=$(tput setaf 4 2>/dev/null || echo "")
         MAGENTA=$(tput setaf 5 2>/dev/null || echo "")
         CYAN=$(tput setaf 6 2>/dev/null || echo "")
-        
+
         # Text attributes
         BOLD=$(tput bold 2>/dev/null || echo "")
         DIM=$(tput dim 2>/dev/null || echo "")
         UNDERLINE=$(tput smul 2>/dev/null || echo "")
         REVERSE=$(tput rev 2>/dev/null || echo "")
         BLINK=$(tput blink 2>/dev/null || echo "")
-        
+
         RESET=$(tput sgr0 2>/dev/null || echo "")
     # Fallback to ANSI escape codes if tput isn't available but terminal likely supports colors
     elif [ -n "$TERM" ] && [ "$TERM" != "dumb" ] && [ "$TERM" != "unknown" ]; then
@@ -70,14 +86,14 @@ if [ -t 1 ]; then
                 BLUE='\033[0;34m'
                 MAGENTA='\033[0;35m'
                 CYAN='\033[0;36m'
-                
+
                 # Text attributes
                 BOLD='\033[1m'
                 DIM='\033[2m'
                 UNDERLINE='\033[4m'
                 REVERSE='\033[7m'
                 BLINK='\033[5m'
-                
+
                 RESET='\033[0m'
                 ;;
             *)
@@ -159,13 +175,13 @@ create_directory() {
         print_warning "Directory $DIR already exists"
         return 0
     fi
-    
+
     print_info "Creating directory: $DIR"
     if ! mkdir -p "$DIR" 2>/dev/null; then
         print_error "Failed to create directory: $DIR"
         return 1
     fi
-    
+
     print_success "Created directory: $DIR"
     return 0
 }
@@ -228,7 +244,7 @@ detect_shell() {
 get_shell_config_files() {
     local shell_name
     shell_name=$(detect_shell)
-    
+
     case "$shell_name" in
         bash)
             # macOS typically uses .bash_profile, Linux uses .bashrc
@@ -309,19 +325,19 @@ is_in_path() {
     local normalized_target
     local path_entry
     local normalized_entry
-    
+
     # Normalize the target directory
     normalized_target=$(normalize_path "$target_dir")
-    
+
     # Handle empty PATH
     if [ -z "$PATH" ]; then
         return 1
     fi
-    
+
     # Save IFS and set it to handle path separation
     local old_ifs="$IFS"
     IFS=':'
-    
+
     # Check each PATH entry
     for path_entry in $PATH; do
         # Skip empty entries
@@ -333,7 +349,7 @@ is_in_path() {
             fi
         fi
     done
-    
+
     # Restore IFS
     IFS="$old_ifs"
     return 1
@@ -358,7 +374,7 @@ add_to_config_file() {
     local shell_name
     shell_name=$(detect_shell)
     config_dir=$(dirname "$config_file")
-    
+
     # Create config directory if it doesn't exist
     if [ ! -d "$config_dir" ]; then
         print_info "Creating configuration directory: $config_dir"
@@ -367,13 +383,13 @@ add_to_config_file() {
             return 1
         fi
     fi
-    
+
     # Check if PATH export already exists
     if path_exists_in_file "$config_file"; then
         print_warning "PATH export for ~/$MORLOC_BIN_BASENAME already exists in $config_file"
         return 0
     fi
-    
+
     # Add the appropriate PATH export based on shell
     case "$shell_name" in
         fish)
@@ -413,7 +429,7 @@ add_to_config_file() {
             print_success "Added POSIX-compatible PATH export to $config_file"
             ;;
     esac
-    
+
     return 0
 }
 
@@ -422,11 +438,11 @@ source_config_file() {
     local config_file="$1"
     local shell_name
     shell_name=$(detect_shell)
-    
+
     print_info "Sourcing configuration file to update current PATH..."
 
     sleep 0.5
-    
+
     # Handle shells that don't support sourcing or have different syntax
     case "$shell_name" in
         fish)
@@ -450,7 +466,7 @@ source_config_file() {
             # shellcheck disable=SC1090
             if [ -f "$config_file" ] && . "$config_file" 2>/dev/null; then
                 print_success "Configuration file sourced successfully"
-                
+
                 # Verify the PATH was updated
                 if is_in_path "$MORLOC_BIN"; then
                     print_success "$MORLOC_BIN is now in your current PATH"
@@ -476,19 +492,19 @@ test_path_functionality() {
     local timestamp
     local test_script
     local test_command
-    
+
     # Get timestamp in a portable way
     if command -v date >/dev/null 2>&1; then
         timestamp=$(date +%s 2>/dev/null || echo "$$")
     else
         timestamp="$$"
     fi
-    
+
     test_script="$MORLOC_BIN/path-test-$timestamp"
     test_command="path-test-$timestamp"
-    
+
     print_info "Testing PATH functionality..."
-    
+
     # Create a simple test script with error handling
     if ! cat > "$test_script" << 'EOF' 2>/dev/null
 #!/usr/bin/env sh
@@ -499,18 +515,18 @@ EOF
         print_error "Failed to create test script"
         return 1
     fi
-    
+
     # Make it executable with error handling
     if ! chmod +x "$test_script" 2>/dev/null; then
         print_error "Failed to make test script executable"
         rm -f "$test_script" 2>/dev/null || true
         return 1
     fi
-    
+
     # Test if we can run it by name (proving it's in PATH)
     # Add a small delay to ensure filesystem consistency
     sleep 1
-    
+
     if command -v "$test_command" >/dev/null 2>&1 && "$test_command" >/dev/null 2>&1; then
         print_success "✓ PATH test passed - executable files in ~/.foo/bin are accessible"
         rm -f "$test_script" 2>/dev/null || true
@@ -551,7 +567,7 @@ add_morloc_bin_to_path() {
     else
         printf "%s[MISSING]%s\n" "$RED" "$RESET"
     fi
-    
+
     printf "  In current PATH? "
     if [ $morloc_bin_is_in_path = 0 ]; then
         printf "%s[YES]%s\n" "$GREEN" "$RESET"
@@ -574,12 +590,12 @@ add_morloc_bin_to_path() {
 
     local operating_system
     operating_system=$(uname -s)
-    
+
     printf "  Detected shell: %s\n" "${shell_name}"
     printf "  Configuration file: %s\n" "${config_file}"
     printf "  Operating system: %s\n" "${operating_system}"
     echo ""
-    
+
     echo "${YELLOW}This script will:${RESET}"
     echo "  1. Create directory: $MORLOC_BIN"
     echo "  2. Add PATH export to config file: $config_file"
@@ -589,9 +605,9 @@ add_morloc_bin_to_path() {
     echo ""
 
     ### Confirmation ####
-    
+
     printf "Do you want to proceed? [y/N]: "
-    
+
     # More portable read that works across shells
     if command -v read >/dev/null 2>&1; then
         read -r response 2>/dev/null || {
@@ -602,7 +618,7 @@ add_morloc_bin_to_path() {
         # Ultimate fallback
         response="n"
     fi
-    
+
     case "$response" in
         [yY]|[yY][eE][sS])
             break
@@ -614,26 +630,26 @@ add_morloc_bin_to_path() {
     esac
 
     ### Doing the thing ####
-    
+
     echo ""
     print_info "Starting setup process..."
-    
+
     # Create target directory
     if ! create_directory "$MORLOC_BIN"; then
         exit 1
     fi
-    
+
     print_info "Using configuration file: $config_file"
-    
+
     # Add to configuration file
     if ! add_to_config_file "$config_file"; then
         print_error "Failed to update configuration file"
         exit 1
     fi
-    
+
     # Source the configuration file to make PATH available immediately
     source_config_file "$config_file"
-    
+
     # Test PATH functionality
     test_passed="false"
     if test_path_functionality; then
@@ -641,11 +657,11 @@ add_morloc_bin_to_path() {
     fi
 
     ### Show completion message ####
-    
+
     echo ""
     print_success "Setup completed successfully!"
     echo ""
-    
+
     if [ "$test_passed" = "true" ]; then
         echo "${GREEN}✓ All systems go!${RESET}"
         echo "  • Directory created: $MORLOC_BIN"
@@ -657,13 +673,13 @@ add_morloc_bin_to_path() {
         echo "  • They will be accessible by name from anywhere"
     else
         echo "${YELLOW}Setup complete with minor issues:${RESET}"
-        echo "  • Directory created: $MORLOC_BIN" 
+        echo "  • Directory created: $MORLOC_BIN"
         echo "  • PATH updated in configuration file"
         echo "  • Executable test failed (shell caching or permissions)"
         echo ""
         echo "${YELLOW}Troubleshooting:${RESET}"
         echo "  • Try opening a new terminal"
-        
+
         if [ "$shell_name" = "fish" ]; then
             echo "  • For fish shell, run: exec fish"
             echo "  • Verify with: echo \$PATH | grep .foo/bin"
@@ -671,10 +687,10 @@ add_morloc_bin_to_path() {
             echo "  • Verify with: echo \$PATH | grep '\\.foo/bin'"
             echo "  • Source manually: . \"${config_file}\""
         fi
-        
+
         echo "  • Test manually: ls -la \"$MORLOC_BIN\""
     fi
-    
+
     # Platform-specific notes
     case "${operating_system}" in
         "Darwin")
@@ -704,7 +720,7 @@ script_menv() {
 $CONTAINER_ENGINE run --rm \\
            --shm-size=$SHARED_MEMORY_SIZE \\
            -e HOME=\$HOME \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/.morloc \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            $CONTAINER_BASE_FULL:$tag "\$@"
@@ -738,7 +754,7 @@ $CONTAINER_ENGINE run --rm \\
            --shm-size=$SHARED_MEMORY_SIZE \\
            -it \\
            -e HOME=\$HOME \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/.morloc \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            $CONTAINER_BASE_FULL:$tag /bin/bash
@@ -760,7 +776,7 @@ EOF
 
 script_menv_dev() {
     script_path=$1
-    tag="local"
+    tag=${LOCAL_VERSION}
 
     print_info "Creating menv-dev at '$script_path'"
 
@@ -773,7 +789,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
            -e HOME=\$HOME \\
            -e PATH="\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/.morloc \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/}} \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
            -v \$PWD:\$HOME/work \\
@@ -786,7 +802,7 @@ EOF
 
 script_morloc_dev_shell() {
     script_path=$1
-    tag="local"
+    tag=${LOCAL_VERSION}
     mock_home="${MORLOC_INSTALL_DIR}/$tag/home"
 
     print_info "Creating dev shell at '$script_path'"
@@ -800,7 +816,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -it \\
            -e HOME=\$HOME \\
            -e PATH="\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/.morloc \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
            -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
@@ -813,16 +829,19 @@ EOF
 # }}}
 # {{{ main help and version
 
-# Help function
+# Version function
+show_version() {
+    echo "${PROGRAM_NAME} ${VERSION}"
+}
+
 show_help() {
     cat << EOF
-${BOLD}$(basename $0)${RESET} ${VERSION} - manage morloc containerized installation
+${BOLD}$(basename $0) env${RESET} ${VERSION} - manage morloc containerized installation
 
 ${BOLD}USAGE${RESET}: $(basename $0) [OPTIONS] COMMAND [ARGS...]
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help     Show this help message
-  -v, --version  Show version information
 
 ${BOLD}COMMANDS${RESET}:
   ${BOLD}${GREEN}install${RESET}    Install morloc containers, scripts, and home
@@ -836,11 +855,6 @@ ${BOLD}EXAMPLES${RESET}:
   $(basename $0) uninstall
   $(basename $0) --help
 EOF
-}
-
-# Version function
-show_version() {
-    echo "${PROGRAM_NAME} ${VERSION}"
 }
 
 # }}}
@@ -998,19 +1012,24 @@ cmd_install() {
         version=$detected_version
     fi
 
-    morloc_home="$HOME/${MORLOC_INSTALL_DIR}/$version"
+    morloc_data_home="$HOME/${MORLOC_INSTALL_DIR}/$version"
 
-    print_info "Setting Morloc home to '${morloc_home}'"
+    print_info "Setting Morloc home to '${morloc_data_home}'"
 
     # create .morloc/version/$version folder
-    create_directory $morloc_home
+    create_directory $morloc_data_home
     if [ $? -ne 0 ]
     then
-        print_error "Failed to create morloc home directory at '$morloc_home'"
+        print_error "Failed to create morloc home directory at '$morloc_data_home'"
         exit 1
     fi
+    create_directory $morloc_data_home/include
+    create_directory $morloc_data_home/lib
+    create_directory $morloc_data_home/opt
+    create_directory $morloc_data_home/src/morloc/plane
+    create_directory $morloc_data_home/tmp
 
-    print_info "Created $morloc_home"
+    print_info "Created $morloc_data_home"
 
     # create morloc scripts
     script_menv             "$MORLOC_BIN/menv" $version
@@ -1126,7 +1145,7 @@ ${BOLD}ARGUMENTS${RESET}:
   version        Version to remove (optional, remove everything by default)
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) uninstall 
+  $(basename $0) uninstall
   $(basename $0) uninstall 0.52.4
 EOF
 }
@@ -1213,7 +1232,7 @@ ${BOLD}OPTIONS${RESET}:
   -h, --help           Show this help message
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) update 
+  $(basename $0) update
 EOF
 }
 
@@ -1335,9 +1354,9 @@ cmd_select() {
         esac
     done
 
-    if [[ $version = "local" ]]
+    if [[ $version = ${LOCAL_VERSION} ]]
     then
-        print_error "Cannot set to 'local' version, please use dev containers"
+        print_error "Cannot set to '${LOCAL_VERSION}' version, please use dev containers"
         exit 1
     fi
 
@@ -1398,7 +1417,7 @@ cmd_info() {
         esac
     done
 
-    versions=$(ls $HOME/${MORLOC_INSTALL_DIR} | grep -v "local")
+    versions=$(ls $HOME/${MORLOC_INSTALL_DIR} | grep -v "${LOCAL_VERSION}")
 
     current_version=$(menv morloc --version)
     if [ $? -ne 0 ]
@@ -1448,14 +1467,11 @@ cmd_info() {
 # {{{ main
 
 # Main argument parsing
+
 main() {
     case "$1" in
         -h|--help)
             show_help
-            exit 0
-            ;;
-        -v|--version)
-            show_version
             exit 0
             ;;
         install)
