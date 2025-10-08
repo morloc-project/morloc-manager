@@ -943,11 +943,11 @@ cmd_install() {
     fi
 
     print_info "Copying this install script to $MORLOC_BIN"
-    if [ $(normalize_path $MORLOC_BIN/morloc-manager) = $(normalize_path $0) ]
+    if [ $(normalize_path $MORLOC_BIN/$PROGRAM_NAME) = $(normalize_path $0) ]
     then
         print_point "$(basename $0) is already on there!"
     else
-        cp $0 $MORLOC_BIN/morloc-manager
+        cp $0 $MORLOC_BIN/$PROGRAM_NAME
     fi
 
     print_info "Looking for a container engine"
@@ -1255,15 +1255,15 @@ cmd_update() {
 
     old_version=$($0 --version)
 
-    tmp_script="/tmp/morloc-manager"
+    tmp_script="/tmp/$PROGRAM_NAME"
 
     if command -v wget > /dev/null 2>&1
     then
-        print_info "Checking for latest morloc-manager script (using curl)"
+        print_info "Checking for latest $PROGRAM_NAME script (using curl)"
         curl -o $tmp_script $THIS_SCRIPT_URL 2> /dev/null
     elif command -v curl > /dev/null 2>&1
     then
-        print_info "Checking for latest morloc-manager script (using wget)"
+        print_info "Checking for latest $PROGRAM_NAME script (using wget)"
         wget -O $tmp_script $THIS_SCRIPT_URL 2> /dev/null
     else
         print_error "Please install either wget or curl"
