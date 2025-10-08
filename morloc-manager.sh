@@ -5,7 +5,7 @@
 # {{{ constants and system info
 
 PROGRAM_NAME="morloc-manager"
-VERSION="0.3.0"
+VERSION="0.4.0-dev"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
@@ -40,7 +40,9 @@ MORLOC_STATE_HOME=${XDG_STATE_HOME:-~/.local/state}/morloc
 MORLOC_CACHE_HOME=${XDG_CACHE_HOME:-~/.cache}/morloc
 
 MORLOC_INSTALL_DIR="${MORLOC_DATA_HOME#$HOME/}/versions"
-MORLOC_STDLIB_GITHUB_ORG="morloclib"
+MORLOC_LIBRARY_RELDIR="src/modules"
+MORLOC_DEFAULT_PLANE="default"
+MORLOC_DEFAULT_PLANE_GITHUB_ORG="morloclib"
 
 # Configuration for setting up executable folder
 MORLOC_BIN_BASENAME=".local/bin"
@@ -49,7 +51,6 @@ PATH_EXPORT_LINE="export PATH=\"${MORLOC_BIN_HOME}:\$PATH\""
 COMMENT_LINE="# For Morloc support"
 
 LOCAL_VERSION="local"
-
 
 # }}}
 # {{{ printing functions
@@ -65,14 +66,14 @@ if [ -t 1 ]; then
         BLUE=$(tput setaf 4 2>/dev/null || echo "")
         MAGENTA=$(tput setaf 5 2>/dev/null || echo "")
         CYAN=$(tput setaf 6 2>/dev/null || echo "")
-        
+
         # Text attributes
         BOLD=$(tput bold 2>/dev/null || echo "")
         DIM=$(tput dim 2>/dev/null || echo "")
         UNDERLINE=$(tput smul 2>/dev/null || echo "")
         REVERSE=$(tput rev 2>/dev/null || echo "")
         BLINK=$(tput blink 2>/dev/null || echo "")
-        
+
         RESET=$(tput sgr0 2>/dev/null || echo "")
     # Fallback to ANSI escape codes if tput isn't available but terminal likely supports colors
     elif [ -n "$TERM" ] && [ "$TERM" != "dumb" ] && [ "$TERM" != "unknown" ]; then
@@ -85,14 +86,14 @@ if [ -t 1 ]; then
                 BLUE='\033[0;34m'
                 MAGENTA='\033[0;35m'
                 CYAN='\033[0;36m'
-                
+
                 # Text attributes
                 BOLD='\033[1m'
                 DIM='\033[2m'
                 UNDERLINE='\033[4m'
                 REVERSE='\033[7m'
                 BLINK='\033[5m'
-                
+
                 RESET='\033[0m'
                 ;;
             *)
@@ -174,13 +175,13 @@ create_directory() {
         print_warning "Directory $DIR already exists"
         return 0
     fi
-    
+
     print_info "Creating directory: $DIR"
     if ! mkdir -p "$DIR" 2>/dev/null; then
         print_error "Failed to create directory: $DIR"
         return 1
     fi
-    
+
     print_success "Created directory: $DIR"
     return 0
 }
@@ -243,7 +244,7 @@ detect_shell() {
 get_shell_config_files() {
     local shell_name
     shell_name=$(detect_shell)
-    
+
     case "$shell_name" in
         bash)
             # macOS typically uses .bash_profile, Linux uses .bashrc
@@ -324,19 +325,19 @@ is_in_path() {
     local normalized_target
     local path_entry
     local normalized_entry
-    
+
     # Normalize the target directory
     normalized_target=$(normalize_path "$target_dir")
-    
+
     # Handle empty PATH
     if [ -z "$PATH" ]; then
         return 1
     fi
-    
+
     # Save IFS and set it to handle path separation
     local old_ifs="$IFS"
     IFS=':'
-    
+
     # Check each PATH entry
     for path_entry in $PATH; do
         # Skip empty entries
@@ -348,7 +349,7 @@ is_in_path() {
             fi
         fi
     done
-    
+
     # Restore IFS
     IFS="$old_ifs"
     return 1
@@ -373,7 +374,7 @@ add_to_config_file() {
     local shell_name
     shell_name=$(detect_shell)
     config_dir=$(dirname "$config_file")
-    
+
     # Create config directory if it doesn't exist
     if [ ! -d "$config_dir" ]; then
         print_info "Creating configuration directory: $config_dir"
@@ -382,13 +383,13 @@ add_to_config_file() {
             return 1
         fi
     fi
-    
+
     # Check if PATH export already exists
     if path_exists_in_file "$config_file"; then
         print_warning "PATH export for ~/$MORLOC_BIN_BASENAME already exists in $config_file"
         return 0
     fi
-    
+
     # Add the appropriate PATH export based on shell
     case "$shell_name" in
         fish)
@@ -428,7 +429,7 @@ add_to_config_file() {
             print_success "Added POSIX-compatible PATH export to $config_file"
             ;;
     esac
-    
+
     return 0
 }
 
@@ -437,11 +438,11 @@ source_config_file() {
     local config_file="$1"
     local shell_name
     shell_name=$(detect_shell)
-    
+
     print_info "Sourcing configuration file to update current PATH..."
 
     sleep 0.5
-    
+
     # Handle shells that don't support sourcing or have different syntax
     case "$shell_name" in
         fish)
@@ -465,7 +466,7 @@ source_config_file() {
             # shellcheck disable=SC1090
             if [ -f "$config_file" ] && . "$config_file" 2>/dev/null; then
                 print_success "Configuration file sourced successfully"
-                
+
                 # Verify the PATH was updated
                 if is_in_path "$MORLOC_BIN"; then
                     print_success "$MORLOC_BIN is now in your current PATH"
@@ -491,19 +492,19 @@ test_path_functionality() {
     local timestamp
     local test_script
     local test_command
-    
+
     # Get timestamp in a portable way
     if command -v date >/dev/null 2>&1; then
         timestamp=$(date +%s 2>/dev/null || echo "$$")
     else
         timestamp="$$"
     fi
-    
+
     test_script="$MORLOC_BIN/path-test-$timestamp"
     test_command="path-test-$timestamp"
-    
+
     print_info "Testing PATH functionality..."
-    
+
     # Create a simple test script with error handling
     if ! cat > "$test_script" << 'EOF' 2>/dev/null
 #!/usr/bin/env sh
@@ -514,18 +515,18 @@ EOF
         print_error "Failed to create test script"
         return 1
     fi
-    
+
     # Make it executable with error handling
     if ! chmod +x "$test_script" 2>/dev/null; then
         print_error "Failed to make test script executable"
         rm -f "$test_script" 2>/dev/null || true
         return 1
     fi
-    
+
     # Test if we can run it by name (proving it's in PATH)
     # Add a small delay to ensure filesystem consistency
     sleep 1
-    
+
     if command -v "$test_command" >/dev/null 2>&1 && "$test_command" >/dev/null 2>&1; then
         print_success "✓ PATH test passed - executable files in ~/.foo/bin are accessible"
         rm -f "$test_script" 2>/dev/null || true
@@ -566,7 +567,7 @@ add_morloc_bin_to_path() {
     else
         printf "%s[MISSING]%s\n" "$RED" "$RESET"
     fi
-    
+
     printf "  In current PATH? "
     if [ $morloc_bin_is_in_path = 0 ]; then
         printf "%s[YES]%s\n" "$GREEN" "$RESET"
@@ -589,12 +590,12 @@ add_morloc_bin_to_path() {
 
     local operating_system
     operating_system=$(uname -s)
-    
+
     printf "  Detected shell: %s\n" "${shell_name}"
     printf "  Configuration file: %s\n" "${config_file}"
     printf "  Operating system: %s\n" "${operating_system}"
     echo ""
-    
+
     echo "${YELLOW}This script will:${RESET}"
     echo "  1. Create directory: $MORLOC_BIN"
     echo "  2. Add PATH export to config file: $config_file"
@@ -604,9 +605,9 @@ add_morloc_bin_to_path() {
     echo ""
 
     ### Confirmation ####
-    
+
     printf "Do you want to proceed? [y/N]: "
-    
+
     # More portable read that works across shells
     if command -v read >/dev/null 2>&1; then
         read -r response 2>/dev/null || {
@@ -617,7 +618,7 @@ add_morloc_bin_to_path() {
         # Ultimate fallback
         response="n"
     fi
-    
+
     case "$response" in
         [yY]|[yY][eE][sS])
             break
@@ -629,26 +630,26 @@ add_morloc_bin_to_path() {
     esac
 
     ### Doing the thing ####
-    
+
     echo ""
     print_info "Starting setup process..."
-    
+
     # Create target directory
     if ! create_directory "$MORLOC_BIN"; then
         exit 1
     fi
-    
+
     print_info "Using configuration file: $config_file"
-    
+
     # Add to configuration file
     if ! add_to_config_file "$config_file"; then
         print_error "Failed to update configuration file"
         exit 1
     fi
-    
+
     # Source the configuration file to make PATH available immediately
     source_config_file "$config_file"
-    
+
     # Test PATH functionality
     test_passed="false"
     if test_path_functionality; then
@@ -656,11 +657,11 @@ add_morloc_bin_to_path() {
     fi
 
     ### Show completion message ####
-    
+
     echo ""
     print_success "Setup completed successfully!"
     echo ""
-    
+
     if [ "$test_passed" = "true" ]; then
         echo "${GREEN}✓ All systems go!${RESET}"
         echo "  • Directory created: $MORLOC_BIN"
@@ -672,13 +673,13 @@ add_morloc_bin_to_path() {
         echo "  • They will be accessible by name from anywhere"
     else
         echo "${YELLOW}Setup complete with minor issues:${RESET}"
-        echo "  • Directory created: $MORLOC_BIN" 
+        echo "  • Directory created: $MORLOC_BIN"
         echo "  • PATH updated in configuration file"
         echo "  • Executable test failed (shell caching or permissions)"
         echo ""
         echo "${YELLOW}Troubleshooting:${RESET}"
         echo "  • Try opening a new terminal"
-        
+
         if [ "$shell_name" = "fish" ]; then
             echo "  • For fish shell, run: exec fish"
             echo "  • Verify with: echo \$PATH | grep .foo/bin"
@@ -686,10 +687,10 @@ add_morloc_bin_to_path() {
             echo "  • Verify with: echo \$PATH | grep '\\.foo/bin'"
             echo "  • Source manually: . \"${config_file}\""
         fi
-        
+
         echo "  • Test manually: ls -la \"$MORLOC_BIN\""
     fi
-    
+
     # Platform-specific notes
     case "${operating_system}" in
         "Darwin")
@@ -828,43 +829,16 @@ EOF
 # }}}
 # {{{ main help and version
 
-# Help functions
-show_help() {
-    cat << EOF
-${BOLD}$(basename $0)${RESET} ${VERSION} - manage morloc containerized installation
-
-${BOLD}USAGE${RESET}: $(basename $0) [OPTIONS] COMMAND [ARGS...]
-
-${BOLD}OPTIONS${RESET}:
-  -h, --help     Show this help message
-  -v, --version  Show version information
-
-${BOLD}SUB-COMMANDS${RESET}:
-  ${BOLD}${GREEN}env${RESET}  Functions for managing morloc environments
-  ${BOLD}${GREEN}mod${RESET}  Functions for managing morloc modules
-
-${BOLD}EXAMPLES${RESET}:
-  $(basename $0) env install
-  $(basename $0) env install 0.55.1
-  $(basename $0) env uninstall
-  $(basename $0) mod install internal root root-py
-  $(basename $0) --help
-EOF
-}
-
 # Version function
 show_version() {
     echo "${PROGRAM_NAME} ${VERSION}"
 }
 
-# }}}
-# {{{ env help
-
-show_env_help() {
+show_help() {
     cat << EOF
 ${BOLD}$(basename $0) env${RESET} ${VERSION} - manage morloc containerized installation
 
-${BOLD}USAGE${RESET}: $(basename $0) env [OPTIONS] COMMAND [ARGS...]
+${BOLD}USAGE${RESET}: $(basename $0) [OPTIONS] COMMAND [ARGS...]
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help     Show this help message
@@ -877,14 +851,14 @@ ${BOLD}COMMANDS${RESET}:
   ${BOLD}${GREEN}info${RESET}       Print info about manager, installs and containers
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) env install
-  $(basename $0) env uninstall
-  $(basename $0) env --help
+  $(basename $0) install
+  $(basename $0) uninstall
+  $(basename $0) --help
 EOF
 }
 
 # }}}
-# {{{ env install subcommand
+# {{{ install subcommand
 
 # Help for install subcommand
 show_install_help() {
@@ -923,7 +897,7 @@ EOF
 }
 
 # Install subcommand
-cmd_env_install() {
+cmd_install() {
     verbose=false
 
     # calling these "undefined" instead of empty strings for better debugging
@@ -1038,19 +1012,24 @@ cmd_env_install() {
         version=$detected_version
     fi
 
-    morloc_home="$HOME/${MORLOC_INSTALL_DIR}/$version"
+    morloc_data_home="$HOME/${MORLOC_INSTALL_DIR}/$version"
 
-    print_info "Setting Morloc home to '${morloc_home}'"
+    print_info "Setting Morloc home to '${morloc_data_home}'"
 
     # create .morloc/version/$version folder
-    create_directory $morloc_home
+    create_directory $morloc_data_home
     if [ $? -ne 0 ]
     then
-        print_error "Failed to create morloc home directory at '$morloc_home'"
+        print_error "Failed to create morloc home directory at '$morloc_data_home'"
         exit 1
     fi
+    create_directory $morloc_data_home/include
+    create_directory $morloc_data_home/lib
+    create_directory $morloc_data_home/opt
+    create_directory $morloc_data_home/src/morloc/plane
+    create_directory $morloc_data_home/tmp
 
-    print_info "Created $morloc_home"
+    print_info "Created $morloc_data_home"
 
     # create morloc scripts
     script_menv             "$MORLOC_BIN/menv" $version
@@ -1070,7 +1049,7 @@ cmd_env_install() {
 }
 
 # }}}
-# {{{ env uninstall subcommand
+# {{{ uninstall subcommand
 
 # Function to remove all containers for a given image
 # Usage: remove_containers_for "image_name"
@@ -1166,12 +1145,12 @@ ${BOLD}ARGUMENTS${RESET}:
   version        Version to remove (optional, remove everything by default)
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) uninstall 
+  $(basename $0) uninstall
   $(basename $0) uninstall 0.52.4
 EOF
 }
 
-cmd_env_uninstall() {
+cmd_uninstall() {
     version=""
 
     # Parse remove subcommand arguments
@@ -1240,7 +1219,7 @@ cmd_env_uninstall() {
 }
 
 # }}}
-# {{{ env update subcommand
+# {{{ update subcommand
 
 # Help for install subcommand
 show_update_help() {
@@ -1253,12 +1232,12 @@ ${BOLD}OPTIONS${RESET}:
   -h, --help           Show this help message
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) update 
+  $(basename $0) update
 EOF
 }
 
 
-cmd_env_update() {
+cmd_update() {
     # Parse install subcommand arguments
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1332,7 +1311,7 @@ cmd_env_update() {
     print_success "Updated from $old_version to $new_version"
 }
 # }}}
-# {{{ env select subcommand
+# {{{ select subcommand
 
 # Help for install subcommand
 show_select_help() {
@@ -1352,7 +1331,7 @@ ${BOLD}EXAMPLES${RESET}:
 EOF
 }
 
-cmd_env_select() {
+cmd_select() {
 
     version="undefined"
 
@@ -1404,7 +1383,7 @@ cmd_env_select() {
 }
 
 # }}}
-# {{{ env info subcommand
+# {{{ info subcommand
 
 # Help for install subcommand
 show_info_help() {
@@ -1421,7 +1400,7 @@ ${BOLD}EXAMPLES${RESET}:
 EOF
 }
 
-cmd_env_info() {
+cmd_info() {
 
     # Parse install subcommand arguments
     while [ $# -gt 0 ]; do
@@ -1485,400 +1464,9 @@ cmd_env_info() {
     exit 0
 }
 # }}}
-# {{{ mod install dispatch
-
-# Detect if a string is hash (7+ hex chars), version, or branch
-detect_reference_type() {
-    ver="$1"
-
-    # handle explicitly typed terms
-    case "$ver" in
-        version:*)
-            printf "version"
-            return
-            ;;
-        hash:*)
-            printf "hash"
-            return
-            ;;
-        branch:*)
-            printf "branch"
-            return
-            ;;
-        *:*)
-            print_error "Unknown reference type in: '$ver'. Choose one of [version|hash|branch]."
-            exit 1
-            ;;
-    esac
-
-    # Check length (must be 7+ for hash)
-    len=$(printf '%s' "$ver" | wc -c)
-    if [ "$len" -lt 7 ]; then
-        printf "version"
-        return
-    fi
-    
-    # Check if it contains only hex characters (0-9, a-f, A-F)
-    ver_lower=$(printf '%s' "$ver" | tr '[:upper:]' '[:lower:]')
-    
-    # Remove all valid hex characters and see if anything remains
-    non_hex=$(printf '%s' "$ver_lower" | tr -d '0-9a-f')
-    
-    if [ -z "$non_hex" ]; then
-        printf "hash"
-    else
-        printf "version"
-    fi
-}
-
-install_module_from_url() {
-  install_path="$1"
-  ref="$2"
-  ref_type="$3"
-  url="$4"
-  printf "installing module from URL to '$install_path'\n"
-}
-
-install_module_from_local_source() {
-  install_path="$1"
-  ref="$2"
-  ref_type="$3"
-  path="$4"
-  printf "installing module from local source '%s' to '$install_path'\n" "$3"
-}
-
-install_module_from_github(){
-  install_path="$1"
-  ref="$2"
-  ref_type="$3"
-  user="$4"
-  repo="$5"
-
-  printf "installing module from github '%s' with reference '%s' to '%s'\n" "$user/$repo" "$ref_type:$ref" "$install_path"
-}
-
-install_module_from_gitlab(){
-  install_path="$1"
-  ref="$2"
-  ref_type="$3"
-  user="$4"
-  repo="$5"
-
-  printf "installing module from gitlab '%s' with reference '%s' to '%s'\n" "$user/$repo" "$ref_type:$ref" "$install_path"
-}
-
-install_module_from_bitbucket(){
-  install_path="$1"  # fold to install the module in
-  ref="$2"           # ref string, version, hash, or branch
-  ref_type="$3"      # version | hash | branch
-  user="$4"          # bitbucket user name
-  repo="$5"          # bitbucket repo name
-
-  printf "installing module from bitbucket '%s' with reference '%s' to '%s'\n" "$user/$repo" "$ref_type:$ref" "$install_path"
-}
-
-install_module_from_remote() {
-  install_path="$1"
-  ref="$2"
-  ref_type="$3"
-  remote_form="$4" # github | gitlab | bitbucket
-  remote_spec="$5"
-
-  user=${remote_spec%%/*}
-  repo=${remote_spec##*/}
-
-  install_module_from_${remote_form} "$install_path" "$ref" "$ref_type" "$user" "$repo"
-  if [ $? != 0 ]; then
-      print_error "Unknown remote type: $remote_form"
-      exit 1
-  fi
-}
-
-install_module_from_core() {
-  install_path="$1"
-  ref="$2"
-  ref_type="$3"
-  remote_spec="$4"
-  repo="${MORLOC_STDLIB_GITHUB_ORG}/$remote_spec"
-  install_module_from_remote "$install_path" "$ref" "$ref_type" github "$repo"
-}
-
-install_module() {
-    # choose location to write the installed module to
-    morloc_version="$1"
-    install_path="${MORLOC_INSTALL_DIR}/$morloc_version"
-
-    # module spec of format: [source:]<package>[@version-or-hash]
-    spec="$2"
-    ref=""
-
-    # handle version info and remove version string
-    case "$spec" in
-      *@*)
-          # the reference with optional type labels (hash|version|branch)
-          ref="${spec##*@}"
-
-          # reference type: hash | version | branch
-          ref_type_or_error=$(detect_reference_type "$ref")
-          if [ $? != 0 ]; then
-              printf "%s\n" "$ref_type_or_error"
-              exit 1
-          fi
-          ref_type=${ref_type_or_error}
-          
-          # the ref with any ref type labels removed
-          case "$ref" in
-            *:*)
-              ref="${ref#*:}"
-              ;;
-          esac
-
-          # the module spec with reference info removed
-          spec="${spec%%@*}"
-          ;;
-    esac
-
-    # handle source and module label
-    case "$spec" in
-        # Install from HTTP/HTTPS URLs
-        http://*|https://*)
-            install_module_from_url "$install_path" "$ref" "$ref_type" "$spec"
-            ;;
-        # Install from a file path
-        file:*)
-            install_module_from_local_source "$install_path" "$ref" "$ref_type" "${spec#file:}"
-            ;;
-        # Check for local paths (. or ./ or / or ~/)
-        .|~/*|./*|/*)
-            install_module_from_local_source "$install_path" "$ref" "$ref_type" "$spec"
-            ;;
-        # Extract source prefix if present (github:, gitlab:, etc.)
-        *:*)
-            install_module_from_remote "$install_path" "$ref" "$ref_type" "${spec%%:*}" "${spec#*:}"
-            ;;
-        # Install from the core library
-        *)
-            install_module_from_core "$install_path" "$ref" "$ref_type" "$spec"
-            ;;
-    esac
-}
-
-# }}}
-# {{{ mod help
-
-show_mod_help() {
-    cat << EOF
-${BOLD}$(basename $0) env${RESET} ${VERSION} - manage morloc modules
-
-${BOLD}USAGE${RESET}: $(basename $0) mod [OPTIONS] COMMAND [ARGS...]
-
-${BOLD}OPTIONS${RESET}:
-  -h, --help     Show this help message
-
-${BOLD}COMMANDS${RESET}:
-  ${BOLD}${GREEN}install${RESET}    Install morloc modules
-  ${BOLD}${GREEN}uninstall${RESET}  Uninstall morloc modules
-  ${BOLD}${GREEN}update${RESET}     Update morloc modules
-  ${BOLD}${GREEN}list${RESET}       List morloc modules
-
-${BOLD}EXAMPLES${RESET}:
-  $(basename $0) mod install root
-  $(basename $0) mod uninstall
-  $(basename $0) mod list
-  $(basename $0) mod --help
-EOF
-}
-
-# }}}
-# {{{ mod install
-
-# Help for install subcommand
-show_mod_install_help() {
-    cat << EOF
-${BOLD}USAGE${RESET}: $(basename $0) mod install [OPTIONS] [<module>...]
-
-Install morloc modules
-
-Each package has the format: [source:]<package>[@version-or-hash]
-
-${BOLD}OPTIONS${RESET}:
-  -h, --help           Show this help message
-
-${BOLD}ARGUMENTS${RESET}:
-  module        module to install
-
-${BOLD}EXAMPLES${RESET}:
-  ${BOLD}standard library${RESET}:
-    morloc-manager install root
-    morloc-manager install root root-py math
-    morloc-manager install root@0.2.0 root-py@abcdef12
-  ${BOLD}install from remote${RESET}:
-    morloc-manager install github:user/repo
-    morloc-manager install github:user/repo@1.0.0
-    morloc-manager install github:user/repo@a1b2c3d4
-    morloc-manager install gitlab:org/project@2.1.0
-    morloc-manager install bitbucket:team/repo@deadbeef12345678
-  ${BOLD}install from other URL${RESET}:
-    morloc-manager install https://example.com/package.tar.gz
-  ${BOLD}local install${RESET}:
-    morloc-manager install .
-    morloc-manager install ./relative/path
-    morloc-manager install /absolute/path
-    morloc-manager install file:./local
-EOF
-}
-
-# Install subcommand
-cmd_mod_install() {
-
-    morloc_version=""
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            -h|--help)
-                show_mod_install_help
-                exit 0
-                ;;
-            --morloc-version)
-                if [ -z "$morloc_version" ]; then
-                    shift
-                    morloc_version="$1"
-                else
-                    print_error "Illegal usage of contradicting arguments '--dev' and '--morloc-version'"
-                    exit 1
-                fi
-                ;;
-            --dev)
-                if [ -z "$morloc_version" ]; then
-                    shift
-                    morloc_version="${LOCAL_VERSION}"
-                else
-                    print_error "Illegal usage of contradicting arguments '--dev' and '--morloc-version'"
-                    exit 1
-                fi
-                ;;
-            -*)
-                print_error "Unknown option for mod install: $1"
-                show_mod_install_help
-                exit 1
-                ;;
-            *)
-                if [ -z "$morloc_version" ]; then
-                    morloc_version=$(menv morloc --version)
-                    if [ $? -ne 0 ]
-                    then
-                        print_error "No current Morloc version set. Please install morloc before installing modules. You may install the latest version of Morloc with the command 'morloc-manager install'."
-                        exit 1
-                    fi
-                fi
-
-                install_module "$morloc_version" "$1"
-                ;;
-        esac
-        shift
-    done
-}
-
-# }}}
-# {{{ mod uninstall
-
-cmd_mod_uninstall() {
-  echo stub
-}
-
-# }}}
-# {{{ mod update
-
-cmd_mod_update() {
-  echo stub
-}
-
-# }}}
-# {{{ mod list
-
-cmd_mod_list() {
-  echo stub
-}
-
-# }}}
 # {{{ main
 
 # Main argument parsing
-
-subcommand_env() {
-    case "$1" in
-        -h|--help)
-            show_env_help
-            exit 0
-            ;;
-        install)
-            shift
-            cmd_env_install "$@"
-            ;;
-        uninstall)
-            shift
-            cmd_env_uninstall "$@"
-            ;;
-        update)
-            shift
-            cmd_env_update "$@"
-            ;;
-        select)
-            shift
-            cmd_env_select "$@"
-            ;;
-        info)
-            shift
-            cmd_env_info "$@"
-            ;;
-        "")
-            print_error "No command specified"
-            show_env_help
-            exit 1
-            ;;
-        *)
-            print_error "Unknown command: $1"
-            show_env_help
-            exit 1
-            ;;
-    esac
-
-}
-
-subcommand_mod() {
-    case "$1" in
-        -h|--help)
-            show_mod_help
-            exit 0
-            ;;
-        install)
-            shift
-            cmd_mod_install "$@"
-            ;;
-        uninstall)
-            shift
-            cmd_mod_uninstall "$@"
-            ;;
-        update)
-            shift
-            cmd_mod_update "$@"
-            ;;
-        list)
-            shift
-            cmd_mod_list "$@"
-            ;;
-        "")
-            print_error "No command specified"
-            show_help
-            exit 1
-            ;;
-        *)
-            print_error "Unknown command: $1"
-            show_help
-            exit 1
-            ;;
-    esac
-
-}
 
 main() {
     case "$1" in
@@ -1886,17 +1474,25 @@ main() {
             show_help
             exit 0
             ;;
-        -v|--version)
-            show_version
-            exit 0
-            ;;
-        env)
+        install)
             shift
-            subcommand_env "$@"
+            cmd_install "$@"
             ;;
-        mod)
+        uninstall)
             shift
-            subcommand_mod "$@"
+            cmd_uninstall "$@"
+            ;;
+        update)
+            shift
+            cmd_update "$@"
+            ;;
+        select)
+            shift
+            cmd_select "$@"
+            ;;
+        info)
+            shift
+            cmd_info "$@"
             ;;
         "")
             print_error "No command specified"
