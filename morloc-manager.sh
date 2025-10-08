@@ -836,7 +836,7 @@ show_version() {
 
 show_help() {
     cat << EOF
-${BOLD}$(basename $0) env${RESET} ${VERSION} - manage morloc containerized installation
+${BOLD}$(basename $0)${RESET} ${VERSION} - manage morloc containerized installation
 
 ${BOLD}USAGE${RESET}: $(basename $0) [OPTIONS] COMMAND [ARGS...]
 
