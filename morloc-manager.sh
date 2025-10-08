@@ -47,7 +47,7 @@ MORLOC_DEFAULT_PLANE_GITHUB_ORG="morloclib"
 # Configuration for setting up executable folder
 MORLOC_BIN_BASENAME=".local/bin"
 MORLOC_BIN="$HOME/$MORLOC_BIN_BASENAME"
-PATH_EXPORT_LINE="export PATH=\"${MORLOC_BIN_HOME}:\$PATH\""
+PATH_EXPORT_LINE="export PATH=\"${MORLOC_BIN}:\$PATH\""
 COMMENT_LINE="# For Morloc support"
 
 LOCAL_VERSION="local"
@@ -720,7 +720,7 @@ script_menv() {
 $CONTAINER_ENGINE run --rm \\
            --shm-size=$SHARED_MEMORY_SIZE \\
            -e HOME=\$HOME \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_INSTALL_DIR} \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            $CONTAINER_BASE_FULL:$tag "\$@"
@@ -754,7 +754,7 @@ $CONTAINER_ENGINE run --rm \\
            --shm-size=$SHARED_MEMORY_SIZE \\
            -it \\
            -e HOME=\$HOME \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_INSTALL_DIR} \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            $CONTAINER_BASE_FULL:$tag /bin/bash
@@ -789,7 +789,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
            -e HOME=\$HOME \\
            -e PATH="\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_INSTALL_DIR} \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/}} \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
            -v \$PWD:\$HOME/work \\
@@ -816,7 +816,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -it \\
            -e HOME=\$HOME \\
            -e PATH="\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_INSTALL_DIR} \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
            -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
