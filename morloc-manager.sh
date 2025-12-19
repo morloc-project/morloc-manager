@@ -1501,9 +1501,8 @@ main() {
             cmd_info "$@"
             ;;
         "")
-            print_error "No command specified"
             show_help
-            exit 1
+            exit 0
             ;;
         *)
             print_error "Unknown command: $1"
