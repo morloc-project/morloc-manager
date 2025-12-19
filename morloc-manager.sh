@@ -1257,18 +1257,19 @@ cmd_update() {
 
     tmp_script="/tmp/$PROGRAM_NAME"
 
-    if command -v wget > /dev/null 2>&1
-    then
-        print_info "Checking for latest $PROGRAM_NAME script (using curl)"
-        curl -o $tmp_script $THIS_SCRIPT_URL 2> /dev/null
-    elif command -v curl > /dev/null 2>&1
-    then
-        print_info "Checking for latest $PROGRAM_NAME script (using wget)"
-        wget -O $tmp_script $THIS_SCRIPT_URL 2> /dev/null
+    WGET_PATH=$(command -v wget 2>/dev/null || true)
+    CURL_PATH=$(command -v curl 2>/dev/null || true)
+
+    if [ -n "$WGET_PATH" ] && [ -x "$WGET_PATH" ]; then
+      print_info "Checking for latest $PROGRAM_NAME script (using wget)"
+      "$WGET_PATH" -q -O "$tmp_script" "$THIS_SCRIPT_URL"
+    elif [ -n "$CURL_PATH" ] && [ -x "$CURL_PATH" ]; then
+      print_info "Checking for latest $PROGRAM_NAME script (using wget)"
+      "$CURL_PATH" -fsSL -o "$tmp_script" "$THIS_SCRIPT_URL"
     else
-        print_error "Please install either wget or curl"
-        rm -f $tmp_script
-        exit 1
+      print_error "Please install either wget or curl"
+      rm -f "$tmp_script"
+      exit 1
     fi
 
     if [ $? -ne 0 ]
