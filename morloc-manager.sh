@@ -831,7 +831,7 @@ EOF
 
 # Version function
 show_version() {
-    echo "${PROGRAM_NAME} ${VERSION}"
+    echo "${VERSION}"
 }
 
 show_help() {
@@ -842,6 +842,7 @@ ${BOLD}USAGE${RESET}: $(basename $0) [OPTIONS] COMMAND [ARGS...]
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help     Show this help message
+  -v, --version  Show this manager version
 
 ${BOLD}COMMANDS${RESET}:
   ${BOLD}${GREEN}install${RESET}    Install morloc containers, scripts, and home
@@ -1473,6 +1474,10 @@ main() {
     case "$1" in
         -h|--help)
             show_help
+            exit 0
+            ;;
+        -v|--version)
+            show_version
             exit 0
             ;;
         install)
