@@ -5,7 +5,7 @@
 # {{{ constants and system info
 
 PROGRAM_NAME="morloc-manager"
-VERSION="0.4.1"
+VERSION="0.4.2"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
@@ -1135,19 +1135,21 @@ remove_all_containers_and_images() {
 # Help for remove subcommand
 show_uninstall_help() {
     cat << EOF
-${BOLD}USAGE${RESET}: $(basename $0) uninstall [OPTIONS] <version>
+${BOLD}USAGE${RESET}: $(basename $0) uninstall [OPTIONS] [VERSION]...
 
 Remove Morloc home (or specfic versions) and all associated containers
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help     Show this help message
+  -a, --all      Remove all Morloc versions
 
 ${BOLD}ARGUMENTS${RESET}:
-  version        Version to remove (optional, remove everything by default)
+  VERSION        Version to remove, may specify multiple versions
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) uninstall
-  $(basename $0) uninstall 0.52.4
+  $(basename $0) uninstall --all
+  $(basename $0) uninstall 0.55.7
+  $(basename $0) uninstall 0.53.6 0.53.7
 EOF
 }
 
@@ -1161,59 +1163,56 @@ cmd_uninstall() {
                 show_uninstall_help
                 exit 0
                 ;;
+            -a|--all)
+                morloc_home="$HOME/${MORLOC_INSTALL_DIR}"
+                if [[ -d "$morloc_home" ]]
+                then
+                    rm -rf "$morloc_home"
+                    if [[ $? -ne 0 ]]
+                    then
+                        print_error "Failed to remove morloc home directory '$morloc_home'"
+                    else
+                        print_success "Removed morloc home directory '$morloc_home'"
+                    fi
+                else
+                    print_warning "Cannot remove morloc home directory '$morloc_home', it does not exist"
+                fi
+
+                # remove all containers/images for all Morloc tags
+                remove_all_containers_and_images $CONTAINER_BASE_FULL
+                remove_all_containers_and_images $CONTAINER_BASE_TINY
+                remove_all_containers_and_images $CONTAINER_BASE_TEST
+                exit 0
+                ;;
             -*)
                 print_error "Unknown option for uninstall: $1"
                 show_remove_help
                 exit 1
                 ;;
             *)
-                if [ -z "$version" ]; then
-                    version="$1"
+                version=$1
+                morloc_home="$HOME/${MORLOC_INSTALL_DIR}/$version"
+                if [[ -d "$morloc_home" ]]
+                then
+                    print_info "Morloc home '$morloc_home' found, deleting"
+                    rm -rf "$morloc_home"
+                    if [[ $? -ne 0 ]]
+                    then
+                        print_error "Failed to remove morloc home directory '$morloc_home'"
+                    else
+                        print_success "Removed morloc directory '$morloc_home'"
+                    fi
                 else
-                    print_error "Multiple version are not supported yet: $1"
-                    exit 1
+                    print_warning "Cannot remove morloc directory '$morloc_home', it does not exist"
                 fi
+                remove_containers_for_version $CONTAINER_BASE_FULL:$version
                 shift
                 ;;
         esac
     done
 
-    if [ -z $version ]
-    then
-        morloc_home="$HOME/${MORLOC_INSTALL_DIR}"
-        if [[ -d "$morloc_home" ]]
-        then
-            rm -rf "$morloc_home"
-            if [[ $? -ne 0 ]]
-            then
-                print_error "Failed to remove morloc home directory '$morloc_home'"
-            else
-                print_success "Removed morloc home directory '$morloc_home'"
-            fi
-        else
-            print_warning "Cannot remove morloc home directory '$morloc_home', it does not exist"
-        fi
-
-        # remove all containers/images for all Morloc tags
-        remove_all_containers_and_images $CONTAINER_BASE_FULL
-        remove_all_containers_and_images $CONTAINER_BASE_TINY
-        remove_all_containers_and_images $CONTAINER_BASE_TEST
-    else
-        morloc_home="$HOME/${MORLOC_INSTALL_DIR}/$version"
-        if [[ -d "$morloc_home" ]]
-        then
-            print_info "Morloc home '$morloc_home' found, deleting"
-            rm -rf "$morloc_home"
-            if [[ $? -ne 0 ]]
-            then
-                print_error "Failed to remove morloc home directory '$morloc_home'"
-            else
-                print_success "Removed morloc directory '$morloc_home'"
-            fi
-        else
-            print_warning "Cannot remove morloc directory '$morloc_home', it does not exist"
-        fi
-        remove_containers_for_version $CONTAINER_BASE_FULL:$version
+    if [ -z "$version" ]; then
+        show_uninstall_help
     fi
 
     print_success "Removed containers and Morloc home, scripts remain"
@@ -1369,10 +1368,9 @@ cmd_select() {
         exit 1
     fi
 
-    add_morloc_bin_to_path
-
     if [[ -d $HOME/${MORLOC_INSTALL_DIR}/$version ]]
     then
+        add_morloc_bin_to_path
         script_menv "$MORLOC_BIN/menv" $version
         script_morloc_shell "$MORLOC_BIN/morloc-shell" $version
     else
@@ -1501,9 +1499,8 @@ main() {
             cmd_info "$@"
             ;;
         "")
-            print_error "No command specified"
             show_help
-            exit 1
+            exit 0
             ;;
         *)
             print_error "Unknown command: $1"
