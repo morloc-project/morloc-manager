@@ -1368,10 +1368,9 @@ cmd_select() {
         exit 1
     fi
 
-    add_morloc_bin_to_path
-
     if [[ -d $HOME/${MORLOC_INSTALL_DIR}/$version ]]
     then
+        add_morloc_bin_to_path
         script_menv "$MORLOC_BIN/menv" $version
         script_morloc_shell "$MORLOC_BIN/morloc-shell" $version
     else
