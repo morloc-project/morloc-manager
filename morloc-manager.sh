@@ -5,7 +5,7 @@
 # {{{ constants and system info
 
 PROGRAM_NAME="morloc-manager"
-VERSION="0.4.2"
+VERSION="0.4.3"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
@@ -757,6 +757,7 @@ $CONTAINER_ENGINE run --rm \\
            -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
+           \$@ \\
            $CONTAINER_BASE_FULL:$tag /bin/bash
 EOF
 
@@ -821,6 +822,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
+           \$@ \\
            $CONTAINER_BASE_TEST /bin/bash
 EOF
     chmod 755 $script_path
