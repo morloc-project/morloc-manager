@@ -5,7 +5,7 @@
 # {{{ constants and system info
 
 PROGRAM_NAME="morloc-manager"
-VERSION="0.5.0"
+VERSION="0.5.1"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
@@ -1321,7 +1321,9 @@ cmd_uninstall() {
     done
 
     if [ -z "$version" ]; then
+        print_error "No version given, to uninstall everything call with --all option"
         show_uninstall_help
+        exit 0
     fi
 
     print_success "Removed containers and Morloc home, scripts remain"
