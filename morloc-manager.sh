@@ -39,6 +39,8 @@ MORLOC_STATE_HOME=${XDG_STATE_HOME:-~/.local/state}/morloc
 # location of all cached data for morloc programs
 MORLOC_CACHE_HOME=${XDG_CACHE_HOME:-~/.cache}/morloc
 
+MORLOC_DEPENDENCY_DIR="$HOME/.local/share/morloc/deps"
+
 MORLOC_INSTALL_DIR="${MORLOC_DATA_HOME#$HOME/}/versions"
 MORLOC_LIBRARY_RELDIR="src/modules"
 MORLOC_DEFAULT_PLANE="default"
@@ -708,10 +710,74 @@ add_morloc_bin_to_path() {
 }
 
 # }}}
-# {{{ define scripts
+# {{{ define scripts and their environments
+
+# build an environment container if it does not yet exist
+build_environment() {
+    envname=$1
+    dockerfile=$2
+    envtag=$3
+    container_base=$4
+
+    # Check if image already exists
+    if $CONTAINER_ENGINE image inspect "$envtag" >/dev/null 2>&1; then
+        # Get the modification time of the Dockerfile
+        if [ -f "$dockerfile" ]; then
+            dockerfile_mtime=$(stat -c %Y "$dockerfile" 2>/dev/null || stat -f %m "$dockerfile" 2>/dev/null)
+            # Get image creation time (Unix timestamp)
+            # Docker and Podman both support this format
+            image_created=$($CONTAINER_ENGINE image inspect "$envtag" --format '{{.Created}}' 2>/dev/null)
+
+            # Convert image created time to Unix timestamp
+            # This is portable across docker and podman
+            if command -v date >/dev/null 2>&1; then
+                image_timestamp=$(date -d "$image_created" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "$image_created" +%s 2>/dev/null)
+
+                # Compare timestamps - rebuild if Dockerfile is newer
+                if [ -n "$dockerfile_mtime" ] && [ -n "$image_timestamp" ]; then
+                    if [ "$dockerfile_mtime" -le "$image_timestamp" ]; then
+                        print_info "Image '$envtag' is up to date"
+                        return 0
+                    else
+                        print_info "Dockerfile has been modified, rebuilding image '$envtag'"
+                    fi
+                fi
+            fi
+        else
+            print_warning "Dockerfile '$dockerfile' not found, but image exists. Using existing image."
+            return 0
+        fi
+    else
+        print_info "Building new image '$envtag'"
+    fi
+
+    # Build the image (quotes needed in case of spaces in paths)
+    if ! $CONTAINER_ENGINE build --build-arg CONTAINER_BASE="$container_base" --tag "$envtag" --file "$dockerfile" "$(dirname "$dockerfile")"; then
+        print_error "Failed to build image '$envtag' from '$dockerfile'"
+        return 1
+    fi
+
+    print_success "Built image '$envtag'"
+    return 0
+}
+
 script_menv() {
     script_path=$1
     tag=$2
+    envname=$3
+    envfile=$4
+
+    base_container=$CONTAINER_BASE_FULL:$tag
+
+    if [ -n "$envname" ] && [ -n "$envfile" ]; then
+        user_container="morloc-env:$tag-$envname"
+        build_environment $envname $envfile $user_container $base_container
+    elif [ -n "$envname" ] || [ -n "$envfile" ]; then
+        print_error "Both env name and file must be provided together"
+        return 1
+    else
+        user_container="$base_container"
+    fi
 
     print_info "Creating menv at '$script_path' with Morloc v${tag}"
 
@@ -723,7 +789,7 @@ $CONTAINER_ENGINE run --rm \\
            -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
-           $CONTAINER_BASE_FULL:$tag "\$@"
+           $user_container "\$@"
 
 EOF
 
@@ -745,6 +811,20 @@ EOF
 script_morloc_shell() {
     script_path=$1
     tag=$2
+    envname=$3
+    envfile=$4
+
+    base_container=$CONTAINER_BASE_FULL:$tag
+
+    if [ -n "$envname" ] && [ -n "$envfile" ]; then
+        user_container="morloc-env:$tag-$envname"
+        build_environment $envname $envfile $user_container $base_container
+    elif [ -n "$envname" ] || [ -n "$envfile" ]; then
+        print_error "Both env name and file must be provided together"
+        return 1
+    else
+        user_container="$base_container"
+    fi
 
     print_info "Creating morloc-shell at '$script_path' with Morloc v${tag}"
 
@@ -757,7 +837,7 @@ $CONTAINER_ENGINE run --rm \\
            -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
-           $CONTAINER_BASE_FULL:$tag /bin/bash
+           $user_container /bin/bash
 EOF
 
     observed_version=$(menv morloc --version)
@@ -776,7 +856,20 @@ EOF
 
 script_menv_dev() {
     script_path=$1
+    envname=$2
+    envfile=$3
+
     tag=${LOCAL_VERSION}
+
+    if [ -n "$envname" ] && [ -n "$envfile" ]; then
+        user_container="morloc-env:$tag-$envname"
+        build_environment $envname $envfile $user_container $base_container
+    elif [ -n "$envname" ] || [ -n "$envfile" ]; then
+        print_error "Both env name and file must be provided together"
+        return 1
+    else
+        user_container="$CONTAINER_BASE_TEST"
+    fi
 
     print_info "Creating menv-dev at '$script_path'"
 
@@ -794,7 +887,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
-           $CONTAINER_BASE_TEST "\$@"
+           $user_container "\$@"
 
 EOF
     chmod 755 $script_path
@@ -802,8 +895,21 @@ EOF
 
 script_morloc_dev_shell() {
     script_path=$1
+    envname=$2
+    envfile=$3
+
     tag=${LOCAL_VERSION}
     mock_home="${MORLOC_INSTALL_DIR}/$tag/home"
+
+    if [ -n "$envname" ] && [ -n "$envfile" ]; then
+        user_container="morloc-env:$tag-$envname"
+        build_environment $envname $envfile $user_container $base_container
+    elif [ -n "$envname" ] || [ -n "$envfile" ]; then
+        print_error "Both env name and file must be provided together"
+        return 1
+    else
+        user_container="$CONTAINER_BASE_TEST"
+    fi
 
     print_info "Creating dev shell at '$script_path'"
 
@@ -821,7 +927,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
-           $CONTAINER_BASE_TEST /bin/bash
+           $user_container /bin/bash
 EOF
     chmod 755 $script_path
 }
@@ -849,6 +955,7 @@ ${BOLD}COMMANDS${RESET}:
   ${BOLD}${GREEN}uninstall${RESET}  Remove morloc containers, scripts, and home
   ${BOLD}${GREEN}update${RESET}     Pull the latest version of this script
   ${BOLD}${GREEN}select${RESET}     Choose a new Morloc version
+  ${BOLD}${GREEN}env${RESET}        Select or explore available environments
   ${BOLD}${GREEN}info${RESET}       Print info about manager, installs and containers
 
 ${BOLD}EXAMPLES${RESET}:
@@ -1465,6 +1572,225 @@ cmd_info() {
     exit 0
 }
 # }}}
+# {{{ env subcommand
+
+update_environment() {
+  envname=$1
+  update_dev=$2
+  update_usr=$3
+  envfile="$MORLOC_DEPENDENCY_DIR/$envname.Dockerfile"
+
+  print_info "Attempting to switch environment to ${envname} with ${envfile}"
+
+  if [ -e "$envfile" ]; then
+    print_info "$envfile found, attempting to build"
+  else
+    print_error "$envfile not found, please create and retry"
+    return 1
+  fi
+
+  version=$(menv morloc --version)
+  if [ $? -ne 0 ]
+  then
+      print_error "morloc does not appear to be installed, first install and then set the environment"
+      return 1
+  else
+      print_info "Currently using morloc v$version"
+  fi
+
+  if [ $update_usr = "true" ]; then
+      script_menv         "$MORLOC_BIN/menv"         "$version" "$envname" "$envfile"
+      script_morloc_shell "$MORLOC_BIN/morloc-shell" "$version" "$envname" "$envfile"
+      print_success "Switched user profiles to $version-$envname and built all required containers"
+  fi
+
+  if [ $update_dev = "true" ]; then
+      script_menv_dev         "$MORLOC_BIN/menv-dev"         "$envname" "$envfile"
+      script_morloc_dev_shell "$MORLOC_BIN/morloc-shell-dev" "$envname" "$envfile"
+      print_success "Switched dev profiles to $version-$envname and built all required containers"
+  fi
+
+  return 0
+}
+
+reset_environment() {
+  version=$(menv morloc --version)
+  if [ $? -ne 0 ]
+  then
+      print_error "morloc does not appear to be installed, nothing needs to be reset"
+      return 1
+  else
+      print_info "Currently using morloc v$version"
+  fi
+
+  if [ $update_usr = "true" ]; then
+      script_menv             "$MORLOC_BIN/menv"         $version
+      script_morloc_shell     "$MORLOC_BIN/morloc-shell" $version
+      print_success "Successfully reset user profiles to default environment"
+  fi
+
+  if [ $update_dev = "true" ]; then
+      script_menv_dev         "$MORLOC_BIN/menv-dev"
+      script_morloc_dev_shell "$MORLOC_BIN/morloc-shell-dev"
+      print_success "Successfully reset dev profiles to default environment"
+  fi
+
+  return 0
+}
+
+list_local_environment() {
+
+    # Check if directory doesn't exist
+    if [ ! -d "$MORLOC_DEPENDENCY_DIR" ]; then
+        print_info "No dependency environments defined. To add an environment, create a Dockerfile in the $MORLOC_DEPENDENCY_DIR directory"
+        return 0
+    fi
+
+    # Check if directory is empty or has no .Dockerfile files
+    found=0
+    for file in "$MORLOC_DEPENDENCY_DIR"/*.Dockerfile; do
+        # Check if glob matched anything (fails if no files exist)
+        if [ -e "$file" ]; then
+            found=1
+            break
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        print_info "No dependency environments defined"
+        return 0
+    fi
+
+    current_env=$(menv sh -c "echo \$MORLOC_ENV_NAME")
+    print_info "current_env='$current_env'"
+
+    # List all .Dockerfile files
+    for file in "$MORLOC_DEPENDENCY_DIR"/*.Dockerfile; do
+        if [ -e "$file" ]; then
+            basename="${file##*/}"           # Get basename
+            basename="${basename%.Dockerfile}"  # Remove .Dockerfile extension
+            if [ $basename = $current_env ]; then
+                printf "%s\t%s\t(current)\n" "$basename" "$file"
+            else
+                printf "%s\t%s\n" "$basename" "$file"
+            fi
+        fi
+    done
+}
+
+init_environment() {
+    envname="$1"
+    envfile="$MORLOC_DEPENDENCY_DIR/$1.Dockerfile"
+
+    # if MORLOC_DEPENDENCY_DIR does not exist, create the directory
+    mkdir -p $MORLOC_DEPENDENCY_DIR
+
+    if [ -e "$envfile" ]; then
+        print_error "Cannot create $envfile, file already exists"
+        exit 1
+    fi
+
+    cat << EOF > "$envfile"
+# Automatically generated section, DO NOT MODIFY
+# ----------------------------------------------
+ARG CONTAINER_BASE
+FROM \${CONTAINER_BASE}
+LABEL morloc.environment="$envname"
+ENV MORLOC_ENV_NAME="$envname"
+# End of automatically generated section
+# ----------------------------------------------
+
+# Add custom setup below this line
+EOF
+
+    print_success "Created stub Dockerfile at $envfile, edit as needed"
+    exit 0
+}
+
+# Help for env subcommand
+show_env_help() {
+    cat << EOF
+${BOLD}USAGE${RESET}: $(basename $0) env <env_name>
+
+Select an environment. The environment is defined as a Dockerfile that builds
+on a version-specific morloc image.
+
+${BOLD}OPTIONS${RESET}:
+  -h, --help     Show this help message
+      --list     List all locally defined environments
+      --init ENV Create a stub Dockerfile
+      --reset    Reset to the default environment
+      --dev      Act only on the dev profiles
+      --usr      Act only on the user profiles
+
+${BOLD}EXAMPLES${RESET}:
+  $(basename $0) env --list
+  $(basename $0) env --init ml
+  $(basename $0) env ml
+EOF
+}
+
+cmd_env() {
+    # Parse install subcommand arguments
+    env=""
+    update_dev="true"
+    update_usr="true"
+    reset="false"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                show_env_help
+                exit 0
+                ;;
+            --list)
+                list_local_environment
+                exit 0
+                ;;
+            --init)
+                shift
+                init_environment $1
+                exit 0
+                ;;
+            --reset)
+                shift
+                reset="true"
+                ;;
+            --dev)
+                shift
+                update_dev="true"
+                update_usr="false"
+                ;;
+            --usr)
+                shift
+                update_dev="false"
+                update_usr="true"
+                ;;
+            -*)
+                print_error "Unexpected argument"
+                show_env_help
+                exit 1
+                ;;
+            *)
+                if [ -z "$env" ]; then
+                    env="$1"
+                    shift
+                else
+                    print_error "Nested environments are not supported"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    if [ $reset = "true" ]; then
+        reset_environment
+    else
+        update_environment "$env" $update_dev $update_usr
+    fi
+
+    exit 0
+}
+# }}}
 # {{{ main
 
 # Main argument parsing
@@ -1494,6 +1820,10 @@ main() {
         select)
             shift
             cmd_select "$@"
+            ;;
+        env)
+            shift
+            cmd_env "$@"
             ;;
         info)
             shift
