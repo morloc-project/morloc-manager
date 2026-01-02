@@ -1162,10 +1162,10 @@ cmd_install() {
 # Function to remove all containers for a given image
 # Usage: remove_containers_for "image_name"
 remove_containers_for_version() {
-    image_name="$1"
+    version="$1"
 
-    if [ -z "$image_name" ]; then
-        print_error "Image name required missing"
+    if [ -z "$version" ]; then
+        print_error "Image version required missing"
         return 1
     fi
 
@@ -1174,22 +1174,21 @@ remove_containers_for_version() {
         return 1
     fi
 
-    print_info "Removing containers for $image_name using $CONTAINER_ENGINE ..."
+    print_info "Removing containers for $version using $CONTAINER_ENGINE ..."
 
-    # Get container IDs
-    container_ids=$($CONTAINER_ENGINE ps -a --filter "ancestor=$image_name" --format '{{.ID}}' 2>/dev/null)
+    # Remove containers using this version
+    $CONTAINER_ENGINE ps -a --filter "ancestor=$CONTAINER_BASE_FULL:$version" --format '{{.ID}}' | xargs -r $CONTAINER_ENGINE rm -f
+    $CONTAINER_ENGINE ps -a --filter "ancestor=$CONTAINER_BASE_TINY:$version" --format '{{.ID}}' | xargs -r $CONTAINER_ENGINE rm -f
 
-    if [ -n "$container_ids" ]; then
-        echo "Found containers: $container_ids"
-        if $CONTAINER_ENGINE rm -f $container_ids; then
-            print_success "Containers removed successfully"
-        else
-            print_error "Error removing containers"
-            return 1
-        fi
-    else
-        print_warning "No containers found for $image_name"
-    fi
+    # Remove environment images for this version
+    $CONTAINER_ENGINE images --filter "reference=morloc-env:$version-*" --format '{{.ID}}' | xargs -r $CONTAINER_ENGINE rmi -f
+
+    # Remove base image
+    $CONTAINER_ENGINE rmi -f "$CONTAINER_BASE_FULL:$version"
+    $CONTAINER_ENGINE rmi -f "$CONTAINER_BASE_TINY:$version"
+
+    print_success "All containers and images removed for $version"
+
 }
 
 
@@ -1312,7 +1311,7 @@ cmd_uninstall() {
                 else
                     print_warning "Cannot remove morloc directory '$morloc_home', it does not exist"
                 fi
-                remove_containers_for_version $CONTAINER_BASE_FULL:$version
+                remove_containers_for_version "$version"
                 shift
                 ;;
         esac
@@ -1531,6 +1530,7 @@ cmd_info() {
     if [ $? -ne 0 ]
     then
         print_error "No current Morloc version set"
+        current_version="none"
     fi
 
     dev_container=${CONTAINER_BASE_TEST}
