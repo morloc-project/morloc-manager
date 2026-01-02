@@ -5,7 +5,7 @@
 # {{{ constants and system info
 
 PROGRAM_NAME="morloc-manager"
-VERSION="0.5.1"
+VERSION="0.5.2"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
@@ -1714,10 +1714,10 @@ EOF
 # Help for env subcommand
 show_env_help() {
     cat << EOF
-${BOLD}USAGE${RESET}: $(basename $0) env <env_name>
+${BOLD}USAGE${RESET}: $(basename $0) env [OPTIONS] [ENV]
 
-Select an environment. The environment is defined as a Dockerfile that builds
-on a version-specific morloc image.
+Select an environment. The environment is defined as a Dockerfile
+that builds on a version-specific morloc image.
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help     Show this help message
