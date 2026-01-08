@@ -771,7 +771,7 @@ script_menv() {
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
-        build_environment $envname $envfile $user_container $base_container
+        build_environment $envname $envfile $user_container $base_container || return $?
     elif [ -n "$envname" ] || [ -n "$envfile" ]; then
         print_error "Both env name and file must be provided together"
         return 1
@@ -818,7 +818,7 @@ script_morloc_shell() {
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
-        build_environment $envname $envfile $user_container $base_container
+        build_environment $envname $envfile $user_container $base_container || return $?
     elif [ -n "$envname" ] || [ -n "$envfile" ]; then
         print_error "Both env name and file must be provided together"
         return 1
@@ -863,7 +863,7 @@ script_menv_dev() {
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
-        build_environment $envname $envfile $user_container $base_container
+        build_environment $envname $envfile $user_container $base_container || return $?
     elif [ -n "$envname" ] || [ -n "$envfile" ]; then
         print_error "Both env name and file must be provided together"
         return 1
@@ -903,7 +903,7 @@ script_morloc_dev_shell() {
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
-        build_environment $envname $envfile $user_container $base_container
+        build_environment $envname $envfile $user_container $base_container || return $?
     elif [ -n "$envname" ] || [ -n "$envfile" ]; then
         print_error "Both env name and file must be provided together"
         return 1
@@ -1044,11 +1044,7 @@ cmd_install() {
         tag=$version
     fi
 
-    add_morloc_bin_to_path
-    if [ $? -ne 0 ]
-    then
-        exit 1
-    fi
+    add_morloc_bin_to_path || exit 1
 
     print_info "Copying this install script to $MORLOC_BIN"
     if [ $(normalize_path $MORLOC_BIN/$PROGRAM_NAME) = $(normalize_path $0) ]
@@ -1065,7 +1061,7 @@ cmd_install() {
         print_error "No container engine found, please install podman or docker"
         exit 1
     else
-        print_info "Using $CONTAINER_ENGINE $CONTAINER_ENGINE_VERSION as a container engine"
+        print_info "Using $CONTAINER_ENGINE $CONTAINER_ENGINE_VERSION as container engine"
     fi
 
     if [ "$version" = "undefined" ]
