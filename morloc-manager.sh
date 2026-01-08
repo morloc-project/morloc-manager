@@ -1785,7 +1785,12 @@ cmd_env() {
     if [ $reset = "true" ]; then
         reset_environment
     else
-        update_environment "$env" $update_dev $update_usr
+        if [ -z $env ]; then
+          print_error "No environment specified"
+          show_env_help
+        else
+          update_environment "$env" $update_dev $update_usr
+        fi
     fi
 
     exit 0
