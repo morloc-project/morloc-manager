@@ -5,7 +5,7 @@
 # {{{ constants and system info
 
 PROGRAM_NAME="morloc-manager"
-VERSION="0.5.2"
+VERSION="0.6.0"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
@@ -762,16 +762,17 @@ build_environment() {
 }
 
 script_menv() {
-    script_path=$1
-    tag=$2
-    envname=$3
-    envfile=$4
+    script_path=$1; shift
+    tag=$1;         shift
+    envname=$1;     shift
+    envfile=$1;     shift
+    extra_args="$1"
 
     base_container=$CONTAINER_BASE_FULL:$tag
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
-        build_environment $envname $envfile $user_container $base_container
+        build_environment $envname $envfile $user_container $base_container || return $?
     elif [ -n "$envname" ] || [ -n "$envfile" ]; then
         print_error "Both env name and file must be provided together"
         return 1
@@ -789,7 +790,7 @@ $CONTAINER_ENGINE run --rm \\
            -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
-           $user_container "\$@"
+           ${extra_args}${user_container} "\$@"
 
 EOF
 
@@ -809,16 +810,17 @@ EOF
 }
 
 script_morloc_shell() {
-    script_path=$1
-    tag=$2
-    envname=$3
-    envfile=$4
+    script_path=$1; shift
+    tag=$1;         shift
+    envname=$1;     shift
+    envfile=$1;     shift
+    extra_args=$1
 
     base_container=$CONTAINER_BASE_FULL:$tag
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
-        build_environment $envname $envfile $user_container $base_container
+        build_environment $envname $envfile $user_container $base_container || return $?
     elif [ -n "$envname" ] || [ -n "$envfile" ]; then
         print_error "Both env name and file must be provided together"
         return 1
@@ -838,7 +840,7 @@ $CONTAINER_ENGINE run --rm \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            \$@ \\
-           $user_container /bin/bash
+           ${extra_args}${user_container} /bin/bash
 EOF
 
     observed_version=$(menv morloc --version)
@@ -856,15 +858,16 @@ EOF
 }
 
 script_menv_dev() {
-    script_path=$1
-    envname=$2
-    envfile=$3
+    script_path=$1; shift
+    envname=$1;     shift
+    envfile=$1;     shift
+    extra_args=$1
 
     tag=${LOCAL_VERSION}
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
-        build_environment $envname $envfile $user_container $base_container
+        build_environment $envname $envfile $user_container $base_container || return $?
     elif [ -n "$envname" ] || [ -n "$envfile" ]; then
         print_error "Both env name and file must be provided together"
         return 1
@@ -888,23 +891,24 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
-           $user_container "\$@"
+           ${extra_args}${user_container} "\$@"
 
 EOF
     chmod 755 $script_path
 }
 
 script_morloc_dev_shell() {
-    script_path=$1
-    envname=$2
-    envfile=$3
+    script_path=$1; shift
+    envname=$1;     shift
+    envfile=$1;     shift
+    extra_args=$1
 
     tag=${LOCAL_VERSION}
     mock_home="${MORLOC_INSTALL_DIR}/$tag/home"
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
-        build_environment $envname $envfile $user_container $base_container
+        build_environment $envname $envfile $user_container $base_container || return $?
     elif [ -n "$envname" ] || [ -n "$envfile" ]; then
         print_error "Both env name and file must be provided together"
         return 1
@@ -929,7 +933,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            \$@ \\
-           $user_container /bin/bash
+           ${extra_args}${user_container} /bin/bash
 EOF
     chmod 755 $script_path
 }
@@ -1047,11 +1051,7 @@ cmd_install() {
         tag=$version
     fi
 
-    add_morloc_bin_to_path
-    if [ $? -ne 0 ]
-    then
-        exit 1
-    fi
+    add_morloc_bin_to_path || exit 1
 
     print_info "Copying this install script to $MORLOC_BIN"
     if [ $(normalize_path $MORLOC_BIN/$PROGRAM_NAME) = $(normalize_path $0) ]
@@ -1068,7 +1068,7 @@ cmd_install() {
         print_error "No container engine found, please install podman or docker"
         exit 1
     else
-        print_info "Using $CONTAINER_ENGINE $CONTAINER_ENGINE_VERSION as a container engine"
+        print_info "Using $CONTAINER_ENGINE $CONTAINER_ENGINE_VERSION as container engine"
     fi
 
     if [ "$version" = "undefined" ]
@@ -1365,6 +1365,12 @@ cmd_update() {
     done
 
     old_version=$($0 --version)
+    if [ $? -ne 0 ]; then
+      print_info "No current version detected"
+      old_version=""
+    else
+      print_info "Current version: $old_version"
+    fi
 
     tmp_script="/tmp/$PROGRAM_NAME"
 
@@ -1420,7 +1426,11 @@ cmd_update() {
         exit 1
     fi
 
-    print_success "Updated from $old_version to $new_version"
+    if [ -z $old_version ]; then
+      print_success "Updated to $new_version"
+    else
+      print_success "Updated from $old_version to $new_version"
+    fi
 }
 # }}}
 # {{{ select subcommand
@@ -1579,9 +1589,10 @@ cmd_info() {
 # {{{ env subcommand
 
 update_environment() {
-  envname=$1
-  update_dev=$2
-  update_usr=$3
+  envname=$1; shift
+  update_dev=$1; shift
+  update_usr=$1; shift
+  extra_args=$1
   envfile="$MORLOC_DEPENDENCY_DIR/$envname.Dockerfile"
 
   print_info "Attempting to switch environment to ${envname} with ${envfile}"
@@ -1603,14 +1614,14 @@ update_environment() {
   fi
 
   if [ $update_usr = "true" ]; then
-      script_menv         "$MORLOC_BIN/menv"         "$version" "$envname" "$envfile"
-      script_morloc_shell "$MORLOC_BIN/morloc-shell" "$version" "$envname" "$envfile"
+      script_menv         "$MORLOC_BIN/menv"         "$version" "$envname" "$envfile" "$extra_args"
+      script_morloc_shell "$MORLOC_BIN/morloc-shell" "$version" "$envname" "$envfile" "$extra_args"
       print_success "Switched user profiles to $version-$envname and built all required containers"
   fi
 
   if [ $update_dev = "true" ]; then
-      script_menv_dev         "$MORLOC_BIN/menv-dev"         "$envname" "$envfile"
-      script_morloc_dev_shell "$MORLOC_BIN/morloc-shell-dev" "$envname" "$envfile"
+      script_menv_dev         "$MORLOC_BIN/menv-dev"         "$envname" "$envfile" "$extra_args"
+      script_morloc_dev_shell "$MORLOC_BIN/morloc-shell-dev" "$envname" "$envfile" "$extra_args"
       print_success "Switched dev profiles to $version-$envname and built all required containers"
   fi
 
@@ -1666,7 +1677,6 @@ list_local_environment() {
     fi
 
     current_env=$(menv sh -c "echo \$MORLOC_ENV_NAME")
-    print_info "current_env='$current_env'"
 
     # List all .Dockerfile files
     for file in "$MORLOC_DEPENDENCY_DIR"/*.Dockerfile; do
@@ -1720,17 +1730,19 @@ Select an environment. The environment is defined as a Dockerfile
 that builds on a version-specific morloc image.
 
 ${BOLD}OPTIONS${RESET}:
-  -h, --help     Show this help message
-      --list     List all locally defined environments
-      --init ENV Create a stub Dockerfile
-      --reset    Reset to the default environment
-      --dev      Act only on the dev profiles
-      --usr      Act only on the user profiles
+  -h, --help      Show this help message
+      --list      List all locally defined environments
+      --init ENV  Create a stub Dockerfile
+      --reset     Reset to the default environment
+  -x, --extra ARG Extra arguments for the container
+      --dev       Act only on the dev profiles
+      --usr       Act only on the user profiles
 
 ${BOLD}EXAMPLES${RESET}:
   $(basename $0) env --list
   $(basename $0) env --init ml
   $(basename $0) env ml
+  $(basename $0) env app --extra "-p 8000:8000"
 EOF
 }
 
@@ -1740,6 +1752,7 @@ cmd_env() {
     update_dev="true"
     update_usr="true"
     reset="false"
+    extra_args=""
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)
@@ -1769,6 +1782,11 @@ cmd_env() {
                 update_dev="false"
                 update_usr="true"
                 ;;
+            -x|--extra)
+                shift
+                extra_args="${extra_args}${1} "
+                shift
+                ;;
             -*)
                 print_error "Unexpected argument"
                 show_env_help
@@ -1789,7 +1807,12 @@ cmd_env() {
     if [ $reset = "true" ]; then
         reset_environment
     else
-        update_environment "$env" $update_dev $update_usr
+        if [ -z $env ]; then
+          print_error "No environment specified"
+          show_env_help
+        else
+          update_environment "$env" "$update_dev" "$update_usr" "$extra_args"
+        fi
     fi
 
     exit 0
