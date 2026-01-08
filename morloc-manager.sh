@@ -1360,6 +1360,12 @@ cmd_update() {
     done
 
     old_version=$($0 --version)
+    if [ $? -ne 0 ]; then
+      print_info "No current version detected"
+      old_version=""
+    else
+      print_info "Current version: $old_version"
+    fi
 
     tmp_script="/tmp/$PROGRAM_NAME"
 
@@ -1415,7 +1421,11 @@ cmd_update() {
         exit 1
     fi
 
-    print_success "Updated from $old_version to $new_version"
+    if [ -z $old_version ]; then
+      print_success "Updated to $new_version"
+    else
+      print_success "Updated from $old_version to $new_version"
+    fi
 }
 # }}}
 # {{{ select subcommand
