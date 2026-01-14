@@ -1001,6 +1001,7 @@ Creates four executable scripts:
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help           Show this help message
+      --no-init        Do not run 'morloc init'
 
 ${BOLD}ARGUMENTS${RESET}:
   version        Version to install
@@ -1018,6 +1019,7 @@ cmd_install() {
     # calling these "undefined" instead of empty strings for better debugging
     version="undefined"
     tag="undefined"
+    no_init="false"
 
     # Parse install subcommand arguments
     while [ $# -gt 0 ]; do
@@ -1025,6 +1027,10 @@ cmd_install() {
             -h|--help)
                 show_install_help
                 exit 0
+                ;;
+            --no-init)
+                no_init="true"
+                shift
                 ;;
             -*)
                 print_error "Unknown option for install: $1"
@@ -1148,12 +1154,16 @@ cmd_install() {
     script_menv_dev         "$MORLOC_BIN/menv-dev"
     script_morloc_dev_shell "$MORLOC_BIN/morloc-shell-dev"
 
-    print_info "Initializing morloc libraries"
-    menv morloc init -f
-    if [ $? -ne 0 ]
-    then
-        print_error "Failed to build morloc libraries"
-        exit 1
+    if [ "$no_init" -eq "false" ]; then
+      print_info "Initializing morloc libraries"
+      menv morloc init -f
+      if [ $? -ne 0 ]
+      then
+          print_error "Failed to build morloc libraries"
+          exit 1
+      fi
+    else
+      print_info "Skipping morloc init step"
     fi
 
     print_success "Morloc v$version installed successfully"
