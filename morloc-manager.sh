@@ -832,15 +832,17 @@ script_morloc_shell() {
 
     cat << EOF > "$script_path"
 # automatically generated script, do not modify
-$CONTAINER_ENGINE run --rm \\
-           --shm-size=$SHARED_MEMORY_SIZE \\
-           -it \\
+$CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
+           --rm -it \\
            -e HOME=\$HOME \\
+           -e PATH="/root/.ghcup/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
            -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
+           -v \$HOME/.local/share/morloc/versions/local/home/.local/bin:${MORLOC_BIN} \\
+           -v \$HOME/.local/share/morloc/versions/local/home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
-           \$@ \\
-           ${extra_args}${user_container} /bin/bash
+           $@ \\
+           ghcr.io/morloc-project/morloc/morloc-test /bin/bash
 EOF
 
     observed_version=$(menv morloc --version)
@@ -886,9 +888,9 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
            -e HOME=\$HOME \\
            -e PATH="/root/.ghcup/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/}} \\
-           -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
-           -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
+           -v \$HOME/.local/share/morloc/versions/local/home/.local/bin:${MORLOC_BIN} \\
+           -v \$HOME/.local/share/morloc/versions/local/home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            ${extra_args}${user_container} "\$@"
