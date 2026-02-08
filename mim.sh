@@ -1,11 +1,11 @@
 #!/usr/bin/env sh
 
-# Morloc Manager
+# Morloc Installation Manager (mim)
 
 # {{{ constants and system info
 
-PROGRAM_NAME="morloc-manager"
-VERSION="0.6.0"
+PROGRAM_NAME="mim"
+VERSION="0.7.0"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
@@ -16,7 +16,7 @@ CONTAINER_BASE_FULL=ghcr.io/morloc-project/morloc/morloc-full
 CONTAINER_BASE_TINY=ghcr.io/morloc-project/morloc/morloc-tiny
 CONTAINER_BASE_TEST=ghcr.io/morloc-project/morloc/morloc-test
 
-THIS_SCRIPT_URL="https://raw.githubusercontent.com/morloc-project/morloc-manager/refs/heads/main/morloc-manager.sh"
+THIS_SCRIPT_URL="https://raw.githubusercontent.com/morloc-project/morloc-manager/refs/heads/main/mim.sh"
 
 if command -v podman >/dev/null 2>&1; then
     CONTAINER_ENGINE_VERSION=$(podman --version 2>/dev/null | sed 's/.* //')
@@ -832,15 +832,18 @@ script_morloc_shell() {
 
     cat << EOF > "$script_path"
 # automatically generated script, do not modify
-$CONTAINER_ENGINE run --rm \\
-           --shm-size=$SHARED_MEMORY_SIZE \\
-           -it \\
+$CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
+           --rm -it \\
            -e HOME=\$HOME \\
+           -e PATH="/root/.ghcup/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
            -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
+           -v \$HOME/.local/share/morloc/versions/local/home/.local/bin:${MORLOC_BIN} \\
+           -v \$HOME/.local/share/morloc/versions/local/home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
-           \$@ \\
-           ${extra_args}${user_container} /bin/bash
+           $@ \\
+           $base_container /bin/bash
+
 EOF
 
     observed_version=$(menv morloc --version)
@@ -885,10 +888,10 @@ script_menv_dev() {
 $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
            -e HOME=\$HOME \\
-           -e PATH="\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/}} \\
-           -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
-           -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
+           -e PATH="/root/.ghcup/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
+           -v \$HOME/.local/share/morloc/versions/local/home/.local/bin:${MORLOC_BIN} \\
+           -v \$HOME/.local/share/morloc/versions/local/home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            ${extra_args}${user_container} "\$@"
@@ -926,7 +929,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
            -it \\
            -e HOME=\$HOME \\
-           -e PATH="\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
+           -e PATH="/root/.ghcup/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
            -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
            -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
@@ -1001,6 +1004,7 @@ Creates four executable scripts:
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help           Show this help message
+      --no-init        Do not run 'morloc init'
 
 ${BOLD}ARGUMENTS${RESET}:
   version        Version to install
@@ -1018,6 +1022,7 @@ cmd_install() {
     # calling these "undefined" instead of empty strings for better debugging
     version="undefined"
     tag="undefined"
+    no_init="false"
 
     # Parse install subcommand arguments
     while [ $# -gt 0 ]; do
@@ -1025,6 +1030,10 @@ cmd_install() {
             -h|--help)
                 show_install_help
                 exit 0
+                ;;
+            --no-init)
+                no_init="true"
+                shift
                 ;;
             -*)
                 print_error "Unknown option for install: $1"
@@ -1148,12 +1157,16 @@ cmd_install() {
     script_menv_dev         "$MORLOC_BIN/menv-dev"
     script_morloc_dev_shell "$MORLOC_BIN/morloc-shell-dev"
 
-    print_info "Initializing morloc libraries"
-    menv morloc init -f
-    if [ $? -ne 0 ]
-    then
-        print_error "Failed to build morloc libraries"
-        exit 1
+    if [ "$no_init" -eq "false" ]; then
+      print_info "Initializing morloc libraries"
+      menv morloc init -f
+      if [ $? -ne 0 ]
+      then
+          print_error "Failed to build morloc libraries"
+          exit 1
+      fi
+    else
+      print_info "Skipping morloc init step"
     fi
 
     print_success "Morloc v$version installed successfully"
