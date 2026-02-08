@@ -842,7 +842,8 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            $@ \\
-           ghcr.io/morloc-project/morloc/morloc-test /bin/bash
+           $base_container /bin/bash
+
 EOF
 
     observed_version=$(menv morloc --version)
