@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
 
-# Morloc Manager
+# Morloc Installation Manager (mim)
 
 # {{{ constants and system info
 
-PROGRAM_NAME="morloc-manager"
+PROGRAM_NAME="mim"
 VERSION="0.6.0"
 
 CONTAINER_ENGINE_VERSION=""
@@ -16,7 +16,7 @@ CONTAINER_BASE_FULL=ghcr.io/morloc-project/morloc/morloc-full
 CONTAINER_BASE_TINY=ghcr.io/morloc-project/morloc/morloc-tiny
 CONTAINER_BASE_TEST=ghcr.io/morloc-project/morloc/morloc-test
 
-THIS_SCRIPT_URL="https://raw.githubusercontent.com/morloc-project/morloc-manager/refs/heads/main/morloc-manager.sh"
+THIS_SCRIPT_URL="https://raw.githubusercontent.com/morloc-project/morloc-manager/refs/heads/main/mim.sh"
 
 if command -v podman >/dev/null 2>&1; then
     CONTAINER_ENGINE_VERSION=$(podman --version 2>/dev/null | sed 's/.* //')
