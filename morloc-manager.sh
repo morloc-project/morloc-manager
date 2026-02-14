@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
 
-# Morloc Installation Manager (mim)
+# Morloc Installation Manager
 
 # {{{ constants and system info
 
-PROGRAM_NAME="mim"
+PROGRAM_NAME="morloc-manager"
 VERSION="0.7.0"
 
 CONTAINER_ENGINE_VERSION=""
