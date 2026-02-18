@@ -1,5 +1,0 @@
- [ ] less hacky configuration (maybe docker compose support or something)
- [ ] better dependency specification
- [ ] add `run` subcommand to replace the `menv`, `morloc-shell`, `menv dev`, and `morloc-shell-dev` scripts
-     - mm run --dev -v 0.58.3 -e bio -- <MORLOC COMMAND>
-     - mm run -i -m 0.58.3 -e bio
