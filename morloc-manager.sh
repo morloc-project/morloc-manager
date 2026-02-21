@@ -18,11 +18,14 @@ CONTAINER_BASE_TEST=ghcr.io/morloc-project/morloc/morloc-test
 
 THIS_SCRIPT_URL="https://raw.githubusercontent.com/morloc-project/morloc-manager/refs/heads/main/morloc-manager.sh"
 
-if command -v podman >/dev/null 2>&1; then
+if [ -n "${MORLOC_CONTAINER_ENGINE:-}" ]; then
+    CONTAINER_ENGINE="$MORLOC_CONTAINER_ENGINE"
+    CONTAINER_ENGINE_VERSION=$($CONTAINER_ENGINE --version 2>/dev/null | sed 's/.*version \([0-9.]*\).*/\1/')
+elif command -v podman >/dev/null 2>&1; then
     CONTAINER_ENGINE_VERSION=$(podman --version 2>/dev/null | sed 's/.* //')
     CONTAINER_ENGINE="podman"
 elif command -v docker >/dev/null 2>&1; then
-    CONTAINER_ENGINE_VERSION=$(docker --version 2>/dev/null | sed 's/.* //')
+    CONTAINER_ENGINE_VERSION=$(docker --version 2>/dev/null | sed 's/.*version \([0-9.]*\).*/\1/')
     CONTAINER_ENGINE="docker"
 fi
 
@@ -440,8 +443,6 @@ source_config_file() {
 
     print_info "Sourcing configuration file to update current PATH..."
 
-    sleep 1
-
     # Handle shells that don't support sourcing or have different syntax
     case "$shell_name" in
         fish)
@@ -461,22 +462,15 @@ source_config_file() {
             ;;
         *)
             # POSIX-compatible shells (bash, zsh, sh, dash, ash, ksh, etc.)
-            # Use the portable '.' command for POSIX shells
-            # shellcheck disable=SC1090
-            if [ -f "$config_file" ] && . "$config_file" 2>/dev/null; then
-                print_success "Configuration file sourced successfully"
+            # Add to PATH directly instead of sourcing the full config file,
+            # which can have side effects (override variables, produce output, etc.)
+            export PATH="$MORLOC_BIN:$PATH"
 
-                # Verify the PATH was updated
-                if is_in_path "$MORLOC_BIN"; then
-                    print_success "$MORLOC_BIN is now in your current PATH"
-                else
-                    print_warning "PATH update may not have taken effect immediately"
-                    print_warning "Try opening a new terminal if the directory isn't accessible"
-                fi
+            if is_in_path "$MORLOC_BIN"; then
+                print_success "$MORLOC_BIN is now in your current PATH"
             else
-                print_warning "Could not source $config_file automatically"
-                print_warning "The PATH will be available in new shell sessions"
-                print_warning "To update current session manually, run: . \"$config_file\""
+                print_warning "PATH update may not have taken effect immediately"
+                print_warning "Try opening a new terminal if the directory isn't accessible"
             fi
             ;;
     esac
@@ -523,9 +517,6 @@ EOF
     fi
 
     # Test if we can run it by name (proving it's in PATH)
-    # Add a small delay to ensure filesystem consistency
-    sleep 1
-
     if command -v "$test_command" >/dev/null 2>&1 && "$test_command" >/dev/null 2>&1; then
         print_success "PATH test passed - executable files in ~/$MORLOC_BIN_BASENAME are accessible"
         rm -f "$test_script" 2>/dev/null || true
@@ -576,7 +567,8 @@ add_morloc_bin_to_path() {
 
     if [ $morloc_bin_exists = 0 ]; then
         if [ $morloc_bin_is_in_path = 0 ]; then
-            echo "  ${GREEN}✓ All systems go!${RESET}"
+            printf "  %s[OK] All systems go!%s\n" "$GREEN" "$RESET"
+            trap - INT TERM EXIT
             return 0
         fi
     fi
@@ -595,7 +587,7 @@ add_morloc_bin_to_path() {
     printf "  Operating system: %s\n" "${operating_system}"
     echo ""
 
-    echo "${YELLOW}This script will:${RESET}"
+    printf "%sThis script will:%s\n" "$YELLOW" "$RESET"
     echo "  1. Create directory: $MORLOC_BIN"
     echo "  2. Add PATH export to config file: $config_file"
     echo "  3. Source the config file to update current PATH"
@@ -623,6 +615,7 @@ add_morloc_bin_to_path() {
             ;;
         *)
             print_info "Operation cancelled by user"
+            trap - INT TERM EXIT
             return 1
             ;;
     esac
@@ -661,48 +654,50 @@ add_morloc_bin_to_path() {
     echo ""
 
     if [ "$test_passed" = "true" ]; then
-        echo "${GREEN}✓ All systems go!${RESET}"
-        echo "  • Directory created: $MORLOC_BIN"
-        echo "  • PATH updated and active"
-        echo "  • Executable test passed"
+        printf "%s[OK] All systems go!%s\n" "$GREEN" "$RESET"
+        echo "  - Directory created: $MORLOC_BIN"
+        echo "  - PATH updated and active"
+        echo "  - Executable test passed"
         echo ""
-        echo "${YELLOW}Ready to use:${RESET}"
-        echo "  • Place executable files in: $MORLOC_BIN"
-        echo "  • They will be accessible by name from anywhere"
+        printf "%sReady to use:%s\n" "$YELLOW" "$RESET"
+        echo "  - Place executable files in: $MORLOC_BIN"
+        echo "  - They will be accessible by name from anywhere"
     else
-        echo "${YELLOW}Setup complete with minor issues:${RESET}"
-        echo "  • Directory created: $MORLOC_BIN"
-        echo "  • PATH updated in configuration file"
-        echo "  • Executable test failed (shell caching or permissions)"
+        printf "%sSetup complete with minor issues:%s\n" "$YELLOW" "$RESET"
+        echo "  - Directory created: $MORLOC_BIN"
+        echo "  - PATH updated in configuration file"
+        echo "  - Executable test failed (shell caching or permissions)"
         echo ""
-        echo "${YELLOW}Troubleshooting:${RESET}"
-        echo "  • Try opening a new terminal"
+        printf "%sTroubleshooting:%s\n" "$YELLOW" "$RESET"
+        echo "  - Try opening a new terminal"
 
         if [ "$shell_name" = "fish" ]; then
-            echo "  • For fish shell, run: exec fish"
-            echo "  • Verify with: echo \$PATH | grep $MORLOC_BIN_BASENAME"
+            echo "  - For fish shell, run: exec fish"
+            echo "  - Verify with: echo \$PATH | grep $MORLOC_BIN_BASENAME"
         else
-            echo "  • Verify with: echo \$PATH | grep '$MORLOC_BIN_BASENAME'"
-            echo "  • Source manually: . \"${config_file}\""
+            echo "  - Verify with: echo \$PATH | grep '$MORLOC_BIN_BASENAME'"
+            echo "  - Source manually: . \"${config_file}\""
         fi
 
-        echo "  • Test manually: ls -la \"$MORLOC_BIN\""
+        echo "  - Test manually: ls -la \"$MORLOC_BIN\""
     fi
 
     # Platform-specific notes
     case "${operating_system}" in
         "Darwin")
             echo ""
-            echo "${BLUE}macOS Note:${RESET} Terminal.app may need to be restarted for PATH changes"
+            printf "%smacOS Note:%s Terminal.app may need to be restarted for PATH changes\n" "$BLUE" "$RESET"
             ;;
         "Linux")
             # Check for WSL
             if [ -n "$WSL_DISTRO_NAME" ] || [ -n "$WSLENV" ] || grep -qi microsoft /proc/version 2>/dev/null; then
                 echo ""
-                echo "${BLUE}WSL Note:${RESET} Windows Terminal may need to be restarted for PATH changes"
+                printf "%sWSL Note:%s Windows Terminal may need to be restarted for PATH changes\n" "$BLUE" "$RESET"
             fi
             ;;
     esac
+
+    trap - INT TERM EXIT
 }
 
 # }}}
@@ -728,16 +723,16 @@ build_environment() {
             # This is portable across docker and podman
             if command -v date >/dev/null 2>&1; then
                 image_timestamp=$(date -d "$image_created" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "$image_created" +%s 2>/dev/null)
+            fi
 
-                # Compare timestamps - rebuild if Dockerfile is newer
-                if [ -n "$dockerfile_mtime" ] && [ -n "$image_timestamp" ]; then
-                    if [ "$dockerfile_mtime" -le "$image_timestamp" ]; then
-                        print_info "Image '$envtag' is up to date"
-                        return 0
-                    else
-                        print_info "Dockerfile has been modified, rebuilding image '$envtag'"
-                    fi
-                fi
+            # Compare timestamps - rebuild if Dockerfile is newer
+            # Default to rebuilding when comparison fails (empty values or arithmetic errors)
+            if [ -n "$dockerfile_mtime" ] && [ -n "$image_timestamp" ] && \
+               [ "$dockerfile_mtime" -le "$image_timestamp" ] 2>/dev/null; then
+                print_info "Image '$envtag' is up to date"
+                return 0
+            else
+                print_info "Dockerfile has been modified (or timestamp comparison failed), rebuilding image '$envtag'"
             fi
         else
             print_warning "Dockerfile '$dockerfile' not found, but image exists. Using existing image."
@@ -758,11 +753,11 @@ build_environment() {
 }
 
 script_menv() {
-    script_path=$1; shift
-    tag=$1;         shift
-    envname=$1;     shift
-    envfile=$1;     shift
-    extra_args="$1"
+    script_path="${1:-}"; [ $# -gt 0 ] && shift
+    tag="${1:-}";         [ $# -gt 0 ] && shift
+    envname="${1:-}";     [ $# -gt 0 ] && shift
+    envfile="${1:-}";     [ $# -gt 0 ] && shift
+    extra_args="${1:-}"
 
     base_container=$CONTAINER_BASE_FULL:$tag
 
@@ -779,6 +774,7 @@ script_menv() {
     print_info "Creating menv at '$script_path' with Morloc v${tag}"
 
     cat << EOF > "$script_path"
+#!/usr/bin/env sh
 # automatically generated script, do not modify
 $CONTAINER_ENGINE run --rm \\
            --shm-size=$SHARED_MEMORY_SIZE \\
@@ -808,11 +804,11 @@ EOF
 }
 
 script_morloc_shell() {
-    script_path=$1; shift
-    tag=$1;         shift
-    envname=$1;     shift
-    envfile=$1;     shift
-    extra_args=$1
+    script_path="${1:-}"; [ $# -gt 0 ] && shift
+    tag="${1:-}";         [ $# -gt 0 ] && shift
+    envname="${1:-}";     [ $# -gt 0 ] && shift
+    envfile="${1:-}";     [ $# -gt 0 ] && shift
+    extra_args="${1:-}"
 
     base_container=$CONTAINER_BASE_FULL:$tag
 
@@ -829,14 +825,13 @@ script_morloc_shell() {
     print_info "Creating morloc-shell at '$script_path' with Morloc v${tag}"
 
     cat << EOF > "$script_path"
+#!/usr/bin/env sh
 # automatically generated script, do not modify
 $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm -it \\
            -e HOME=\$HOME \\
            -e PATH="/root/.ghcup/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
            -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
-           -v \$HOME/.local/share/morloc/versions/local/home/.local/bin:${MORLOC_BIN} \\
-           -v \$HOME/.local/share/morloc/versions/local/home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            ${extra_args}${user_container} /bin/bash
@@ -859,12 +854,13 @@ EOF
 }
 
 script_menv_dev() {
-    script_path=$1; shift
-    envname=$1;     shift
-    envfile=$1;     shift
-    extra_args=$1
+    script_path="${1:-}"; [ $# -gt 0 ] && shift
+    envname="${1:-}";     [ $# -gt 0 ] && shift
+    envfile="${1:-}";     [ $# -gt 0 ] && shift
+    extra_args="${1:-}"
 
     tag=${LOCAL_VERSION}
+    base_container=$CONTAINER_BASE_TEST
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
@@ -882,6 +878,7 @@ script_menv_dev() {
     mkdir -p "$HOME/$mock_home/.stack"
     mkdir -p "$HOME/$mock_home/.local/bin"
     cat << EOF > "$script_path"
+#!/usr/bin/env sh
 # automatically generated script, do not modify
 $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
@@ -899,12 +896,13 @@ EOF
 }
 
 script_morloc_dev_shell() {
-    script_path=$1; shift
-    envname=$1;     shift
-    envfile=$1;     shift
-    extra_args=$1
+    script_path="${1:-}"; [ $# -gt 0 ] && shift
+    envname="${1:-}";     [ $# -gt 0 ] && shift
+    envfile="${1:-}";     [ $# -gt 0 ] && shift
+    extra_args="${1:-}"
 
     tag=${LOCAL_VERSION}
+    base_container=$CONTAINER_BASE_TEST
     mock_home="${MORLOC_INSTALL_DIR}/$tag/home"
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
@@ -922,6 +920,7 @@ script_morloc_dev_shell() {
     mkdir -p "$HOME/$mock_home/.stack"
     mkdir -p "$HOME/$mock_home/.local/bin"
     cat << EOF > "$script_path"
+#!/usr/bin/env sh
 # automatically generated script, do not modify
 $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
@@ -1089,6 +1088,9 @@ cmd_install() {
     then
         print_error "Failed to pull container 'tiny'"
         echo "  Are you sure this Morloc version is defined?"
+        echo "  If you are behind a corporate firewall or proxy, configure your container engine:"
+        echo "    docker: set HTTPS_PROXY environment variable"
+        echo "    podman: set HTTPS_PROXY or configure in /etc/containers/registries.conf"
         exit 1
     fi
 
@@ -1098,14 +1100,20 @@ cmd_install() {
     then
         print_error "Failed to pull container 'full'"
         echo "  Are you sure this Morloc version is defined?"
+        echo "  If you are behind a corporate firewall or proxy, configure your container engine:"
+        echo "    docker: set HTTPS_PROXY environment variable"
+        echo "    podman: set HTTPS_PROXY or configure in /etc/containers/registries.conf"
         exit 1
     fi
 
-    $CONTAINER_ENGINE pull "$CONTAINER_BASE_TEST"
+    $CONTAINER_ENGINE pull "$CONTAINER_BASE_TEST:latest"
     if [ $? -ne 0 ]
     then
         print_error "Failed to pull container 'dev'"
         echo "  Are you sure this Morloc version is defined?"
+        echo "  If you are behind a corporate firewall or proxy, configure your container engine:"
+        echo "    docker: set HTTPS_PROXY environment variable"
+        echo "    podman: set HTTPS_PROXY or configure in /etc/containers/registries.conf"
         exit 1
     fi
 
@@ -1113,12 +1121,13 @@ cmd_install() {
     # filter out the carriage return that podman helpfully provided
     if [ "$version" = "undefined" ]
     then
-        detected_version=$($CONTAINER_ENGINE run --rm "$CONTAINER_BASE_FULL:edge" morloc --version | tr -d '\r\n')
+        detected_version=$($CONTAINER_ENGINE run --rm "$CONTAINER_BASE_FULL:edge" morloc --version 2>/dev/null)
         if [ $? -ne 0 ]
         then
             print_error "Failed to detect version from morloc container"
             exit 1
         fi
+        detected_version=$(printf '%s' "$detected_version" | tr -d '\r\n')
 
         if [ -z "$detected_version" ]
         then
@@ -1190,11 +1199,14 @@ remove_containers_for_version() {
     print_info "Removing containers for $version using $CONTAINER_ENGINE ..."
 
     # Remove containers using this version
-    $CONTAINER_ENGINE ps -a --filter "ancestor=$CONTAINER_BASE_FULL:$version" --format '{{.ID}}' | xargs -r $CONTAINER_ENGINE rm -f
-    $CONTAINER_ENGINE ps -a --filter "ancestor=$CONTAINER_BASE_TINY:$version" --format '{{.ID}}' | xargs -r $CONTAINER_ENGINE rm -f
+    ids=$($CONTAINER_ENGINE ps -a --filter "ancestor=$CONTAINER_BASE_FULL:$version" --format '{{.ID}}')
+    [ -n "$ids" ] && echo "$ids" | xargs $CONTAINER_ENGINE rm -f
+    ids=$($CONTAINER_ENGINE ps -a --filter "ancestor=$CONTAINER_BASE_TINY:$version" --format '{{.ID}}')
+    [ -n "$ids" ] && echo "$ids" | xargs $CONTAINER_ENGINE rm -f
 
     # Remove environment images for this version
-    $CONTAINER_ENGINE images --filter "reference=morloc-env:$version-*" --format '{{.ID}}' | xargs -r $CONTAINER_ENGINE rmi -f
+    ids=$($CONTAINER_ENGINE images --filter "reference=morloc-env:$version-*" --format '{{.ID}}')
+    [ -n "$ids" ] && echo "$ids" | xargs $CONTAINER_ENGINE rmi -f
 
     # Remove base image
     $CONTAINER_ENGINE rmi -f "$CONTAINER_BASE_FULL:$version"
@@ -1333,7 +1345,7 @@ cmd_uninstall() {
     if [ -z "$version" ]; then
         print_error "No version given, to uninstall everything call with --all option"
         show_uninstall_help
-        exit 0
+        exit 1
     fi
 
     print_success "Removed containers and Morloc home, scripts remain"
@@ -1588,12 +1600,6 @@ cmd_info() {
             selection=" selected"
         fi
 
-        "$0" "select" "$version" > /dev/null 2>&1
-        if [ $? -ne 0 ]
-        then
-            print_error "Failed to switch to $version"
-        fi
-
         version_container="${CONTAINER_BASE_FULL}:${version}"
 
         if $CONTAINER_ENGINE images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${version_container}$"
@@ -1604,9 +1610,6 @@ cmd_info() {
         fi
 
     done
-
-    # switch back to original version
-    "$0" "select" "$current_version" > /dev/null 2>&1
 
     exit 0
 }
