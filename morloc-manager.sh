@@ -224,7 +224,7 @@ detect_shell() {
     else
         # Try to get process name from ps (with fallback)
         if command -v ps >/dev/null 2>&1; then
-            shell_name=$(ps -p $ -o comm= 2>/dev/null | sed 's/^-//' || echo "sh")
+            shell_name=$(ps -p $$ -o comm= 2>/dev/null | sed 's/^-//' || echo "sh")
             case "$shell_name" in
                 *zsh*) echo "zsh" ;;
                 *bash*) echo "bash" ;;
@@ -309,16 +309,13 @@ get_shell_config_files() {
 
 # Function to normalize a path (remove trailing slashes, resolve basic issues)
 normalize_path() {
-    local path="$1"
+    _np_path="$1"
     # Remove trailing slashes (but keep root /)
-    if [ "$path" != "/" ]; then
-        path="${path%/}"
-    fi
-    # Handle multiple consecutive slashes
-    while [ "$path" != "${path//\/\//\/}" ]; do
-        path="${path//\/\//\/}"
+    while [ "$_np_path" != "/" ] && [ "${_np_path%/}" != "$_np_path" ]; do
+        _np_path="${_np_path%/}"
     done
-    echo "$path"
+    # Collapse multiple consecutive slashes
+    echo "$_np_path" | sed 's|//*|/|g'
 }
 
 # Function to check if directory is already in PATH
@@ -443,7 +440,7 @@ source_config_file() {
 
     print_info "Sourcing configuration file to update current PATH..."
 
-    sleep 0.5
+    sleep 1
 
     # Handle shells that don't support sourcing or have different syntax
     case "$shell_name" in
@@ -530,7 +527,7 @@ EOF
     sleep 1
 
     if command -v "$test_command" >/dev/null 2>&1 && "$test_command" >/dev/null 2>&1; then
-        print_success "✓ PATH test passed - executable files in ~/.foo/bin are accessible"
+        print_success "PATH test passed - executable files in ~/$MORLOC_BIN_BASENAME are accessible"
         rm -f "$test_script" 2>/dev/null || true
         return 0
     else
@@ -551,7 +548,7 @@ add_morloc_bin_to_path() {
     }
 
     # Set up signal handlers
-    trap 'cleanup; log_error "Script interrupted"; exit 1' INT TERM
+    trap 'cleanup; print_error "Script interrupted"; exit 1' INT TERM
     trap 'cleanup' EXIT
 
     ### Configuration ####
@@ -562,7 +559,7 @@ add_morloc_bin_to_path() {
     morloc_bin_exists=$( if [ -d "$MORLOC_BIN" ]; then echo 0; else echo 1; fi )
     morloc_bin_is_in_path=$( if is_in_path "$MORLOC_BIN"; then echo 0; else echo 1; fi )
 
-    printf "  Target Morloc bin folder: $MORLOC_BIN "
+    printf "  Target Morloc bin folder: %s " "$MORLOC_BIN"
 
     if [ $morloc_bin_exists = 0 ]; then
         printf "%s[EXISTS]%s\n" "$GREEN" "$RESET"
@@ -623,7 +620,6 @@ add_morloc_bin_to_path() {
 
     case "$response" in
         [yY]|[yY][eE][sS])
-            break
             ;;
         *)
             print_info "Operation cancelled by user"
@@ -684,9 +680,9 @@ add_morloc_bin_to_path() {
 
         if [ "$shell_name" = "fish" ]; then
             echo "  • For fish shell, run: exec fish"
-            echo "  • Verify with: echo \$PATH | grep .foo/bin"
+            echo "  • Verify with: echo \$PATH | grep $MORLOC_BIN_BASENAME"
         else
-            echo "  • Verify with: echo \$PATH | grep '\\.foo/bin'"
+            echo "  • Verify with: echo \$PATH | grep '$MORLOC_BIN_BASENAME'"
             echo "  • Source manually: . \"${config_file}\""
         fi
 
@@ -772,7 +768,7 @@ script_menv() {
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
-        build_environment $envname $envfile $user_container $base_container || return $?
+        build_environment "$envname" "$envfile" "$user_container" "$base_container" || return $?
     elif [ -n "$envname" ] || [ -n "$envfile" ]; then
         print_error "Both env name and file must be provided together"
         return 1
@@ -794,18 +790,20 @@ $CONTAINER_ENGINE run --rm \\
 
 EOF
 
-    if [ $? -ne 0 ]
-    then
-        print_error "Failed to get run 'menv morloc --version'"
+    if [ $? -ne 0 ]; then
+        print_error "Failed to create script at '$script_path'"
+        return 1
     fi
 
-    observed_version=$(menv morloc --version)
-    if [ "$observed_version" != "$tag" ]
-    then
+    chmod 755 "$script_path"
+
+    observed_version=$("$script_path" morloc --version 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        print_warning "Could not verify morloc version from '$script_path'"
+    elif [ "$observed_version" != "$tag" ]; then
         print_warning "Observed version ($observed_version) is different from expected version ($tag)"
     fi
 
-    chmod 755 $script_path
     print_info "$script_path made executable"
 }
 
@@ -820,7 +818,7 @@ script_morloc_shell() {
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
-        build_environment $envname $envfile $user_container $base_container || return $?
+        build_environment "$envname" "$envfile" "$user_container" "$base_container" || return $?
     elif [ -n "$envname" ] || [ -n "$envfile" ]; then
         print_error "Both env name and file must be provided together"
         return 1
@@ -841,23 +839,23 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -v \$HOME/.local/share/morloc/versions/local/home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
-           $@ \\
-           $base_container /bin/bash
+           ${extra_args}${user_container} /bin/bash
 
 EOF
 
-    observed_version=$(menv morloc --version)
-    if [ $? -ne 0 ]
-    then
-        print_error "Failed to get run `menv morloc --version`"
+    if [ $? -ne 0 ]; then
+        print_error "Failed to create script at '$script_path'"
+        return 1
     fi
 
-    if [ "$observed_version" != "$tag" ]
-    then
+    chmod 755 "$script_path"
+
+    observed_version=$("$MORLOC_BIN/menv" morloc --version 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        print_warning "Could not verify morloc version from '$MORLOC_BIN/menv'"
+    elif [ "$observed_version" != "$tag" ]; then
         print_warning "Observed version ($observed_version) is different from expected version ($tag)"
     fi
-
-    chmod 755 $script_path
 }
 
 script_menv_dev() {
@@ -870,7 +868,7 @@ script_menv_dev() {
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
-        build_environment $envname $envfile $user_container $base_container || return $?
+        build_environment "$envname" "$envfile" "$user_container" "$base_container" || return $?
     elif [ -n "$envname" ] || [ -n "$envfile" ]; then
         print_error "Both env name and file must be provided together"
         return 1
@@ -897,7 +895,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            ${extra_args}${user_container} "\$@"
 
 EOF
-    chmod 755 $script_path
+    chmod 755 "$script_path"
 }
 
 script_morloc_dev_shell() {
@@ -911,7 +909,7 @@ script_morloc_dev_shell() {
 
     if [ -n "$envname" ] && [ -n "$envfile" ]; then
         user_container="morloc-env:$tag-$envname"
-        build_environment $envname $envfile $user_container $base_container || return $?
+        build_environment "$envname" "$envfile" "$user_container" "$base_container" || return $?
     elif [ -n "$envname" ] || [ -n "$envfile" ]; then
         print_error "Both env name and file must be provided together"
         return 1
@@ -935,10 +933,9 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
-           \$@ \\
            ${extra_args}${user_container} /bin/bash
 EOF
-    chmod 755 $script_path
+    chmod 755 "$script_path"
 }
 
 # }}}
@@ -951,9 +948,9 @@ show_version() {
 
 show_help() {
     cat << EOF
-${BOLD}$(basename $0)${RESET} ${VERSION} - manage morloc containerized installation
+${BOLD}$(basename "$0")${RESET} ${VERSION} - manage morloc containerized installation
 
-${BOLD}USAGE${RESET}: $(basename $0) [OPTIONS] COMMAND [ARGS...]
+${BOLD}USAGE${RESET}: $(basename "$0") [OPTIONS] COMMAND [ARGS...]
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help     Show this help message
@@ -968,9 +965,9 @@ ${BOLD}COMMANDS${RESET}:
   ${BOLD}${GREEN}info${RESET}       Print info about manager, installs and containers
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) install
-  $(basename $0) uninstall
-  $(basename $0) --help
+  $(basename "$0") install
+  $(basename "$0") uninstall
+  $(basename "$0") --help
 EOF
 }
 
@@ -980,7 +977,7 @@ EOF
 # Help for install subcommand
 show_install_help() {
     cat << EOF
-${BOLD}USAGE${RESET}: $(basename $0) install [OPTIONS] <version>
+${BOLD}USAGE${RESET}: $(basename "$0") install [OPTIONS] <version>
 
 Setup morloc containers, scripts, and home for either the latest version
 of Morloc or for the specified version.
@@ -1010,8 +1007,8 @@ ${BOLD}ARGUMENTS${RESET}:
   version        Version to install
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) install
-  $(basename $0) install 0.54.2
+  $(basename "$0") install
+  $(basename "$0") install 0.54.2
 EOF
 }
 
@@ -1041,7 +1038,7 @@ cmd_install() {
                 exit 1
                 ;;
             *)
-                if [ $version = "undefined" ]; then
+                if [ "$version" = "undefined" ]; then
                     version="$1"
                 else
                     print_error "Multiple version installation not supported: $1"
@@ -1052,7 +1049,7 @@ cmd_install() {
         esac
     done
 
-    if [ $version = "undefined" ]; then
+    if [ "$version" = "undefined" ]; then
         print_info "Installing latest Morloc version"
         tag="edge"
     else
@@ -1063,11 +1060,11 @@ cmd_install() {
     add_morloc_bin_to_path || exit 1
 
     print_info "Copying this install script to $MORLOC_BIN"
-    if [ $(normalize_path $MORLOC_BIN/$PROGRAM_NAME) = $(normalize_path $0) ]
+    if [ "$(normalize_path "$MORLOC_BIN/$PROGRAM_NAME")" = "$(normalize_path "$0")" ]
     then
-        print_point "$(basename $0) is already on there!"
+        print_point "$(basename "$0") is already on there!"
     else
-        cp $0 $MORLOC_BIN/$PROGRAM_NAME
+        cp "$0" "$MORLOC_BIN/$PROGRAM_NAME"
     fi
 
     print_info "Looking for a container engine"
@@ -1087,7 +1084,7 @@ cmd_install() {
         print_info "Attempting to pull containers for Morloc version $version"
     fi
 
-    $CONTAINER_ENGINE pull $CONTAINER_BASE_TINY:${tag}
+    $CONTAINER_ENGINE pull "$CONTAINER_BASE_TINY:${tag}"
     if [ $? -ne 0 ]
     then
         print_error "Failed to pull container 'tiny'"
@@ -1096,7 +1093,7 @@ cmd_install() {
     fi
 
     # pull container
-    $CONTAINER_ENGINE pull $CONTAINER_BASE_FULL:${tag}
+    $CONTAINER_ENGINE pull "$CONTAINER_BASE_FULL:${tag}"
     if [ $? -ne 0 ]
     then
         print_error "Failed to pull container 'full'"
@@ -1104,7 +1101,7 @@ cmd_install() {
         exit 1
     fi
 
-    $CONTAINER_ENGINE pull $CONTAINER_BASE_TEST
+    $CONTAINER_ENGINE pull "$CONTAINER_BASE_TEST"
     if [ $? -ne 0 ]
     then
         print_error "Failed to pull container 'dev'"
@@ -1116,14 +1113,14 @@ cmd_install() {
     # filter out the carriage return that podman helpfully provided
     if [ "$version" = "undefined" ]
     then
-        detected_version=$($CONTAINER_ENGINE run -it $CONTAINER_BASE_FULL:edge morloc --version | tr -d '\r\n')
+        detected_version=$($CONTAINER_ENGINE run --rm "$CONTAINER_BASE_FULL:edge" morloc --version | tr -d '\r\n')
         if [ $? -ne 0 ]
         then
             print_error "Failed to detect version from morloc container"
             exit 1
         fi
 
-        if [ $detected_version = "" ]
+        if [ -z "$detected_version" ]
         then
             print_error "No Morloc version found - something went wrong"
             exit 1
@@ -1137,29 +1134,29 @@ cmd_install() {
     print_info "Setting Morloc home to '${morloc_data_home}'"
 
     # create .morloc/version/$version folder
-    create_directory $morloc_data_home
+    create_directory "$morloc_data_home"
     if [ $? -ne 0 ]
     then
         print_error "Failed to create morloc home directory at '$morloc_data_home'"
         exit 1
     fi
-    create_directory $morloc_data_home/include
-    create_directory $morloc_data_home/lib
-    create_directory $morloc_data_home/opt
-    create_directory $morloc_data_home/src/morloc/plane
-    create_directory $morloc_data_home/tmp
+    create_directory "$morloc_data_home/include"
+    create_directory "$morloc_data_home/lib"
+    create_directory "$morloc_data_home/opt"
+    create_directory "$morloc_data_home/src/morloc/plane"
+    create_directory "$morloc_data_home/tmp"
 
     print_info "Created $morloc_data_home"
 
     # create morloc scripts
-    script_menv             "$MORLOC_BIN/menv" $version
-    script_morloc_shell     "$MORLOC_BIN/morloc-shell" $version
+    script_menv             "$MORLOC_BIN/menv" "$version"
+    script_morloc_shell     "$MORLOC_BIN/morloc-shell" "$version"
     script_menv_dev         "$MORLOC_BIN/menv-dev"
     script_morloc_dev_shell "$MORLOC_BIN/morloc-shell-dev"
 
-    if [ "$no_init" -eq "false" ]; then
+    if [ "$no_init" = "false" ]; then
       print_info "Initializing morloc libraries"
-      menv morloc init -f
+      "$MORLOC_BIN/menv" morloc init -f
       if [ $? -ne 0 ]
       then
           print_error "Failed to build morloc libraries"
@@ -1257,7 +1254,7 @@ remove_all_containers_and_images() {
 # Help for remove subcommand
 show_uninstall_help() {
     cat << EOF
-${BOLD}USAGE${RESET}: $(basename $0) uninstall [OPTIONS] [VERSION]...
+${BOLD}USAGE${RESET}: $(basename "$0") uninstall [OPTIONS] [VERSION]...
 
 Remove Morloc home (or specfic versions) and all associated containers
 
@@ -1269,9 +1266,9 @@ ${BOLD}ARGUMENTS${RESET}:
   VERSION        Version to remove, may specify multiple versions
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) uninstall --all
-  $(basename $0) uninstall 0.55.7
-  $(basename $0) uninstall 0.53.6 0.53.7
+  $(basename "$0") uninstall --all
+  $(basename "$0") uninstall 0.55.7
+  $(basename "$0") uninstall 0.53.6 0.53.7
 EOF
 }
 
@@ -1287,10 +1284,10 @@ cmd_uninstall() {
                 ;;
             -a|--all)
                 morloc_home="$HOME/${MORLOC_INSTALL_DIR}"
-                if [[ -d "$morloc_home" ]]
+                if [ -d "$morloc_home" ]
                 then
                     rm -rf "$morloc_home"
-                    if [[ $? -ne 0 ]]
+                    if [ $? -ne 0 ]
                     then
                         print_error "Failed to remove morloc home directory '$morloc_home'"
                     else
@@ -1301,24 +1298,24 @@ cmd_uninstall() {
                 fi
 
                 # remove all containers/images for all Morloc tags
-                remove_all_containers_and_images $CONTAINER_BASE_FULL
-                remove_all_containers_and_images $CONTAINER_BASE_TINY
-                remove_all_containers_and_images $CONTAINER_BASE_TEST
+                remove_all_containers_and_images "$CONTAINER_BASE_FULL"
+                remove_all_containers_and_images "$CONTAINER_BASE_TINY"
+                remove_all_containers_and_images "$CONTAINER_BASE_TEST"
                 exit 0
                 ;;
             -*)
                 print_error "Unknown option for uninstall: $1"
-                show_remove_help
+                show_uninstall_help
                 exit 1
                 ;;
             *)
                 version=$1
                 morloc_home="$HOME/${MORLOC_INSTALL_DIR}/$version"
-                if [[ -d "$morloc_home" ]]
+                if [ -d "$morloc_home" ]
                 then
                     print_info "Morloc home '$morloc_home' found, deleting"
                     rm -rf "$morloc_home"
-                    if [[ $? -ne 0 ]]
+                    if [ $? -ne 0 ]
                     then
                         print_error "Failed to remove morloc home directory '$morloc_home'"
                     else
@@ -1348,15 +1345,15 @@ cmd_uninstall() {
 # Help for install subcommand
 show_update_help() {
     cat << EOF
-${BOLD}USAGE${RESET}: $(basename $0) update
+${BOLD}USAGE${RESET}: $(basename "$0") update
 
-Update this install sccript
+Update this install script
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help           Show this help message
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) update
+  $(basename "$0") update
 EOF
 }
 
@@ -1377,7 +1374,7 @@ cmd_update() {
         esac
     done
 
-    old_version=$($0 --version)
+    old_version=$("$0" --version)
     if [ $? -ne 0 ]; then
       print_info "No current version detected"
       old_version=""
@@ -1385,7 +1382,11 @@ cmd_update() {
       print_info "Current version: $old_version"
     fi
 
-    tmp_script="/tmp/$PROGRAM_NAME"
+    if command -v mktemp >/dev/null 2>&1; then
+        tmp_script=$(mktemp "/tmp/${PROGRAM_NAME}.XXXXXX")
+    else
+        tmp_script="/tmp/${PROGRAM_NAME}.$$"
+    fi
 
     WGET_PATH=$(command -v wget 2>/dev/null || true)
     CURL_PATH=$(command -v curl 2>/dev/null || true)
@@ -1394,7 +1395,7 @@ cmd_update() {
       print_info "Checking for latest $PROGRAM_NAME script (using wget)"
       "$WGET_PATH" -q -O "$tmp_script" "$THIS_SCRIPT_URL"
     elif [ -n "$CURL_PATH" ] && [ -x "$CURL_PATH" ]; then
-      print_info "Checking for latest $PROGRAM_NAME script (using wget)"
+      print_info "Checking for latest $PROGRAM_NAME script (using curl)"
       "$CURL_PATH" -fsSL -o "$tmp_script" "$THIS_SCRIPT_URL"
     else
       print_error "Please install either wget or curl"
@@ -1405,41 +1406,41 @@ cmd_update() {
     if [ $? -ne 0 ]
     then
         print_error "Failed to retrieve script from '$THIS_SCRIPT_URL'"
-        rm -f $tmp_script
+        rm -f "$tmp_script"
         exit 1
     fi
 
-    nlinesdiff=$(diff $tmp_script $0 | wc -l)
-    if [ $nlinesdiff -ne 0 ]
+    nlinesdiff=$(diff "$tmp_script" "$0" | wc -l)
+    if [ "$nlinesdiff" -ne 0 ]
     then
         print_info "Successfully pulled '$THIS_SCRIPT_URL'"
     else
         print_info "You are already using the latest version"
-        rm -f $tmp_script
+        rm -f "$tmp_script"
         exit 0
     fi
 
     print_info "Making script executable"
-    chmod 755 $tmp_script
+    chmod 755 "$tmp_script"
     if [ $? -ne 0 ]
     then
-        print_exit "Failed to make new script executable, exiting"
-        rm -f $tmp_script
+        print_error "Failed to make new script executable, exiting"
+        rm -f "$tmp_script"
         exit 1
     fi
 
-    new_version=$($tmp_script --version)
+    new_version=$("$tmp_script" --version)
 
     print_info "Replacing current script at '$0'"
-    mv $tmp_script $0
+    mv "$tmp_script" "$0"
     if [ $? -ne 0 ]
     then
-        print_exit "Failed to replace current script, exiting"
-        rm -f $tmp_script
+        print_error "Failed to replace current script, exiting"
+        rm -f "$tmp_script"
         exit 1
     fi
 
-    if [ -z $old_version ]; then
+    if [ -z "$old_version" ]; then
       print_success "Updated to $new_version"
     else
       print_success "Updated from $old_version to $new_version"
@@ -1451,7 +1452,7 @@ cmd_update() {
 # Help for install subcommand
 show_select_help() {
     cat << EOF
-${BOLD}USAGE${RESET}: $(basename $0) select <version>
+${BOLD}USAGE${RESET}: $(basename "$0") select <version>
 
 Set Morloc version.
 
@@ -1462,7 +1463,7 @@ ${BOLD}ARGUMENTS${RESET}:
   version        Version to install
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) select 0.54.2
+  $(basename "$0") select 0.54.2
 EOF
 }
 
@@ -1478,7 +1479,7 @@ cmd_select() {
                 exit 0
                 ;;
             *)
-                if [ $version = "undefined" ]; then
+                if [ "$version" = "undefined" ]; then
                     version="$1"
                 else
                     print_error "Multiple version installation not supported: $1"
@@ -1489,30 +1490,30 @@ cmd_select() {
         esac
     done
 
-    if [[ $version = ${LOCAL_VERSION} ]]
+    if [ "$version" = "$LOCAL_VERSION" ]
     then
         print_error "Cannot set to '${LOCAL_VERSION}' version, please use dev containers"
         exit 1
     fi
 
-    if [[ $version = "undefined" ]]
+    if [ "$version" = "undefined" ]
     then
         print_error "Please select a version"
         show_select_help
         exit 1
     fi
 
-    if [[ -d $HOME/${MORLOC_INSTALL_DIR}/$version ]]
+    if [ -d "$HOME/${MORLOC_INSTALL_DIR}/$version" ]
     then
         add_morloc_bin_to_path
-        script_menv "$MORLOC_BIN/menv" $version
-        script_morloc_shell "$MORLOC_BIN/morloc-shell" $version
+        script_menv "$MORLOC_BIN/menv" "$version"
+        script_morloc_shell "$MORLOC_BIN/morloc-shell" "$version"
     else
         print_error "Morloc version '$version' does not exist, install first"
         exit 1
     fi
 
-    print_success "Swicted to Morloc version '$version'"
+    print_success "Switched to Morloc version '$version'"
     exit 0
 }
 
@@ -1522,7 +1523,7 @@ cmd_select() {
 # Help for install subcommand
 show_info_help() {
     cat << EOF
-${BOLD}USAGE${RESET}: $(basename $0) info
+${BOLD}USAGE${RESET}: $(basename "$0") info
 
 Print info on Morloc versions and check containers
 
@@ -1530,7 +1531,7 @@ ${BOLD}OPTIONS${RESET}:
   -h, --help   Show this help message
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) info
+  $(basename "$0") info
 EOF
 }
 
@@ -1551,9 +1552,20 @@ cmd_info() {
         esac
     done
 
-    versions=$(ls $HOME/${MORLOC_INSTALL_DIR} | grep -v "${LOCAL_VERSION}")
+    install_dir="$HOME/${MORLOC_INSTALL_DIR}"
+    versions=""
+    if [ -d "$install_dir" ]; then
+        for d in "$install_dir"/*/; do
+            [ -d "$d" ] || continue
+            v=$(basename "$d")
+            case "$v" in
+                "$LOCAL_VERSION") continue ;;
+            esac
+            versions="$versions $v"
+        done
+    fi
 
-    current_version=$(menv morloc --version)
+    current_version=$("$MORLOC_BIN/menv" morloc --version 2>/dev/null)
     if [ $? -ne 0 ]
     then
         print_error "No current Morloc version set"
@@ -1563,38 +1575,38 @@ cmd_info() {
     dev_container=${CONTAINER_BASE_TEST}
     if $CONTAINER_ENGINE images --format '{{.Repository}}' | grep -q "^${dev_container}$"
     then
-        printf "dev             ${GREEN}container exists${RESET}\n"
+        printf "dev             %scontainer exists%s\n" "$GREEN" "$RESET"
     else
-        printf "dev             ${RED}container missing${RESET}\n"
+        printf "dev             %scontainer missing%s\n" "$RED" "$RESET"
     fi
 
     for version in $versions
     do
         selection="         "
-        if [ $version = $current_version ]
+        if [ "$version" = "$current_version" ]
         then
             selection=" selected"
         fi
 
-        $0 "select" $version > /dev/null 2>&1
+        "$0" "select" "$version" > /dev/null 2>&1
         if [ $? -ne 0 ]
         then
             print_error "Failed to switch to $version"
         fi
 
-        version_container=${CONTAINER_BASE_FULL}:${version}
+        version_container="${CONTAINER_BASE_FULL}:${version}"
 
         if $CONTAINER_ENGINE images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${version_container}$"
         then
-            printf "${version}${selection} ${GREEN}container exists${RESET}\n"
+            printf "%s%s %scontainer exists%s\n" "$version" "$selection" "$GREEN" "$RESET"
         else
-            printf "${version}${selection} ${RED}container missing${RESET}\n"
+            printf "%s%s %scontainer missing%s\n" "$version" "$selection" "$RED" "$RESET"
         fi
 
     done
 
     # switch back to original version
-    $0 "select" $current_version > /dev/null 2>&1
+    "$0" "select" "$current_version" > /dev/null 2>&1
 
     exit 0
 }
@@ -1617,7 +1629,7 @@ update_environment() {
     return 1
   fi
 
-  version=$(menv morloc --version)
+  version=$("$MORLOC_BIN/menv" morloc --version 2>/dev/null)
   if [ $? -ne 0 ]
   then
       print_error "morloc does not appear to be installed, first install and then set the environment"
@@ -1626,13 +1638,13 @@ update_environment() {
       print_info "Currently using morloc v$version"
   fi
 
-  if [ $update_usr = "true" ]; then
+  if [ "$update_usr" = "true" ]; then
       script_menv         "$MORLOC_BIN/menv"         "$version" "$envname" "$envfile" "$extra_args"
       script_morloc_shell "$MORLOC_BIN/morloc-shell" "$version" "$envname" "$envfile" "$extra_args"
       print_success "Switched user profiles to $version-$envname and built all required containers"
   fi
 
-  if [ $update_dev = "true" ]; then
+  if [ "$update_dev" = "true" ]; then
       script_menv_dev         "$MORLOC_BIN/menv-dev"         "$envname" "$envfile" "$extra_args"
       script_morloc_dev_shell "$MORLOC_BIN/morloc-shell-dev" "$envname" "$envfile" "$extra_args"
       print_success "Switched dev profiles to $version-$envname and built all required containers"
@@ -1642,7 +1654,10 @@ update_environment() {
 }
 
 reset_environment() {
-  version=$(menv morloc --version)
+  reset_update_dev="$1"
+  reset_update_usr="$2"
+
+  version=$("$MORLOC_BIN/menv" morloc --version 2>/dev/null)
   if [ $? -ne 0 ]
   then
       print_error "morloc does not appear to be installed, nothing needs to be reset"
@@ -1651,13 +1666,13 @@ reset_environment() {
       print_info "Currently using morloc v$version"
   fi
 
-  if [ $update_usr = "true" ]; then
-      script_menv             "$MORLOC_BIN/menv"         $version
-      script_morloc_shell     "$MORLOC_BIN/morloc-shell" $version
+  if [ "$reset_update_usr" = "true" ]; then
+      script_menv             "$MORLOC_BIN/menv"         "$version"
+      script_morloc_shell     "$MORLOC_BIN/morloc-shell" "$version"
       print_success "Successfully reset user profiles to default environment"
   fi
 
-  if [ $update_dev = "true" ]; then
+  if [ "$reset_update_dev" = "true" ]; then
       script_menv_dev         "$MORLOC_BIN/menv-dev"
       script_morloc_dev_shell "$MORLOC_BIN/morloc-shell-dev"
       print_success "Successfully reset dev profiles to default environment"
@@ -1689,14 +1704,14 @@ list_local_environment() {
         return 0
     fi
 
-    current_env=$(menv sh -c "echo \$MORLOC_ENV_NAME")
+    current_env=$("$MORLOC_BIN/menv" sh -c "echo \$MORLOC_ENV_NAME" 2>/dev/null)
 
     # List all .Dockerfile files
     for file in "$MORLOC_DEPENDENCY_DIR"/*.Dockerfile; do
         if [ -e "$file" ]; then
             basename="${file##*/}"           # Get basename
             basename="${basename%.Dockerfile}"  # Remove .Dockerfile extension
-            if [ $basename = $current_env ]; then
+            if [ "$basename" = "$current_env" ]; then
                 printf "%s\t%s\t(current)\n" "$basename" "$file"
             else
                 printf "%s\t%s\n" "$basename" "$file"
@@ -1710,7 +1725,7 @@ init_environment() {
     envfile="$MORLOC_DEPENDENCY_DIR/$1.Dockerfile"
 
     # if MORLOC_DEPENDENCY_DIR does not exist, create the directory
-    mkdir -p $MORLOC_DEPENDENCY_DIR
+    mkdir -p "$MORLOC_DEPENDENCY_DIR"
 
     if [ -e "$envfile" ]; then
         print_error "Cannot create $envfile, file already exists"
@@ -1737,7 +1752,7 @@ EOF
 # Help for env subcommand
 show_env_help() {
     cat << EOF
-${BOLD}USAGE${RESET}: $(basename $0) env [OPTIONS] [ENV]
+${BOLD}USAGE${RESET}: $(basename "$0") env [OPTIONS] [ENV]
 
 Select an environment. The environment is defined as a Dockerfile
 that builds on a version-specific morloc image.
@@ -1752,10 +1767,10 @@ ${BOLD}OPTIONS${RESET}:
       --usr       Act only on the user profiles
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename $0) env --list
-  $(basename $0) env --init ml
-  $(basename $0) env ml
-  $(basename $0) env app --extra "-p 8000:8000"
+  $(basename "$0") env --list
+  $(basename "$0") env --init ml
+  $(basename "$0") env ml
+  $(basename "$0") env app --extra "-p 8000:8000"
 EOF
 }
 
@@ -1778,7 +1793,7 @@ cmd_env() {
                 ;;
             --init)
                 shift
-                init_environment $1
+                init_environment "$1"
                 exit 0
                 ;;
             --reset)
@@ -1817,10 +1832,10 @@ cmd_env() {
         esac
     done
 
-    if [ $reset = "true" ]; then
-        reset_environment
+    if [ "$reset" = "true" ]; then
+        reset_environment "$update_dev" "$update_usr"
     else
-        if [ -z $env ]; then
+        if [ -z "$env" ]; then
           print_error "No environment specified"
           show_env_help
         else
