@@ -29,6 +29,15 @@ elif command -v docker >/dev/null 2>&1; then
     CONTAINER_ENGINE="docker"
 fi
 
+set_container_engine() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "[ERROR] Container engine '$1' not found" >&2
+        exit 1
+    fi
+    CONTAINER_ENGINE="$1"
+    CONTAINER_ENGINE_VERSION=$($CONTAINER_ENGINE --version 2>/dev/null | sed 's/.*version \([0-9.]*\).*/\1/')
+}
+
 # location of modules and other data will be stored for all morloc versions
 MORLOC_DATA_HOME=${XDG_DATA_HOME:-~/.local/share}/morloc
 
@@ -952,8 +961,9 @@ ${BOLD}$(basename "$0")${RESET} ${VERSION} - manage morloc containerized install
 ${BOLD}USAGE${RESET}: $(basename "$0") [OPTIONS] COMMAND [ARGS...]
 
 ${BOLD}OPTIONS${RESET}:
-  -h, --help     Show this help message
-  -v, --version  Show this manager version
+  -h, --help                Show this help message
+  -v, --version             Show this manager version
+  --container-engine ENGINE  Use ENGINE instead of auto-detected (docker/podman)
 
 ${BOLD}COMMANDS${RESET}:
   ${BOLD}${GREEN}install${RESET}    Install morloc containers, scripts, and home
@@ -966,6 +976,7 @@ ${BOLD}COMMANDS${RESET}:
 ${BOLD}EXAMPLES${RESET}:
   $(basename "$0") install
   $(basename "$0") uninstall
+  $(basename "$0") --container-engine docker install
   $(basename "$0") --help
 EOF
 }
@@ -1854,48 +1865,43 @@ cmd_env() {
 # Main argument parsing
 
 main() {
-    case "$1" in
-        -h|--help)
-            show_help
-            exit 0
-            ;;
-        -v|--version)
-            show_version
-            exit 0
-            ;;
-        install)
-            shift
-            cmd_install "$@"
-            ;;
-        uninstall)
-            shift
-            cmd_uninstall "$@"
-            ;;
-        update)
-            shift
-            cmd_update "$@"
-            ;;
-        select)
-            shift
-            cmd_select "$@"
-            ;;
-        env)
-            shift
-            cmd_env "$@"
-            ;;
-        info)
-            shift
-            cmd_info "$@"
-            ;;
-        "")
-            show_help
-            exit 0
-            ;;
-        *)
-            print_error "Unknown command: $1"
-            show_help
-            exit 1
-            ;;
+    # Parse global options
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -v|--version)
+                show_version
+                exit 0
+                ;;
+            --container-engine)
+                shift
+                set_container_engine "${1:?'--container-engine requires an argument'}"
+                shift
+                ;;
+            -*)
+                print_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    # Dispatch subcommand
+    case "${1:-}" in
+        install)   shift; cmd_install "$@" ;;
+        uninstall) shift; cmd_uninstall "$@" ;;
+        update)    shift; cmd_update "$@" ;;
+        select)    shift; cmd_select "$@" ;;
+        env)       shift; cmd_env "$@" ;;
+        info)      shift; cmd_info "$@" ;;
+        "")        show_help; exit 0 ;;
+        *)         print_error "Unknown command: $1"; show_help; exit 1 ;;
     esac
 }
 
