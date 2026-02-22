@@ -55,6 +55,6 @@ $ menv ./foo double 21
 
  3. menv-dev: runs commands in a dev container
     - contains Haskell tools for building from source
-    - can access to all system executables
+    - can access all system executables
 
  4. morloc-shell-dev: enter the dev shell

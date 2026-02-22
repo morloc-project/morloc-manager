@@ -53,7 +53,18 @@ MORLOC_CACHE_HOME=${XDG_CACHE_HOME:-~/.cache}/morloc
 
 MORLOC_DEPENDENCY_DIR="$HOME/.local/share/morloc/deps"
 
-MORLOC_INSTALL_DIR="${MORLOC_DATA_HOME#$HOME/}/versions"
+# Derive a relative path from HOME for use in mount paths
+case "$MORLOC_DATA_HOME" in
+    "$HOME"/*)
+        MORLOC_DATA_RELDIR="${MORLOC_DATA_HOME#$HOME/}"
+        ;;
+    *)
+        # Non-standard XDG_DATA_HOME; fall back to default relative path
+        printf "[WARNING] XDG_DATA_HOME is outside \$HOME; using default ~/.local/share/morloc for container mounts\n" >&2
+        MORLOC_DATA_RELDIR=".local/share/morloc"
+        ;;
+esac
+MORLOC_INSTALL_DIR="${MORLOC_DATA_RELDIR}/versions"
 MORLOC_LIBRARY_RELDIR="src/modules"
 MORLOC_DEFAULT_PLANE="default"
 MORLOC_DEFAULT_PLANE_GITHUB_ORG="morloclib"
@@ -330,6 +341,25 @@ normalize_path() {
     echo "$_np_path" | sed 's|//*|/|g'
 }
 
+# Function to resolve a path to absolute (POSIX-portable)
+resolve_path() {
+    _rp_path="$1"
+    if [ -f "$_rp_path" ]; then
+        _rp_dir=$(cd "$(dirname "$_rp_path")" && pwd)
+        echo "$_rp_dir/$(basename "$_rp_path")"
+    elif [ -d "$_rp_path" ]; then
+        (cd "$_rp_path" && pwd)
+    else
+        # File doesn't exist yet; resolve parent dir
+        _rp_dir=$(cd "$(dirname "$_rp_path")" 2>/dev/null && pwd)
+        if [ -n "$_rp_dir" ]; then
+            echo "$_rp_dir/$(basename "$_rp_path")"
+        else
+            echo "$_rp_path"
+        fi
+    fi
+}
+
 # Function to check if directory is already in PATH
 is_in_path() {
     local target_dir="$1"
@@ -541,16 +571,6 @@ EOF
 # Main function
 add_morloc_bin_to_path() {
 
-    # Improved error handling that works across platforms
-    cleanup() {
-        # Clean up any temporary files
-        rm -f "$MORLOC_BIN"/path-test-* 2>/dev/null || true
-    }
-
-    # Set up signal handlers
-    trap 'cleanup; print_error "Script interrupted"; exit 1' INT TERM
-    trap 'cleanup' EXIT
-
     ### Configuration ####
 
     # Show current status
@@ -577,7 +597,6 @@ add_morloc_bin_to_path() {
     if [ $morloc_bin_exists = 0 ]; then
         if [ $morloc_bin_is_in_path = 0 ]; then
             printf "  %s[OK] All systems go!%s\n" "$GREEN" "$RESET"
-            trap - INT TERM EXIT
             return 0
         fi
     fi
@@ -624,7 +643,6 @@ add_morloc_bin_to_path() {
             ;;
         *)
             print_info "Operation cancelled by user"
-            trap - INT TERM EXIT
             return 1
             ;;
     esac
@@ -636,7 +654,7 @@ add_morloc_bin_to_path() {
 
     # Create target directory
     if ! create_directory "$MORLOC_BIN"; then
-        exit 1
+        return 1
     fi
 
     print_info "Using configuration file: $config_file"
@@ -644,7 +662,7 @@ add_morloc_bin_to_path() {
     # Add to configuration file
     if ! add_to_config_file "$config_file"; then
         print_error "Failed to update configuration file"
-        exit 1
+        return 1
     fi
 
     # Source the configuration file to make PATH available immediately
@@ -705,8 +723,6 @@ add_morloc_bin_to_path() {
             fi
             ;;
     esac
-
-    trap - INT TERM EXIT
 }
 
 # }}}
@@ -788,7 +804,7 @@ script_menv() {
 $CONTAINER_ENGINE run --rm \\
            --shm-size=$SHARED_MEMORY_SIZE \\
            -e HOME=\$HOME \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_RELDIR} \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            ${extra_args}${user_container} "\$@"
@@ -840,7 +856,7 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm -it \\
            -e HOME=\$HOME \\
            -e PATH="/root/.ghcup/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_RELDIR} \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            ${extra_args}${user_container} /bin/bash
@@ -854,11 +870,14 @@ EOF
 
     chmod 755 "$script_path"
 
-    observed_version=$("$MORLOC_BIN/menv" morloc --version 2>/dev/null)
-    if [ $? -ne 0 ]; then
-        print_warning "Could not verify morloc version from '$MORLOC_BIN/menv'"
-    elif [ "$observed_version" != "$tag" ]; then
-        print_warning "Observed version ($observed_version) is different from expected version ($tag)"
+    # Check version via menv (morloc-shell is interactive, can't run non-interactively)
+    if [ -f "$MORLOC_BIN/menv" ]; then
+        observed_version=$("$MORLOC_BIN/menv" morloc --version 2>/dev/null)
+        if [ $? -ne 0 ]; then
+            print_warning "Could not verify morloc version from '$MORLOC_BIN/menv'"
+        elif [ "$observed_version" != "$tag" ]; then
+            print_warning "Observed version ($observed_version) is different from expected version ($tag)"
+        fi
     fi
 }
 
@@ -893,9 +912,9 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
            -e HOME=\$HOME \\
            -e PATH="/root/.ghcup/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
-           -v \$HOME/.local/share/morloc/versions/local/home/.local/bin:${MORLOC_BIN} \\
-           -v \$HOME/.local/share/morloc/versions/local/home/.stack:\$HOME/.stack \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_RELDIR} \\
+           -v \$HOME/$mock_home/.local/bin:\$HOME/${MORLOC_BIN_BASENAME} \\
+           -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
            ${extra_args}${user_container} "\$@"
@@ -936,8 +955,8 @@ $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            -it \\
            -e HOME=\$HOME \\
            -e PATH="/root/.ghcup/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_HOME#$HOME/} \\
-           -v \$HOME/$mock_home/.local/bin:\$HOME/.local/bin \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_RELDIR} \\
+           -v \$HOME/$mock_home/.local/bin:\$HOME/${MORLOC_BIN_BASENAME} \\
            -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
            -v \$PWD:\$HOME/work \\
            -w \$HOME/work \\
@@ -1070,7 +1089,7 @@ cmd_install() {
     add_morloc_bin_to_path || exit 1
 
     print_info "Copying this install script to $MORLOC_BIN"
-    if [ "$(normalize_path "$MORLOC_BIN/$PROGRAM_NAME")" = "$(normalize_path "$0")" ]
+    if [ "$(resolve_path "$MORLOC_BIN/$PROGRAM_NAME")" = "$(resolve_path "$0")" ]
     then
         print_point "$(basename "$0") is already on there!"
     else
@@ -1240,7 +1259,14 @@ remove_all_containers_and_images() {
 
     # Step 1: Remove all containers based on any tag of this base image
     print_info "Step 1: Removing containers..."
-    container_ids=$($CONTAINER_ENGINE ps -a --filter "ancestor=$base_image" --format '{{.ID}}' 2>/dev/null)
+    # Get all image IDs for this base image (all tags)
+    all_image_ids=$($CONTAINER_ENGINE images --filter "reference=${base_image}:*" --format '{{.ID}}' 2>/dev/null)
+    # For each image ID, find containers
+    container_ids=""
+    for img_id in $all_image_ids; do
+        ids=$($CONTAINER_ENGINE ps -a --filter "ancestor=$img_id" --format '{{.ID}}' 2>/dev/null)
+        [ -n "$ids" ] && container_ids="$container_ids $ids"
+    done
 
     if [ -n "$container_ids" ]; then
         print_info "Found containers: $container_ids"
@@ -1279,7 +1305,7 @@ show_uninstall_help() {
     cat << EOF
 ${BOLD}USAGE${RESET}: $(basename "$0") uninstall [OPTIONS] [VERSION]...
 
-Remove Morloc home (or specfic versions) and all associated containers
+Remove Morloc home (or specific versions) and all associated containers
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help     Show this help message
@@ -1324,6 +1350,8 @@ cmd_uninstall() {
                 remove_all_containers_and_images "$CONTAINER_BASE_FULL"
                 remove_all_containers_and_images "$CONTAINER_BASE_TINY"
                 remove_all_containers_and_images "$CONTAINER_BASE_TEST"
+                print_warning "Scripts in $MORLOC_BIN (menv, morloc-shell, etc.) were not removed"
+                print_info "To remove them: rm $MORLOC_BIN/menv $MORLOC_BIN/morloc-shell $MORLOC_BIN/menv-dev $MORLOC_BIN/morloc-shell-dev"
                 exit 0
                 ;;
             -*)
@@ -1417,16 +1445,18 @@ cmd_update() {
     if [ -n "$WGET_PATH" ] && [ -x "$WGET_PATH" ]; then
       print_info "Checking for latest $PROGRAM_NAME script (using wget)"
       "$WGET_PATH" -q -O "$tmp_script" "$THIS_SCRIPT_URL"
+      download_rc=$?
     elif [ -n "$CURL_PATH" ] && [ -x "$CURL_PATH" ]; then
       print_info "Checking for latest $PROGRAM_NAME script (using curl)"
       "$CURL_PATH" -fsSL -o "$tmp_script" "$THIS_SCRIPT_URL"
+      download_rc=$?
     else
       print_error "Please install either wget or curl"
       rm -f "$tmp_script"
       exit 1
     fi
 
-    if [ $? -ne 0 ]
+    if [ "$download_rc" -ne 0 ]
     then
         print_error "Failed to retrieve script from '$THIS_SCRIPT_URL'"
         rm -f "$tmp_script"
@@ -1522,6 +1552,17 @@ cmd_select() {
     if [ "$version" = "undefined" ]
     then
         print_error "Please select a version"
+        # List available versions
+        install_dir="$HOME/${MORLOC_INSTALL_DIR}"
+        if [ -d "$install_dir" ]; then
+            print_info "Available versions:"
+            for d in "$install_dir"/*/; do
+                [ -d "$d" ] || continue
+                v=$(basename "$d")
+                case "$v" in "$LOCAL_VERSION") continue ;; esac
+                print_point "$v"
+            done
+        fi
         show_select_help
         exit 1
     fi
@@ -1807,6 +1848,11 @@ cmd_env() {
                 ;;
             --init)
                 shift
+                if [ -z "${1:-}" ]; then
+                    print_error "Missing environment name for --init"
+                    show_env_help
+                    exit 1
+                fi
                 init_environment "$1"
                 exit 0
                 ;;
@@ -1847,6 +1893,9 @@ cmd_env() {
     done
 
     if [ "$reset" = "true" ]; then
+        if [ -n "$env" ]; then
+            print_warning "Ignoring environment name '$env' with --reset"
+        fi
         reset_environment "$update_dev" "$update_usr"
     else
         if [ -z "$env" ]; then
