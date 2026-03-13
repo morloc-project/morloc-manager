@@ -908,6 +908,8 @@ script_menv_dev() {
     cat << EOF > "$script_path"
 #!/usr/bin/env sh
 # automatically generated script, do not modify
+mkdir -p \$HOME/$mock_home/.local/bin
+mkdir -p \$HOME/$mock_home/.stack
 $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
            -e HOME=\$HOME \\
@@ -950,6 +952,8 @@ script_morloc_dev_shell() {
     cat << EOF > "$script_path"
 #!/usr/bin/env sh
 # automatically generated script, do not modify
+mkdir -p \$HOME/$mock_home/.local/bin
+mkdir -p \$HOME/$mock_home/.stack
 $CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
            -it \\
