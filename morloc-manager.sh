@@ -29,6 +29,13 @@ elif command -v docker >/dev/null 2>&1; then
     CONTAINER_ENGINE="docker"
 fi
 
+SELINUX_SUFFIX=""
+SUDO_PREFIX=""
+
+if [ "${MORLOC_ROOTFUL:-}" = "1" ]; then
+    SUDO_PREFIX="sudo "
+fi
+
 set_container_engine() {
     if ! command -v "$1" >/dev/null 2>&1; then
         echo "[ERROR] Container engine '$1' not found" >&2
@@ -36,6 +43,16 @@ set_container_engine() {
     fi
     CONTAINER_ENGINE="$1"
     CONTAINER_ENGINE_VERSION=$($CONTAINER_ENGINE --version 2>/dev/null | sed 's/.*version \([0-9.]*\).*/\1/')
+}
+
+detect_selinux() {
+    if command -v getenforce >/dev/null 2>&1; then
+        case "$(getenforce 2>/dev/null)" in
+            Enforcing|Permissive)
+                SELINUX_SUFFIX=":z"
+                ;;
+        esac
+    fi
 }
 
 # location of modules and other data will be stored for all morloc versions
@@ -736,13 +753,13 @@ build_environment() {
     container_base=$4
 
     # Check if image already exists
-    if $CONTAINER_ENGINE image inspect "$envtag" >/dev/null 2>&1; then
+    if $SUDO_PREFIX$CONTAINER_ENGINE image inspect "$envtag" >/dev/null 2>&1; then
         # Get the modification time of the Dockerfile
         if [ -f "$dockerfile" ]; then
             dockerfile_mtime=$(stat -c %Y "$dockerfile" 2>/dev/null || stat -f %m "$dockerfile" 2>/dev/null)
             # Get image creation time (Unix timestamp)
             # Docker and Podman both support this format
-            image_created=$($CONTAINER_ENGINE image inspect "$envtag" --format '{{.Created}}' 2>/dev/null)
+            image_created=$($SUDO_PREFIX$CONTAINER_ENGINE image inspect "$envtag" --format '{{.Created}}' 2>/dev/null)
 
             # Convert image created time to Unix timestamp
             # This is portable across docker and podman
@@ -768,7 +785,7 @@ build_environment() {
     fi
 
     # Build the image (quotes needed in case of spaces in paths)
-    if ! $CONTAINER_ENGINE build --build-arg CONTAINER_BASE="$container_base" --tag "$envtag" --file "$dockerfile" "$(dirname "$dockerfile")"; then
+    if ! $SUDO_PREFIX$CONTAINER_ENGINE build --build-arg CONTAINER_BASE="$container_base" --tag "$envtag" --file "$dockerfile" "$(dirname "$dockerfile")"; then
         print_error "Failed to build image '$envtag' from '$dockerfile'"
         return 1
     fi
@@ -801,11 +818,11 @@ script_menv() {
     cat << EOF > "$script_path"
 #!/usr/bin/env sh
 # automatically generated script, do not modify
-$CONTAINER_ENGINE run --rm \\
+${SUDO_PREFIX}$CONTAINER_ENGINE run --rm \\
            --shm-size=$SHARED_MEMORY_SIZE \\
            -e HOME=\$HOME \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_RELDIR} \\
-           -v \$PWD:\$HOME/work \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_RELDIR}${SELINUX_SUFFIX} \\
+           -v \$PWD:\$HOME/work${SELINUX_SUFFIX} \\
            -w \$HOME/work \\
            ${extra_args}${user_container} "\$@"
 
@@ -852,12 +869,12 @@ script_morloc_shell() {
     cat << EOF > "$script_path"
 #!/usr/bin/env sh
 # automatically generated script, do not modify
-$CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
+${SUDO_PREFIX}$CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm -it \\
            -e HOME=\$HOME \\
            -e PATH="/root/.ghcup/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_RELDIR} \\
-           -v \$PWD:\$HOME/work \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_RELDIR}${SELINUX_SUFFIX} \\
+           -v \$PWD:\$HOME/work${SELINUX_SUFFIX} \\
            -w \$HOME/work \\
            ${extra_args}${user_container} /bin/bash
 
@@ -910,14 +927,14 @@ script_menv_dev() {
 # automatically generated script, do not modify
 mkdir -p \$HOME/$mock_home/.local/bin
 mkdir -p \$HOME/$mock_home/.stack
-$CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
+${SUDO_PREFIX}$CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
            -e HOME=\$HOME \\
            -e PATH="/root/.ghcup/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_RELDIR} \\
-           -v \$HOME/$mock_home/.local/bin:\$HOME/${MORLOC_BIN_BASENAME} \\
-           -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
-           -v \$PWD:\$HOME/work \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_RELDIR}${SELINUX_SUFFIX} \\
+           -v \$HOME/$mock_home/.local/bin:\$HOME/${MORLOC_BIN_BASENAME}${SELINUX_SUFFIX} \\
+           -v \$HOME/$mock_home/.stack:\$HOME/.stack${SELINUX_SUFFIX} \\
+           -v \$PWD:\$HOME/work${SELINUX_SUFFIX} \\
            -w \$HOME/work \\
            ${extra_args}${user_container} "\$@"
 
@@ -954,15 +971,15 @@ script_morloc_dev_shell() {
 # automatically generated script, do not modify
 mkdir -p \$HOME/$mock_home/.local/bin
 mkdir -p \$HOME/$mock_home/.stack
-$CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
+${SUDO_PREFIX}$CONTAINER_ENGINE run --shm-size=$SHARED_MEMORY_SIZE \\
            --rm \\
            -it \\
            -e HOME=\$HOME \\
            -e PATH="/root/.ghcup/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_RELDIR} \\
-           -v \$HOME/$mock_home/.local/bin:\$HOME/${MORLOC_BIN_BASENAME} \\
-           -v \$HOME/$mock_home/.stack:\$HOME/.stack \\
-           -v \$PWD:\$HOME/work \\
+           -v \$HOME/${MORLOC_INSTALL_DIR}/$tag:\$HOME/${MORLOC_DATA_RELDIR}${SELINUX_SUFFIX} \\
+           -v \$HOME/$mock_home/.local/bin:\$HOME/${MORLOC_BIN_BASENAME}${SELINUX_SUFFIX} \\
+           -v \$HOME/$mock_home/.stack:\$HOME/.stack${SELINUX_SUFFIX} \\
+           -v \$PWD:\$HOME/work${SELINUX_SUFFIX} \\
            -w \$HOME/work \\
            ${extra_args}${user_container} /bin/bash
 EOF
@@ -987,6 +1004,7 @@ ${BOLD}OPTIONS${RESET}:
   -h, --help                Show this help message
   -v, --version             Show this manager version
   --container-engine ENGINE  Use ENGINE instead of auto-detected (docker/podman)
+  --rootful                 Run containers with sudo (for systems without rootless support)
 
 ${BOLD}COMMANDS${RESET}:
   ${BOLD}${GREEN}install${RESET}    Install morloc containers, scripts, and home
@@ -1117,7 +1135,7 @@ cmd_install() {
         print_info "Attempting to pull containers for Morloc version $version"
     fi
 
-    $CONTAINER_ENGINE pull "$CONTAINER_BASE_TINY:${tag}"
+    $SUDO_PREFIX$CONTAINER_ENGINE pull "$CONTAINER_BASE_TINY:${tag}"
     if [ $? -ne 0 ]
     then
         print_error "Failed to pull container 'tiny'"
@@ -1129,7 +1147,7 @@ cmd_install() {
     fi
 
     # pull container
-    $CONTAINER_ENGINE pull "$CONTAINER_BASE_FULL:${tag}"
+    $SUDO_PREFIX$CONTAINER_ENGINE pull "$CONTAINER_BASE_FULL:${tag}"
     if [ $? -ne 0 ]
     then
         print_error "Failed to pull container 'full'"
@@ -1140,7 +1158,7 @@ cmd_install() {
         exit 1
     fi
 
-    $CONTAINER_ENGINE pull "$CONTAINER_BASE_TEST:latest"
+    $SUDO_PREFIX$CONTAINER_ENGINE pull "$CONTAINER_BASE_TEST:latest"
     if [ $? -ne 0 ]
     then
         print_error "Failed to pull container 'dev'"
@@ -1155,7 +1173,7 @@ cmd_install() {
     # filter out the carriage return that podman helpfully provided
     if [ "$version" = "undefined" ]
     then
-        detected_version=$($CONTAINER_ENGINE run --rm "$CONTAINER_BASE_FULL:edge" morloc --version 2>/dev/null)
+        detected_version=$($SUDO_PREFIX$CONTAINER_ENGINE run --rm "$CONTAINER_BASE_FULL:edge" morloc --version 2>/dev/null)
         if [ $? -ne 0 ]
         then
             print_error "Failed to detect version from morloc container"
@@ -1233,18 +1251,18 @@ remove_containers_for_version() {
     print_info "Removing containers for $version using $CONTAINER_ENGINE ..."
 
     # Remove containers using this version
-    ids=$($CONTAINER_ENGINE ps -a --filter "ancestor=$CONTAINER_BASE_FULL:$version" --format '{{.ID}}')
-    [ -n "$ids" ] && echo "$ids" | xargs $CONTAINER_ENGINE rm -f
-    ids=$($CONTAINER_ENGINE ps -a --filter "ancestor=$CONTAINER_BASE_TINY:$version" --format '{{.ID}}')
-    [ -n "$ids" ] && echo "$ids" | xargs $CONTAINER_ENGINE rm -f
+    ids=$($SUDO_PREFIX$CONTAINER_ENGINE ps -a --filter "ancestor=$CONTAINER_BASE_FULL:$version" --format '{{.ID}}')
+    [ -n "$ids" ] && echo "$ids" | xargs $SUDO_PREFIX$CONTAINER_ENGINE rm -f
+    ids=$($SUDO_PREFIX$CONTAINER_ENGINE ps -a --filter "ancestor=$CONTAINER_BASE_TINY:$version" --format '{{.ID}}')
+    [ -n "$ids" ] && echo "$ids" | xargs $SUDO_PREFIX$CONTAINER_ENGINE rm -f
 
     # Remove environment images for this version
-    ids=$($CONTAINER_ENGINE images --filter "reference=morloc-env:$version-*" --format '{{.ID}}')
-    [ -n "$ids" ] && echo "$ids" | xargs $CONTAINER_ENGINE rmi -f
+    ids=$($SUDO_PREFIX$CONTAINER_ENGINE images --filter "reference=morloc-env:$version-*" --format '{{.ID}}')
+    [ -n "$ids" ] && echo "$ids" | xargs $SUDO_PREFIX$CONTAINER_ENGINE rmi -f
 
     # Remove base image
-    $CONTAINER_ENGINE rmi -f "$CONTAINER_BASE_FULL:$version"
-    $CONTAINER_ENGINE rmi -f "$CONTAINER_BASE_TINY:$version"
+    $SUDO_PREFIX$CONTAINER_ENGINE rmi -f "$CONTAINER_BASE_FULL:$version"
+    $SUDO_PREFIX$CONTAINER_ENGINE rmi -f "$CONTAINER_BASE_TINY:$version"
 
     print_success "All containers and images removed for $version"
 
@@ -1264,17 +1282,17 @@ remove_all_containers_and_images() {
     # Step 1: Remove all containers based on any tag of this base image
     print_info "Step 1: Removing containers..."
     # Get all image IDs for this base image (all tags)
-    all_image_ids=$($CONTAINER_ENGINE images --filter "reference=${base_image}:*" --format '{{.ID}}' 2>/dev/null)
+    all_image_ids=$($SUDO_PREFIX$CONTAINER_ENGINE images --filter "reference=${base_image}:*" --format '{{.ID}}' 2>/dev/null)
     # For each image ID, find containers
     container_ids=""
     for img_id in $all_image_ids; do
-        ids=$($CONTAINER_ENGINE ps -a --filter "ancestor=$img_id" --format '{{.ID}}' 2>/dev/null)
+        ids=$($SUDO_PREFIX$CONTAINER_ENGINE ps -a --filter "ancestor=$img_id" --format '{{.ID}}' 2>/dev/null)
         [ -n "$ids" ] && container_ids="$container_ids $ids"
     done
 
     if [ -n "$container_ids" ]; then
         print_info "Found containers: $container_ids"
-        if $CONTAINER_ENGINE rm -f $container_ids; then
+        if $SUDO_PREFIX$CONTAINER_ENGINE rm -f $container_ids; then
             print_success "Containers removed successfully"
         else
             print_warning "Error removing containers"
@@ -1286,11 +1304,11 @@ remove_all_containers_and_images() {
 
     # Step 2: Find and remove all images with this base name (all tags)
     print_info "Step 2: Removing images (this may take a moment) ..."
-    image_ids=$($CONTAINER_ENGINE images --filter "reference=$base_image" --format '{{.ID}}' 2>/dev/null)
+    image_ids=$($SUDO_PREFIX$CONTAINER_ENGINE images --filter "reference=$base_image" --format '{{.ID}}' 2>/dev/null)
 
     if [ -n "$image_ids" ]; then
         print_info "Found images: $image_ids"
-        if $CONTAINER_ENGINE rmi -f $image_ids; then
+        if $SUDO_PREFIX$CONTAINER_ENGINE rmi -f $image_ids; then
             print_success "Images removed successfully"
         else
             print_warning "Error removing images"
@@ -1640,8 +1658,20 @@ cmd_info() {
         current_version="none"
     fi
 
+    # Display mode and SELinux info
+    if [ -n "$SUDO_PREFIX" ]; then
+        printf "Mode:    rootful (sudo)\n"
+    else
+        printf "Mode:    rootless\n"
+    fi
+    if [ -n "$SELINUX_SUFFIX" ]; then
+        printf "SELinux: enforcing (bind mounts use :z)\n"
+    else
+        printf "SELinux: not detected\n"
+    fi
+
     dev_container=${CONTAINER_BASE_TEST}
-    if $CONTAINER_ENGINE images --format '{{.Repository}}' | grep -q "^${dev_container}$"
+    if $SUDO_PREFIX$CONTAINER_ENGINE images --format '{{.Repository}}' | grep -q "^${dev_container}$"
     then
         printf "dev             %scontainer exists%s\n" "$GREEN" "$RESET"
     else
@@ -1658,7 +1688,7 @@ cmd_info() {
 
         version_container="${CONTAINER_BASE_FULL}:${version}"
 
-        if $CONTAINER_ENGINE images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${version_container}$"
+        if $SUDO_PREFIX$CONTAINER_ENGINE images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${version_container}$"
         then
             printf "%s%s %scontainer exists%s\n" "$version" "$selection" "$GREEN" "$RESET"
         else
@@ -1934,6 +1964,10 @@ main() {
                 set_container_engine "${1:?'--container-engine requires an argument'}"
                 shift
                 ;;
+            --rootful)
+                SUDO_PREFIX="sudo "
+                shift
+                ;;
             -*)
                 print_error "Unknown option: $1"
                 show_help
@@ -1944,6 +1978,8 @@ main() {
                 ;;
         esac
     done
+
+    detect_selinux
 
     # Dispatch subcommand
     case "${1:-}" in
