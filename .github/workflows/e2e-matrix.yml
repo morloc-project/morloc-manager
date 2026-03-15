@@ -1,0 +1,99 @@
+name: E2E Matrix Tests
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'  # Weekly on Sunday at 4am UTC
+  push:
+    tags: ['v*']          # On release tags
+  workflow_dispatch:       # Manual trigger
+
+jobs:
+  e2e-docker:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - fedora-39
+          - debian-12
+          - alpine-3.19
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build test container
+        run: |
+          docker build \
+            -t mm-test-${{ matrix.distro }} \
+            -f test/distro/Dockerfile.${{ matrix.distro }} \
+            .
+
+      - name: Run e2e tests in container
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v ${{ github.workspace }}:/workspace \
+            mm-test-${{ matrix.distro }} \
+            bats /workspace/test/e2e/
+
+  e2e-podman:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - fedora-39
+          - debian-12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Run e2e tests with Podman
+        run: test/lib/bats/bin/bats test/e2e/
+        env:
+          MORLOC_CONTAINER_ENGINE: podman
+
+  e2e-arm64:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - ubuntu-22.04
+          - ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up QEMU for ARM64
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ARM64 test container
+        run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            -t mm-test-arm64-${{ matrix.distro }} \
+            -f test/distro/Dockerfile.${{ matrix.distro }} \
+            --load \
+            .
+
+      - name: Run e2e tests on ARM64
+        run: |
+          docker run --rm \
+            --platform linux/arm64 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v ${{ github.workspace }}:/workspace \
+            mm-test-arm64-${{ matrix.distro }} \
+            bats /workspace/test/e2e/

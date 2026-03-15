@@ -1960,5 +1960,7 @@ main() {
 
 # }}}
 
-# Run main function with all arguments
-main "$@"
+# Run main unless sourced for testing
+if [ "${MORLOC_MANAGER_TESTING:-}" != "1" ]; then
+    main "$@"
+fi

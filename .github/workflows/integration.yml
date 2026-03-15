@@ -1,0 +1,32 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [docker, podman]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify Docker is available
+        if: matrix.engine == 'docker'
+        run: docker --version
+
+      - name: Verify Podman is available
+        if: matrix.engine == 'podman'
+        run: podman --version
+
+      - name: Run integration tests
+        run: test/lib/bats/bin/bats test/integration/
+        env:
+          MORLOC_CONTAINER_ENGINE: ${{ matrix.engine }}

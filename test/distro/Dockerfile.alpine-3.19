@@ -1,0 +1,25 @@
+FROM alpine:3.19
+
+RUN apk add --no-cache \
+    bash \
+    curl \
+    wget \
+    git \
+    ca-certificates \
+    sudo \
+    docker-cli
+
+# Create non-root test user
+RUN adduser -D -s /bin/bash testuser \
+    && echo 'testuser ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+
+# Install BATS from source
+COPY test/lib/bats /opt/bats
+RUN /opt/bats/install.sh /usr/local
+
+COPY test/lib/bats-support /opt/bats-support
+COPY test/lib/bats-assert /opt/bats-assert
+COPY test/lib/bats-file /opt/bats-file
+
+USER testuser
+WORKDIR /workspace

@@ -1,0 +1,9 @@
+module hello (hello, double)
+
+import root-py
+
+hello :: Str
+hello = "Hello, World!"
+
+double :: Real -> Real
+double x = x + x
