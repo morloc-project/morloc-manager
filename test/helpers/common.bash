@@ -119,9 +119,11 @@ require_cgroup_v2() {
     fi
 }
 
-# Skip always -- placeholder until rootful support is implemented
+# Skip unless sudo is available without a password
 require_rootful_support() {
-    skip "rootful support not yet implemented"
+    if ! sudo -n true 2>/dev/null; then
+        skip "sudo access not available"
+    fi
 }
 
 # Detect an available container engine for VM tests (real, not mock)
@@ -135,6 +137,24 @@ detect_available_engine() {
         skip "no container engine available"
     fi
     export DETECTED_ENGINE
+}
+
+# Set up a mock getenforce command that returns the given mode
+setup_mock_getenforce() {
+    local mode="${1:-Enforcing}"
+    MOCK_SELINUX_DIR="$(mktemp -d "${BATS_TMPDIR:-/tmp}/mock-selinux.XXXXXX")"
+    printf '#!/bin/sh\necho "%s"\n' "$mode" > "$MOCK_SELINUX_DIR/getenforce"
+    chmod +x "$MOCK_SELINUX_DIR/getenforce"
+    export PATH="$MOCK_SELINUX_DIR:$PATH"
+}
+
+# Remove mock getenforce from PATH
+teardown_mock_getenforce() {
+    if [ -n "${MOCK_SELINUX_DIR:-}" ]; then
+        rm -rf "$MOCK_SELINUX_DIR"
+        export PATH="${PATH#$MOCK_SELINUX_DIR:}"
+        unset MOCK_SELINUX_DIR
+    fi
 }
 
 # Assert that a file does NOT contain a specific string (literal match)

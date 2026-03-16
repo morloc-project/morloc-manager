@@ -101,7 +101,8 @@ teardown() {
     if ! id testuser >/dev/null 2>&1; then
         skip "testuser does not exist"
     fi
-    run su - testuser -c "podman info" 2>/dev/null
+    # Use timeout and /dev/null stdin to prevent hanging on password prompts
+    run timeout 10 su - testuser -c "podman info" </dev/null 2>/dev/null
     if [ "$status" -ne 0 ]; then
         skip "podman not available for testuser"
     fi
@@ -112,6 +113,9 @@ teardown() {
 
 @test "rootful docker: sudo docker run" {
     require_rootful_support
+    if ! command -v docker >/dev/null 2>&1; then
+        skip "docker not installed"
+    fi
     run sudo docker run --rm alpine echo "rootful-docker-ok"
     assert_success
     assert_output "rootful-docker-ok"
@@ -119,13 +123,23 @@ teardown() {
 
 @test "rootful docker: menv script generation" {
     require_rootful_support
-    # Future: CONTAINER_ENGINE="sudo docker" or --rootful flag
+    if ! command -v docker >/dev/null 2>&1; then
+        skip "docker not installed"
+    fi
+    SUDO_PREFIX="sudo "
+    CONTAINER_ENGINE="docker"
+    local menv_path="$HOME/.local/bin/menv"
+    script_menv "$menv_path" "edge"
+    assert_file_contains "$menv_path" "sudo docker run"
 }
 
 # ---- Rootful Podman ----
 
 @test "rootful podman: sudo podman run" {
     require_rootful_support
+    if ! command -v podman >/dev/null 2>&1; then
+        skip "podman not installed"
+    fi
     run sudo podman run --rm alpine echo "rootful-podman-ok"
     assert_success
     assert_output "rootful-podman-ok"
@@ -133,5 +147,12 @@ teardown() {
 
 @test "rootful podman: menv script generation" {
     require_rootful_support
-    # Future: CONTAINER_ENGINE="sudo podman" or --rootful flag
+    if ! command -v podman >/dev/null 2>&1; then
+        skip "podman not installed"
+    fi
+    SUDO_PREFIX="sudo "
+    CONTAINER_ENGINE="podman"
+    local menv_path="$HOME/.local/bin/menv"
+    script_menv "$menv_path" "edge"
+    assert_file_contains "$menv_path" "sudo podman run"
 }

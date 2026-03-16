@@ -1,8 +1,5 @@
 #!/usr/bin/env bats
-# Rootful container tests -- ALL skip until rootful support is implemented
-#
-# These tests define the acceptance criteria for rootful support.
-# When rootful support is added to morloc-manager.sh, remove the skip lines.
+# Rootful container tests -- require sudo access
 #
 # Usage:
 #   vagrant ssh fedora -c "cd /vagrant && bats test/vm/rootful.bats"
@@ -20,6 +17,9 @@ teardown() {
 
 @test "rootful: sudo docker run basic execution" {
     require_rootful_support
+    if ! command -v docker >/dev/null 2>&1; then
+        skip "docker not installed"
+    fi
     run sudo docker run --rm alpine echo "rootful-ok"
     assert_success
     assert_output "rootful-ok"
@@ -27,6 +27,9 @@ teardown() {
 
 @test "rootful: sudo podman run basic execution" {
     require_rootful_support
+    if ! command -v podman >/dev/null 2>&1; then
+        skip "podman not installed"
+    fi
     run sudo podman run --rm alpine echo "rootful-ok"
     assert_success
     assert_output "rootful-ok"
@@ -34,40 +37,44 @@ teardown() {
 
 @test "rootful: menv script generation with --rootful flag" {
     require_rootful_support
+    detect_available_engine
 
+    SUDO_PREFIX="sudo "
+    CONTAINER_ENGINE="$DETECTED_ENGINE"
     local menv_path="$HOME/.local/bin/menv"
-    # Future API: script_menv with rootful flag
-    CONTAINER_ENGINE="docker"
     script_menv "$menv_path" "edge"
 
-    # When implemented, the generated script should use sudo
     assert_file_contains "$menv_path" "sudo"
+    assert_file_contains "$menv_path" "$DETECTED_ENGINE run"
 }
 
 @test "rootful: menv script runs morloc --version" {
     require_rootful_support
+    detect_available_engine
 
+    SUDO_PREFIX="sudo "
+    CONTAINER_ENGINE="$DETECTED_ENGINE"
     local menv_path="$HOME/.local/bin/menv"
-    CONTAINER_ENGINE="docker"
     script_menv "$menv_path" "edge"
 
-    run sudo sh "$menv_path" morloc --version
+    run sh "$menv_path" morloc --version
     assert_success
 }
 
 @test "rootful: bind mount permissions (no UID mapping issues)" {
     require_rootful_support
+    detect_available_engine
 
     local test_dir="$HOME/rootful-mount-test"
     mkdir -p "$test_dir"
     echo "test" > "$test_dir/input.txt"
 
-    run sudo docker run --rm -v "$test_dir:/mnt/test" alpine cat /mnt/test/input.txt
+    run sudo "$DETECTED_ENGINE" run --rm -v "$test_dir:/mnt/test" alpine cat /mnt/test/input.txt
     assert_success
     assert_output "test"
 
     # Rootful should not have UID mapping issues
-    run sudo docker run --rm -v "$test_dir:/mnt/test" alpine sh -c "echo written > /mnt/test/output.txt"
+    run sudo "$DETECTED_ENGINE" run --rm -v "$test_dir:/mnt/test" alpine sh -c "echo written > /mnt/test/output.txt"
     assert_success
 
     # File should be readable by the current user (may be root-owned)
@@ -76,28 +83,24 @@ teardown() {
 
 @test "rootful: shm-size allocation" {
     require_rootful_support
+    detect_available_engine
 
-    run sudo docker run --rm --shm-size=4g \
+    run sudo "$DETECTED_ENGINE" run --rm --shm-size=4g \
         alpine sh -c "df -m /dev/shm | tail -1 | awk '{print \$2}'"
     assert_success
     local shm_size="${lines[-1]}"
     [ "$shm_size" -ge 4000 ]
 }
 
-@test "rootful: auto-detect rootful vs rootless" {
-    require_rootful_support
-    # Future: morloc-manager should detect if user has rootless access
-    # and fall back to rootful if not
-}
-
 @test "rootful: generated scripts use correct engine invocation" {
     require_rootful_support
+    detect_available_engine
 
+    SUDO_PREFIX="sudo "
+    CONTAINER_ENGINE="$DETECTED_ENGINE"
     local menv_path="$HOME/.local/bin/menv"
-    CONTAINER_ENGINE="docker"
     script_menv "$menv_path" "edge"
 
-    # When rootful is implemented, verify the generated script
-    # uses the correct sudo/engine combination
     assert_file_exists "$menv_path"
+    assert_file_contains "$menv_path" "sudo $DETECTED_ENGINE run"
 }

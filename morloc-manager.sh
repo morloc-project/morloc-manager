@@ -835,8 +835,8 @@ EOF
 
     chmod 755 "$script_path"
 
-    observed_version=$("$script_path" morloc --version 2>/dev/null)
-    if [ $? -ne 0 ]; then
+    observed_version=$("$script_path" morloc --version 2>/dev/null) || true
+    if [ -z "$observed_version" ]; then
         print_warning "Could not verify morloc version from '$script_path'"
     elif [ "$observed_version" != "$tag" ]; then
         print_warning "Observed version ($observed_version) is different from expected version ($tag)"
@@ -889,8 +889,8 @@ EOF
 
     # Check version via menv (morloc-shell is interactive, can't run non-interactively)
     if [ -f "$MORLOC_BIN/menv" ]; then
-        observed_version=$("$MORLOC_BIN/menv" morloc --version 2>/dev/null)
-        if [ $? -ne 0 ]; then
+        observed_version=$("$MORLOC_BIN/menv" morloc --version 2>/dev/null) || true
+        if [ -z "$observed_version" ]; then
             print_warning "Could not verify morloc version from '$MORLOC_BIN/menv'"
         elif [ "$observed_version" != "$tag" ]; then
             print_warning "Observed version ($observed_version) is different from expected version ($tag)"

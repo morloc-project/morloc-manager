@@ -125,3 +125,51 @@ EOF
     assert_file_contains "$MORLOC_BIN/menv" "podman run"
     assert_file_not_contains "$MORLOC_BIN/menv" "docker run"
 }
+
+# --- SELinux suffix tests ---
+
+@test "script_generation: menv bind mounts have :z when SELinux detected" {
+    SELINUX_SUFFIX=":z"
+    script_menv "$MORLOC_BIN/menv" "0.55.0"
+    # All -v lines should end with :z
+    local v_lines
+    v_lines=$(grep -- '-v ' "$MORLOC_BIN/menv")
+    echo "$v_lines" | while IFS= read -r line; do
+        echo "$line" | grep -qF ":z" || { echo "Missing :z in: $line" >&2; return 1; }
+    done
+}
+
+@test "script_generation: menv bind mounts lack :z when no SELinux" {
+    SELINUX_SUFFIX=""
+    script_menv "$MORLOC_BIN/menv" "0.55.0"
+    assert_file_not_contains "$MORLOC_BIN/menv" ":z"
+}
+
+@test "script_generation: menv has sudo prefix when --rootful" {
+    # Create a mock sudo that passes through to the real command
+    local mock_sudo_dir
+    mock_sudo_dir="$(mktemp -d "${BATS_TMPDIR:-/tmp}/mock-sudo.XXXXXX")"
+    printf '#!/bin/sh\n"$@"\n' > "$mock_sudo_dir/sudo"
+    chmod +x "$mock_sudo_dir/sudo"
+    export PATH="$mock_sudo_dir:$PATH"
+
+    SUDO_PREFIX="sudo "
+    script_menv "$MORLOC_BIN/menv" "0.55.0"
+    assert_file_contains "$MORLOC_BIN/menv" "sudo docker run"
+
+    rm -rf "$mock_sudo_dir"
+}
+
+@test "script_generation: menv lacks sudo by default" {
+    SUDO_PREFIX=""
+    script_menv "$MORLOC_BIN/menv" "0.55.0"
+    assert_file_not_contains "$MORLOC_BIN/menv" "sudo"
+}
+
+@test "script_generation: menv-dev all 4 mounts have :z" {
+    SELINUX_SUFFIX=":z"
+    script_menv_dev "$MORLOC_BIN/menv-dev"
+    local v_count
+    v_count=$(grep -c ':z' "$MORLOC_BIN/menv-dev")
+    [ "$v_count" -ge 4 ]
+}

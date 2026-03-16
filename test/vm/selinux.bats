@@ -84,27 +84,21 @@ teardown() {
     [ "$shm_size" -ge 256 ]
 }
 
-@test "generated bind mounts include :z label (future)" {
+@test "generated bind mounts include :z label" {
     require_selinux_enforcing
-    skip "bind mount :z label support not yet implemented"
 
     local menv_path="$HOME/.local/bin/menv"
-    CONTAINER_ENGINE="docker"
+    detect_available_engine
+    CONTAINER_ENGINE="$DETECTED_ENGINE"
+    detect_selinux
     script_menv "$menv_path" "edge"
 
-    # When implemented, generated scripts should include :z on bind mounts
-    assert_file_contains "$menv_path" ":z"
-}
-
-@test "generated bind mounts include :Z label for private volumes (future)" {
-    require_selinux_enforcing
-    skip "bind mount :Z label support not yet implemented"
-
-    local menv_path="$HOME/.local/bin/menv"
-    CONTAINER_ENGINE="docker"
-    script_menv "$menv_path" "edge"
-
-    assert_file_contains "$menv_path" ":Z"
+    # All -v lines should have :z suffix
+    local v_lines
+    v_lines=$(grep -- '-v ' "$menv_path")
+    echo "$v_lines" | while IFS= read -r line; do
+        echo "$line" | grep -qF ":z" || { echo "Missing :z in: $line" >&2; return 1; }
+    done
 }
 
 @test "SELinux context preserved on container files" {

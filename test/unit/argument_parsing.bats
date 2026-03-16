@@ -113,3 +113,27 @@ setup() {
     run main --container-engine
     assert_failure
 }
+
+# --- --rootful ---
+
+@test "main: --rootful flag is accepted" {
+    run main --rootful --help
+    assert_success
+    assert_output --partial "USAGE"
+}
+
+@test "main: --rootful shows in help text" {
+    run main --help
+    assert_success
+    assert_output --partial "--rootful"
+}
+
+@test "main: MORLOC_ROOTFUL=1 sets SUDO_PREFIX" {
+    # Re-source with env var set
+    MORLOC_ROOTFUL=1 source "$SCRIPT_PATH"
+    [ "$SUDO_PREFIX" = "sudo " ]
+}
+
+@test "main: default SUDO_PREFIX is empty" {
+    [ -z "$SUDO_PREFIX" ]
+}
