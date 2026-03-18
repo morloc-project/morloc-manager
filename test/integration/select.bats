@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Integration tests for the select subcommand (compose-based)
+# Integration tests for the select subcommand
 
 load "../helpers/common"
 load "../helpers/mock_engine"

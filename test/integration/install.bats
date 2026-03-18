@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Integration tests for the install subcommand (compose-based)
+# Integration tests for the install subcommand
 # These use mock container engines - no real Docker/Podman needed
 
 load "../helpers/common"
@@ -20,11 +20,6 @@ teardown() {
     teardown_isolated_home
 }
 
-@test "install: generate_compose_file creates compose file" {
-    generate_compose_file
-    assert_file_exists "$MORLOC_DATA_HOME/docker-compose.yml"
-}
-
 @test "install: generate_env_file creates env file with version" {
     generate_env_file "0.55.0"
     assert_file_exists "$MORLOC_DATA_HOME/.env"
@@ -37,10 +32,10 @@ teardown() {
     [ -x "$MORLOC_BIN/menv" ]
 }
 
-@test "install: menv script uses compose run" {
+@test "install: menv script uses docker run directly" {
     generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "compose"
-    assert_file_contains "$MORLOC_BIN/menv" "run"
+    assert_file_contains "$MORLOC_BIN/menv" "run --rm"
+    assert_file_not_contains "$MORLOC_BIN/menv" "compose"
 }
 
 @test "install: menv script has --rm flag" {
@@ -95,7 +90,7 @@ teardown() {
     assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_CONTAINER_ENGINE=podman"
 }
 
-@test "install: detect_compose_command succeeds with mock docker" {
-    run detect_compose_command
-    assert_success
+@test "install: env file has MORLOC_ENV_FLAGS field" {
+    generate_env_file "0.55.0"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_ENV_FLAGS="
 }

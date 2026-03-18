@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Integration tests for the env subcommand (compose-based)
+# Integration tests for the env subcommand
 
 load "../helpers/common"
 load "../helpers/mock_engine"
@@ -22,6 +22,7 @@ MORLOC_DEV_IMAGE=ghcr.io/morloc-project/morloc/morloc-test:latest
 MORLOC_HOST_HOME=$HOME
 MORLOC_INSTALL_DIR=$MORLOC_INSTALL_DIR
 MORLOC_CONTAINER_ENGINE=docker
+MORLOC_ENV_FLAGS=
 EOF
 }
 
@@ -161,6 +162,95 @@ EOF
     " 2>/dev/null || true
 
     assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_IMAGE=morloc-env:0.55.0-ml"
+}
+
+# --- no env specified ---
+
+@test "env: --init creates flags file stub" {
+    run bash -c "
+        export MORLOC_MANAGER_TESTING=1
+        export HOME='$HOME'
+        export MORLOC_DEPENDENCY_DIR='$MORLOC_DEPENDENCY_DIR'
+        source '$SCRIPT_PATH'
+        CONTAINER_ENGINE=docker
+        cmd_env --init ml
+    "
+    assert_success
+    assert_file_exists "$MORLOC_DEPENDENCY_DIR/ml.flags"
+}
+
+@test "env: --init flags stub contains example comments" {
+    bash -c "
+        export MORLOC_MANAGER_TESTING=1
+        export HOME='$HOME'
+        export MORLOC_DEPENDENCY_DIR='$MORLOC_DEPENDENCY_DIR'
+        source '$SCRIPT_PATH'
+        CONTAINER_ENGINE=docker
+        cmd_env --init flagtest
+    " 2>/dev/null || true
+    assert_file_contains "$MORLOC_DEPENDENCY_DIR/flagtest.flags" "gpus"
+}
+
+@test "env: --list shows flags status" {
+    mkdir -p "$MORLOC_DEPENDENCY_DIR"
+    touch "$MORLOC_DEPENDENCY_DIR/ml.Dockerfile"
+    touch "$MORLOC_DEPENDENCY_DIR/ml.flags"
+    touch "$MORLOC_DEPENDENCY_DIR/bio.Dockerfile"
+    run bash -c "
+        export MORLOC_MANAGER_TESTING=1
+        export HOME='$HOME'
+        export MORLOC_DEPENDENCY_DIR='$MORLOC_DEPENDENCY_DIR'
+        export MORLOC_BIN='$MORLOC_BIN'
+        source '$SCRIPT_PATH'
+        CONTAINER_ENGINE=docker
+        cmd_env --list
+    "
+    assert_success
+    assert_output --partial "flags:yes"
+    assert_output --partial "flags:no"
+}
+
+@test "env: --reset clears MORLOC_ENV_FLAGS in .env" {
+    # Set a custom env flags path first
+    sed -i 's|^MORLOC_ENV_FLAGS=.*|MORLOC_ENV_FLAGS=/some/path/ml.flags|' "$MORLOC_DATA_HOME/.env"
+
+    run bash -c "
+        export MORLOC_MANAGER_TESTING=1
+        export HOME='$HOME'
+        export PATH='$MOCK_ENGINE_DIR:$HOME/.local/bin:/usr/bin:/bin'
+        source '$SCRIPT_PATH'
+        CONTAINER_ENGINE=docker
+        MORLOC_BIN='$MORLOC_BIN'
+        cmd_env --reset
+    "
+    assert_success
+    # Verify MORLOC_ENV_FLAGS was cleared
+    run grep '^MORLOC_ENV_FLAGS=' "$MORLOC_DATA_HOME/.env"
+    assert_output "MORLOC_ENV_FLAGS="
+}
+
+@test "env: activating env sets MORLOC_ENV_FLAGS when flags file exists" {
+    mkdir -p "$MORLOC_DEPENDENCY_DIR"
+    cat > "$MORLOC_DEPENDENCY_DIR/ml.Dockerfile" << 'EOF'
+ARG CONTAINER_BASE
+FROM ${CONTAINER_BASE}
+RUN pip install numpy
+EOF
+    echo "--gpus all" > "$MORLOC_DEPENDENCY_DIR/ml.flags"
+
+    bash -c "
+        export MORLOC_MANAGER_TESTING=1
+        export HOME='$HOME'
+        export PATH='$MOCK_ENGINE_DIR:$HOME/.local/bin:/usr/bin:/bin'
+        source '$SCRIPT_PATH'
+        CONTAINER_ENGINE=docker
+        MORLOC_BIN='$MORLOC_BIN'
+        MORLOC_DEPENDENCY_DIR='$MORLOC_DEPENDENCY_DIR'
+        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
+        cmd_env ml
+    " 2>/dev/null || true
+
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_ENV_FLAGS=$MORLOC_DEPENDENCY_DIR/ml.flags"
 }
 
 # --- no env specified ---
