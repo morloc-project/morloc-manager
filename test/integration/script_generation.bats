@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Integration tests for generated wrapper scripts
+# Integration tests for compose-based file generation
 
 load "../helpers/common"
 load "../helpers/mock_engine"
@@ -19,157 +19,195 @@ teardown() {
     teardown_isolated_home
 }
 
-# --- menv script content ---
+# --- docker-compose.yml content ---
 
-@test "script_generation: menv has correct shebang" {
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
+@test "compose: generate_compose_file creates docker-compose.yml" {
+    generate_compose_file
+    assert_file_exists "$MORLOC_DATA_HOME/docker-compose.yml"
+}
+
+@test "compose: docker-compose.yml has DO NOT EDIT header" {
+    generate_compose_file
+    assert_file_contains "$MORLOC_DATA_HOME/docker-compose.yml" "DO NOT EDIT"
+}
+
+@test "compose: docker-compose.yml has morloc service" {
+    generate_compose_file
+    assert_file_contains "$MORLOC_DATA_HOME/docker-compose.yml" "morloc:"
+}
+
+@test "compose: docker-compose.yml has morloc-dev service" {
+    generate_compose_file
+    assert_file_contains "$MORLOC_DATA_HOME/docker-compose.yml" "morloc-dev:"
+}
+
+@test "compose: docker-compose.yml references MORLOC_IMAGE variable" {
+    generate_compose_file
+    assert_file_contains "$MORLOC_DATA_HOME/docker-compose.yml" 'MORLOC_IMAGE'
+}
+
+@test "compose: docker-compose.yml references MORLOC_DEV_IMAGE variable" {
+    generate_compose_file
+    assert_file_contains "$MORLOC_DATA_HOME/docker-compose.yml" 'MORLOC_DEV_IMAGE'
+}
+
+@test "compose: docker-compose.yml has shm_size" {
+    generate_compose_file
+    assert_file_contains "$MORLOC_DATA_HOME/docker-compose.yml" "shm_size"
+}
+
+@test "compose: docker-compose.yml has MORLOC_WORK_DIR volume" {
+    generate_compose_file
+    assert_file_contains "$MORLOC_DATA_HOME/docker-compose.yml" 'MORLOC_WORK_DIR'
+}
+
+@test "compose: docker-compose.yml has work directory" {
+    generate_compose_file
+    assert_file_contains "$MORLOC_DATA_HOME/docker-compose.yml" "work"
+}
+
+@test "compose: docker-compose.yml dev has ghcup in PATH" {
+    generate_compose_file
+    assert_file_contains "$MORLOC_DATA_HOME/docker-compose.yml" "ghcup"
+}
+
+@test "compose: docker-compose.yml dev has .stack volume" {
+    generate_compose_file
+    assert_file_contains "$MORLOC_DATA_HOME/docker-compose.yml" ".stack"
+}
+
+@test "compose: docker-compose.yml has :z when SELinux detected" {
+    SELINUX_SUFFIX=":z"
+    generate_compose_file
+    assert_file_contains "$MORLOC_DATA_HOME/docker-compose.yml" ":z"
+}
+
+@test "compose: docker-compose.yml lacks :z when no SELinux" {
+    SELINUX_SUFFIX=""
+    generate_compose_file
+    assert_file_not_contains "$MORLOC_DATA_HOME/docker-compose.yml" ":z"
+}
+
+# --- .env content ---
+
+@test "env_file: generate_env_file creates .env" {
+    generate_env_file "0.58.3"
+    assert_file_exists "$MORLOC_DATA_HOME/.env"
+}
+
+@test "env_file: .env has correct version" {
+    generate_env_file "0.58.3"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_VERSION=0.58.3"
+}
+
+@test "env_file: .env has correct image" {
+    generate_env_file "0.58.3"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.58.3"
+}
+
+@test "env_file: .env has dev image" {
+    generate_env_file "0.58.3"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_DEV_IMAGE=ghcr.io/morloc-project/morloc/morloc-test:latest"
+}
+
+@test "env_file: .env has host home" {
+    generate_env_file "0.58.3"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_HOST_HOME=$HOME"
+}
+
+@test "env_file: .env has install dir" {
+    generate_env_file "0.58.3"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_INSTALL_DIR="
+}
+
+@test "env_file: .env has container engine" {
+    generate_env_file "0.58.3"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_CONTAINER_ENGINE=docker"
+}
+
+# --- menv script ---
+
+@test "menv: generate_menv_script creates menv" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_exists "$MORLOC_BIN/menv"
+}
+
+@test "menv: has correct shebang" {
+    generate_menv_script "$MORLOC_BIN/menv"
     local first_line
     first_line=$(head -n1 "$MORLOC_BIN/menv")
     [ "$first_line" = "#!/usr/bin/env sh" ]
 }
 
-@test "script_generation: menv has --rm flag" {
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/menv" "--rm"
+@test "menv: is executable" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    [ -x "$MORLOC_BIN/menv" ]
 }
 
-@test "script_generation: menv mounts PWD to work directory" {
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/menv" 'PWD'
+@test "menv: has --dev flag handler" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_contains "$MORLOC_BIN/menv" "--dev"
 }
 
-@test "script_generation: menv sets working directory" {
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/menv" 'work'
+@test "menv: has --shell flag handler" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_contains "$MORLOC_BIN/menv" "--shell"
 }
 
-@test "script_generation: menv passes through arguments" {
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
+@test "menv: passes through arguments" {
+    generate_menv_script "$MORLOC_BIN/menv"
     assert_file_contains "$MORLOC_BIN/menv" '"$@"'
 }
 
-@test "script_generation: menv uses correct container image" {
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/menv" "ghcr.io/morloc-project/morloc/morloc-full"
+@test "menv: uses compose run" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_contains "$MORLOC_BIN/menv" "compose"
+    assert_file_contains "$MORLOC_BIN/menv" "run"
 }
 
-# --- morloc-shell script content ---
-
-@test "script_generation: morloc-shell has -it for interactive" {
-    script_morloc_shell "$MORLOC_BIN/morloc-shell" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/morloc-shell" "rm -it"
+@test "menv: has --rm flag" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_contains "$MORLOC_BIN/menv" "--rm"
 }
 
-@test "script_generation: morloc-shell ends with /bin/bash" {
-    script_morloc_shell "$MORLOC_BIN/morloc-shell" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/morloc-shell" "/bin/bash"
+@test "menv: references docker-compose.yml" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_contains "$MORLOC_BIN/menv" "docker-compose.yml"
 }
 
-@test "script_generation: morloc-shell does NOT pass through args" {
-    script_morloc_shell "$MORLOC_BIN/morloc-shell" "0.55.0"
-    assert_file_not_contains "$MORLOC_BIN/morloc-shell" '"$@"'
+@test "menv: references .env file" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_contains "$MORLOC_BIN/menv" ".env"
 }
 
-@test "script_generation: morloc-shell sets PATH with ghcup" {
-    script_morloc_shell "$MORLOC_BIN/morloc-shell" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/morloc-shell" "ghcup"
+@test "menv: sets MORLOC_WORK_DIR to PWD" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_contains "$MORLOC_BIN/menv" 'MORLOC_WORK_DIR="$PWD"'
 }
 
-# --- menv-dev script content ---
-
-@test "script_generation: menv-dev uses test container" {
-    script_menv_dev "$MORLOC_BIN/menv-dev"
-    assert_file_contains "$MORLOC_BIN/menv-dev" "morloc-test"
+@test "menv: shell mode runs /bin/bash" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_contains "$MORLOC_BIN/menv" "/bin/bash"
 }
 
-@test "script_generation: menv-dev mounts .stack directory" {
-    script_menv_dev "$MORLOC_BIN/menv-dev"
-    assert_file_contains "$MORLOC_BIN/menv-dev" ".stack"
+@test "menv: non-interactive mode uses -T" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_contains "$MORLOC_BIN/menv" " -T "
 }
 
-@test "script_generation: menv-dev creates needed directories" {
-    script_menv_dev "$MORLOC_BIN/menv-dev"
-    assert_file_contains "$MORLOC_BIN/menv-dev" "mkdir -p"
+@test "menv: creates dev directories when --dev" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_contains "$MORLOC_BIN/menv" "mkdir -p"
 }
 
-# --- morloc-shell-dev script content ---
+# --- detect_compose_command ---
 
-@test "script_generation: morloc-shell-dev has -it flag" {
-    script_morloc_dev_shell "$MORLOC_BIN/morloc-shell-dev"
-    assert_file_contains "$MORLOC_BIN/morloc-shell-dev" "-it"
+@test "compose_detect: finds docker compose plugin" {
+    run detect_compose_command
+    assert_success
 }
 
-@test "script_generation: morloc-shell-dev ends with /bin/bash" {
-    script_morloc_dev_shell "$MORLOC_BIN/morloc-shell-dev"
-    assert_file_contains "$MORLOC_BIN/morloc-shell-dev" "/bin/bash"
-}
-
-# --- environment variant scripts ---
-
-@test "script_generation: menv with env uses custom container tag" {
-    mkdir -p "$HOME/.local/share/morloc/deps"
-    cat > "$HOME/.local/share/morloc/deps/ml.Dockerfile" << 'EOF'
-ARG CONTAINER_BASE
-FROM ${CONTAINER_BASE}
-RUN pip install numpy
-EOF
-    script_menv "$MORLOC_BIN/menv" "0.55.0" "ml" "$HOME/.local/share/morloc/deps/ml.Dockerfile"
-    assert_file_contains "$MORLOC_BIN/menv" "morloc-env:0.55.0-ml"
-}
-
-@test "script_generation: podman scripts use podman run" {
-    teardown_mock_engine
-    setup_mock_engine "podman" "4.7.2"
-    CONTAINER_ENGINE="podman"
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/menv" "podman run"
-    assert_file_not_contains "$MORLOC_BIN/menv" "docker run"
-}
-
-# --- SELinux suffix tests ---
-
-@test "script_generation: menv bind mounts have :z when SELinux detected" {
-    SELINUX_SUFFIX=":z"
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    # All -v lines should end with :z
-    local v_lines
-    v_lines=$(grep -- '-v ' "$MORLOC_BIN/menv")
-    echo "$v_lines" | while IFS= read -r line; do
-        echo "$line" | grep -qF ":z" || { echo "Missing :z in: $line" >&2; return 1; }
-    done
-}
-
-@test "script_generation: menv bind mounts lack :z when no SELinux" {
-    SELINUX_SUFFIX=""
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_not_contains "$MORLOC_BIN/menv" ":z"
-}
-
-@test "script_generation: menv has sudo prefix when --rootful" {
-    # Create a mock sudo that passes through to the real command
-    local mock_sudo_dir
-    mock_sudo_dir="$(mktemp -d "${BATS_TMPDIR:-/tmp}/mock-sudo.XXXXXX")"
-    printf '#!/bin/sh\n"$@"\n' > "$mock_sudo_dir/sudo"
-    chmod +x "$mock_sudo_dir/sudo"
-    export PATH="$mock_sudo_dir:$PATH"
-
-    SUDO_PREFIX="sudo "
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/menv" "sudo docker run"
-
-    rm -rf "$mock_sudo_dir"
-}
-
-@test "script_generation: menv lacks sudo by default" {
-    SUDO_PREFIX=""
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_not_contains "$MORLOC_BIN/menv" "sudo"
-}
-
-@test "script_generation: menv-dev all 4 mounts have :z" {
-    SELINUX_SUFFIX=":z"
-    script_menv_dev "$MORLOC_BIN/menv-dev"
-    local v_count
-    v_count=$(grep -c ':z' "$MORLOC_BIN/menv-dev")
-    [ "$v_count" -ge 4 ]
+@test "compose_detect: sets COMPOSE_COMMAND" {
+    detect_compose_command
+    [ -n "$COMPOSE_COMMAND" ]
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Integration tests for the env subcommand
+# Integration tests for the env subcommand (compose-based)
 
 load "../helpers/common"
 load "../helpers/mock_engine"
@@ -13,6 +13,16 @@ setup() {
     export MORLOC_BIN="$HOME/.local/bin"
     mkdir -p "$MORLOC_BIN"
     export MORLOC_DEPENDENCY_DIR="$HOME/.local/share/morloc/deps"
+    # Pre-create a .env file so env commands can read version
+    mkdir -p "$MORLOC_DATA_HOME"
+    cat > "$MORLOC_DATA_HOME/.env" << EOF
+MORLOC_VERSION=0.55.0
+MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.55.0
+MORLOC_DEV_IMAGE=ghcr.io/morloc-project/morloc/morloc-test:latest
+MORLOC_HOST_HOME=$HOME
+MORLOC_INSTALL_DIR=$MORLOC_INSTALL_DIR
+MORLOC_CONTAINER_ENGINE=docker
+EOF
 }
 
 teardown() {
@@ -109,18 +119,9 @@ teardown() {
 
 # --- reset ---
 
-@test "env: --reset produces success message" {
-    # Create mock menv that returns a version
-    cat > "$MORLOC_BIN/menv" << 'EOF'
-#!/bin/sh
-if [ "$1" = "morloc" ] && [ "$2" = "--version" ]; then
-    echo "0.55.0"
-    exit 0
-fi
-echo "mock-menv: $*"
-exit 0
-EOF
-    chmod +x "$MORLOC_BIN/menv"
+@test "env: --reset updates .env to default image" {
+    # Set a custom image first
+    sed -i 's|^MORLOC_IMAGE=.*|MORLOC_IMAGE=morloc-env:0.55.0-ml|' "$MORLOC_DATA_HOME/.env"
 
     run bash -c "
         export MORLOC_MANAGER_TESTING=1
@@ -133,6 +134,33 @@ EOF
     "
     assert_success
     assert_output --partial "reset"
+    # Verify .env was reset to default base image
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.55.0"
+}
+
+# --- env switching via .env ---
+
+@test "env: activating env updates MORLOC_IMAGE in .env" {
+    mkdir -p "$MORLOC_DEPENDENCY_DIR"
+    cat > "$MORLOC_DEPENDENCY_DIR/ml.Dockerfile" << 'EOF'
+ARG CONTAINER_BASE
+FROM ${CONTAINER_BASE}
+RUN pip install numpy
+EOF
+
+    bash -c "
+        export MORLOC_MANAGER_TESTING=1
+        export HOME='$HOME'
+        export PATH='$MOCK_ENGINE_DIR:$HOME/.local/bin:/usr/bin:/bin'
+        source '$SCRIPT_PATH'
+        CONTAINER_ENGINE=docker
+        MORLOC_BIN='$MORLOC_BIN'
+        MORLOC_DEPENDENCY_DIR='$MORLOC_DEPENDENCY_DIR'
+        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
+        cmd_env ml
+    " 2>/dev/null || true
+
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_IMAGE=morloc-env:0.55.0-ml"
 }
 
 # --- no env specified ---

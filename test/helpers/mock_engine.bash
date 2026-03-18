@@ -17,6 +17,30 @@ case "\$1" in
     --version)
         echo "$engine_name version $engine_version"
         ;;
+    compose)
+        shift
+        case "\$1" in
+            version)
+                echo "$engine_name Compose version v2.24.0"
+                ;;
+            run)
+                shift
+                # Skip flags, find service name and command
+                while [ \$# -gt 0 ]; do
+                    case "\$1" in
+                        --rm|-T)    shift ;;
+                        -f|--env-file) shift 2 ;;
+                        -*)         shift; [ \$# -gt 0 ] && shift ;;
+                        *)          break ;;
+                    esac
+                done
+                echo "mock-compose-run: \$*"
+                ;;
+            *)
+                echo "mock-compose: \$*"
+                ;;
+        esac
+        ;;
     run)
         # Simulate running a container
         shift
@@ -86,6 +110,17 @@ setup_failing_mock_engine() {
 case "\$1" in
     --version)
         echo "$engine_name version 24.0.7"
+        ;;
+    compose)
+        shift
+        case "\$1" in
+            version)
+                echo "$engine_name Compose version v2.24.0"
+                ;;
+            *)
+                exit 0
+                ;;
+        esac
         ;;
     $fail_command)
         echo "Error: $fail_command failed" >&2

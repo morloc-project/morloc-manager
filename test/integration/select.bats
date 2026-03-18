@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Integration tests for the select subcommand
+# Integration tests for the select subcommand (compose-based)
 
 load "../helpers/common"
 load "../helpers/mock_engine"
@@ -16,6 +16,16 @@ setup() {
     touch "$HOME/.bashrc"
     echo "export PATH=\"$HOME/.local/bin:\$PATH\"" >> "$HOME/.bashrc"
     export PATH="$HOME/.local/bin:$PATH"
+    # Pre-create .env file
+    mkdir -p "$MORLOC_DATA_HOME"
+    cat > "$MORLOC_DATA_HOME/.env" << EOF
+MORLOC_VERSION=0.55.0
+MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.55.0
+MORLOC_DEV_IMAGE=ghcr.io/morloc-project/morloc/morloc-test:latest
+MORLOC_HOST_HOME=$HOME
+MORLOC_INSTALL_DIR=$MORLOC_INSTALL_DIR
+MORLOC_CONTAINER_ENGINE=docker
+EOF
 }
 
 teardown() {
@@ -34,6 +44,7 @@ teardown() {
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
         MORLOC_BIN='$MORLOC_BIN'
+        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select 0.55.0
     "
     assert_success
@@ -48,6 +59,7 @@ teardown() {
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
         MORLOC_BIN='$MORLOC_BIN'
+        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select 0.99.0
     "
     assert_failure
@@ -65,6 +77,7 @@ teardown() {
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
         MORLOC_BIN='$MORLOC_BIN'
+        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select
     "
     assert_failure
@@ -79,13 +92,14 @@ teardown() {
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
         MORLOC_BIN='$MORLOC_BIN'
+        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select local
     "
     assert_failure
     assert_output --partial "Cannot set to"
 }
 
-@test "select: regenerates menv script with new version" {
+@test "select: updates .env with new version" {
     local install_dir="$HOME/${MORLOC_INSTALL_DIR}"
     mkdir -p "$install_dir/0.55.0"
     mkdir -p "$install_dir/0.54.0"
@@ -97,9 +111,11 @@ teardown() {
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
         MORLOC_BIN='$MORLOC_BIN'
+        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select 0.54.0
     " 2>/dev/null || true
-    assert_file_contains "$MORLOC_BIN/menv" "0.54.0"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_VERSION=0.54.0"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.54.0"
 
     # Then select 0.55.0
     bash -c "
@@ -109,7 +125,32 @@ teardown() {
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
         MORLOC_BIN='$MORLOC_BIN'
+        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select 0.55.0
     " 2>/dev/null || true
-    assert_file_contains "$MORLOC_BIN/menv" "0.55.0"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_VERSION=0.55.0"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.55.0"
+}
+
+@test "select: does not regenerate menv script" {
+    local install_dir="$HOME/${MORLOC_INSTALL_DIR}"
+    mkdir -p "$install_dir/0.55.0"
+    # Create an menv with a marker
+    echo "#!/usr/bin/env sh" > "$MORLOC_BIN/menv"
+    echo "# MARKER_DO_NOT_CHANGE" >> "$MORLOC_BIN/menv"
+    chmod +x "$MORLOC_BIN/menv"
+
+    bash -c "
+        export MORLOC_MANAGER_TESTING=1
+        export HOME='$HOME'
+        export PATH='$PATH'
+        source '$SCRIPT_PATH'
+        CONTAINER_ENGINE=docker
+        MORLOC_BIN='$MORLOC_BIN'
+        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
+        cmd_select 0.55.0
+    " 2>/dev/null || true
+
+    # menv should still have the marker (not regenerated)
+    assert_file_contains "$MORLOC_BIN/menv" "MARKER_DO_NOT_CHANGE"
 }

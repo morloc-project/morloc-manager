@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Integration tests for the install subcommand
+# Integration tests for the install subcommand (compose-based)
 # These use mock container engines - no real Docker/Podman needed
 
 load "../helpers/common"
@@ -20,57 +20,32 @@ teardown() {
     teardown_isolated_home
 }
 
-@test "install: creates version directory structure" {
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_exists "$MORLOC_BIN/menv"
+@test "install: generate_compose_file creates compose file" {
+    generate_compose_file
+    assert_file_exists "$MORLOC_DATA_HOME/docker-compose.yml"
 }
 
-@test "install: menv script is executable" {
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
+@test "install: generate_env_file creates env file with version" {
+    generate_env_file "0.55.0"
+    assert_file_exists "$MORLOC_DATA_HOME/.env"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_VERSION=0.55.0"
+}
+
+@test "install: generate_menv_script creates executable menv" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_exists "$MORLOC_BIN/menv"
     [ -x "$MORLOC_BIN/menv" ]
 }
 
-@test "install: menv script contains docker run" {
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/menv" "docker run"
+@test "install: menv script uses compose run" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_contains "$MORLOC_BIN/menv" "compose"
+    assert_file_contains "$MORLOC_BIN/menv" "run"
 }
 
-@test "install: menv script contains --shm-size" {
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/menv" "shm-size=4g"
-}
-
-@test "install: menv script contains correct version in mount path" {
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/menv" "0.55.0"
-}
-
-@test "install: morloc-shell script is created and executable" {
-    script_morloc_shell "$MORLOC_BIN/morloc-shell" "0.55.0"
-    assert_file_exists "$MORLOC_BIN/morloc-shell"
-    [ -x "$MORLOC_BIN/morloc-shell" ]
-}
-
-@test "install: morloc-shell script has -it flag for interactive" {
-    script_morloc_shell "$MORLOC_BIN/morloc-shell" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/morloc-shell" "rm -it"
-}
-
-@test "install: morloc-shell script runs /bin/bash" {
-    script_morloc_shell "$MORLOC_BIN/morloc-shell" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/morloc-shell" "/bin/bash"
-}
-
-@test "install: menv-dev script is created" {
-    script_menv_dev "$MORLOC_BIN/menv-dev"
-    assert_file_exists "$MORLOC_BIN/menv-dev"
-    [ -x "$MORLOC_BIN/menv-dev" ]
-}
-
-@test "install: morloc-shell-dev script is created" {
-    script_morloc_dev_shell "$MORLOC_BIN/morloc-shell-dev"
-    assert_file_exists "$MORLOC_BIN/morloc-shell-dev"
-    [ -x "$MORLOC_BIN/morloc-shell-dev" ]
+@test "install: menv script has --rm flag" {
+    generate_menv_script "$MORLOC_BIN/menv"
+    assert_file_contains "$MORLOC_BIN/menv" "--rm"
 }
 
 @test "install: --no-init flag is parsed correctly" {
@@ -112,10 +87,15 @@ teardown() {
     assert_dir_exists "$morloc_data_home/tmp"
 }
 
-@test "install: script uses podman when engine is podman" {
+@test "install: env file records podman when engine is podman" {
     teardown_mock_engine
     setup_mock_engine "podman" "4.7.2"
     CONTAINER_ENGINE="podman"
-    script_menv "$MORLOC_BIN/menv" "0.55.0"
-    assert_file_contains "$MORLOC_BIN/menv" "podman run"
+    generate_env_file "0.55.0"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_CONTAINER_ENGINE=podman"
+}
+
+@test "install: detect_compose_command succeeds with mock docker" {
+    run detect_compose_command
+    assert_success
 }
