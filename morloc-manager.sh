@@ -555,6 +555,9 @@ fi
 # "SELinux relabeling of /home/<user> is not allowed".
 if [ "\$MORLOC_WORK_DIR" != "\$MORLOC_HOST_HOME" ]; then
     BASE+=(-v "\${MORLOC_WORK_DIR}:\${MORLOC_HOST_HOME}/work\${_z}")
+    _workdir="\${MORLOC_HOST_HOME}/work"
+else
+    _workdir="\${MORLOC_HOST_HOME}"
 fi
 
 # Read flags from file into array (strips comments and blank lines)
@@ -581,10 +584,10 @@ if [ -n "\${MORLOC_ENV_FLAGS:-}" ] && [ -f "\$MORLOC_ENV_FLAGS" ]; then
 fi
 
 if [ -n "\$SHELL_MODE" ]; then
-    exec "\$ENGINE" run --rm -it --shm-size ${SHARED_MEMORY_SIZE} -w "\${MORLOC_HOST_HOME}/work" \\
+    exec "\$ENGINE" run --rm -it --shm-size ${SHARED_MEMORY_SIZE} -w "\$_workdir" \\
         "\${BASE[@]}" "\${USER_FLAGS[@]}" "\${EXTRA[@]}" "\$IMAGE" /bin/bash
 else
-    exec "\$ENGINE" run --rm --shm-size ${SHARED_MEMORY_SIZE} -w "\${MORLOC_HOST_HOME}/work" \\
+    exec "\$ENGINE" run --rm --shm-size ${SHARED_MEMORY_SIZE} -w "\$_workdir" \\
         "\${BASE[@]}" "\${USER_FLAGS[@]}" "\${EXTRA[@]}" "\$IMAGE" "\$@"
 fi
 MENV_EOF
