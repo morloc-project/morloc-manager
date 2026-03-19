@@ -122,21 +122,22 @@ if [ -t 1 ]; then
         # Check for common color-capable terminal types
         case "$TERM" in
             *color*|*256*|xterm*|screen*|tmux*|rxvt*|gnome*|konsole*|alacritty*|kitty*)
-                RED='\033[0;31m'
-                GREEN='\033[0;32m'
-                YELLOW='\033[0;33m'
-                BLUE='\033[0;34m'
-                MAGENTA='\033[0;35m'
-                CYAN='\033[0;36m'
+                ESC=$(printf '\033')
+                RED="${ESC}[0;31m"
+                GREEN="${ESC}[0;32m"
+                YELLOW="${ESC}[0;33m"
+                BLUE="${ESC}[0;34m"
+                MAGENTA="${ESC}[0;35m"
+                CYAN="${ESC}[0;36m"
 
                 # Text attributes
-                BOLD='\033[1m'
-                DIM='\033[2m'
-                UNDERLINE='\033[4m'
-                REVERSE='\033[7m'
-                BLINK='\033[5m'
+                BOLD="${ESC}[1m"
+                DIM="${ESC}[2m"
+                UNDERLINE="${ESC}[4m"
+                REVERSE="${ESC}[7m"
+                BLINK="${ESC}[5m"
 
-                RESET='\033[0m'
+                RESET="${ESC}[0m"
                 ;;
             *)
                 # Conservative: disable colors for unknown terminals
