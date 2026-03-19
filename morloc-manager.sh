@@ -951,7 +951,9 @@ else
     IMAGE="\$MORLOC_IMAGE"
     BASE=(
         -v "\${MORLOC_HOST_HOME}/\${MORLOC_INSTALL_DIR}/\${MORLOC_VERSION}:\${MORLOC_HOST_HOME}/${MORLOC_DATA_RELDIR}\${_z}"
+        -v "\${MORLOC_HOST_HOME}/\${MORLOC_INSTALL_DIR}/\${MORLOC_VERSION}/bin:\${MORLOC_HOST_HOME}/${MORLOC_BIN_BASENAME}\${_z}"
         -e "HOME=\${MORLOC_HOST_HOME}"
+        -e "PATH=\${MORLOC_HOST_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     )
 fi
 
@@ -1211,6 +1213,7 @@ cmd_install() {
         print_error "Failed to create morloc home directory at '$morloc_data_home'"
         exit 1
     fi
+    create_directory "$morloc_data_home/bin"
     create_directory "$morloc_data_home/include"
     create_directory "$morloc_data_home/lib"
     create_directory "$morloc_data_home/opt"
