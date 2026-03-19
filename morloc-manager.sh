@@ -944,7 +944,6 @@ if [ "\$SERVICE" = "morloc-dev" ]; then
         -v "\${MORLOC_HOST_HOME}/\${MORLOC_INSTALL_DIR}/local:\${MORLOC_HOST_HOME}/${MORLOC_DATA_RELDIR}\${_z}"
         -v "\${MORLOC_HOST_HOME}/\${MORLOC_INSTALL_DIR}/local/home/.local/bin:\${MORLOC_HOST_HOME}/${MORLOC_BIN_BASENAME}\${_z}"
         -v "\${MORLOC_HOST_HOME}/\${MORLOC_INSTALL_DIR}/local/home/.stack:\${MORLOC_HOST_HOME}/.stack\${_z}"
-        -v "\${MORLOC_WORK_DIR}:\${MORLOC_HOST_HOME}/work\${_z}"
         -e "HOME=\${MORLOC_HOST_HOME}"
         -e "PATH=/root/.ghcup/bin:\${MORLOC_HOST_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     )
@@ -952,9 +951,15 @@ else
     IMAGE="\$MORLOC_IMAGE"
     BASE=(
         -v "\${MORLOC_HOST_HOME}/\${MORLOC_INSTALL_DIR}/\${MORLOC_VERSION}:\${MORLOC_HOST_HOME}/${MORLOC_DATA_RELDIR}\${_z}"
-        -v "\${MORLOC_WORK_DIR}:\${MORLOC_HOST_HOME}/work\${_z}"
         -e "HOME=\${MORLOC_HOST_HOME}"
     )
+fi
+
+# Mount working directory unless it is the home directory itself.
+# On SELinux systems (e.g. Fedora), mounting \$HOME with :z triggers
+# "SELinux relabeling of /home/<user> is not allowed".
+if [ "\$MORLOC_WORK_DIR" != "\$MORLOC_HOST_HOME" ]; then
+    BASE+=(-v "\${MORLOC_WORK_DIR}:\${MORLOC_HOST_HOME}/work\${_z}")
 fi
 
 # Read flags from file into array (strips comments and blank lines)
