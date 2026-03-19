@@ -12,7 +12,7 @@ setup() {
     CONTAINER_ENGINE="docker"
     export MORLOC_BIN="$HOME/.local/bin"
     mkdir -p "$MORLOC_BIN"
-    # Pre-create .bashrc so add_morloc_bin_to_path doesn't prompt
+    # Ensure .local/bin is in PATH for ensure_morloc_bin
     touch "$HOME/.bashrc"
     echo "export PATH=\"$HOME/.local/bin:\$PATH\"" >> "$HOME/.bashrc"
     export PATH="$HOME/.local/bin:$PATH"

@@ -11,7 +11,7 @@ setup() {
     export MORLOC_BIN="$HOME/.local/bin"
     mkdir -p "$MORLOC_BIN"
     export PATH="$MORLOC_BIN:$PATH"
-    # Pre-populate .bashrc so add_morloc_bin_to_path doesn't prompt
+    # Pre-populate .bashrc for PATH setup
     echo "export PATH=\"$HOME/.local/bin:\$PATH\"" > "$HOME/.bashrc"
 }
 

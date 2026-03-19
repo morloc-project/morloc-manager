@@ -90,7 +90,6 @@ MORLOC_DEFAULT_PLANE_GITHUB_ORG="morloclib"
 MORLOC_BIN_BASENAME=".local/bin"
 MORLOC_BIN="$HOME/$MORLOC_BIN_BASENAME"
 PATH_EXPORT_LINE="export PATH=\"${MORLOC_BIN}:\$PATH\""
-COMMENT_LINE="# For Morloc support"
 
 LOCAL_VERSION="local"
 
@@ -230,123 +229,6 @@ create_directory() {
 }
 
 
-# Function to detect the current shell
-detect_shell() {
-    # First, check if we're running under a specific shell using version variables
-    if [ -n "$ZSH_VERSION" ]; then
-        echo "zsh"
-    elif [ -n "$BASH_VERSION" ]; then
-        echo "bash"
-    elif [ -n "$FISH_VERSION" ]; then
-        echo "fish"
-    elif [ -n "$KSH_VERSION" ]; then
-        echo "ksh"
-    # Check for tcsh/csh specific variables
-    elif [ -n "$tcsh" ] || [ -n "$version" ]; then
-        if [ -n "$tcsh" ]; then
-            echo "tcsh"
-        else
-            echo "csh"
-        fi
-    # Check SHELL environment variable
-    elif [ -n "$SHELL" ]; then
-        case "$(basename "$SHELL")" in
-            *zsh*) echo "zsh" ;;
-            *bash*) echo "bash" ;;
-            *fish*) echo "fish" ;;
-            *ksh*) echo "ksh" ;;
-            *tcsh*) echo "tcsh" ;;
-            *csh*) echo "csh" ;;
-            *dash*) echo "dash" ;;
-            *ash*) echo "ash" ;;
-            *) basename "$SHELL" ;;
-        esac
-    # Last resort: check process name
-    else
-        # Try to get process name from ps (with fallback)
-        if command -v ps >/dev/null 2>&1; then
-            shell_name=$(ps -p $$ -o comm= 2>/dev/null | sed 's/^-//' || echo "sh")
-            case "$shell_name" in
-                *zsh*) echo "zsh" ;;
-                *bash*) echo "bash" ;;
-                *fish*) echo "fish" ;;
-                *ksh*) echo "ksh" ;;
-                *tcsh*) echo "tcsh" ;;
-                *csh*) echo "csh" ;;
-                *dash*) echo "dash" ;;
-                *ash*) echo "ash" ;;
-                *) echo "$shell_name" ;;
-            esac
-        else
-            echo "sh"
-        fi
-    fi
-}
-
-# Function to get appropriate shell configuration files
-get_shell_config_files() {
-    local shell_name
-    shell_name=$(detect_shell)
-
-    case "$shell_name" in
-        bash)
-            # macOS typically uses .bash_profile, Linux uses .bashrc
-            # Check in order of preference for login shells
-            if [ "$(uname -s)" = "Darwin" ]; then
-                # macOS prefers .bash_profile for login shells
-                if [ -f "$HOME/.bash_profile" ]; then
-                    echo "$HOME/.bash_profile"
-                elif [ -f "$HOME/.bashrc" ]; then
-                    echo "$HOME/.bashrc"
-                else
-                    echo "$HOME/.bash_profile"
-                fi
-            else
-                # Linux and others: prefer .bashrc
-                if [ -f "$HOME/.bashrc" ]; then
-                    echo "$HOME/.bashrc"
-                elif [ -f "$HOME/.bash_profile" ]; then
-                    echo "$HOME/.bash_profile"
-                else
-                    echo "$HOME/.bashrc"
-                fi
-            fi
-            ;;
-        zsh)
-            echo "$HOME/.zshrc"
-            ;;
-        fish)
-            # Ensure fish config directory exists
-            if [ ! -d "$HOME/.config/fish" ]; then
-                mkdir -p "$HOME/.config/fish" 2>/dev/null || true
-            fi
-            echo "$HOME/.config/fish/config.fish"
-            ;;
-        ksh)
-            # Korn shell typically uses .kshrc or .profile
-            if [ -f "$HOME/.kshrc" ]; then
-                echo "$HOME/.kshrc"
-            else
-                echo "$HOME/.profile"
-            fi
-            ;;
-        dash|ash)
-            # dash and ash are usually non-interactive, but if used as login shell
-            # they typically source .profile
-            echo "$HOME/.profile"
-            ;;
-        tcsh)
-            echo "$HOME/.tcshrc"
-            ;;
-        csh)
-            echo "$HOME/.cshrc"
-            ;;
-        *)
-            # For other shells, use .profile (most portable)
-            echo "$HOME/.profile"
-            ;;
-    esac
-}
 
 # Function to normalize a path (remove trailing slashes, resolve basic issues)
 normalize_path() {
@@ -414,333 +296,44 @@ is_in_path() {
     return 1
 }
 
-# Function to check if PATH export already exists in a file
-path_exists_in_file() {
-    local file="$1"
-    if [ -f "$file" ] && [ -r "$file" ]; then
-        # Use more specific pattern to avoid false positives
-        if grep -q "$MORLOC_BIN_BASENAME" "$file" 2>/dev/null; then
-            return 0
-        fi
-    fi
-    return 1
-}
-
-# Function to safely add PATH export to configuration file (handles multiple shells)
-add_to_config_file() {
-    local config_file="$1"
-    local config_dir
-    local shell_name
-    shell_name=$(detect_shell)
-    config_dir=$(dirname "$config_file")
-
-    # Create config directory if it doesn't exist
-    if [ ! -d "$config_dir" ]; then
-        print_info "Creating configuration directory: $config_dir"
-        if ! mkdir -p "$config_dir" 2>/dev/null; then
-            print_error "Failed to create directory: $config_dir"
-            return 1
-        fi
-    fi
-
-    # Check if PATH export already exists
-    if path_exists_in_file "$config_file"; then
-        print_warning "PATH export for ~/$MORLOC_BIN_BASENAME already exists in $config_file"
-        return 0
-    fi
-
-    # Add the appropriate PATH export based on shell
-    case "$shell_name" in
-        fish)
-            # Fish shell uses different syntax
-            {
-                echo ""
-                echo "# Added by Morloc setup script"
-                echo "set -gx PATH \$HOME/$MORLOC_BIN_BASENAME \$PATH"
-            } >> "$config_file" 2>/dev/null || {
-                print_error "Failed to write to $config_file"
-                return 1
-            }
-            print_success "Added Fish-compatible PATH export to $config_file"
-            ;;
-        tcsh|csh)
-            # C shell family uses different syntax
-            {
-                echo ""
-                echo "# Added by Morloc setup script"
-                echo "set path = (\$HOME/$MORLOC_BIN_BASENAME \$path)"
-            } >> "$config_file" 2>/dev/null || {
-                print_error "Failed to write to $config_file"
-                return 1
-            }
-            print_success "Added C shell-compatible PATH export to $config_file"
-            ;;
-        *)
-            # POSIX-compatible shells (bash, zsh, sh, dash, ash, ksh, etc.)
-            {
-                echo ""
-                echo "$COMMENT_LINE"
-                echo "$PATH_EXPORT_LINE"
-            } >> "$config_file" 2>/dev/null || {
-                print_error "Failed to write to $config_file"
-                return 1
-            }
-            print_success "Added POSIX-compatible PATH export to $config_file"
-            ;;
-    esac
-
-    return 0
-}
-
-# Function to source the configuration file (shell-aware)
-source_config_file() {
-    local config_file="$1"
-    local shell_name
-    shell_name=$(detect_shell)
-
-    print_info "Sourcing configuration file to update current PATH..."
-
-    # Handle shells that don't support sourcing or have different syntax
-    case "$shell_name" in
-        fish)
-            print_info "Fish shell detected - PATH will be available in new fish sessions"
-            print_info "To update current session: exec fish"
-            return 0
-            ;;
-        tcsh|csh)
-            print_info "C shell detected - PATH will be available in new shell sessions"
-            print_info "To update current session: source \"$config_file\""
-            # Try to source with csh syntax, but don't fail if it doesn't work
-            # shellcheck disable=SC1090
-            if [ -f "$config_file" ] && command -v source >/dev/null 2>&1; then
-                source "$config_file" 2>/dev/null || true
-            fi
-            return 0
-            ;;
-        *)
-            # POSIX-compatible shells (bash, zsh, sh, dash, ash, ksh, etc.)
-            # Add to PATH directly instead of sourcing the full config file,
-            # which can have side effects (override variables, produce output, etc.)
-            export PATH="$MORLOC_BIN:$PATH"
-
-            if is_in_path "$MORLOC_BIN"; then
-                print_success "$MORLOC_BIN is now in your current PATH"
-            else
-                print_warning "PATH update may not have taken effect immediately"
-                print_warning "Try opening a new terminal if the directory isn't accessible"
-            fi
-            ;;
-    esac
-}
-
 # }}}
 # {{{ setup Morloc bin folder
 
-# Function to test PATH functionality
-test_path_functionality() {
-    # Use a more unique test filename to avoid conflicts
-    local timestamp
-    local test_script
-    local test_command
+# Ensure ~/.local/bin exists and is in PATH, advising the user if not.
+# Never modifies shell rc files.
+ensure_morloc_bin() {
+    # Create ~/.local/bin if needed
+    create_directory "$MORLOC_BIN" || return 1
 
-    # Get timestamp in a portable way
-    if command -v date >/dev/null 2>&1; then
-        timestamp=$(date +%s 2>/dev/null || echo "$$")
-    else
-        timestamp="$$"
-    fi
-
-    test_script="$MORLOC_BIN/path-test-$timestamp"
-    test_command="path-test-$timestamp"
-
-    print_info "Testing PATH functionality..."
-
-    # Create a simple test script with error handling
-    if ! cat > "$test_script" << 'EOF' 2>/dev/null
-#!/usr/bin/env sh
-echo "PATH test successful!"
-exit 0
-EOF
-    then
-        print_error "Failed to create test script"
-        return 1
-    fi
-
-    # Make it executable with error handling
-    if ! chmod +x "$test_script" 2>/dev/null; then
-        print_error "Failed to make test script executable"
-        rm -f "$test_script" 2>/dev/null || true
-        return 1
-    fi
-
-    # Test if we can run it by name (proving it's in PATH)
-    if command -v "$test_command" >/dev/null 2>&1 && "$test_command" >/dev/null 2>&1; then
-        print_success "PATH test passed - executable files in ~/$MORLOC_BIN_BASENAME are accessible"
-        rm -f "$test_script" 2>/dev/null || true
+    # Already in PATH — nothing to do
+    if is_in_path "$MORLOC_BIN"; then
+        print_success "$MORLOC_BIN is in PATH"
         return 0
-    else
-        print_warning "PATH test failed - executable may not be immediately accessible"
-        print_info "This sometimes happens due to shell caching - try opening a new terminal"
-        rm -f "$test_script" 2>/dev/null || true
-        return 1
-    fi
-}
-
-# Main function
-add_morloc_bin_to_path() {
-
-    ### Configuration ####
-
-    # Show current status
-    print_info "Setting up Morloc bin:"
-
-    morloc_bin_exists=$( if [ -d "$MORLOC_BIN" ]; then echo 0; else echo 1; fi )
-    morloc_bin_is_in_path=$( if is_in_path "$MORLOC_BIN"; then echo 0; else echo 1; fi )
-
-    printf "  Target Morloc bin folder: %s " "$MORLOC_BIN"
-
-    if [ $morloc_bin_exists = 0 ]; then
-        printf "%s[EXISTS]%s\n" "$GREEN" "$RESET"
-    else
-        printf "%s[MISSING]%s\n" "$RED" "$RESET"
     fi
 
-    printf "  In current PATH? "
-    if [ $morloc_bin_is_in_path = 0 ]; then
-        printf "%s[YES]%s\n" "$GREEN" "$RESET"
-    else
-        printf "%s[NO]%s\n" "$RED" "$RESET"
-    fi
-
-    if [ $morloc_bin_exists = 0 ]; then
-        if [ $morloc_bin_is_in_path = 0 ]; then
-            printf "  %s[OK] All systems go!%s\n" "$GREEN" "$RESET"
+    # Check if ~/.profile or similar will add it on next login
+    for f in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zprofile"; do
+        if [ -f "$f" ] && grep -q '\.local/bin' "$f" 2>/dev/null; then
+            print_warning "$MORLOC_BIN is not yet in your PATH, but will be on next login"
+            print_info "To use morloc now, run:  export PATH=\"$MORLOC_BIN:\$PATH\""
+            export PATH="$MORLOC_BIN:$PATH"
             return 0
         fi
-    fi
+    done
 
-    local shell_name
-    shell_name=$(detect_shell)
-
-    local config_file
-    config_file=$(get_shell_config_files)
-
-    local operating_system
-    operating_system=$(uname -s)
-
-    printf "  Detected shell: %s\n" "${shell_name}"
-    printf "  Configuration file: %s\n" "${config_file}"
-    printf "  Operating system: %s\n" "${operating_system}"
+    # Advise user
+    print_warning "$MORLOC_BIN is not in your PATH"
     echo ""
-
-    printf "%sThis script will:%s\n" "$YELLOW" "$RESET"
-    echo "  1. Create directory: $MORLOC_BIN"
-    echo "  2. Add PATH export to config file: $config_file"
-    echo "  3. Source the config file to update current PATH"
-    echo "  4. Test PATH functionality with a sample executable"
-    echo "  5. Make ~/${MORLOC_BIN_BASENAME} available immediately and in future sessions"
+    print_info "Add it to your shell configuration:"
     echo ""
-
-    ### Confirmation ####
-
-    printf "Do you want to proceed? [y/N]: "
-
-    # More portable read that works across shells
-    if command -v read >/dev/null 2>&1; then
-        read -r response 2>/dev/null || {
-            # Fallback for systems where read might not work as expected
-            response=$(head -n1 2>/dev/null || echo "n")
-        }
-    else
-        # Ultimate fallback
-        response="n"
-    fi
-
-    case "$response" in
-        [yY]|[yY][eE][sS])
-            ;;
-        *)
-            print_info "Operation cancelled by user"
-            return 1
-            ;;
-    esac
-
-    ### Doing the thing ####
-
+    echo "  bash/zsh/ksh:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.profile"
+    echo "  fish:          fish_add_path ~/.local/bin"
     echo ""
-    print_info "Starting setup process..."
+    print_info "Then restart your shell, or run:  export PATH=\"$MORLOC_BIN:\$PATH\""
 
-    # Create target directory
-    if ! create_directory "$MORLOC_BIN"; then
-        return 1
-    fi
-
-    print_info "Using configuration file: $config_file"
-
-    # Add to configuration file
-    if ! add_to_config_file "$config_file"; then
-        print_error "Failed to update configuration file"
-        return 1
-    fi
-
-    # Source the configuration file to make PATH available immediately
-    source_config_file "$config_file"
-
-    # Test PATH functionality
-    test_passed="false"
-    if test_path_functionality; then
-        test_passed="true"
-    fi
-
-    ### Show completion message ####
-
-    echo ""
-    print_success "Setup completed successfully!"
-    echo ""
-
-    if [ "$test_passed" = "true" ]; then
-        printf "%s[OK] All systems go!%s\n" "$GREEN" "$RESET"
-        echo "  - Directory created: $MORLOC_BIN"
-        echo "  - PATH updated and active"
-        echo "  - Executable test passed"
-        echo ""
-        printf "%sReady to use:%s\n" "$YELLOW" "$RESET"
-        echo "  - Place executable files in: $MORLOC_BIN"
-        echo "  - They will be accessible by name from anywhere"
-    else
-        printf "%sSetup complete with minor issues:%s\n" "$YELLOW" "$RESET"
-        echo "  - Directory created: $MORLOC_BIN"
-        echo "  - PATH updated in configuration file"
-        echo "  - Executable test failed (shell caching or permissions)"
-        echo ""
-        printf "%sTroubleshooting:%s\n" "$YELLOW" "$RESET"
-        echo "  - Try opening a new terminal"
-
-        if [ "$shell_name" = "fish" ]; then
-            echo "  - For fish shell, run: exec fish"
-            echo "  - Verify with: echo \$PATH | grep $MORLOC_BIN_BASENAME"
-        else
-            echo "  - Verify with: echo \$PATH | grep '$MORLOC_BIN_BASENAME'"
-            echo "  - Source manually: . \"${config_file}\""
-        fi
-
-        echo "  - Test manually: ls -la \"$MORLOC_BIN\""
-    fi
-
-    # Platform-specific notes
-    case "${operating_system}" in
-        "Darwin")
-            echo ""
-            printf "%smacOS Note:%s Terminal.app may need to be restarted for PATH changes\n" "$BLUE" "$RESET"
-            ;;
-        "Linux")
-            # Check for WSL
-            if [ -n "$WSL_DISTRO_NAME" ] || [ -n "$WSLENV" ] || grep -qi microsoft /proc/version 2>/dev/null; then
-                echo ""
-                printf "%sWSL Note:%s Windows Terminal may need to be restarted for PATH changes\n" "$BLUE" "$RESET"
-            fi
-            ;;
-    esac
+    # Set for current session so install can proceed
+    export PATH="$MORLOC_BIN:$PATH"
+    return 0
 }
 
 # }}}
@@ -1120,7 +713,7 @@ cmd_install() {
         tag=$version
     fi
 
-    add_morloc_bin_to_path || exit 1
+    ensure_morloc_bin || exit 1
 
     print_info "Copying this install script to $MORLOC_BIN"
     if [ "$(resolve_path "$MORLOC_BIN/$PROGRAM_NAME")" = "$(resolve_path "$0")" ]

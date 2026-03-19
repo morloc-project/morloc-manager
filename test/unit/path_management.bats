@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Tests for is_in_path, path_exists_in_file, and related PATH functions
+# Tests for is_in_path, ensure_morloc_bin, and related PATH functions
 
 load "../helpers/common"
 
@@ -69,34 +69,6 @@ teardown() {
     assert_success
 }
 
-# --- path_exists_in_file ---
-
-@test "path_exists_in_file: returns 0 when pattern found" {
-    local rc_file="$HOME/.bashrc"
-    echo 'export PATH="$HOME/.local/bin:$PATH"' > "$rc_file"
-    run path_exists_in_file "$rc_file"
-    assert_success
-}
-
-@test "path_exists_in_file: returns 1 when pattern absent" {
-    local rc_file="$HOME/.bashrc"
-    echo 'export FOO=bar' > "$rc_file"
-    run path_exists_in_file "$rc_file"
-    assert_failure
-}
-
-@test "path_exists_in_file: returns 1 for missing file" {
-    run path_exists_in_file "$HOME/.nonexistent_rc"
-    assert_failure
-}
-
-@test "path_exists_in_file: returns 1 for empty file" {
-    local rc_file="$HOME/.bashrc"
-    touch "$rc_file"
-    run path_exists_in_file "$rc_file"
-    assert_failure
-}
-
 # --- resolve_path ---
 
 @test "resolve_path: resolves existing directory" {
@@ -119,4 +91,59 @@ teardown() {
     run resolve_path "$HOME/nonexistent.txt"
     assert_success
     assert_output "$HOME/nonexistent.txt"
+}
+
+# --- ensure_morloc_bin ---
+
+@test "ensure_morloc_bin: succeeds silently when already in PATH" {
+    export MORLOC_BIN="$HOME/.local/bin"
+    export PATH="$MORLOC_BIN:$SAVED_PATH"
+    run ensure_morloc_bin
+    assert_success
+    assert_output --partial "is in PATH"
+}
+
+@test "ensure_morloc_bin: detects profile reference and advises" {
+    export MORLOC_BIN="$HOME/.local/bin"
+    # Remove MORLOC_BIN from PATH
+    export PATH="$SAVED_PATH"
+    # Create a .profile that references .local/bin
+    echo 'export PATH="$HOME/.local/bin:$PATH"' > "$HOME/.profile"
+    run ensure_morloc_bin
+    assert_success
+    assert_output --partial "not yet in your PATH, but will be on next login"
+}
+
+@test "ensure_morloc_bin: advises user when not in PATH and no profile" {
+    export MORLOC_BIN="$HOME/.local/bin"
+    # Remove MORLOC_BIN from PATH
+    export PATH="$SAVED_PATH"
+    # No .profile exists
+    run ensure_morloc_bin
+    assert_success
+    assert_output --partial "not in your PATH"
+    assert_output --partial "~/.profile"
+}
+
+@test "ensure_morloc_bin: creates MORLOC_BIN directory if missing" {
+    export MORLOC_BIN="$HOME/.local/newbin"
+    export PATH="$SAVED_PATH"
+    run ensure_morloc_bin
+    assert_success
+    assert_dir_exists "$HOME/.local/newbin"
+}
+
+@test "ensure_morloc_bin: never modifies rc files" {
+    export MORLOC_BIN="$HOME/.local/bin"
+    export PATH="$SAVED_PATH"
+    # Create rc files to verify they are untouched
+    touch "$HOME/.bashrc"
+    touch "$HOME/.zshrc"
+    local bashrc_before zshrc_before
+    bashrc_before=$(cat "$HOME/.bashrc")
+    zshrc_before=$(cat "$HOME/.zshrc")
+    run ensure_morloc_bin
+    assert_success
+    [ "$(cat "$HOME/.bashrc")" = "$bashrc_before" ]
+    [ "$(cat "$HOME/.zshrc")" = "$zshrc_before" ]
 }

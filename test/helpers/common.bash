@@ -47,27 +47,6 @@ teardown_isolated_home() {
     fi
 }
 
-# Create a minimal shell rc file for testing
-create_shell_rc() {
-    local shell_name="$1"
-    local rc_file
-    case "$shell_name" in
-        bash)   rc_file="$HOME/.bashrc" ;;
-        zsh)    rc_file="$HOME/.zshrc" ;;
-        fish)
-            mkdir -p "$HOME/.config/fish"
-            rc_file="$HOME/.config/fish/config.fish"
-            ;;
-        ksh)    rc_file="$HOME/.kshrc" ;;
-        dash|ash) rc_file="$HOME/.profile" ;;
-        tcsh)   rc_file="$HOME/.tcshrc" ;;
-        csh)    rc_file="$HOME/.cshrc" ;;
-        *)      rc_file="$HOME/.profile" ;;
-    esac
-    touch "$rc_file"
-    echo "$rc_file"
-}
-
 # Assert that a file contains a specific string (literal match)
 assert_file_contains() {
     local file="$1"
