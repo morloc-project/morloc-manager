@@ -68,7 +68,7 @@ set_paths() {
         MORLOC_STATE_HOME="/var/lib/morloc"
         MORLOC_CACHE_HOME="/var/cache/morloc"
         MORLOC_DEPENDENCY_DIR="/usr/local/share/morloc/deps"
-        MORLOC_BIN="/usr/local/bin"
+        MORLOC_BIN="/usr/bin"
         MORLOC_CONTAINER_HOME="/root"
     else
         MORLOC_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/morloc"
