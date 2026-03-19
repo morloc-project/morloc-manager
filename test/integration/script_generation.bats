@@ -41,14 +41,19 @@ teardown() {
     assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_DEV_IMAGE=ghcr.io/morloc-project/morloc/morloc-test:latest"
 }
 
-@test "env_file: .env has host home" {
+@test "env_file: .env has host version dir" {
     generate_env_file "0.58.3"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_HOST_HOME=$HOME"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_HOST_VERSION_DIR=$MORLOC_HOST_VERSION_DIR"
 }
 
-@test "env_file: .env has install dir" {
+@test "env_file: .env has container home" {
     generate_env_file "0.58.3"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_INSTALL_DIR="
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_CONTAINER_HOME=$MORLOC_CONTAINER_HOME"
+}
+
+@test "env_file: .env has rootful field" {
+    generate_env_file "0.58.3"
+    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_ROOTFUL="
 }
 
 @test "env_file: .env has container engine" {

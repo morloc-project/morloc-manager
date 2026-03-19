@@ -22,7 +22,14 @@ Download the manager and place it on your PATH:
 ```sh
 curl -o morloc-manager https://raw.githubusercontent.com/morloc-project/morloc-manager/refs/heads/main/morloc-manager.sh
 chmod +x morloc-manager
+mkdir -p ~/.local/bin
 mv morloc-manager ~/.local/bin/
+```
+
+If necessary, update the path:
+
+```sh
+PATH="~/.local/bin:$PATH"
 ```
 
 Then install Morloc:

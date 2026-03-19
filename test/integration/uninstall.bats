@@ -20,7 +20,7 @@ teardown() {
 }
 
 @test "uninstall: --all removes version directory" {
-    local install_dir="$HOME/${MORLOC_INSTALL_DIR}"
+    local install_dir="$MORLOC_HOST_VERSION_DIR"
     mkdir -p "$install_dir/0.55.0"
     # cmd_uninstall --all calls exit, so test in subshell
     run bash -c "
@@ -36,7 +36,7 @@ teardown() {
 }
 
 @test "uninstall: specific version removes only that version" {
-    local install_dir="$HOME/${MORLOC_INSTALL_DIR}"
+    local install_dir="$MORLOC_HOST_VERSION_DIR"
     mkdir -p "$install_dir/0.55.0"
     mkdir -p "$install_dir/0.54.0"
     run bash -c "

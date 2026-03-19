@@ -22,9 +22,11 @@ setup() {
 MORLOC_VERSION=0.55.0
 MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.55.0
 MORLOC_DEV_IMAGE=ghcr.io/morloc-project/morloc/morloc-test:latest
-MORLOC_HOST_HOME=$HOME
-MORLOC_INSTALL_DIR=$MORLOC_INSTALL_DIR
+MORLOC_HOST_VERSION_DIR=$MORLOC_HOST_VERSION_DIR
+MORLOC_CONTAINER_HOME=$MORLOC_CONTAINER_HOME
 MORLOC_CONTAINER_ENGINE=docker
+MORLOC_ROOTFUL=
+MORLOC_ENV_FLAGS=
 EOF
 }
 
@@ -34,7 +36,7 @@ teardown() {
 }
 
 @test "select: switches version when installed" {
-    local install_dir="$HOME/${MORLOC_INSTALL_DIR}"
+    local install_dir="$MORLOC_HOST_VERSION_DIR"
     mkdir -p "$install_dir/0.55.0"
     # cmd_select calls exit, test in subshell
     run bash -c "
@@ -67,7 +69,7 @@ teardown() {
 }
 
 @test "select: no version shows error and lists available" {
-    local install_dir="$HOME/${MORLOC_INSTALL_DIR}"
+    local install_dir="$MORLOC_HOST_VERSION_DIR"
     mkdir -p "$install_dir/0.55.0"
     mkdir -p "$install_dir/0.54.0"
     run bash -c "
@@ -100,7 +102,7 @@ teardown() {
 }
 
 @test "select: updates .env with new version" {
-    local install_dir="$HOME/${MORLOC_INSTALL_DIR}"
+    local install_dir="$MORLOC_HOST_VERSION_DIR"
     mkdir -p "$install_dir/0.55.0"
     mkdir -p "$install_dir/0.54.0"
     # First select 0.54.0
@@ -133,7 +135,7 @@ teardown() {
 }
 
 @test "select: does not regenerate menv script" {
-    local install_dir="$HOME/${MORLOC_INSTALL_DIR}"
+    local install_dir="$MORLOC_HOST_VERSION_DIR"
     mkdir -p "$install_dir/0.55.0"
     # Create an menv with a marker
     echo "#!/usr/bin/env sh" > "$MORLOC_BIN/menv"

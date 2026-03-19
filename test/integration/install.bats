@@ -66,7 +66,7 @@ teardown() {
 
 @test "install: version data directory structure is correct" {
     local version="0.55.0"
-    local morloc_data_home="$HOME/${MORLOC_INSTALL_DIR}/$version"
+    local morloc_data_home="$MORLOC_HOST_VERSION_DIR/$version"
     create_directory "$morloc_data_home"
     create_directory "$morloc_data_home/include"
     create_directory "$morloc_data_home/lib"
