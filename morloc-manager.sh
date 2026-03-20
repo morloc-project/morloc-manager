@@ -32,10 +32,6 @@ fi
 SELINUX_SUFFIX=""
 SUDO_PREFIX=""
 
-if [ "${MORLOC_SCOPE:-}" = "system" ]; then
-    SUDO_PREFIX="sudo "
-fi
-
 set_container_engine() {
     if ! command -v "$1" >/dev/null 2>&1; then
         echo "[ERROR] Container engine '$1' not found" >&2
@@ -60,7 +56,8 @@ MORLOC_DEFAULT_PLANE="default"
 MORLOC_DEFAULT_PLANE_GITHUB_ORG="morloclib"
 LOCAL_VERSION="local"
 
-# Initialize all paths. Must be called after --system flag is processed.
+# Initialize all paths based on MORLOC_SCOPE. Subcommands set MORLOC_SCOPE
+# before calling set_paths when --system is passed.
 set_paths() {
     if [ "${MORLOC_SCOPE:-}" = "system" ]; then
         MORLOC_DATA_HOME="/usr/local/share/morloc"
@@ -83,7 +80,7 @@ set_paths() {
     PATH_EXPORT_LINE="export PATH=\"${MORLOC_BIN}:\$PATH\""
 }
 
-# Set default paths (main() will re-call after parsing --system)
+# Set default paths (subcommands re-call after parsing --system)
 set_paths
 
 # }}}
@@ -744,12 +741,6 @@ cmd_run() {
     fi
 }
 
-# Open interactive shell in the morloc container
-# Usage: cmd_shell [OPTIONS]
-cmd_shell() {
-    cmd_run --shell "$@"
-}
-
 # }}}
 # {{{ main help and version
 
@@ -768,7 +759,6 @@ ${BOLD}OPTIONS${RESET}:
   -h, --help                Show this help message
   -v, --version             Show this manager version
   --container-engine ENGINE  Use ENGINE instead of auto-detected (docker/podman)
-  --system                  Target system-wide (rootful) scope
 
 ${BOLD}COMMANDS${RESET}:
   ${BOLD}${GREEN}install${RESET}    Install morloc containers and home
@@ -776,7 +766,6 @@ ${BOLD}COMMANDS${RESET}:
   ${BOLD}${GREEN}update${RESET}     Pull the latest version of this script
   ${BOLD}${GREEN}select${RESET}     Choose a new Morloc version
   ${BOLD}${GREEN}run${RESET}        Run a command inside the morloc container
-  ${BOLD}${GREEN}shell${RESET}      Open an interactive shell in the morloc container
   ${BOLD}${GREEN}env${RESET}        Select or explore available environments
   ${BOLD}${GREEN}info${RESET}       Print info about manager, installs and containers
 
@@ -1850,11 +1839,6 @@ main() {
                 set_container_engine "${1:?'--container-engine requires an argument'}"
                 shift
                 ;;
-            --system)
-                MORLOC_SCOPE="system"
-                SUDO_PREFIX="sudo "
-                shift
-                ;;
             -*)
                 print_error "Unknown option: $1"
                 show_help
@@ -1876,7 +1860,6 @@ main() {
         update)    shift; cmd_update "$@" ;;
         select)    shift; cmd_select "$@" ;;
         run)       shift; cmd_run "$@" ;;
-        shell)     shift; cmd_shell "$@" ;;
         env)       shift; cmd_env "$@" ;;
         info)      shift; cmd_info "$@" ;;
         "")        show_help; exit 0 ;;

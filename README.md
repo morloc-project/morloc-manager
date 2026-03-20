@@ -20,10 +20,16 @@ The manager auto-detects whichever is available. You can override the choice wit
 Download the manager and place it on your PATH:
 
 ```sh
-curl -o morloc-manager https://raw.githubusercontent.com/morloc-project/morloc-manager/refs/heads/main/morloc-manager.sh
+BRANCH=dev
+curl -o morloc-manager https://raw.githubusercontent.com/morloc-project/morloc-manager/refs/heads/${BRANCH}/morloc-manager.sh
 chmod +x morloc-manager
+
+# if using local containers:
 mkdir -p ~/.local/bin
 mv morloc-manager ~/.local/bin/
+
+# if using system containers:
+sudo mv morloc-manager /usr/bin
 ```
 
 If necessary, update the path:

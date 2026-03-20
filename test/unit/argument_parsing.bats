@@ -123,18 +123,6 @@ setup() {
 
 # --- --system ---
 
-@test "main: --system flag is accepted" {
-    run main --system --help
-    assert_success
-    assert_output --partial "USAGE"
-}
-
-@test "main: --system shows in help text" {
-    run main --help
-    assert_success
-    assert_output --partial "--system"
-}
-
 @test "main: default SUDO_PREFIX is empty" {
     [ -z "$SUDO_PREFIX" ]
 }
@@ -147,8 +135,3 @@ setup() {
     assert_output --partial "run"
 }
 
-@test "main: help text includes shell command" {
-    run main --help
-    assert_success
-    assert_output --partial "shell"
-}

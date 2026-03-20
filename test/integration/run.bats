@@ -78,10 +78,3 @@ teardown() {
     assert_output --partial "-x FLAG"
 }
 
-@test "shell: cmd_shell invokes cmd_run --shell" {
-    # cmd_shell is just cmd_run --shell
-    # We can test help passes through
-    run cmd_shell --help
-    assert_success
-    assert_output --partial "USAGE"
-}
