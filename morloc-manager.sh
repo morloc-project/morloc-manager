@@ -734,8 +734,13 @@ cmd_run() {
         _cr_flags="$_cr_flags -e PATH=${_cr_container_home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     fi
 
-    # Mount working directory
-    if [ "$MORLOC_WORK_DIR" != "$_cr_container_home" ]; then
+    # Mount working directory (skip for "morloc init" which doesn't need it —
+    # mounting $HOME triggers SELinux relabeling errors)
+    _cr_need_workdir=true
+    case "$1" in
+        morloc) [ "${2:-}" = "init" ] && _cr_need_workdir=false ;;
+    esac
+    if $_cr_need_workdir && [ "$MORLOC_WORK_DIR" != "$_cr_container_home" ]; then
         _cr_flags="$_cr_flags -v ${MORLOC_WORK_DIR}:${_cr_container_home}/work${_cr_z}"
         _cr_workdir="${_cr_container_home}/work"
     else
