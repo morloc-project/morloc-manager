@@ -1816,6 +1816,15 @@ cmd_env() {
     update_usr="true"
     reset="false"
     extra_args=""
+
+    # Resolve scope from active install — env always operates on the active version
+    _ce_scope=$(active_scope)
+    if [ "$_ce_scope" = "system" ]; then
+        MORLOC_SCOPE="system"
+        SUDO_PREFIX="sudo "
+        set_paths
+    fi
+
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)
