@@ -58,7 +58,18 @@ LOCAL_VERSION="local"
 
 # Initialize all paths based on MORLOC_SCOPE. Subcommands set MORLOC_SCOPE
 # before calling set_paths when --system is passed.
+# When run under sudo, $HOME is /root. Returns the invoking user's home
+# so that local-scope paths always point to the real user's directories.
+real_home() {
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        eval echo "~$SUDO_USER"
+    else
+        echo "$HOME"
+    fi
+}
+
 set_paths() {
+    _sp_home=$(real_home)
     if [ "${MORLOC_SCOPE:-}" = "system" ]; then
         MORLOC_DATA_HOME="/usr/local/share/morloc"
         MORLOC_CONFIG_HOME="/etc/morloc"
@@ -67,12 +78,12 @@ set_paths() {
         MORLOC_DEPENDENCY_DIR="/usr/local/share/morloc/deps"
         MORLOC_BIN="/usr/bin"
     else
-        MORLOC_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/morloc"
-        MORLOC_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/morloc"
-        MORLOC_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/morloc"
-        MORLOC_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/morloc"
-        MORLOC_DEPENDENCY_DIR="$HOME/.local/share/morloc/deps"
-        MORLOC_BIN="$HOME/.local/bin"
+        MORLOC_DATA_HOME="${XDG_DATA_HOME:-$_sp_home/.local/share}/morloc"
+        MORLOC_CONFIG_HOME="${XDG_CONFIG_HOME:-$_sp_home/.config}/morloc"
+        MORLOC_STATE_HOME="${XDG_STATE_HOME:-$_sp_home/.local/state}/morloc"
+        MORLOC_CACHE_HOME="${XDG_CACHE_HOME:-$_sp_home/.cache}/morloc"
+        MORLOC_DEPENDENCY_DIR="$_sp_home/.local/share/morloc/deps"
+        MORLOC_BIN="$_sp_home/.local/bin"
     fi
     MORLOC_HOST_VERSION_DIR="$MORLOC_DATA_HOME/versions"
     PATH_EXPORT_LINE="export PATH=\"${MORLOC_BIN}:\$PATH\""
@@ -293,7 +304,7 @@ config_root() {
     if [ "${1:-}" = "--system" ]; then
         echo "/etc/morloc"
     else
-        echo "${XDG_CONFIG_HOME:-$HOME/.config}/morloc"
+        echo "${XDG_CONFIG_HOME:-$(real_home)/.config}/morloc"
     fi
 }
 
@@ -303,7 +314,7 @@ data_root() {
     if [ "${1:-}" = "--system" ]; then
         echo "/usr/local/share/morloc"
     else
-        echo "${XDG_DATA_HOME:-$HOME/.local/share}/morloc"
+        echo "${XDG_DATA_HOME:-$(real_home)/.local/share}/morloc"
     fi
 }
 
@@ -313,7 +324,7 @@ bin_root() {
     if [ "${1:-}" = "--system" ]; then
         echo "/usr/bin"
     else
-        echo "$HOME/.local/bin"
+        echo "$(real_home)/.local/bin"
     fi
 }
 
@@ -508,7 +519,8 @@ ensure_morloc_bin() {
     fi
 
     # Check if ~/.profile or similar will add it on next login
-    for f in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zprofile"; do
+    _emb_home=$(real_home)
+    for f in "$_emb_home/.profile" "$_emb_home/.bash_profile" "$_emb_home/.zprofile"; do
         if [ -f "$f" ] && grep -q '\.local/bin' "$f" 2>/dev/null; then
             print_warning "$MORLOC_BIN is not yet in your PATH, but will be on next login"
             print_info "To use morloc now, run:  export PATH=\"$MORLOC_BIN:\$PATH\""
@@ -636,24 +648,15 @@ cmd_run() {
         esac
     done
 
-    # When run under sudo, resolve the invoking user's home for config
-    # lookups. The user config lives under the real user's HOME, not root's.
-    _cr_real_home="$HOME"
-    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
-        _cr_real_home=$(eval echo "~$SUDO_USER")
-    fi
-    _cr_user_cfg="${XDG_CONFIG_HOME:-$_cr_real_home/.config}/morloc/config"
-
     # Resolve version and scope from config
-    _cr_version=$(read_config "active_version" "$_cr_user_cfg")
+    _cr_version=$(active_version)
     if [ -z "$_cr_version" ]; then
         print_error "No active version set. Run 'install' or 'select' first."
         exit 1
     fi
 
     if [ -z "$_cr_scope" ]; then
-        _cr_scope=$(read_config "active_scope" "$_cr_user_cfg")
-        [ -z "$_cr_scope" ] && _cr_scope="local"
+        _cr_scope=$(active_scope)
     fi
 
     # Read version config
