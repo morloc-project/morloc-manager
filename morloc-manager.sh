@@ -9,6 +9,7 @@ VERSION="0.9.0"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
+CONTAINER_ENGINE_EXPLICIT=""
 
 SHARED_MEMORY_SIZE=4g
 
@@ -20,6 +21,7 @@ THIS_SCRIPT_URL="https://raw.githubusercontent.com/morloc-project/morloc-manager
 
 if [ -n "${MORLOC_CONTAINER_ENGINE:-}" ]; then
     CONTAINER_ENGINE="$MORLOC_CONTAINER_ENGINE"
+    CONTAINER_ENGINE_EXPLICIT="1"
     CONTAINER_ENGINE_VERSION=$($CONTAINER_ENGINE --version 2>/dev/null | sed 's/.*version \([0-9.]*\).*/\1/')
 elif command -v podman >/dev/null 2>&1; then
     CONTAINER_ENGINE_VERSION=$(podman --version 2>/dev/null | sed 's/.* //')
@@ -38,6 +40,7 @@ set_container_engine() {
         exit 1
     fi
     CONTAINER_ENGINE="$1"
+    CONTAINER_ENGINE_EXPLICIT="1"
     CONTAINER_ENGINE_VERSION=$($CONTAINER_ENGINE --version 2>/dev/null | sed 's/.*version \([0-9.]*\).*/\1/')
 }
 
@@ -678,9 +681,13 @@ cmd_run() {
         [ -n "$_cr_env_image" ] && _cr_image="$_cr_env_image"
     fi
 
-    # Read container engine from config (fallback to auto-detected)
-    _cr_engine=$(read_config "container_engine" "$_cr_user_cfg")
-    [ -z "$_cr_engine" ] && _cr_engine="$CONTAINER_ENGINE"
+    # Read container engine: CLI flag > config > auto-detected
+    if [ -n "$CONTAINER_ENGINE_EXPLICIT" ]; then
+        _cr_engine="$CONTAINER_ENGINE"
+    else
+        _cr_engine=$(read_config "container_engine" "$_cr_user_cfg")
+        [ -z "$_cr_engine" ] && _cr_engine="$CONTAINER_ENGINE"
+    fi
 
     # Determine container home — use invoking user's home, not root's
     _cr_container_home="$_cr_real_home"
