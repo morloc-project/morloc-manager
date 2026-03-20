@@ -686,6 +686,7 @@ cmd_run() {
     [ -z "$_cr_engine" ] && _cr_engine="$CONTAINER_ENGINE"
 
     # Determine container home — use invoking user's home, not root's
+    _cr_real_home=$(real_home)
     _cr_container_home="$_cr_real_home"
     if [ "$_cr_scope" = "system" ]; then
         _cr_container_home="/root"
