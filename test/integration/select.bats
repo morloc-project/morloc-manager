@@ -46,7 +46,7 @@ teardown() {
         cmd_select 0.99.0
     "
     assert_failure
-    assert_output --partial "does not exist"
+    assert_output --partial "is not installed"
 }
 
 @test "select: no version shows error and lists available" {

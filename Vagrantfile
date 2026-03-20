@@ -28,7 +28,7 @@ Vagrant.configure("2") do |config|
   config.vm.provider :libvirt do |lv|
     lv.memory = 4096
     lv.cpus = 2
-    lv.machine_virtual_size = 40
+    lv.machine_virtual_size = 60
   end
 
   config.vm.synced_folder ".", "/vagrant", type: "rsync",
