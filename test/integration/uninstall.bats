@@ -83,3 +83,47 @@ teardown() {
     assert_success
     assert_output --partial "USAGE"
 }
+
+@test "uninstall: removes version config directory" {
+    setup_version_config "0.55.0" "local"
+    mkdir -p "$MORLOC_HOST_VERSION_DIR/0.55.0"
+    local vcfg="$(config_root)/versions/0.55.0"
+
+    bash -c "
+        export MORLOC_MANAGER_TESTING=1
+        export HOME='$HOME'
+        export PATH='$PATH'
+        source '$SCRIPT_PATH'
+        CONTAINER_ENGINE=docker
+        cmd_uninstall 0.55.0
+    " 2>/dev/null || true
+
+    assert_dir_not_exists "$vcfg"
+}
+
+@test "uninstall: clears active_version when uninstalling active version" {
+    setup_version_config "0.55.0" "local"
+    mkdir -p "$MORLOC_HOST_VERSION_DIR/0.55.0"
+
+    bash -c "
+        export MORLOC_MANAGER_TESTING=1
+        export HOME='$HOME'
+        export PATH='$PATH'
+        source '$SCRIPT_PATH'
+        CONTAINER_ENGINE=docker
+        cmd_uninstall 0.55.0
+    " 2>/dev/null || true
+
+    local ucfg="$(config_root)/config"
+    assert_file_contains "$ucfg" "active_version="
+    # The value should be empty after the key
+    local val
+    val=$(grep '^active_version=' "$ucfg" | cut -d= -f2-)
+    [ -z "$val" ]
+}
+
+@test "uninstall: --system flag is accepted" {
+    run cmd_uninstall --help
+    assert_success
+    assert_output --partial "--system"
+}

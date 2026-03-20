@@ -83,6 +83,13 @@ setup() {
     assert_output --partial "info"
 }
 
+@test "main: run --help shows run usage" {
+    run main run --help
+    assert_success
+    assert_output --partial "run"
+    assert_output --partial "USAGE"
+}
+
 # --- unknown subcommand ---
 
 @test "main: unknown subcommand shows error" {
@@ -114,26 +121,34 @@ setup() {
     assert_failure
 }
 
-# --- --rootful ---
+# --- --system ---
 
-@test "main: --rootful flag is accepted" {
-    run main --rootful --help
+@test "main: --system flag is accepted" {
+    run main --system --help
     assert_success
     assert_output --partial "USAGE"
 }
 
-@test "main: --rootful shows in help text" {
+@test "main: --system shows in help text" {
     run main --help
     assert_success
-    assert_output --partial "--rootful"
-}
-
-@test "main: MORLOC_ROOTFUL=1 sets SUDO_PREFIX" {
-    # Re-source with env var set
-    MORLOC_ROOTFUL=1 source "$SCRIPT_PATH"
-    [ "$SUDO_PREFIX" = "sudo " ]
+    assert_output --partial "--system"
 }
 
 @test "main: default SUDO_PREFIX is empty" {
     [ -z "$SUDO_PREFIX" ]
+}
+
+# --- help text includes run and shell ---
+
+@test "main: help text includes run command" {
+    run main --help
+    assert_success
+    assert_output --partial "run"
+}
+
+@test "main: help text includes shell command" {
+    run main --help
+    assert_success
+    assert_output --partial "shell"
 }

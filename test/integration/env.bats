@@ -13,17 +13,8 @@ setup() {
     export MORLOC_BIN="$HOME/.local/bin"
     mkdir -p "$MORLOC_BIN"
     export MORLOC_DEPENDENCY_DIR="$HOME/.local/share/morloc/deps"
-    # Pre-create a .env file so env commands can read version
-    mkdir -p "$MORLOC_DATA_HOME"
-    cat > "$MORLOC_DATA_HOME/.env" << EOF
-MORLOC_VERSION=0.55.0
-MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.55.0
-MORLOC_DEV_IMAGE=ghcr.io/morloc-project/morloc/morloc-test:latest
-MORLOC_HOST_HOME=$HOME
-MORLOC_INSTALL_DIR=$MORLOC_INSTALL_DIR
-MORLOC_CONTAINER_ENGINE=docker
-MORLOC_ENV_FLAGS=
-EOF
+    # Pre-create version config
+    setup_version_config "0.55.0" "local"
 }
 
 teardown() {
@@ -120,9 +111,10 @@ teardown() {
 
 # --- reset ---
 
-@test "env: --reset updates .env to default image" {
-    # Set a custom image first
-    sed -i 's|^MORLOC_IMAGE=.*|MORLOC_IMAGE=morloc-env:0.55.0-ml|' "$MORLOC_DATA_HOME/.env"
+@test "env: --reset resets version config to default image" {
+    # Set a custom image first via version config
+    local vcfg="$(config_root)/versions/0.55.0/config"
+    write_config "image" "morloc-env:0.55.0-ml" "$vcfg"
 
     run bash -c "
         export MORLOC_MANAGER_TESTING=1
@@ -135,13 +127,13 @@ teardown() {
     "
     assert_success
     assert_output --partial "reset"
-    # Verify .env was reset to default base image
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.55.0"
+    # Verify version config was reset to default base image
+    assert_file_contains "$vcfg" "image=ghcr.io/morloc-project/morloc/morloc-full:0.55.0"
 }
 
-# --- env switching via .env ---
+# --- env switching ---
 
-@test "env: activating env updates MORLOC_IMAGE in .env" {
+@test "env: activating env updates version config image" {
     mkdir -p "$MORLOC_DEPENDENCY_DIR"
     cat > "$MORLOC_DEPENDENCY_DIR/ml.Dockerfile" << 'EOF'
 ARG CONTAINER_BASE
@@ -161,10 +153,11 @@ EOF
         cmd_env ml
     " 2>/dev/null || true
 
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_IMAGE=morloc-env:0.55.0-ml"
+    local vcfg="$(config_root)/versions/0.55.0/config"
+    assert_file_contains "$vcfg" "image=morloc-env:0.55.0-ml"
 }
 
-# --- no env specified ---
+# --- flags ---
 
 @test "env: --init creates flags file stub" {
     run bash -c "
@@ -210,9 +203,8 @@ EOF
     assert_output --partial "flags:no"
 }
 
-@test "env: --reset clears MORLOC_ENV_FLAGS in .env" {
-    # Set a custom env flags path first
-    sed -i 's|^MORLOC_ENV_FLAGS=.*|MORLOC_ENV_FLAGS=/some/path/ml.flags|' "$MORLOC_DATA_HOME/.env"
+@test "env: --reset resets active_env to base in user config" {
+    write_config "active_env" "ml" "$(config_root)/config"
 
     run bash -c "
         export MORLOC_MANAGER_TESTING=1
@@ -224,12 +216,10 @@ EOF
         cmd_env --reset
     "
     assert_success
-    # Verify MORLOC_ENV_FLAGS was cleared
-    run grep '^MORLOC_ENV_FLAGS=' "$MORLOC_DATA_HOME/.env"
-    assert_output "MORLOC_ENV_FLAGS="
+    assert_file_contains "$(config_root)/config" "active_env=base"
 }
 
-@test "env: activating env sets MORLOC_ENV_FLAGS when flags file exists" {
+@test "env: activating env sets active_env in user config" {
     mkdir -p "$MORLOC_DEPENDENCY_DIR"
     cat > "$MORLOC_DEPENDENCY_DIR/ml.Dockerfile" << 'EOF'
 ARG CONTAINER_BASE
@@ -250,7 +240,7 @@ EOF
         cmd_env ml
     " 2>/dev/null || true
 
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_ENV_FLAGS=$MORLOC_DEPENDENCY_DIR/ml.flags"
+    assert_file_contains "$(config_root)/config" "active_env=ml"
 }
 
 # --- no env specified ---

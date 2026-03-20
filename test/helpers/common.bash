@@ -147,3 +147,44 @@ assert_file_not_contains() {
         return 1
     fi
 }
+
+# Set up a pre-populated config directory for tests that need an active version
+setup_version_config() {
+    local version="${1:-0.55.0}"
+    local scope="${2:-local}"
+    local cfg_root
+    if [ "$scope" = "system" ]; then
+        cfg_root="/etc/morloc"
+    else
+        cfg_root="${XDG_CONFIG_HOME:-$HOME/.config}/morloc"
+    fi
+    local data_root
+    if [ "$scope" = "system" ]; then
+        data_root="/usr/local/share/morloc"
+    else
+        data_root="${XDG_DATA_HOME:-$HOME/.local/share}/morloc"
+    fi
+
+    mkdir -p "$cfg_root/versions/$version/environments"
+    mkdir -p "$data_root/versions/$version"
+
+    # Write user config
+    cat > "$cfg_root/config" << EOF
+active_version=$version
+active_scope=$scope
+active_env=base
+container_engine=docker
+EOF
+
+    # Write version config
+    cat > "$cfg_root/versions/$version/config" << EOF
+image=ghcr.io/morloc-project/morloc/morloc-full:$version
+dev_image=ghcr.io/morloc-project/morloc/morloc-test:latest
+host_dir=$data_root/versions/$version
+EOF
+
+    # Write base.conf
+    cat > "$cfg_root/versions/$version/environments/base.conf" << EOF
+image=ghcr.io/morloc-project/morloc/morloc-full:$version
+EOF
+}

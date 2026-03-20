@@ -20,33 +20,50 @@ teardown() {
     teardown_isolated_home
 }
 
-@test "install: generate_env_file creates env file with version" {
-    generate_env_file "0.55.0"
-    assert_file_exists "$MORLOC_DATA_HOME/.env"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_VERSION=0.55.0"
+@test "install: write_version_config creates config directory" {
+    write_version_config "0.55.0" "local"
+    assert_dir_exists "$(config_root)/versions/0.55.0"
+    assert_dir_exists "$(config_root)/versions/0.55.0/environments"
 }
 
-@test "install: generate_menv_script creates executable menv" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_exists "$MORLOC_BIN/menv"
-    [ -x "$MORLOC_BIN/menv" ]
+@test "install: write_version_config creates version config file" {
+    write_version_config "0.55.0" "local"
+    local vcfg="$(config_root)/versions/0.55.0/config"
+    assert_file_exists "$vcfg"
+    assert_file_contains "$vcfg" "image=ghcr.io/morloc-project/morloc/morloc-full:0.55.0"
 }
 
-@test "install: menv script uses docker run directly" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "run --rm"
-    assert_file_not_contains "$MORLOC_BIN/menv" "compose"
+@test "install: write_version_config sets active version in user config" {
+    write_version_config "0.55.0" "local"
+    local ucfg="$(config_root)/config"
+    assert_file_exists "$ucfg"
+    assert_file_contains "$ucfg" "active_version=0.55.0"
+    assert_file_contains "$ucfg" "active_scope=local"
 }
 
-@test "install: menv script has --rm flag" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "--rm"
+@test "install: write_version_config creates base.conf" {
+    write_version_config "0.55.0" "local"
+    local base="$(config_root)/versions/0.55.0/environments/base.conf"
+    assert_file_exists "$base"
+    assert_file_contains "$base" "image=ghcr.io/morloc-project/morloc/morloc-full:0.55.0"
+}
+
+@test "install: write_version_config records container engine" {
+    write_version_config "0.55.0" "local"
+    local ucfg="$(config_root)/config"
+    assert_file_contains "$ucfg" "container_engine=docker"
 }
 
 @test "install: --no-init flag is parsed correctly" {
     run show_install_help
     assert_success
     assert_output --partial "--no-init"
+}
+
+@test "install: --system flag is parsed correctly" {
+    run show_install_help
+    assert_success
+    assert_output --partial "--system"
 }
 
 @test "install: create_directory makes new directory" {
@@ -82,15 +99,17 @@ teardown() {
     assert_dir_exists "$morloc_data_home/tmp"
 }
 
-@test "install: env file records podman when engine is podman" {
+@test "install: write_version_config with podman records podman" {
     teardown_mock_engine
     setup_mock_engine "podman" "4.7.2"
     CONTAINER_ENGINE="podman"
-    generate_env_file "0.55.0"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_CONTAINER_ENGINE=podman"
+    write_version_config "0.55.0" "local"
+    local ucfg="$(config_root)/config"
+    assert_file_contains "$ucfg" "container_engine=podman"
 }
 
-@test "install: env file has MORLOC_ENV_FLAGS field" {
-    generate_env_file "0.55.0"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_ENV_FLAGS="
+@test "install: write_version_config sets active_env to base" {
+    write_version_config "0.55.0" "local"
+    local ucfg="$(config_root)/config"
+    assert_file_contains "$ucfg" "active_env=base"
 }

@@ -32,7 +32,7 @@ fi
 SELINUX_SUFFIX=""
 SUDO_PREFIX=""
 
-if [ "${MORLOC_ROOTFUL:-}" = "1" ]; then
+if [ "${MORLOC_SCOPE:-}" = "system" ]; then
     SUDO_PREFIX="sudo "
 fi
 
@@ -60,9 +60,9 @@ MORLOC_DEFAULT_PLANE="default"
 MORLOC_DEFAULT_PLANE_GITHUB_ORG="morloclib"
 LOCAL_VERSION="local"
 
-# Initialize all paths. Must be called after --rootful flag is processed.
+# Initialize all paths. Must be called after --system flag is processed.
 set_paths() {
-    if [ "${MORLOC_ROOTFUL:-}" = "1" ]; then
+    if [ "${MORLOC_SCOPE:-}" = "system" ]; then
         MORLOC_DATA_HOME="/usr/local/share/morloc"
         MORLOC_CONFIG_HOME="/etc/morloc"
         MORLOC_STATE_HOME="/var/lib/morloc"
@@ -83,7 +83,7 @@ set_paths() {
     PATH_EXPORT_LINE="export PATH=\"${MORLOC_BIN}:\$PATH\""
 }
 
-# Set default paths (main() will re-call after parsing --rootful)
+# Set default paths (main() will re-call after parsing --system)
 set_paths
 
 # }}}
@@ -290,6 +290,195 @@ is_in_path() {
 }
 
 # }}}
+# {{{ config helpers
+
+# Returns the config root directory for the given scope
+# Usage: config_root [--system]
+config_root() {
+    if [ "${1:-}" = "--system" ]; then
+        echo "/etc/morloc"
+    else
+        echo "${XDG_CONFIG_HOME:-$HOME/.config}/morloc"
+    fi
+}
+
+# Returns the data root directory for the given scope
+# Usage: data_root [--system]
+data_root() {
+    if [ "${1:-}" = "--system" ]; then
+        echo "/usr/local/share/morloc"
+    else
+        echo "${XDG_DATA_HOME:-$HOME/.local/share}/morloc"
+    fi
+}
+
+# Returns the bin directory for the given scope
+# Usage: bin_root [--system]
+bin_root() {
+    if [ "${1:-}" = "--system" ]; then
+        echo "/usr/bin"
+    else
+        echo "$HOME/.local/bin"
+    fi
+}
+
+# Read a key=value from a config file
+# Usage: read_config KEY [FILE]
+# FILE defaults to the user config file
+read_config() {
+    _rc_key="$1"
+    _rc_file="${2:-$(config_root)/config}"
+    if [ -f "$_rc_file" ]; then
+        grep "^${_rc_key}=" "$_rc_file" 2>/dev/null | head -n1 | cut -d= -f2-
+    fi
+}
+
+# Write or update a key=value in a config file
+# Usage: write_config KEY VALUE [FILE]
+# FILE defaults to the user config file. Creates parent dirs if needed.
+write_config() {
+    _wc_key="$1"
+    _wc_value="$2"
+    _wc_file="${3:-$(config_root)/config}"
+    $SUDO_PREFIX mkdir -p "$(dirname "$_wc_file")"
+    if [ -f "$_wc_file" ] && grep -q "^${_wc_key}=" "$_wc_file" 2>/dev/null; then
+        $SUDO_PREFIX sed -i "s|^${_wc_key}=.*|${_wc_key}=${_wc_value}|" "$_wc_file"
+    else
+        printf '%s=%s\n' "$_wc_key" "$_wc_value" | $SUDO_PREFIX tee -a "$_wc_file" > /dev/null
+    fi
+}
+
+# Read active_version from user config
+active_version() {
+    read_config "active_version"
+}
+
+# Read active_scope from user config, default "local"
+active_scope() {
+    _as_val=$(read_config "active_scope")
+    echo "${_as_val:-local}"
+}
+
+# Resolve which scope a version is in: checks local first, then system.
+# Prints "local" or "system". Returns 1 if not found.
+# Usage: resolve_version VERSION
+resolve_version() {
+    _rv_ver="$1"
+    _rv_local_data="$(data_root)/versions/$_rv_ver"
+    _rv_sys_data="$(data_root --system)/versions/$_rv_ver"
+    if [ -d "$_rv_local_data" ]; then
+        echo "local"
+        return 0
+    elif [ -d "$_rv_sys_data" ]; then
+        echo "system"
+        return 0
+    fi
+    return 1
+}
+
+# List installed versions
+# Usage: list_versions [--local|--system|--all]
+list_versions() {
+    _lv_filter="${1:---all}"
+    _list_from_dir() {
+        _lv_dir="$1/versions"
+        _lv_scope="$2"
+        if [ -d "$_lv_dir" ]; then
+            for _lv_d in "$_lv_dir"/*/; do
+                [ -d "$_lv_d" ] || continue
+                _lv_v=$(basename "$_lv_d")
+                case "$_lv_v" in "$LOCAL_VERSION") continue ;; esac
+                printf '%s\t%s\n' "$_lv_v" "$_lv_scope"
+            done
+        fi
+    }
+    case "$_lv_filter" in
+        --local)  _list_from_dir "$(data_root)" "local" ;;
+        --system) _list_from_dir "$(data_root --system)" "system" ;;
+        --all)
+            _list_from_dir "$(data_root)" "local"
+            _list_from_dir "$(data_root --system)" "system"
+            ;;
+    esac
+}
+
+# Returns the version-specific config directory
+# Usage: version_config_root VER SCOPE
+version_config_root() {
+    _vcr_ver="$1"
+    _vcr_scope="$2"
+    if [ "$_vcr_scope" = "system" ]; then
+        echo "$(config_root --system)/versions/$_vcr_ver"
+    else
+        echo "$(config_root)/versions/$_vcr_ver"
+    fi
+}
+
+# Returns the version-specific data directory
+# Usage: version_data_root VER SCOPE
+version_data_root() {
+    _vdr_ver="$1"
+    _vdr_scope="$2"
+    if [ "$_vdr_scope" = "system" ]; then
+        echo "$(data_root --system)/versions/$_vdr_ver"
+    else
+        echo "$(data_root)/versions/$_vdr_ver"
+    fi
+}
+
+# Write per-version config + base.conf environment
+# Usage: write_version_config VER SCOPE
+write_version_config() {
+    _wvc_ver="$1"
+    _wvc_scope="$2"
+    _wvc_cfgdir=$(version_config_root "$_wvc_ver" "$_wvc_scope")
+    _wvc_datadir=$(version_data_root "$_wvc_ver" "$_wvc_scope")
+
+    $SUDO_PREFIX mkdir -p "$_wvc_cfgdir/environments"
+
+    _wvc_scope_flag=""
+    [ "$_wvc_scope" = "system" ] && _wvc_scope_flag="--system"
+
+    _wvc_cfg="$_wvc_cfgdir/config"
+    write_config "image" "${CONTAINER_BASE_FULL}:${_wvc_ver}" "$_wvc_cfg"
+    write_config "dev_image" "${CONTAINER_BASE_TEST}:latest" "$_wvc_cfg"
+    write_config "host_dir" "$_wvc_datadir" "$_wvc_cfg"
+
+    # Create base.conf environment if it doesn't exist
+    _wvc_base="$_wvc_cfgdir/environments/base.conf"
+    if [ ! -f "$_wvc_base" ]; then
+        printf 'image=%s\n' "${CONTAINER_BASE_FULL}:${_wvc_ver}" | $SUDO_PREFIX tee "$_wvc_base" > /dev/null
+    fi
+
+    # Update user-level active version
+    _wvc_user_cfg="$(config_root)/config"
+    write_config "active_version" "$_wvc_ver" "$_wvc_user_cfg"
+    write_config "active_scope" "$_wvc_scope" "$_wvc_user_cfg"
+    write_config "active_env" "base" "$_wvc_user_cfg"
+    write_config "container_engine" "$CONTAINER_ENGINE" "$_wvc_user_cfg"
+
+    print_success "Wrote version config for $_wvc_ver ($_wvc_scope)"
+}
+
+# Read flags from a file, stripping comments and blank lines.
+# Prints one flag per line.
+# Usage: read_flags_file FILE
+read_flags_file() {
+    _rff_file="$1"
+    [ -f "$_rff_file" ] || return 0
+    while IFS= read -r _rff_line || [ -n "$_rff_line" ]; do
+        # Strip comments
+        _rff_line="${_rff_line%%#*}"
+        # Trim leading whitespace (POSIX)
+        _rff_line="${_rff_line#"${_rff_line%%[![:space:]]*}"}"
+        # Trim trailing whitespace (POSIX)
+        _rff_line="${_rff_line%"${_rff_line##*[![:space:]]}"}"
+        [ -z "$_rff_line" ] && continue
+        printf '%s\n' "$_rff_line"
+    done < "$_rff_file"
+}
+
+# }}}
 # {{{ setup Morloc bin folder
 
 # Ensure the morloc bin directory exists and is in PATH, advising the user if not.
@@ -298,8 +487,8 @@ ensure_morloc_bin() {
     # Create bin dir if needed
     create_directory "$MORLOC_BIN" || return 1
 
-    # In rootful mode, /usr/local/bin is standard FHS — skip PATH advice
-    if [ "${MORLOC_ROOTFUL:-}" = "1" ]; then
+    # In system scope, /usr/bin is standard FHS — skip PATH advice
+    if [ "${MORLOC_SCOPE:-}" = "system" ]; then
         return 0
     fi
 
@@ -386,230 +575,180 @@ build_environment() {
     return 0
 }
 
-# Generate .env file in MORLOC_DATA_HOME
-# Usage: generate_env_file <version>
-generate_env_file() {
-    _version="$1"
-    env_file="$MORLOC_DATA_HOME/.env"
 
-    print_info "Generating $env_file"
+# }}}
+# {{{ run and shell subcommands
 
-    _rootful_val=""
-    if [ "${MORLOC_ROOTFUL:-}" = "1" ]; then
-        _rootful_val="1"
-    fi
+show_run_help() {
+    cat << EOF
+${BOLD}USAGE${RESET}: $(basename "$0") run [OPTIONS] [--] COMMAND [ARGS...]
 
-    $SUDO_PREFIX tee "$env_file" > /dev/null << ENV_EOF
-MORLOC_VERSION=${_version}
-MORLOC_IMAGE=${CONTAINER_BASE_FULL}:${_version}
-MORLOC_DEV_IMAGE=${CONTAINER_BASE_TEST}:latest
-MORLOC_HOST_VERSION_DIR=${MORLOC_HOST_VERSION_DIR}
-MORLOC_CONTAINER_HOME=${MORLOC_CONTAINER_HOME}
-MORLOC_CONTAINER_ENGINE=${CONTAINER_ENGINE}
-MORLOC_ROOTFUL=${_rootful_val}
-MORLOC_ENV_FLAGS=
-ENV_EOF
-
-    if [ $? -ne 0 ]; then
-        print_error "Failed to write $env_file"
-        return 1
-    fi
-    print_success "Generated $env_file"
-}
-
-# Generate the unified menv wrapper script
-# Usage: generate_menv_script <script_path>
-generate_menv_script() {
-    _script_path="$1"
-    _z="$SELINUX_SUFFIX"
-
-    print_info "Generating menv at $_script_path"
-
-    # Note: menv uses bash (not POSIX sh) for safe array-based flag handling.
-    # The main morloc-manager.sh remains POSIX sh.
-    _gen_date=$(date '+%Y-%m-%d %H:%M:%S')
-
-    $SUDO_PREFIX tee "$_script_path" > /dev/null << MENV_EOF
-#!/usr/bin/env bash
-# menv -- Morloc container entry point
-# Generated by morloc-manager ${VERSION} on ${_gen_date}
-
-MENV_MANAGER_VERSION="${VERSION}"
-MENV_GENERATED="${_gen_date}"
-
-show_menv_help() {
-    cat << 'HELP_EOF'
-${BOLD}menv${RESET} -- run commands inside a Morloc container
-${DIM}Generated by morloc-manager ${VERSION} on ${_gen_date}${RESET}
-
-${BOLD}USAGE${RESET}:
-  ${BOLD}${GREEN}menv${RESET} [OPTIONS] [--] COMMAND [ARGS...]
-  ${BOLD}${GREEN}menv${RESET} --shell
-  ${BOLD}${GREEN}menv${RESET} --dev COMMAND [ARGS...]
+Run a command inside the morloc container.
 
 ${BOLD}OPTIONS${RESET}:
-  ${BOLD}-h${RESET}, ${BOLD}--help${RESET}       Show this help message and exit
-  ${BOLD}-v${RESET}, ${BOLD}--version${RESET}    Show version info (morloc-manager and morloc) and exit
-      ${BOLD}--dev${RESET}        Use the dev container (has Haskell toolchain, stack, ghcup)
-      ${BOLD}--shell${RESET}      Open an interactive bash shell in the container
-  ${BOLD}-x${RESET} FLAG          Pass an extra flag to docker/podman run (repeatable)
-      ${BOLD}--${RESET}            Stop processing options; remaining args are the command
+  -h, --help       Show this help message
+      --dev        Use the dev container (has Haskell toolchain, stack, ghcup)
+      --shell      Open an interactive bash shell in the container
+      --system     Use system-scope version
+      --local      Use local-scope version
+  -x FLAG          Pass an extra flag to docker/podman run (repeatable)
+      --            Stop processing options; remaining args are the command
 
 ${BOLD}EXAMPLES${RESET}:
-  ${GREEN}menv morloc --version${RESET}            Print the morloc version
-  ${GREEN}menv morloc make -o foo foo.loc${RESET}  Compile a morloc program
-  ${GREEN}menv --shell${RESET}                     Interactive shell in the morloc container
-  ${GREEN}menv --dev stack build${RESET}           Build the compiler in the dev container
-  ${GREEN}menv --dev --shell${RESET}               Dev interactive shell
-  ${GREEN}menv -x "--gpus all" python train.py${RESET}
-                                   Pass extra docker flags
-
-${BOLD}ENVIRONMENT${RESET}:
-  ${CYAN}MORLOC_HOME${RESET}         Override default data dir (~/.local/share/morloc)
-  ${CYAN}MORLOC_WORK_DIR${RESET}     Set automatically to \$PWD (mounted as ~/work)
-
-${BOLD}FILES${RESET}:
-  ${CYAN}<data>/.env${RESET}              Container engine, image, version, active env flags
-  ${CYAN}<data>/morloc.flags${RESET}      Global extra flags applied to every menv invocation
-  ${CYAN}<deps>/<name>.flags${RESET}      Per-environment flags (activated via morloc-manager env)
-
-  Flag files contain one docker/podman run flag per line. Lines starting
-  with ${DIM}#${RESET} are comments. Global flags are applied first, then environment
-  flags are appended. Additive flags (${YELLOW}-v${RESET}, ${YELLOW}-p${RESET}, ${YELLOW}-e${RESET}) accumulate; singular
-  flags (${YELLOW}--network${RESET}, ${YELLOW}--shm-size${RESET}) last-one-wins.
-
-${BOLD}SEE ALSO${RESET}:
-  ${BOLD}${GREEN}morloc-manager install${RESET}    Install morloc containers and generate this script
-  ${BOLD}${GREEN}morloc-manager env${RESET}        Manage dependency environments and flags files
-  ${BOLD}${GREEN}morloc-manager info${RESET}       Show current configuration and status
-HELP_EOF
+  $(basename "$0") run morloc --version
+  $(basename "$0") run morloc make -o foo foo.loc
+  $(basename "$0") run --shell
+  $(basename "$0") run --dev stack build
+  $(basename "$0") run -x "--gpus all" python train.py
+EOF
 }
 
-show_menv_version() {
-    echo "${BOLD}menv${RESET}"
-    if [ -f "\$MORLOC_DATA/.env" ]; then
-        . "\$MORLOC_DATA/.env"
-        echo "  ${BOLD}creation time${RESET}:          \$MENV_GENERATED"
-        echo "  ${BOLD}morloc-manager version${RESET}: ${GREEN}\${MENV_MANAGER_VERSION:-unknown}${RESET}"
-        echo "  ${BOLD}morloc version${RESET}:         ${GREEN}\${MORLOC_VERSION:-unknown}${RESET}"
-        echo "  ${BOLD}container engine${RESET}:       \${MORLOC_CONTAINER_ENGINE:-docker}"
-        echo "  ${BOLD}image${RESET}:                  ${CYAN}\${MORLOC_IMAGE:-unknown}${RESET}"
-        if [ -n "\${MORLOC_ENV_FLAGS:-}" ]; then
-            _env="\${MORLOC_ENV_FLAGS##*/}"
-            _env="\${_env%.flags}"
-            echo "  ${BOLD}environment${RESET}:       ${YELLOW}\$_env${RESET}"
+# Run a command inside the morloc container
+# Usage: cmd_run [--dev] [--shell] [--system|--local] [-x FLAG]... [--] CMD...
+cmd_run() {
+    _cr_dev=""
+    _cr_shell=""
+    _cr_scope=""
+    _cr_extra=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)    show_run_help; exit 0 ;;
+            --dev)        _cr_dev=1; shift ;;
+            --shell)      _cr_shell=1; shift ;;
+            --system)     _cr_scope="system"; shift ;;
+            --local)      _cr_scope="local"; shift ;;
+            -x)           _cr_extra="$_cr_extra $2"; shift 2 ;;
+            --)           shift; break ;;
+            *)            break ;;
+        esac
+    done
+
+    # Resolve version and scope from config
+    _cr_version=$(active_version)
+    if [ -z "$_cr_version" ]; then
+        print_error "No active version set. Run 'install' or 'select' first."
+        exit 1
+    fi
+
+    if [ -z "$_cr_scope" ]; then
+        _cr_scope=$(active_scope)
+    fi
+
+    # Read version config
+    _cr_scope_flag=""
+    [ "$_cr_scope" = "system" ] && _cr_scope_flag="--system"
+
+    _cr_vcfg=$(version_config_root "$_cr_version" "$_cr_scope")
+    _cr_vdata=$(version_data_root "$_cr_version" "$_cr_scope")
+    _cr_versions_dir="$(data_root $_cr_scope_flag)/versions"
+
+    # Read image from version config
+    _cr_image=$(read_config "image" "$_cr_vcfg/config")
+    _cr_dev_image=$(read_config "dev_image" "$_cr_vcfg/config")
+    [ -z "$_cr_image" ] && _cr_image="${CONTAINER_BASE_FULL}:${_cr_version}"
+    [ -z "$_cr_dev_image" ] && _cr_dev_image="${CONTAINER_BASE_TEST}:latest"
+
+    # Read active environment
+    _cr_env=$(read_config "active_env")
+    if [ -n "$_cr_env" ] && [ "$_cr_env" != "base" ]; then
+        _cr_env_conf="$_cr_vcfg/environments/${_cr_env}.conf"
+        _cr_env_image=$(read_config "image" "$_cr_env_conf")
+        [ -n "$_cr_env_image" ] && _cr_image="$_cr_env_image"
+    fi
+
+    # Read container engine from config (fallback to auto-detected)
+    _cr_engine=$(read_config "container_engine")
+    [ -z "$_cr_engine" ] && _cr_engine="$CONTAINER_ENGINE"
+
+    # Determine container home
+    if [ "$_cr_scope" = "system" ]; then
+        _cr_container_home="/root"
+    else
+        _cr_container_home="$HOME"
+    fi
+
+    # Detect SELinux
+    detect_selinux
+    _cr_z="$SELINUX_SUFFIX"
+
+    export MORLOC_WORK_DIR="$PWD"
+
+    # Build base flags
+    if [ -n "$_cr_dev" ]; then
+        _cr_use_image="$_cr_dev_image"
+        $SUDO_PREFIX mkdir -p "$_cr_versions_dir/${LOCAL_VERSION}/home/.local/bin"
+        $SUDO_PREFIX mkdir -p "$_cr_versions_dir/${LOCAL_VERSION}/home/.stack"
+
+        _cr_flags="-v ${_cr_versions_dir}/${LOCAL_VERSION}:${_cr_container_home}/.local/share/morloc${_cr_z}"
+        _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${LOCAL_VERSION}/home/.local/bin:${_cr_container_home}/.local/bin${_cr_z}"
+        _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${LOCAL_VERSION}/home/.stack:${_cr_container_home}/.stack${_cr_z}"
+        _cr_flags="$_cr_flags -e HOME=${_cr_container_home}"
+        _cr_flags="$_cr_flags -e PATH=/root/.ghcup/bin:${_cr_container_home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    else
+        _cr_use_image="$_cr_image"
+
+        _cr_flags="-v ${_cr_vdata}:${_cr_container_home}/.local/share/morloc${_cr_z}"
+        _cr_flags="$_cr_flags -v ${_cr_vdata}/bin:${_cr_container_home}/.local/bin${_cr_z}"
+        _cr_flags="$_cr_flags -e HOME=${_cr_container_home}"
+        _cr_flags="$_cr_flags -e PATH=${_cr_container_home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    fi
+
+    # Mount working directory
+    if [ "$MORLOC_WORK_DIR" != "$_cr_container_home" ]; then
+        _cr_flags="$_cr_flags -v ${MORLOC_WORK_DIR}:${_cr_container_home}/work${_cr_z}"
+        _cr_workdir="${_cr_container_home}/work"
+    else
+        _cr_workdir="${_cr_container_home}"
+    fi
+
+    # Read global flags file
+    _cr_global_flags_file="$(data_root $_cr_scope_flag)/morloc.flags"
+    _cr_user_flags=""
+    if [ -f "$_cr_global_flags_file" ]; then
+        _cr_gf=$(read_flags_file "$_cr_global_flags_file")
+        [ -n "$_cr_gf" ] && _cr_user_flags="$_cr_gf"
+    fi
+
+    # Read environment flags
+    if [ -n "$_cr_env" ] && [ "$_cr_env" != "base" ]; then
+        _cr_env_flags_file="$_cr_vcfg/environments/${_cr_env}.flags"
+        if [ -f "$_cr_env_flags_file" ]; then
+            _cr_ef=$(read_flags_file "$_cr_env_flags_file")
+            [ -n "$_cr_ef" ] && _cr_user_flags="$_cr_user_flags $_cr_ef"
         fi
     fi
-}
 
-MORLOC_DATA="\${MORLOC_HOME:-${MORLOC_DATA_HOME}}"
-. "\$MORLOC_DATA/.env"
-
-SERVICE="morloc"
-SHELL_MODE=""
-EXTRA=()
-
-while [ \$# -gt 0 ]; do
-    case "\$1" in
-        -h|--help)    show_menv_help; exit 0 ;;
-        -v|--version) show_menv_version; exit 0 ;;
-        --dev)   SERVICE="morloc-dev"; shift ;;
-        --shell) SHELL_MODE=1; shift ;;
-        -x)      EXTRA+=("\$2"); shift 2 ;;
-        --)      shift; break ;;
-        *)       break ;;
-    esac
-done
-
-export MORLOC_WORK_DIR="\$PWD"
-ENGINE="\${MORLOC_CONTAINER_ENGINE:-docker}"
-
-# Ensure dev directories exist before starting dev service
-if [ "\$SERVICE" = "morloc-dev" ]; then
-    mkdir -p "\$MORLOC_HOST_VERSION_DIR/local/home/.local/bin"
-    mkdir -p "\$MORLOC_HOST_VERSION_DIR/local/home/.stack"
-fi
-
-# SELinux suffix baked in at generation time
-_z="${_z}"
-
-# Base flags per service
-if [ "\$SERVICE" = "morloc-dev" ]; then
-    IMAGE="\$MORLOC_DEV_IMAGE"
-    BASE=(
-        -v "\${MORLOC_HOST_VERSION_DIR}/local:\${MORLOC_CONTAINER_HOME}/.local/share/morloc\${_z}"
-        -v "\${MORLOC_HOST_VERSION_DIR}/local/home/.local/bin:\${MORLOC_CONTAINER_HOME}/.local/bin\${_z}"
-        -v "\${MORLOC_HOST_VERSION_DIR}/local/home/.stack:\${MORLOC_CONTAINER_HOME}/.stack\${_z}"
-        -e "HOME=\${MORLOC_CONTAINER_HOME}"
-        -e "PATH=/root/.ghcup/bin:\${MORLOC_CONTAINER_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    )
-else
-    IMAGE="\$MORLOC_IMAGE"
-    BASE=(
-        -v "\${MORLOC_HOST_VERSION_DIR}/\${MORLOC_VERSION}:\${MORLOC_CONTAINER_HOME}/.local/share/morloc\${_z}"
-        -v "\${MORLOC_HOST_VERSION_DIR}/\${MORLOC_VERSION}/bin:\${MORLOC_CONTAINER_HOME}/.local/bin\${_z}"
-        -e "HOME=\${MORLOC_CONTAINER_HOME}"
-        -e "PATH=\${MORLOC_CONTAINER_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    )
-fi
-
-# Mount working directory unless it is the container home directory itself.
-# On SELinux systems (e.g. Fedora), mounting \$HOME with the SELinux
-# relabel suffix triggers "SELinux relabeling of /home/<user> is not allowed".
-if [ "\$MORLOC_WORK_DIR" != "\$MORLOC_CONTAINER_HOME" ]; then
-    BASE+=(-v "\${MORLOC_WORK_DIR}:\${MORLOC_CONTAINER_HOME}/work\${_z}")
-    _workdir="\${MORLOC_CONTAINER_HOME}/work"
-else
-    _workdir="\${MORLOC_CONTAINER_HOME}"
-fi
-
-# Read flags from file into array (strips comments and blank lines)
-read_flags() {
-    local file="\$1"
-    local flags=()
-    [ -f "\$file" ] || return
-    while IFS= read -r line || [ -n "\$line" ]; do
-        line="\${line%%#*}"
-        line="\${line#"\${line%%[![:space:]]*}"}"
-        line="\${line%"\${line##*[![:space:]]}"}"
-        [ -z "\$line" ] && continue
-        # shellcheck disable=SC2206
-        flags+=(\$line)
-    done < "\$file"
-    printf '%s\n' "\${flags[@]}"
-}
-
-# Merge global flags + environment flags
-USER_FLAGS=()
-while IFS= read -r f; do [ -n "\$f" ] && USER_FLAGS+=("\$f"); done < <(read_flags "\$MORLOC_DATA/morloc.flags")
-if [ -n "\${MORLOC_ENV_FLAGS:-}" ] && [ -f "\$MORLOC_ENV_FLAGS" ]; then
-    while IFS= read -r f; do [ -n "\$f" ] && USER_FLAGS+=("\$f"); done < <(read_flags "\$MORLOC_ENV_FLAGS")
-fi
-
-# Prepend sudo for rootful mode
-_SUDO=()
-if [ "\${MORLOC_ROOTFUL:-}" = "1" ]; then
-    _SUDO=(sudo)
-fi
-
-if [ -n "\$SHELL_MODE" ]; then
-    exec "\${_SUDO[@]}" "\$ENGINE" run --rm -it --shm-size ${SHARED_MEMORY_SIZE} -w "\$_workdir" \\
-        "\${BASE[@]}" "\${USER_FLAGS[@]}" "\${EXTRA[@]}" "\$IMAGE" /bin/bash
-else
-    exec "\${_SUDO[@]}" "\$ENGINE" run --rm --shm-size ${SHARED_MEMORY_SIZE} -w "\$_workdir" \\
-        "\${BASE[@]}" "\${USER_FLAGS[@]}" "\${EXTRA[@]}" "\$IMAGE" "\$@"
-fi
-MENV_EOF
-
-    if [ $? -ne 0 ]; then
-        print_error "Failed to create menv at '$_script_path'"
-        return 1
+    # Also support legacy per-dependency flags
+    _cr_env_flags_path=$(read_config "env_flags")
+    if [ -n "$_cr_env_flags_path" ] && [ -f "$_cr_env_flags_path" ]; then
+        _cr_lf=$(read_flags_file "$_cr_env_flags_path")
+        [ -n "$_cr_lf" ] && _cr_user_flags="$_cr_user_flags $_cr_lf"
     fi
 
-    $SUDO_PREFIX chmod 755 "$_script_path"
-    print_success "Generated menv at $_script_path"
+    # Build sudo prefix
+    _cr_sudo=""
+    if [ "$_cr_scope" = "system" ]; then
+        _cr_sudo="sudo"
+    fi
+
+    # Execute
+    if [ -n "$_cr_shell" ]; then
+        # shellcheck disable=SC2086
+        exec $_cr_sudo "$_cr_engine" run --rm -it --shm-size ${SHARED_MEMORY_SIZE} -w "$_cr_workdir" \
+            $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" /bin/bash
+    else
+        # shellcheck disable=SC2086
+        exec $_cr_sudo "$_cr_engine" run --rm --shm-size ${SHARED_MEMORY_SIZE} -w "$_cr_workdir" \
+            $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" "$@"
+    fi
 }
 
+# Open interactive shell in the morloc container
+# Usage: cmd_shell [OPTIONS]
+cmd_shell() {
+    cmd_run --shell "$@"
+}
 
 # }}}
 # {{{ main help and version
@@ -629,13 +768,15 @@ ${BOLD}OPTIONS${RESET}:
   -h, --help                Show this help message
   -v, --version             Show this manager version
   --container-engine ENGINE  Use ENGINE instead of auto-detected (docker/podman)
-  --rootful                 Run containers with sudo (for systems without rootless support)
+  --system                  Target system-wide (rootful) scope
 
 ${BOLD}COMMANDS${RESET}:
-  ${BOLD}${GREEN}install${RESET}    Install morloc containers, scripts, and home
-  ${BOLD}${GREEN}uninstall${RESET}  Remove morloc containers, scripts, and home
+  ${BOLD}${GREEN}install${RESET}    Install morloc containers and home
+  ${BOLD}${GREEN}uninstall${RESET}  Remove morloc containers and home
   ${BOLD}${GREEN}update${RESET}     Pull the latest version of this script
   ${BOLD}${GREEN}select${RESET}     Choose a new Morloc version
+  ${BOLD}${GREEN}run${RESET}        Run a command inside the morloc container
+  ${BOLD}${GREEN}shell${RESET}      Open an interactive shell in the morloc container
   ${BOLD}${GREEN}env${RESET}        Select or explore available environments
   ${BOLD}${GREEN}info${RESET}       Print info about manager, installs and containers
 
@@ -658,17 +799,14 @@ ${BOLD}USAGE${RESET}: $(basename "$0") install [OPTIONS] <version>
 Setup morloc containers, scripts, and home for either the latest version
 of Morloc or for the specified version.
 
-Generates a .env and a single ${BOLD}${GREEN}menv${RESET} wrapper script
-and creates the unified ${BOLD}${GREEN}menv${RESET} wrapper script.
-
-${BOLD}USAGE${RESET}:
-  ${BOLD}${GREEN}menv${RESET} morloc make -o foo foo.loc   Run a command in the container
-  ${BOLD}${GREEN}menv${RESET} --shell                      Interactive shell
-  ${BOLD}${GREEN}menv${RESET} --dev stack build             Dev container command
-  ${BOLD}${GREEN}menv${RESET} --dev --shell                 Dev interactive shell
+After installation, use:
+  $(basename "$0") run morloc make -o foo foo.loc   Run a command in the container
+  $(basename "$0") run --shell                      Interactive shell
+  $(basename "$0") run --dev stack build            Dev container command
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help           Show this help message
+      --system         Install to system scope (rootful)
       --no-init        Do not run 'morloc init'
 
 ${BOLD}ARGUMENTS${RESET}:
@@ -677,6 +815,7 @@ ${BOLD}ARGUMENTS${RESET}:
 ${BOLD}EXAMPLES${RESET}:
   $(basename "$0") install
   $(basename "$0") install 0.54.2
+  $(basename "$0") install --system 0.54.2
 EOF
 }
 
@@ -695,6 +834,12 @@ cmd_install() {
             -h|--help)
                 show_install_help
                 exit 0
+                ;;
+            --system)
+                MORLOC_SCOPE="system"
+                SUDO_PREFIX="sudo "
+                set_paths
+                shift
                 ;;
             --no-init)
                 no_init="true"
@@ -838,12 +983,16 @@ cmd_install() {
         print_info "See 'morloc-manager env --help' for details."
     fi
 
-    # Generate .env and menv script
-    generate_env_file "$version"
-    generate_menv_script "$MORLOC_BIN/menv"
+    # Determine scope
+    _inst_scope="local"
+    [ "${MORLOC_SCOPE:-}" = "system" ] && _inst_scope="system"
+
+    # Write version config
+    write_version_config "$version" "$_inst_scope"
+
     if [ "$no_init" = "false" ]; then
       print_info "Initializing morloc libraries"
-      "$MORLOC_BIN/menv" morloc init -f
+      cmd_run morloc init -f
       if [ $? -ne 0 ]
       then
           print_error "Failed to build morloc libraries"
@@ -958,6 +1107,7 @@ Remove Morloc home (or specific versions) and all associated containers
 ${BOLD}OPTIONS${RESET}:
   -h, --help     Show this help message
   -a, --all      Remove all Morloc versions
+      --system   Target system scope
 
 ${BOLD}ARGUMENTS${RESET}:
   VERSION        Version to remove, may specify multiple versions
@@ -965,12 +1115,14 @@ ${BOLD}ARGUMENTS${RESET}:
 ${BOLD}EXAMPLES${RESET}:
   $(basename "$0") uninstall --all
   $(basename "$0") uninstall 0.55.7
+  $(basename "$0") uninstall --system 0.55.7
   $(basename "$0") uninstall 0.53.6 0.53.7
 EOF
 }
 
 cmd_uninstall() {
     version=""
+    _uninst_scope="local"
 
     # Parse remove subcommand arguments
     while [ $# -gt 0 ]; do
@@ -978,6 +1130,11 @@ cmd_uninstall() {
             -h|--help)
                 show_uninstall_help
                 exit 0
+                ;;
+            --system)
+                _uninst_scope="system"
+                SUDO_PREFIX="sudo "
+                shift
                 ;;
             -a|--all)
                 morloc_home="$MORLOC_HOST_VERSION_DIR"
@@ -999,21 +1156,29 @@ cmd_uninstall() {
                 remove_all_containers_and_images "$CONTAINER_BASE_TINY"
                 remove_all_containers_and_images "$CONTAINER_BASE_TEST"
 
-                # Clean up generated files
+                # Clean up config directories
+                _uninst_cfg_root=$(config_root)
+                [ "$_uninst_scope" = "system" ] && _uninst_cfg_root=$(config_root --system)
+                if [ -d "$_uninst_cfg_root/versions" ]; then
+                    $SUDO_PREFIX rm -rf "$_uninst_cfg_root/versions"
+                fi
+
+                # Clean up legacy files
                 $SUDO_PREFIX rm -f "$MORLOC_DATA_HOME/.env"
                 $SUDO_PREFIX rm -f "$MORLOC_DATA_HOME/morloc.flags"
-                # Remove legacy compose files if present
                 $SUDO_PREFIX rm -f "$MORLOC_DATA_HOME/docker-compose.yml"
-                if [ -f "$MORLOC_DATA_HOME/docker-compose.override.yml" ]; then
-                    print_warning "Legacy override file preserved: $MORLOC_DATA_HOME/docker-compose.override.yml"
-                fi
+
                 # Clean up environment flags
                 if [ -d "$MORLOC_DEPENDENCY_DIR" ]; then
                     $SUDO_PREFIX rm -f "$MORLOC_DEPENDENCY_DIR"/*.flags
                 fi
 
-                print_warning "Script $MORLOC_BIN/menv was not removed"
-                print_info "To remove it: rm $MORLOC_BIN/menv"
+                # Clear active version in user config
+                _uninst_user_cfg="$(config_root)/config"
+                if [ -f "$_uninst_user_cfg" ]; then
+                    write_config "active_version" "" "$_uninst_user_cfg"
+                fi
+
                 exit 0
                 ;;
             -*)
@@ -1023,6 +1188,7 @@ cmd_uninstall() {
                 ;;
             *)
                 version=$1
+                # Remove data directory
                 morloc_home="$MORLOC_HOST_VERSION_DIR/$version"
                 if [ -d "$morloc_home" ]
                 then
@@ -1037,6 +1203,20 @@ cmd_uninstall() {
                 else
                     print_warning "Cannot remove morloc directory '$morloc_home', it does not exist"
                 fi
+
+                # Remove version config directory
+                _uninst_vcfg=$(version_config_root "$version" "$_uninst_scope")
+                if [ -d "$_uninst_vcfg" ]; then
+                    $SUDO_PREFIX rm -rf "$_uninst_vcfg"
+                    print_success "Removed config directory '$_uninst_vcfg'"
+                fi
+
+                # Clear active version if it was the uninstalled one
+                _uninst_active=$(active_version)
+                if [ "$_uninst_active" = "$version" ]; then
+                    write_config "active_version" "" "$(config_root)/config"
+                fi
+
                 remove_containers_for_version "$version"
                 shift
                 ;;
@@ -1167,31 +1347,43 @@ cmd_update() {
 # Help for install subcommand
 show_select_help() {
     cat << EOF
-${BOLD}USAGE${RESET}: $(basename "$0") select <version>
+${BOLD}USAGE${RESET}: $(basename "$0") select [OPTIONS] <version>
 
-Set Morloc version.
+Set active Morloc version.
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help           Show this help message
+      --system         Force system scope
+      --local          Force local scope
 
 ${BOLD}ARGUMENTS${RESET}:
-  version        Version to install
+  version        Version to activate
 
 ${BOLD}EXAMPLES${RESET}:
   $(basename "$0") select 0.54.2
+  $(basename "$0") select --system 0.54.2
 EOF
 }
 
 cmd_select() {
 
     version="undefined"
+    _sel_scope=""
 
-    # Parse install subcommand arguments
+    # Parse select subcommand arguments
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)
                 show_select_help
                 exit 0
+                ;;
+            --system)
+                _sel_scope="system"
+                shift
+                ;;
+            --local)
+                _sel_scope="local"
+                shift
                 ;;
             *)
                 if [ "$version" = "undefined" ]; then
@@ -1214,36 +1406,38 @@ cmd_select() {
     if [ "$version" = "undefined" ]
     then
         print_error "Please select a version"
-        # List available versions
-        install_dir="$MORLOC_HOST_VERSION_DIR"
-        if [ -d "$install_dir" ]; then
-            print_info "Available versions:"
-            for d in "$install_dir"/*/; do
-                [ -d "$d" ] || continue
-                v=$(basename "$d")
-                case "$v" in "$LOCAL_VERSION") continue ;; esac
-                print_point "$v"
-            done
-        fi
+        # List available versions with scope annotations
+        print_info "Available versions:"
+        list_versions --all | while IFS='	' read -r _sv_v _sv_s; do
+            print_point "$_sv_v ($_sv_s)"
+        done
         show_select_help
         exit 1
     fi
 
-    if [ -d "$MORLOC_HOST_VERSION_DIR/$version" ]
-    then
-        env_file="$MORLOC_DATA_HOME/.env"
-        if [ ! -f "$env_file" ]; then
-            print_error "No .env file found at $env_file — run 'install' first"
-            exit 1
-        fi
-        $SUDO_PREFIX sed -i "s|^MORLOC_VERSION=.*|MORLOC_VERSION=${version}|" "$env_file"
-        $SUDO_PREFIX sed -i "s|^MORLOC_IMAGE=.*|MORLOC_IMAGE=${CONTAINER_BASE_FULL}:${version}|" "$env_file"
-    else
+    # Auto-resolve scope if not forced
+    if [ -z "$_sel_scope" ]; then
+        _sel_scope=$(resolve_version "$version") || true
+    fi
+
+    if [ -z "$_sel_scope" ]; then
         print_error "Morloc version '$version' does not exist, install first"
         exit 1
     fi
 
-    print_success "Switched to Morloc version '$version'"
+    # Verify the version directory exists
+    _sel_vdata=$(version_data_root "$version" "$_sel_scope")
+    if [ ! -d "$_sel_vdata" ]; then
+        print_error "Morloc version '$version' does not exist in $_sel_scope scope, install first"
+        exit 1
+    fi
+
+    # Write active version to user config
+    _sel_user_cfg="$(config_root)/config"
+    write_config "active_version" "$version" "$_sel_user_cfg"
+    write_config "active_scope" "$_sel_scope" "$_sel_user_cfg"
+
+    print_success "Switched to Morloc version '$version' ($_sel_scope)"
     exit 0
 }
 
@@ -1267,7 +1461,7 @@ EOF
 
 cmd_info() {
 
-    # Parse install subcommand arguments
+    # Parse info subcommand arguments
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)
@@ -1282,99 +1476,56 @@ cmd_info() {
         esac
     done
 
-    install_dir="$MORLOC_HOST_VERSION_DIR"
-    env_file="$MORLOC_DATA_HOME/.env"
-    global_flags="$MORLOC_DATA_HOME/morloc.flags"
-    versions=""
-    if [ -d "$install_dir" ]; then
-        for d in "$install_dir"/*/; do
-            [ -d "$d" ] || continue
-            v=$(basename "$d")
-            case "$v" in
-                "$LOCAL_VERSION") continue ;;
-            esac
-            versions="$versions $v"
-        done
-    fi
+    # Read from structured config
+    _info_version=$(active_version)
+    _info_scope=$(active_scope)
+    _info_env=$(read_config "active_env")
+    _info_engine=$(read_config "container_engine")
+    [ -z "$_info_version" ] && _info_version="none"
+    [ -z "$_info_env" ] && _info_env="base"
+    [ -z "$_info_engine" ] && _info_engine="${CONTAINER_ENGINE:-none}"
 
-    # Read current version and env flags from .env
-    current_version="none"
-    active_env_flags=""
-    if [ -f "$env_file" ]; then
-        current_version=$(grep '^MORLOC_VERSION=' "$env_file" | cut -d= -f2-)
-        [ -z "$current_version" ] && current_version="none"
-        active_env_flags=$(grep '^MORLOC_ENV_FLAGS=' "$env_file" | cut -d= -f2-)
-    fi
-
-    # Display mode and SELinux info
-    if [ -n "$SUDO_PREFIX" ]; then
-        printf "Mode:           rootful (sudo)\n"
+    # Display scope and SELinux info
+    detect_selinux
+    if [ "$_info_scope" = "system" ]; then
+        printf "Scope:          system\n"
     else
-        printf "Mode:           rootless\n"
+        printf "Scope:          local\n"
     fi
     if [ -n "$SELINUX_SUFFIX" ]; then
         printf "SELinux:        enforcing (bind mounts use :z)\n"
     else
         printf "SELinux:        not detected\n"
     fi
-    printf "Data home:      %s\n" "$MORLOC_DATA_HOME"
-    printf "Versions dir:   %s\n" "$MORLOC_HOST_VERSION_DIR"
+    printf "Active version: %s\n" "$_info_version"
+    printf "Active scope:   %s\n" "$_info_scope"
+    printf "Active env:     %s\n" "$_info_env"
+    printf "Engine:         %s\n" "$_info_engine"
+    printf "Config root:    %s\n" "$(config_root)"
+    printf "Data root:      %s\n" "$(data_root)"
     printf "Bin dir:        %s\n" "$MORLOC_BIN"
-    printf "Container home: %s\n" "$MORLOC_CONTAINER_HOME"
 
-    # Config file info
-    printf "\n"
-    if [ -f "$env_file" ]; then
-        printf "Env:          %s %s[exists]%s\n" "$env_file" "$GREEN" "$RESET"
-    else
-        printf "Env:          %s %s[missing]%s\n" "$env_file" "$RED" "$RESET"
-    fi
-    if [ -f "$global_flags" ]; then
-        printf "Global flags: %s %s[exists]%s\n" "$global_flags" "$GREEN" "$RESET"
-    else
-        printf "Global flags: (create %s for site-wide container flags)\n" "$global_flags"
-    fi
-    if [ -n "$active_env_flags" ]; then
-        # Extract env name from flags path
-        _env_name="${active_env_flags##*/}"
-        _env_name="${_env_name%.flags}"
-        if [ -f "$active_env_flags" ]; then
-            printf "Env flags:    %s %s[active: %s]%s\n" "$active_env_flags" "$GREEN" "$_env_name" "$RESET"
-        else
-            printf "Env flags:    %s %s[set but file missing]%s\n" "$active_env_flags" "$RED" "$RESET"
-        fi
-    else
-        printf "Env flags:    (none active)\n"
-    fi
-
-    printf "\n"
-
-    dev_container=${CONTAINER_BASE_TEST}
-    if $SUDO_PREFIX$CONTAINER_ENGINE images --format '{{.Repository}}' | grep -q "^${dev_container}$"
-    then
-        printf "dev             %scontainer exists%s\n" "$GREEN" "$RESET"
-    else
-        printf "dev             %scontainer missing%s\n" "$RED" "$RESET"
-    fi
-
-    for version in $versions
-    do
-        selection="         "
-        if [ "$version" = "$current_version" ]
-        then
-            selection=" selected"
-        fi
-
-        version_container="${CONTAINER_BASE_FULL}:${version}"
-
-        if $SUDO_PREFIX$CONTAINER_ENGINE images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${version_container}$"
-        then
-            printf "%s%s %scontainer exists%s\n" "$version" "$selection" "$GREEN" "$RESET"
-        else
-            printf "%s%s %scontainer missing%s\n" "$version" "$selection" "$RED" "$RESET"
-        fi
-
+    # Show local versions
+    printf "\nLocal versions:\n"
+    _info_found=""
+    list_versions --local | while IFS='	' read -r _iv_v _iv_s; do
+        _iv_mark=""
+        [ "$_iv_v" = "$_info_version" ] && [ "$_info_scope" = "local" ] && _iv_mark=" (active)"
+        printf "  %s%s\n" "$_iv_v" "$_iv_mark"
+        _info_found=1
     done
+    [ -z "$_info_found" ] && printf "  (none)\n"
+
+    # Show system versions
+    printf "\nSystem versions:\n"
+    _info_found=""
+    list_versions --system | while IFS='	' read -r _iv_v _iv_s; do
+        _iv_mark=""
+        [ "$_iv_v" = "$_info_version" ] && [ "$_info_scope" = "system" ] && _iv_mark=" (active)"
+        printf "  %s%s\n" "$_iv_v" "$_iv_mark"
+        _info_found=1
+    done
+    [ -z "$_info_found" ] && printf "  (none)\n"
 
     exit 0
 }
@@ -1387,7 +1538,6 @@ update_environment() {
   update_usr=$1; shift
   extra_args=$1
   envfile="$MORLOC_DEPENDENCY_DIR/$envname.Dockerfile"
-  env_file="$MORLOC_DATA_HOME/.env"
 
   print_info "Attempting to switch environment to ${envname} with ${envfile}"
 
@@ -1398,42 +1548,48 @@ update_environment() {
     return 1
   fi
 
-  if [ ! -f "$env_file" ]; then
-      print_error "No .env file found — run 'install' first"
-      return 1
-  fi
-
-  # Read current version from .env
-  version=$(grep '^MORLOC_VERSION=' "$env_file" | cut -d= -f2-)
+  # Read current version and scope from config
+  version=$(active_version)
+  _ue_scope=$(active_scope)
   if [ -z "$version" ]; then
-      print_error "Could not determine current version from $env_file"
+      print_error "No active version — run 'install' first"
       return 1
   fi
   print_info "Currently using morloc v$version"
+
+  _ue_vcfg=$(version_config_root "$version" "$_ue_scope")
 
   if [ "$update_usr" = "true" ]; then
       base_container="${CONTAINER_BASE_FULL}:${version}"
       user_container="morloc-env:${version}-${envname}"
       build_environment "$envname" "$envfile" "$user_container" "$base_container" || return $?
-      $SUDO_PREFIX sed -i "s|^MORLOC_IMAGE=.*|MORLOC_IMAGE=${user_container}|" "$env_file"
+      write_config "image" "$user_container" "$_ue_vcfg/config"
       print_success "Switched user environment to $version-$envname"
   fi
 
   if [ "$update_dev" = "true" ]; then
       dev_container="morloc-env:local-${envname}"
       build_environment "$envname" "$envfile" "$dev_container" "$CONTAINER_BASE_TEST" || return $?
-      $SUDO_PREFIX sed -i "s|^MORLOC_DEV_IMAGE=.*|MORLOC_DEV_IMAGE=${dev_container}|" "$env_file"
+      write_config "dev_image" "$dev_container" "$_ue_vcfg/config"
       print_success "Switched dev environment to local-$envname"
   fi
 
-  # Activate environment flags file
+  # Write environment config file to version-specific environments dir
+  $SUDO_PREFIX mkdir -p "$_ue_vcfg/environments"
+  _ue_env_conf="$_ue_vcfg/environments/${envname}.conf"
+  if [ "$update_usr" = "true" ]; then
+      write_config "image" "$user_container" "$_ue_env_conf"
+  fi
+
+  # Copy flags file to version environments dir if it exists
   flags_file="$MORLOC_DEPENDENCY_DIR/${envname}.flags"
   if [ -f "$flags_file" ]; then
-      $SUDO_PREFIX sed -i "s|^MORLOC_ENV_FLAGS=.*|MORLOC_ENV_FLAGS=${flags_file}|" "$env_file"
+      $SUDO_PREFIX cp "$flags_file" "$_ue_vcfg/environments/${envname}.flags"
       print_info "Activated environment flags: $flags_file"
-  else
-      $SUDO_PREFIX sed -i "s|^MORLOC_ENV_FLAGS=.*|MORLOC_ENV_FLAGS=|" "$env_file"
   fi
+
+  # Set active environment in user config
+  write_config "active_env" "$envname" "$(config_root)/config"
 
   return 0
 }
@@ -1441,34 +1597,30 @@ update_environment() {
 reset_environment() {
   reset_update_dev="$1"
   reset_update_usr="$2"
-  env_file="$MORLOC_DATA_HOME/.env"
 
-  if [ ! -f "$env_file" ]; then
-      print_error "No .env file found — nothing to reset"
-      return 1
-  fi
-
-  # Read current version from .env
-  version=$(grep '^MORLOC_VERSION=' "$env_file" | cut -d= -f2-)
+  version=$(active_version)
+  _re_scope=$(active_scope)
   if [ -z "$version" ]; then
-      print_error "Could not determine current version from $env_file"
+      print_error "No active version — nothing to reset"
       return 1
   fi
   print_info "Currently using morloc v$version"
 
+  _re_vcfg=$(version_config_root "$version" "$_re_scope")
+
   if [ "$reset_update_usr" = "true" ]; then
-      $SUDO_PREFIX sed -i "s|^MORLOC_IMAGE=.*|MORLOC_IMAGE=${CONTAINER_BASE_FULL}:${version}|" "$env_file"
+      write_config "image" "${CONTAINER_BASE_FULL}:${version}" "$_re_vcfg/config"
       print_success "Successfully reset user environment to default"
   fi
 
   if [ "$reset_update_dev" = "true" ]; then
-      $SUDO_PREFIX sed -i "s|^MORLOC_DEV_IMAGE=.*|MORLOC_DEV_IMAGE=${CONTAINER_BASE_TEST}:latest|" "$env_file"
+      write_config "dev_image" "${CONTAINER_BASE_TEST}:latest" "$_re_vcfg/config"
       print_success "Successfully reset dev environment to default"
   fi
 
-  # Clear environment flags
-  $SUDO_PREFIX sed -i "s|^MORLOC_ENV_FLAGS=.*|MORLOC_ENV_FLAGS=|" "$env_file"
-  print_info "Cleared environment flags"
+  # Reset active env to base
+  write_config "active_env" "base" "$(config_root)/config"
+  print_info "Reset active environment to base"
 
   return 0
 }
@@ -1484,7 +1636,6 @@ list_local_environment() {
     # Check if directory is empty or has no .Dockerfile files
     found=0
     for file in "$MORLOC_DEPENDENCY_DIR"/*.Dockerfile; do
-        # Check if glob matched anything (fails if no files exist)
         if [ -e "$file" ]; then
             found=1
             break
@@ -1496,23 +1647,23 @@ list_local_environment() {
         return 0
     fi
 
-    current_env=$("$MORLOC_BIN/menv" sh -c "echo \$MORLOC_ENV_NAME" 2>/dev/null)
+    current_env=$(read_config "active_env")
 
     # List all .Dockerfile files
     for file in "$MORLOC_DEPENDENCY_DIR"/*.Dockerfile; do
         if [ -e "$file" ]; then
-            basename="${file##*/}"           # Get basename
-            basename="${basename%.Dockerfile}"  # Remove .Dockerfile extension
-            flags_file="$MORLOC_DEPENDENCY_DIR/${basename}.flags"
+            _le_base="${file##*/}"
+            _le_base="${_le_base%.Dockerfile}"
+            flags_file="$MORLOC_DEPENDENCY_DIR/${_le_base}.flags"
             if [ -f "$flags_file" ]; then
                 flags_status="flags:yes"
             else
                 flags_status="flags:no"
             fi
-            if [ "$basename" = "$current_env" ]; then
-                printf "%s\t%s\t%s\t(current)\n" "$basename" "$file" "$flags_status"
+            if [ "$_le_base" = "$current_env" ]; then
+                printf "%s\t%s\t%s\t(current)\n" "$_le_base" "$file" "$flags_status"
             else
-                printf "%s\t%s\t%s\n" "$basename" "$file" "$flags_status"
+                printf "%s\t%s\t%s\n" "$_le_base" "$file" "$flags_status"
             fi
         fi
     done
@@ -1699,8 +1850,8 @@ main() {
                 set_container_engine "${1:?'--container-engine requires an argument'}"
                 shift
                 ;;
-            --rootful)
-                MORLOC_ROOTFUL="1"
+            --system)
+                MORLOC_SCOPE="system"
                 SUDO_PREFIX="sudo "
                 shift
                 ;;
@@ -1724,6 +1875,8 @@ main() {
         uninstall) shift; cmd_uninstall "$@" ;;
         update)    shift; cmd_update "$@" ;;
         select)    shift; cmd_select "$@" ;;
+        run)       shift; cmd_run "$@" ;;
+        shell)     shift; cmd_shell "$@" ;;
         env)       shift; cmd_env "$@" ;;
         info)      shift; cmd_info "$@" ;;
         "")        show_help; exit 0 ;;

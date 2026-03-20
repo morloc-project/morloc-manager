@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Integration tests for file generation (direct docker run, no compose)
+# Integration tests for config directory structure (replaces old .env/menv generation tests)
 
 load "../helpers/common"
 load "../helpers/mock_engine"
@@ -19,175 +19,198 @@ teardown() {
     teardown_isolated_home
 }
 
-# --- .env content ---
+# --- config helpers ---
 
-@test "env_file: generate_env_file creates .env" {
-    generate_env_file "0.58.3"
-    assert_file_exists "$MORLOC_DATA_HOME/.env"
+@test "config_root: returns XDG config dir for local" {
+    run config_root
+    assert_success
+    assert_output "$HOME/.config/morloc"
 }
 
-@test "env_file: .env has correct version" {
-    generate_env_file "0.58.3"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_VERSION=0.58.3"
+@test "config_root: returns /etc/morloc for system" {
+    run config_root --system
+    assert_success
+    assert_output "/etc/morloc"
 }
 
-@test "env_file: .env has correct image" {
-    generate_env_file "0.58.3"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.58.3"
+@test "data_root: returns XDG data dir for local" {
+    run data_root
+    assert_success
+    assert_output "$HOME/.local/share/morloc"
 }
 
-@test "env_file: .env has dev image" {
-    generate_env_file "0.58.3"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_DEV_IMAGE=ghcr.io/morloc-project/morloc/morloc-test:latest"
+@test "data_root: returns /usr/local/share/morloc for system" {
+    run data_root --system
+    assert_success
+    assert_output "/usr/local/share/morloc"
 }
 
-@test "env_file: .env has host version dir" {
-    generate_env_file "0.58.3"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_HOST_VERSION_DIR=$MORLOC_HOST_VERSION_DIR"
+@test "bin_root: returns local bin for local" {
+    run bin_root
+    assert_success
+    assert_output "$HOME/.local/bin"
 }
 
-@test "env_file: .env has container home" {
-    generate_env_file "0.58.3"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_CONTAINER_HOME=$MORLOC_CONTAINER_HOME"
+@test "bin_root: returns /usr/bin for system" {
+    run bin_root --system
+    assert_success
+    assert_output "/usr/bin"
 }
 
-@test "env_file: .env has rootful field" {
-    generate_env_file "0.58.3"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_ROOTFUL="
+# --- read_config / write_config ---
+
+@test "read_config: reads existing key" {
+    local cfg="$HOME/.config/morloc/config"
+    mkdir -p "$(dirname "$cfg")"
+    printf 'active_version=0.55.0\nactive_scope=local\n' > "$cfg"
+    run read_config "active_version" "$cfg"
+    assert_success
+    assert_output "0.55.0"
 }
 
-@test "env_file: .env has container engine" {
-    generate_env_file "0.58.3"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_CONTAINER_ENGINE=docker"
+@test "read_config: returns empty for missing key" {
+    local cfg="$HOME/.config/morloc/config"
+    mkdir -p "$(dirname "$cfg")"
+    printf 'active_scope=local\n' > "$cfg"
+    run read_config "active_version" "$cfg"
+    assert_success
+    assert_output ""
 }
 
-@test "env_file: .env has MORLOC_ENV_FLAGS field" {
-    generate_env_file "0.58.3"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_ENV_FLAGS="
+@test "write_config: creates file and key" {
+    local cfg="$HOME/test-config/config"
+    write_config "mykey" "myval" "$cfg"
+    assert_file_exists "$cfg"
+    assert_file_contains "$cfg" "mykey=myval"
 }
 
-# --- menv script ---
-
-@test "menv: generate_menv_script creates menv" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_exists "$MORLOC_BIN/menv"
+@test "write_config: updates existing key" {
+    local cfg="$HOME/test-config/config"
+    mkdir -p "$(dirname "$cfg")"
+    printf 'mykey=old\n' > "$cfg"
+    write_config "mykey" "new" "$cfg"
+    assert_file_contains "$cfg" "mykey=new"
+    assert_file_not_contains "$cfg" "mykey=old"
 }
 
-@test "menv: has bash shebang" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    local first_line
-    first_line=$(head -n1 "$MORLOC_BIN/menv")
-    [ "$first_line" = "#!/usr/bin/env bash" ]
+# --- active_version / active_scope ---
+
+@test "active_version: reads from user config" {
+    setup_version_config "0.55.0" "local"
+    run active_version
+    assert_success
+    assert_output "0.55.0"
 }
 
-@test "menv: is executable" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    [ -x "$MORLOC_BIN/menv" ]
+@test "active_scope: defaults to local" {
+    mkdir -p "$(config_root)"
+    printf '' > "$(config_root)/config"
+    run active_scope
+    assert_success
+    assert_output "local"
 }
 
-@test "menv: has --dev flag handler" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "--dev"
+@test "active_scope: reads system when set" {
+    setup_version_config "0.55.0" "local"
+    write_config "active_scope" "system" "$(config_root)/config"
+    run active_scope
+    assert_success
+    assert_output "system"
 }
 
-@test "menv: has --shell flag handler" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "--shell"
+# --- resolve_version ---
+
+@test "resolve_version: finds local version" {
+    mkdir -p "$(data_root)/versions/0.55.0"
+    run resolve_version "0.55.0"
+    assert_success
+    assert_output "local"
 }
 
-@test "menv: passes through arguments" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" '"$@"'
+@test "resolve_version: fails for missing version" {
+    run resolve_version "0.99.0"
+    assert_failure
 }
 
-@test "menv: uses docker run directly (no compose)" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "run --rm"
-    assert_file_not_contains "$MORLOC_BIN/menv" "compose"
-    assert_file_not_contains "$MORLOC_BIN/menv" "docker-compose"
+# --- list_versions ---
+
+@test "list_versions: lists local versions" {
+    mkdir -p "$(data_root)/versions/0.55.0"
+    mkdir -p "$(data_root)/versions/0.54.0"
+    run list_versions --local
+    assert_success
+    assert_output --partial "0.55.0"
+    assert_output --partial "0.54.0"
 }
 
-@test "menv: has --rm flag" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "--rm"
+@test "list_versions: excludes local version keyword" {
+    mkdir -p "$(data_root)/versions/local"
+    mkdir -p "$(data_root)/versions/0.55.0"
+    run list_versions --local
+    assert_success
+    assert_output --partial "0.55.0"
+    # The output has "0.55.0\tlocal" where "local" is the scope, not the version.
+    # Verify the "local" VERSION directory is not listed as a version name.
+    # Each line is "version\tscope", so check no line starts with "local\t"
+    refute_output --regexp "^local	"
 }
 
-@test "menv: has --shm-size flag" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "--shm-size"
+# --- version_config_root / version_data_root ---
+
+@test "version_config_root: returns correct path for local" {
+    run version_config_root "0.55.0" "local"
+    assert_success
+    assert_output "$HOME/.config/morloc/versions/0.55.0"
 }
 
-@test "menv: sources .env file" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" ".env"
+@test "version_config_root: returns correct path for system" {
+    run version_config_root "0.55.0" "system"
+    assert_success
+    assert_output "/etc/morloc/versions/0.55.0"
 }
 
-@test "menv: sets MORLOC_WORK_DIR to PWD" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" 'MORLOC_WORK_DIR="$PWD"'
+@test "version_data_root: returns correct path for local" {
+    run version_data_root "0.55.0" "local"
+    assert_success
+    assert_output "$HOME/.local/share/morloc/versions/0.55.0"
 }
 
-@test "menv: shell mode runs /bin/bash" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "/bin/bash"
+# --- read_flags_file ---
+
+@test "read_flags_file: strips comments and blank lines" {
+    local flagsfile="$HOME/test.flags"
+    printf '# comment\n--gpus all\n\n-v /data:/data\n# another comment\n' > "$flagsfile"
+    run read_flags_file "$flagsfile"
+    assert_success
+    assert_line --index 0 "--gpus all"
+    assert_line --index 1 "-v /data:/data"
 }
 
-@test "menv: creates dev directories when --dev" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "mkdir -p"
+@test "read_flags_file: returns nothing for missing file" {
+    run read_flags_file "$HOME/nonexistent.flags"
+    assert_success
+    assert_output ""
 }
 
-@test "menv: reads global morloc.flags" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "morloc.flags"
-}
+# --- write_version_config full flow ---
 
-@test "menv: reads MORLOC_ENV_FLAGS" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "MORLOC_ENV_FLAGS"
-}
+@test "write_version_config: creates full config structure" {
+    write_version_config "0.58.3" "local"
 
-@test "menv: has read_flags function" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "read_flags"
-}
+    # User config
+    assert_file_exists "$(config_root)/config"
+    assert_file_contains "$(config_root)/config" "active_version=0.58.3"
+    assert_file_contains "$(config_root)/config" "active_scope=local"
+    assert_file_contains "$(config_root)/config" "active_env=base"
 
-@test "menv: has -h/--help handler" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "show_menv_help"
-    assert_file_contains "$MORLOC_BIN/menv" -- "--help"
-}
+    # Version config
+    local vcfg="$(config_root)/versions/0.58.3/config"
+    assert_file_exists "$vcfg"
+    assert_file_contains "$vcfg" "image=ghcr.io/morloc-project/morloc/morloc-full:0.58.3"
+    assert_file_contains "$vcfg" "dev_image=ghcr.io/morloc-project/morloc/morloc-test:latest"
 
-@test "menv: has -v/--version handler" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "show_menv_version"
-    assert_file_contains "$MORLOC_BIN/menv" -- "--version"
-}
-
-@test "menv: help text includes usage examples" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "morloc make"
-    assert_file_contains "$MORLOC_BIN/menv" "stack build"
-}
-
-@test "menv: embeds morloc-manager version" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "MENV_MANAGER_VERSION="
-}
-
-@test "menv: embeds generation date" {
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" "MENV_GENERATED="
-}
-
-@test "menv: has SELinux suffix when detected" {
-    SELINUX_SUFFIX=":z"
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_contains "$MORLOC_BIN/menv" ':z'
-}
-
-@test "menv: no SELinux suffix when not detected" {
-    SELINUX_SUFFIX=""
-    generate_menv_script "$MORLOC_BIN/menv"
-    assert_file_not_contains "$MORLOC_BIN/menv" ':z'
+    # Base environment
+    local base="$(config_root)/versions/0.58.3/environments/base.conf"
+    assert_file_exists "$base"
+    assert_file_contains "$base" "image=ghcr.io/morloc-project/morloc/morloc-full:0.58.3"
 }

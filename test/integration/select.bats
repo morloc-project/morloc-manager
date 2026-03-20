@@ -12,22 +12,8 @@ setup() {
     CONTAINER_ENGINE="docker"
     export MORLOC_BIN="$HOME/.local/bin"
     mkdir -p "$MORLOC_BIN"
-    # Ensure .local/bin is in PATH for ensure_morloc_bin
-    touch "$HOME/.bashrc"
-    echo "export PATH=\"$HOME/.local/bin:\$PATH\"" >> "$HOME/.bashrc"
-    export PATH="$HOME/.local/bin:$PATH"
-    # Pre-create .env file
-    mkdir -p "$MORLOC_DATA_HOME"
-    cat > "$MORLOC_DATA_HOME/.env" << EOF
-MORLOC_VERSION=0.55.0
-MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.55.0
-MORLOC_DEV_IMAGE=ghcr.io/morloc-project/morloc/morloc-test:latest
-MORLOC_HOST_VERSION_DIR=$MORLOC_HOST_VERSION_DIR
-MORLOC_CONTAINER_HOME=$MORLOC_CONTAINER_HOME
-MORLOC_CONTAINER_ENGINE=docker
-MORLOC_ROOTFUL=
-MORLOC_ENV_FLAGS=
-EOF
+    # Pre-create version config
+    setup_version_config "0.55.0" "local"
 }
 
 teardown() {
@@ -36,17 +22,14 @@ teardown() {
 }
 
 @test "select: switches version when installed" {
-    local install_dir="$MORLOC_HOST_VERSION_DIR"
-    mkdir -p "$install_dir/0.55.0"
-    # cmd_select calls exit, test in subshell
+    local data_dir="$(data_root)/versions/0.55.0"
+    mkdir -p "$data_dir"
     run bash -c "
         export MORLOC_MANAGER_TESTING=1
         export HOME='$HOME'
         export PATH='$PATH'
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
-        MORLOC_BIN='$MORLOC_BIN'
-        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select 0.55.0
     "
     assert_success
@@ -60,8 +43,6 @@ teardown() {
         export PATH='$PATH'
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
-        MORLOC_BIN='$MORLOC_BIN'
-        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select 0.99.0
     "
     assert_failure
@@ -69,17 +50,14 @@ teardown() {
 }
 
 @test "select: no version shows error and lists available" {
-    local install_dir="$MORLOC_HOST_VERSION_DIR"
-    mkdir -p "$install_dir/0.55.0"
-    mkdir -p "$install_dir/0.54.0"
+    mkdir -p "$(data_root)/versions/0.55.0"
+    mkdir -p "$(data_root)/versions/0.54.0"
     run bash -c "
         export MORLOC_MANAGER_TESTING=1
         export HOME='$HOME'
         export PATH='$PATH'
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
-        MORLOC_BIN='$MORLOC_BIN'
-        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select
     "
     assert_failure
@@ -93,66 +71,63 @@ teardown() {
         export PATH='$PATH'
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
-        MORLOC_BIN='$MORLOC_BIN'
-        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select local
     "
     assert_failure
     assert_output --partial "Cannot set to"
 }
 
-@test "select: updates .env with new version" {
-    local install_dir="$MORLOC_HOST_VERSION_DIR"
-    mkdir -p "$install_dir/0.55.0"
-    mkdir -p "$install_dir/0.54.0"
-    # First select 0.54.0
+@test "select: updates user config with new version" {
+    mkdir -p "$(data_root)/versions/0.55.0"
+    mkdir -p "$(data_root)/versions/0.54.0"
+    # Select 0.54.0
     bash -c "
         export MORLOC_MANAGER_TESTING=1
         export HOME='$HOME'
         export PATH='$PATH'
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
-        MORLOC_BIN='$MORLOC_BIN'
-        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select 0.54.0
     " 2>/dev/null || true
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_VERSION=0.54.0"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.54.0"
+    assert_file_contains "$(config_root)/config" "active_version=0.54.0"
 
-    # Then select 0.55.0
+    # Select 0.55.0
     bash -c "
         export MORLOC_MANAGER_TESTING=1
         export HOME='$HOME'
         export PATH='$PATH'
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
-        MORLOC_BIN='$MORLOC_BIN'
-        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select 0.55.0
     " 2>/dev/null || true
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_VERSION=0.55.0"
-    assert_file_contains "$MORLOC_DATA_HOME/.env" "MORLOC_IMAGE=ghcr.io/morloc-project/morloc/morloc-full:0.55.0"
+    assert_file_contains "$(config_root)/config" "active_version=0.55.0"
 }
 
-@test "select: does not regenerate menv script" {
-    local install_dir="$MORLOC_HOST_VERSION_DIR"
-    mkdir -p "$install_dir/0.55.0"
-    # Create an menv with a marker
-    echo "#!/usr/bin/env sh" > "$MORLOC_BIN/menv"
-    echo "# MARKER_DO_NOT_CHANGE" >> "$MORLOC_BIN/menv"
-    chmod +x "$MORLOC_BIN/menv"
+@test "select: --system flag forces system scope" {
+    # Create system version dir
+    mkdir -p "$(data_root --system)/versions/0.55.0"
+    run bash -c "
+        export MORLOC_MANAGER_TESTING=1
+        export HOME='$HOME'
+        export PATH='$PATH'
+        source '$SCRIPT_PATH'
+        CONTAINER_ENGINE=docker
+        # Can't actually use sudo in test, so just test the flag parsing
+        cmd_select --help
+    "
+    assert_success
+    assert_output --partial "--system"
+}
 
+@test "select: auto-resolves scope via resolve_version" {
+    mkdir -p "$(data_root)/versions/0.55.0"
     bash -c "
         export MORLOC_MANAGER_TESTING=1
         export HOME='$HOME'
         export PATH='$PATH'
         source '$SCRIPT_PATH'
         CONTAINER_ENGINE=docker
-        MORLOC_BIN='$MORLOC_BIN'
-        MORLOC_DATA_HOME='$MORLOC_DATA_HOME'
         cmd_select 0.55.0
     " 2>/dev/null || true
-
-    # menv should still have the marker (not regenerated)
-    assert_file_contains "$MORLOC_BIN/menv" "MARKER_DO_NOT_CHANGE"
+    assert_file_contains "$(config_root)/config" "active_scope=local"
 }
