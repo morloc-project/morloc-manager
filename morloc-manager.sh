@@ -9,7 +9,6 @@ VERSION="0.9.0"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
-CONTAINER_ENGINE_EXPLICIT=""
 
 SHARED_MEMORY_SIZE=4g
 
@@ -21,7 +20,6 @@ THIS_SCRIPT_URL="https://raw.githubusercontent.com/morloc-project/morloc-manager
 
 if [ -n "${MORLOC_CONTAINER_ENGINE:-}" ]; then
     CONTAINER_ENGINE="$MORLOC_CONTAINER_ENGINE"
-    CONTAINER_ENGINE_EXPLICIT="1"
     CONTAINER_ENGINE_VERSION=$($CONTAINER_ENGINE --version 2>/dev/null | sed 's/.*version \([0-9.]*\).*/\1/')
 elif command -v podman >/dev/null 2>&1; then
     CONTAINER_ENGINE_VERSION=$(podman --version 2>/dev/null | sed 's/.* //')
@@ -40,7 +38,6 @@ set_container_engine() {
         exit 1
     fi
     CONTAINER_ENGINE="$1"
-    CONTAINER_ENGINE_EXPLICIT="1"
     CONTAINER_ENGINE_VERSION=$($CONTAINER_ENGINE --version 2>/dev/null | sed 's/.*version \([0-9.]*\).*/\1/')
 }
 
@@ -451,6 +448,7 @@ write_version_config() {
     write_config "image" "${CONTAINER_BASE_FULL}:${_wvc_ver}" "$_wvc_cfg" $_wvc_sudo
     write_config "dev_image" "${CONTAINER_BASE_TEST}:latest" "$_wvc_cfg" $_wvc_sudo
     write_config "host_dir" "$_wvc_datadir" "$_wvc_cfg" $_wvc_sudo
+    write_config "container_engine" "$CONTAINER_ENGINE" "$_wvc_cfg" $_wvc_sudo
 
     # Create base.conf environment if it doesn't exist
     _wvc_base="$_wvc_cfgdir/environments/base.conf"
@@ -467,7 +465,6 @@ write_version_config() {
     write_config "active_version" "$_wvc_ver" "$_wvc_user_cfg"
     write_config "active_scope" "$_wvc_scope" "$_wvc_user_cfg"
     write_config "active_env" "base" "$_wvc_user_cfg"
-    write_config "container_engine" "$CONTAINER_ENGINE" "$_wvc_user_cfg"
 
     print_success "Wrote version config for $_wvc_ver ($_wvc_scope)"
 }
@@ -681,13 +678,9 @@ cmd_run() {
         [ -n "$_cr_env_image" ] && _cr_image="$_cr_env_image"
     fi
 
-    # Read container engine: CLI flag > config > auto-detected
-    if [ -n "$CONTAINER_ENGINE_EXPLICIT" ]; then
-        _cr_engine="$CONTAINER_ENGINE"
-    else
-        _cr_engine=$(read_config "container_engine" "$_cr_user_cfg")
-        [ -z "$_cr_engine" ] && _cr_engine="$CONTAINER_ENGINE"
-    fi
+    # Read container engine: CLI flag > version config > auto-detected
+    _cr_engine=$(read_config "container_engine" "$_cr_vcfg/config")
+    [ -z "$_cr_engine" ] && _cr_engine="$CONTAINER_ENGINE"
 
     # Determine container home — use invoking user's home, not root's
     _cr_container_home="$_cr_real_home"
@@ -1516,9 +1509,16 @@ cmd_info() {
     _info_version=$(active_version)
     _info_scope=$(active_scope)
     _info_env=$(read_config "active_env")
-    _info_engine=$(read_config "container_engine")
     [ -z "$_info_version" ] && _info_version="none"
     [ -z "$_info_env" ] && _info_env="base"
+
+    # Read engine from version config, fall back to auto-detected or "none"
+    if [ "$_info_version" != "none" ]; then
+        _info_vcfg=$(version_config_root "$_info_version" "$_info_scope")
+        _info_engine=$(read_config "container_engine" "$_info_vcfg/config")
+    else
+        _info_engine=""
+    fi
     [ -z "$_info_engine" ] && _info_engine="${CONTAINER_ENGINE:-none}"
 
     # Display scope and SELinux info

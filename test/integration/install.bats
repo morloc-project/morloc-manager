@@ -50,8 +50,8 @@ teardown() {
 
 @test "install: write_version_config records container engine" {
     write_version_config "0.55.0" "local"
-    local ucfg="$(config_root)/config"
-    assert_file_contains "$ucfg" "container_engine=docker"
+    local vcfg="$(version_config_root "0.55.0" "local")/config"
+    assert_file_contains "$vcfg" "container_engine=docker"
 }
 
 @test "install: --no-init flag is parsed correctly" {
@@ -104,8 +104,8 @@ teardown() {
     setup_mock_engine "podman" "4.7.2"
     CONTAINER_ENGINE="podman"
     write_version_config "0.55.0" "local"
-    local ucfg="$(config_root)/config"
-    assert_file_contains "$ucfg" "container_engine=podman"
+    local vcfg="$(version_config_root "0.55.0" "local")/config"
+    assert_file_contains "$vcfg" "container_engine=podman"
 }
 
 @test "install: write_version_config sets active_env to base" {
