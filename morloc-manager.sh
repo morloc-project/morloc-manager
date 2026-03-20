@@ -5,7 +5,7 @@
 # {{{ constants and system info
 
 PROGRAM_NAME="morloc-manager"
-VERSION="0.9.0"
+VERSION="0.10.0-1"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
