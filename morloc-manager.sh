@@ -5,7 +5,7 @@
 # {{{ constants and system info
 
 PROGRAM_NAME="morloc-manager"
-VERSION="0.10.0-1"
+VERSION="0.10.0-2"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
@@ -712,7 +712,7 @@ cmd_run() {
         fi
 
         # Dev container uses /home/dev as HOME so files are writable by
-        # the host user. ghcup stays at /root/.ghcup/bin (read-only via PATH).
+        # the host user. ghcup stays at /opt/.ghcup/bin (read-only via PATH).
         _cr_dev_home="/home/dev"
 
         _cr_mk=""
@@ -720,12 +720,19 @@ cmd_run() {
         ${_cr_mk}mkdir -p "$_cr_versions_dir/${LOCAL_VERSION}/home/.local/bin"
         ${_cr_mk}mkdir -p "$_cr_versions_dir/${LOCAL_VERSION}/home/.stack"
 
+        # Fix ownership if a previous Docker/Podman run created these as root
+        _cr_stack_dir="$_cr_versions_dir/${LOCAL_VERSION}/home/.stack"
+        if [ -d "$_cr_stack_dir" ] && [ ! -w "$_cr_stack_dir" ]; then
+            print_info "Fixing ownership of $_cr_stack_dir"
+            sudo chown -R "${_cr_uid}:${_cr_gid}" "$_cr_versions_dir/${LOCAL_VERSION}/home"
+        fi
+
         _cr_flags="--user ${_cr_uid}:${_cr_gid}"
         _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${LOCAL_VERSION}:${_cr_dev_home}/.local/share/morloc${_cr_z}"
         _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${LOCAL_VERSION}/home/.local/bin:${_cr_dev_home}/.local/bin${_cr_z}"
         _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${LOCAL_VERSION}/home/.stack:${_cr_dev_home}/.stack${_cr_z}"
         _cr_flags="$_cr_flags -e HOME=${_cr_dev_home}"
-        _cr_flags="$_cr_flags -e PATH=/root/.ghcup/bin:${_cr_dev_home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        _cr_flags="$_cr_flags -e PATH=/opt/.ghcup/bin:${_cr_dev_home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
         # Override container_home for work dir mount below
         _cr_container_home="$_cr_dev_home"
