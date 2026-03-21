@@ -822,6 +822,7 @@ ${BOLD}OPTIONS${RESET}:
 ${BOLD}COMMANDS${RESET}:
   ${BOLD}${GREEN}install${RESET}    Install morloc containers and home
   ${BOLD}${GREEN}uninstall${RESET}  Remove morloc containers and home
+  ${BOLD}${GREEN}clean${RESET}      Remove build artifacts (keeps containers)
   ${BOLD}${GREEN}update${RESET}     Pull the latest version of this script
   ${BOLD}${GREEN}select${RESET}     Choose a new Morloc version
   ${BOLD}${GREEN}run${RESET}        Run a command inside the morloc container
@@ -1264,6 +1265,148 @@ cmd_uninstall() {
     fi
 
     print_success "Removed containers and Morloc home, scripts remain"
+}
+
+# }}}
+# {{{ clean subcommand
+
+show_clean_help() {
+    cat << EOF
+${BOLD}USAGE${RESET}: $(basename "$0") clean [OPTIONS] [VERSION]
+
+Remove build artifacts without removing container images.
+
+${BOLD}OPTIONS${RESET}:
+  -h, --help     Show this help message
+      --dev      Clean dev container cache (GHC, stack build cache)
+      --all      Clean all version data and dev cache
+      --system   Target system scope
+      --dry-run  List what would be deleted without deleting
+
+${BOLD}ARGUMENTS${RESET}:
+  VERSION        Clean runtime artifacts for a specific version
+
+${BOLD}EXAMPLES${RESET}:
+  $(basename "$0") clean --dev              Remove stack/GHC cache
+  $(basename "$0") clean --dev --dry-run    Show what --dev would remove
+  $(basename "$0") clean 0.55.0            Remove runtime data for 0.55.0
+  $(basename "$0") clean --all             Remove all version data + dev cache
+EOF
+}
+
+cmd_clean() {
+    _cl_scope="local"
+    _cl_dry_run=""
+    _cl_dev=""
+    _cl_all=""
+    _cl_version=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                show_clean_help
+                exit 0
+                ;;
+            --system)
+                _cl_scope="system"
+                SUDO_PREFIX="sudo "
+                shift
+                ;;
+            --dev)
+                _cl_dev=1
+                shift
+                ;;
+            --all)
+                _cl_all=1
+                shift
+                ;;
+            --dry-run)
+                _cl_dry_run=1
+                shift
+                ;;
+            -*)
+                print_error "Unknown option for clean: $1"
+                show_clean_help
+                exit 1
+                ;;
+            *)
+                if [ -n "$_cl_version" ]; then
+                    print_error "Multiple versions not supported; use --all to clean everything"
+                    exit 1
+                fi
+                _cl_version="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [ -z "$_cl_dev" ] && [ -z "$_cl_all" ] && [ -z "$_cl_version" ]; then
+        print_error "Specify --dev, --all, or a VERSION to clean"
+        show_clean_help
+        exit 1
+    fi
+
+    _cl_scope_flag=""
+    [ "$_cl_scope" = "system" ] && _cl_scope_flag="--system"
+    _cl_versions_dir="$(data_root $_cl_scope_flag)/versions"
+
+    # Helper: remove a path (or print it in dry-run mode)
+    _clean_remove() {
+        if [ ! -e "$1" ]; then
+            return
+        fi
+        if [ -n "$_cl_dry_run" ]; then
+            _sz=$(du -sh "$1" 2>/dev/null | cut -f1)
+            print_info "[dry-run] would remove: $1 ($_sz)"
+        else
+            $SUDO_PREFIX rm -rf "$1"
+            print_success "Removed $1"
+        fi
+    }
+
+    # --dev: clean stack/GHC cache
+    if [ -n "$_cl_dev" ] || [ -n "$_cl_all" ]; then
+        _cl_dev_home="$_cl_versions_dir/${LOCAL_VERSION}/home"
+        if [ -d "$_cl_dev_home" ]; then
+            _clean_remove "$_cl_dev_home/.stack"
+            _clean_remove "$_cl_dev_home/.local/bin"
+            if [ -z "$_cl_dry_run" ]; then
+                $SUDO_PREFIX mkdir -p "$_cl_dev_home/.stack"
+                $SUDO_PREFIX mkdir -p "$_cl_dev_home/.local/bin"
+                print_info "Recreated empty dev cache directories"
+            fi
+        else
+            print_info "No dev cache found at $_cl_dev_home"
+        fi
+    fi
+
+    # --all: clean every version data directory
+    if [ -n "$_cl_all" ]; then
+        if [ -d "$_cl_versions_dir" ]; then
+            for _cl_d in "$_cl_versions_dir"/*/; do
+                # Skip the local/ dir (already handled by --dev above)
+                case "$_cl_d" in
+                    */"${LOCAL_VERSION}"/) continue ;;
+                esac
+                [ -d "$_cl_d" ] && _clean_remove "$_cl_d"
+            done
+        else
+            print_info "No versions directory found at $_cl_versions_dir"
+        fi
+        if [ -z "$_cl_dry_run" ]; then
+            print_success "All version data cleaned"
+        fi
+    fi
+
+    # VERSION: clean a specific version's data
+    if [ -n "$_cl_version" ]; then
+        _cl_vdata=$(version_data_root "$_cl_version" "$_cl_scope")
+        if [ -d "$_cl_vdata" ]; then
+            _clean_remove "$_cl_vdata"
+        else
+            print_warning "No data found for version $_cl_version at $_cl_vdata"
+        fi
+    fi
 }
 
 # }}}
@@ -1948,6 +2091,7 @@ main() {
     case "${1:-}" in
         install)   shift; cmd_install "$@" ;;
         uninstall) shift; cmd_uninstall "$@" ;;
+        clean)     shift; cmd_clean "$@" ;;
         update)    shift; cmd_update "$@" ;;
         select)    shift; cmd_select "$@" ;;
         run)       shift; cmd_run "$@" ;;
