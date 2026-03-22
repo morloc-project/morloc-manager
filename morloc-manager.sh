@@ -566,9 +566,11 @@ build_environment() {
             image_created=$($SUDO_PREFIX$CONTAINER_ENGINE image inspect "$envtag" --format '{{.Created}}' 2>/dev/null)
 
             # Convert image created time to Unix timestamp
-            # This is portable across docker and podman
+            # Strip nanoseconds and timezone offset for portable parsing
+            # (podman emits full RFC 3339 with nanos, e.g. 2026-03-22T19:48:56.123456789+00:00)
+            _be_created_norm=$(printf '%s' "$image_created" | sed 's/\.[0-9]*//' | sed 's/[+-][0-9:]*$//')
             if command -v date >/dev/null 2>&1; then
-                image_timestamp=$(date -d "$image_created" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "$image_created" +%s 2>/dev/null)
+                image_timestamp=$(date -d "$_be_created_norm" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "$_be_created_norm" +%s 2>/dev/null)
             fi
 
             # Compare timestamps - rebuild if Dockerfile is newer
@@ -752,8 +754,21 @@ cmd_run() {
         morloc) [ "${2:-}" = "init" ] && _cr_need_workdir=false ;;
     esac
     if $_cr_need_workdir; then
-        _cr_flags="$_cr_flags -v ${MORLOC_WORK_DIR}:${_cr_container_home}/work${_cr_z}"
-        _cr_workdir="${_cr_container_home}/work"
+        # SELinux prevents relabeling system directories like /tmp
+        if [ -n "$_cr_z" ]; then
+            case "$MORLOC_WORK_DIR" in
+                /tmp/*|/tmp|/var/tmp/*|/var/tmp)
+                    print_error "Cannot bind-mount '$MORLOC_WORK_DIR': SELinux prevents relabeling system directories."
+                    print_info "Move your project to a non-system directory (e.g. ~/project/) and retry."
+                    exit 1
+                    ;;
+            esac
+        fi
+        if [ "$MORLOC_WORK_DIR" = "$_cr_real_home" ]; then
+            print_warning "Running from home directory: only morloc-specific subdirs (.local/share/morloc, .local/bin) are mounted inside the container."
+        fi
+        _cr_flags="$_cr_flags -v ${MORLOC_WORK_DIR}:${MORLOC_WORK_DIR}${_cr_z}"
+        _cr_workdir="${MORLOC_WORK_DIR}"
     else
         _cr_workdir="${_cr_container_home}"
     fi
@@ -790,10 +805,27 @@ cmd_run() {
 
     # Execute
     if [ -n "$_cr_shell" ]; then
+        if ! [ -t 0 ] || ! [ -t 1 ]; then
+            print_error "--shell requires an interactive terminal (TTY)."
+            print_info "If connecting over SSH, use: ssh -t <host> morloc-manager run --shell"
+            exit 1
+        fi
+        if [ "${_MORLOC_NO_EXEC:-}" = "1" ]; then
+            # shellcheck disable=SC2086
+            $_cr_sudo "$_cr_engine" run --rm -it --shm-size ${SHARED_MEMORY_SIZE} -w "$_cr_workdir" \
+                $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" /bin/bash
+            return $?
+        fi
         # shellcheck disable=SC2086
         exec $_cr_sudo "$_cr_engine" run --rm -it --shm-size ${SHARED_MEMORY_SIZE} -w "$_cr_workdir" \
             $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" /bin/bash
     else
+        if [ "${_MORLOC_NO_EXEC:-}" = "1" ]; then
+            # shellcheck disable=SC2086
+            $_cr_sudo "$_cr_engine" run --rm --shm-size ${SHARED_MEMORY_SIZE} -w "$_cr_workdir" \
+                $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" "$@"
+            return $?
+        fi
         # shellcheck disable=SC2086
         exec $_cr_sudo "$_cr_engine" run --rm --shm-size ${SHARED_MEMORY_SIZE} -w "$_cr_workdir" \
             $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" "$@"
@@ -868,6 +900,26 @@ ${BOLD}EXAMPLES${RESET}:
 EOF
 }
 
+# Pull an image if not already present in the engine's store
+_pull_if_missing() {
+    _pim_image="$1"
+    _pim_label="$2"
+    if $SUDO_PREFIX$CONTAINER_ENGINE image inspect "$_pim_image" >/dev/null 2>&1; then
+        print_info "Image '$_pim_image' already present, skipping pull"
+        return 0
+    fi
+    $SUDO_PREFIX$CONTAINER_ENGINE pull "$_pim_image"
+    _pim_rc=$?
+    if [ $_pim_rc -ne 0 ]; then
+        print_error "Failed to pull container '$_pim_label'"
+        echo "  Are you sure this Morloc version is defined?"
+        echo "  If you are behind a corporate firewall or proxy, configure your container engine:"
+        echo "    docker: set HTTPS_PROXY environment variable"
+        echo "    podman: set HTTPS_PROXY or configure in /etc/containers/registries.conf"
+        return 1
+    fi
+}
+
 # Install subcommand
 cmd_install() {
     # calling these "undefined" instead of empty strings for better debugging
@@ -910,7 +962,7 @@ cmd_install() {
     done
 
     if [ "$version" = "undefined" ]; then
-        print_info "Installing latest Morloc version"
+        print_info "Detecting latest stable version..."
         tag="edge"
     else
         print_info "Installing Morloc v$version"
@@ -944,27 +996,9 @@ cmd_install() {
         print_info "Attempting to pull containers for Morloc version $version"
     fi
 
-    # Pull an image if not already present in the engine's store
-    _pull_if_missing() {
-        _pim_image="$1"
-        _pim_label="$2"
-        if $SUDO_PREFIX$CONTAINER_ENGINE image inspect "$_pim_image" >/dev/null 2>&1; then
-            print_info "Image '$_pim_image' already present, skipping pull"
-            return 0
-        fi
-        if ! $SUDO_PREFIX$CONTAINER_ENGINE pull "$_pim_image"; then
-            print_error "Failed to pull container '$_pim_label'"
-            echo "  Are you sure this Morloc version is defined?"
-            echo "  If you are behind a corporate firewall or proxy, configure your container engine:"
-            echo "    docker: set HTTPS_PROXY environment variable"
-            echo "    podman: set HTTPS_PROXY or configure in /etc/containers/registries.conf"
-            exit 1
-        fi
-    }
-
-    _pull_if_missing "$CONTAINER_BASE_TINY:${tag}" "tiny"
-    _pull_if_missing "$CONTAINER_BASE_FULL:${tag}" "full"
-    _pull_if_missing "$CONTAINER_BASE_TEST:latest" "dev"
+    _pull_if_missing "$CONTAINER_BASE_TINY:${tag}" "tiny" || exit 1
+    _pull_if_missing "$CONTAINER_BASE_FULL:${tag}" "full" || exit 1
+    _pull_if_missing "$CONTAINER_BASE_TEST:latest" "dev" || exit 1
 
     # get Morloc version from container
     # filter out the carriage return that podman helpfully provided
@@ -1027,7 +1061,7 @@ cmd_install() {
 
     if [ "$no_init" = "false" ]; then
       print_info "Initializing morloc libraries"
-      cmd_run morloc init -f
+      _MORLOC_NO_EXEC=1 cmd_run morloc init -f
       if [ $? -ne 0 ]
       then
           print_error "Failed to build morloc libraries"
@@ -1341,9 +1375,13 @@ cmd_clean() {
     done
 
     if [ -z "$_cl_dev" ] && [ -z "$_cl_all" ] && [ -z "$_cl_version" ]; then
-        print_error "Specify --dev, --all, or a VERSION to clean"
-        show_clean_help
-        exit 1
+        if [ -n "$_cl_dry_run" ]; then
+            _cl_all=1
+        else
+            print_error "Specify --dev, --all, or a VERSION to clean"
+            show_clean_help
+            exit 1
+        fi
     fi
 
     _cl_scope_flag=""
@@ -1932,6 +1970,8 @@ EOF
 
 # Help for env subcommand
 show_env_help() {
+    _eh_dep_display=$(printf '%s' "$MORLOC_DEPENDENCY_DIR" | sed "s|^$HOME|~|")
+    _eh_data_display=$(printf '%s' "$MORLOC_DATA_HOME" | sed "s|^$HOME|~|")
     cat << EOF
 ${BOLD}USAGE${RESET}: $(basename "$0") env [OPTIONS] [ENV]
 
@@ -1939,11 +1979,11 @@ Select an environment. An environment is a Dockerfile that builds on a
 version-specific morloc image, plus a .flags file with extra docker/podman
 flags (volumes, ports, GPUs, etc.).
 
-Files live in ${MORLOC_DEPENDENCY_DIR}:
+Files live in ${_eh_dep_display}:
   <name>.Dockerfile   What is inside the container (packages)
   <name>.flags        How the container connects to the host (volumes, ports, etc.)
 
-A global ${MORLOC_DATA_HOME}/morloc.flags applies to ALL runs. At runtime,
+A global ${_eh_data_display}/morloc.flags applies to ALL runs. At runtime,
 global flags are applied first, then environment flags appended.
 
 ${BOLD}OPTIONS${RESET}:

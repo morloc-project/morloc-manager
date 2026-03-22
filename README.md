@@ -7,10 +7,7 @@ Handle Morloc installation, version management, and custom environments.
 
 ## Prerequisites
 
-You need a container engine with Compose support:
-
- * [Docker](https://docs.docker.com/engine/install/) (v2 plugin — `docker compose` — is included in modern Docker Desktop and Engine installs)
- * [Podman](https://podman.io/docs/installation) with `podman compose` or standalone `podman-compose`
+You need a container engine: [Docker](https://docs.docker.com/engine/install/) (v20+) or [Podman](https://podman.io/docs/installation) (v3+). No Compose plugin is required.
 
 The manager auto-detects whichever is available. You can override the choice with `--container-engine` or the `MORLOC_CONTAINER_ENGINE` environment variable.
 
