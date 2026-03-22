@@ -32,7 +32,7 @@ Vagrant.configure("2") do |config|
   end
 
   config.vm.synced_folder ".", "/vagrant", type: "rsync",
-    rsync__exclude: [".git/", "test/lib/bats/.git/", "test/lib/bats-*/.git/"]
+    rsync__exclude: [".git/", "findings/"]
 
   # ---------- Fedora 40 ----------
   # Primary: SELinux enforcing, cgroup v2
@@ -52,13 +52,6 @@ Vagrant.configure("2") do |config|
 
       # Dev tools
       dnf install -y git ShellCheck
-
-      # Install BATS from submodule
-      if [ -x /vagrant/test/lib/bats/install.sh ]; then
-        bash /vagrant/test/lib/bats/install.sh /usr/local
-      else
-        dnf install -y bats
-      fi
 
       # Create testuser for rootless testing
       if ! id testuser &>/dev/null; then
@@ -118,11 +111,6 @@ Vagrant.configure("2") do |config|
 
       # Dev tools
       apt-get install -y git shellcheck
-
-      # Install BATS from submodule
-      if [ -x /vagrant/test/lib/bats/install.sh ]; then
-        bash /vagrant/test/lib/bats/install.sh /usr/local
-      fi
 
       # Create testuser for rootless testing
       if ! id testuser &>/dev/null; then
@@ -184,11 +172,6 @@ Vagrant.configure("2") do |config|
 
       # Dev tools
       apt-get install -y git shellcheck
-
-      # Install BATS from submodule
-      if [ -x /vagrant/test/lib/bats/install.sh ]; then
-        bash /vagrant/test/lib/bats/install.sh /usr/local
-      fi
 
       # Create testuser for rootless testing
       if ! id testuser &>/dev/null; then

@@ -45,20 +45,33 @@ morloc-manager install          # latest version
 morloc-manager install 0.58.3   # specific version
 ```
 
-This pulls the container images, generates a Docker Compose configuration, and
-creates the `menv` wrapper script in `~/.local/bin/`.
+This pulls the container images and sets up the local configuration.
 
 
 ## Usage
 
-`menv` is the single command for running anything inside the Morloc container.
-Your current working directory is automatically mounted into the container.
+`morloc-manager run` executes commands within the morloc container.
 
 ### Compile and run a program
 
+Given the morloc program:
+
+```morloc
+module foo (double)
+
+import root-py
+
+double :: Int -> Int
+double x = 2 * x
+```
+
+You can install the required module with
+
 ```sh
-menv morloc make -o foo foo.loc
-menv ./foo double 21              # output: 42
+morloc-manager run -- morloc install root-py
+morloc-manager run -- morloc make foo.loc
+morloc-manager run -- ./foo -h              # view usage statement
+morloc-manager run -- ./foo 21              # output: 42
 ```
 
 ### Interactive shell
@@ -67,7 +80,7 @@ Drop into a container shell with the full Morloc toolchain. Including language
 support for Python, R, C++ as well niceties like vim
 
 ```sh
-menv --shell
+morloc-manager run --shell
 ```
 
 ### Compiler development
@@ -75,9 +88,9 @@ menv --shell
 The dev container includes Haskell tools for building the compiler from source:
 
 ```sh
-menv --dev stack build            # build the compiler
-menv --dev stack test             # run the test suite
-menv --dev --shell                # interactive dev shell
+morloc-manager run --dev -- stack build     # build the compiler
+morloc-manager run --dev -- stack test      # run the test suite
+morloc-manager run --dev --shell            # interactive dev shell
 ```
 
 ### Switching versions
@@ -124,12 +137,12 @@ RUN pip install scikit-learn matplotlib pandas
 morloc-manager env ml
 ```
 
-This builds the custom image (if needed) and updates `.env` so that `menv` uses
-it. All subsequent `menv` calls run inside the custom environment — no flag
+This builds the custom image (if needed) and updates the active environment. All
+subsequent `morloc-manager run` calls use the custom environment — no flag
 changes required:
 
 ```sh
-menv morloc make -o pipeline pipeline.loc   # runs in the ml environment
+morloc-manager run -- morloc make -o pipeline pipeline.loc   # runs in the ml environment
 ```
 
 ### Reset to the base environment
@@ -156,45 +169,26 @@ morloc-manager env ml --usr            # apply only to the user container
 
 ### How it works
 
-The manager generates three files in `~/.local/share/morloc/`:
+The manager uses directory-based structured config under `~/.config/morloc/`
+(local scope) or `/etc/morloc/` (system scope). Key config entries include
+`active_version`, `active_scope`, `active_env`, and `container_engine`.
+Per-version config lives under `versions/<ver>/config` with `image`,
+`dev_image`, and `host_dir`. Custom environments are stored under
+`versions/<ver>/environments/`.
 
-| File | Purpose |
-|---|---|
-| `docker-compose.yml` | Defines two services: `morloc` (user) and `morloc-dev` (compiler development). Regenerated on `install`. |
-| `.env` | Stores the active version, image tags, host paths, and container engine. Edited by `select` and `env` — no script regeneration needed. |
-| `docker-compose.override.yml` | Optional. If you create this file, Compose auto-merges it. The manager never writes, reads, or deletes it. |
+`morloc-manager run` invokes `docker run` / `podman run` directly (no Compose
+required), bind-mounting the version data directory and your current working
+directory into the container.
 
-The `menv` wrapper script reads these files and calls `docker compose run`
-(or `podman compose run`) with the appropriate service.
-
-### Editing `.env` directly
-
-Advanced users can edit `~/.local/share/morloc/.env` to:
-
-| Goal | Variable to change |
-|---|---|
-| Pin a different version | `MORLOC_VERSION` and `MORLOC_IMAGE` |
-| Use a custom image | `MORLOC_IMAGE=my-registry/my-image:tag` |
-| Switch container engine | `MORLOC_CONTAINER_ENGINE=podman` |
-
-### Override file
+### Extra container flags
 
 For changes that go beyond image selection — port mapping, GPU passthrough,
-extra volumes — create `~/.local/share/morloc/docker-compose.override.yml`:
+extra volumes — use the `-x` flag to pass additional arguments to the container
+engine:
 
-```yaml
-services:
-  morloc:
-    ports:
-      - "8080:8080"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
+```sh
+morloc-manager run -x "--gpus all" -- morloc make foo.loc
 ```
-
-Compose merges this automatically with the generated `docker-compose.yml`.
 
 ### Info and diagnostics
 
@@ -215,38 +209,3 @@ morloc-manager uninstall --all    # remove everything
 `uninstall --all` removes version data, compose files, and container images.
 The override file (if any) is preserved with a warning. Scripts in
 `~/.local/bin/` are not removed — the output tells you how to delete them.
-
-
-## Testing
-
-The manager has a test suite that checks everything from individual helper
-functions up through the full new-user installation experience. Tests are
-organized in four tiers:
-
- - **Unit tests** verify that the script's internal functions (shell detection,
-   path management, config file editing, argument parsing) behave correctly in
-   isolation. These run instantly and need nothing beyond Bash.
-
- - **Integration tests** exercise each subcommand (install, uninstall, select,
-   env, update) against a mock container engine, checking that the right
-   directories are created, compose files have the right content, `.env` values
-   are correct, and error cases are handled gracefully.
-
- - **End-to-end tests** run the actual installation workflow with a real
-   Docker or Podman engine, including compiling and running a morloc program
-   inside a container.
-
- - **VM tests** spin up full virtual machines to validate the manager on
-   enterprise Linux configurations (SELinux enforcing, AppArmor, cgroup v1/v2)
-   and to provide a testing environment for rootful container support, which is
-   a major planned feature. Running inside real VMs is the only way to test
-   these kernel-level security and container runtime behaviors.
-
-To run the fast tests locally (no container engine required):
-
-```
-make test
-```
-
-Run `make help` to see all targets, or see [test/README.md](test/README.md)
-for full details on running every tier.

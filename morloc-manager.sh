@@ -702,15 +702,6 @@ cmd_run() {
     if [ -n "$_cr_dev" ]; then
         _cr_use_image="$_cr_dev_image"
 
-        # Resolve the invoking user's UID/GID for --user flag
-        if [ -n "${SUDO_USER:-}" ]; then
-            _cr_uid=$(id -u "$SUDO_USER")
-            _cr_gid=$(id -g "$SUDO_USER")
-        else
-            _cr_uid=$(id -u)
-            _cr_gid=$(id -g)
-        fi
-
         # Dev container uses /home/dev as HOME so files are writable by
         # the host user. ghcup stays at /opt/.ghcup/bin (read-only via PATH).
         _cr_dev_home="/home/dev"
@@ -720,14 +711,23 @@ cmd_run() {
         ${_cr_mk}mkdir -p "$_cr_versions_dir/${LOCAL_VERSION}/home/.local/bin"
         ${_cr_mk}mkdir -p "$_cr_versions_dir/${LOCAL_VERSION}/home/.stack"
 
-        # Fix ownership if a previous Docker/Podman run created these as root
-        _cr_stack_dir="$_cr_versions_dir/${LOCAL_VERSION}/home/.stack"
-        if [ -d "$_cr_stack_dir" ] && [ ! -w "$_cr_stack_dir" ]; then
-            print_info "Fixing ownership of $_cr_stack_dir"
-            sudo chown -R "${_cr_uid}:${_cr_gid}" "$_cr_versions_dir/${LOCAL_VERSION}/home"
+        # Map host UID into the container so bind mounts are writable.
+        # Rootless podman uses user namespaces where --user remaps UIDs
+        # through /etc/subuid, breaking bind mount permissions.
+        # --userns=keep-id preserves the host UID:GID 1:1 instead.
+        # Docker and rootful podman use --user directly.
+        if [ "$_cr_engine" = "podman" ] && [ "$(id -u)" != "0" ]; then
+            _cr_flags="--userns=keep-id"
+        else
+            if [ -n "${SUDO_USER:-}" ]; then
+                _cr_uid=$(id -u "$SUDO_USER")
+                _cr_gid=$(id -g "$SUDO_USER")
+            else
+                _cr_uid=$(id -u)
+                _cr_gid=$(id -g)
+            fi
+            _cr_flags="--user ${_cr_uid}:${_cr_gid}"
         fi
-
-        _cr_flags="--user ${_cr_uid}:${_cr_gid}"
         _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${LOCAL_VERSION}:${_cr_dev_home}/.local/share/morloc${_cr_z}"
         _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${LOCAL_VERSION}/home/.local/bin:${_cr_dev_home}/.local/bin${_cr_z}"
         _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${LOCAL_VERSION}/home/.stack:${_cr_dev_home}/.stack${_cr_z}"
@@ -751,7 +751,7 @@ cmd_run() {
     case "$1" in
         morloc) [ "${2:-}" = "init" ] && _cr_need_workdir=false ;;
     esac
-    if $_cr_need_workdir && [ "$MORLOC_WORK_DIR" != "$_cr_container_home" ]; then
+    if $_cr_need_workdir; then
         _cr_flags="$_cr_flags -v ${MORLOC_WORK_DIR}:${_cr_container_home}/work${_cr_z}"
         _cr_workdir="${_cr_container_home}/work"
     else

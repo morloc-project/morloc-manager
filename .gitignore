@@ -1,3 +1,5 @@
 CLAUDE.md
 TODO
 .vagrant
+.claude/settings.local.json
+findings/
