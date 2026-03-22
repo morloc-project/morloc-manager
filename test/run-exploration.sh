@@ -216,6 +216,8 @@ done
 log "All VMs done. Running analyst agent"
 claude -p "Fold across all bug reports in findings/. Initialize findings/action-plan.md, then process each bug report one at a time: compare it to existing root causes in the action plan, either merge it into an existing root cause or add a new one. The result should be a single consolidated action plan grouped by root cause, not a per-report analysis.
 
+After the action plan is complete, produce a UX report. Glob all usage summaries (findings/*/*/summary.md), fold them into findings/ux-report.md — a consolidated narrative of user experience across personas and VMs.
+
 $ANALYST_CONTEXT" \
     --agent vm-analyst \
     --allowedTools "Read,Write,Glob,Grep" \
@@ -228,3 +230,4 @@ rm -rf "$FINDINGS_DIR/.ssh"
 
 log "Exploration complete. Results in $FINDINGS_DIR/"
 log "Action plan: $FINDINGS_DIR/action-plan.md"
+log "UX report: $FINDINGS_DIR/ux-report.md"

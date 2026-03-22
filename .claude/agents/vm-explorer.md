@@ -72,3 +72,19 @@ Your primary deliverable is bug report FILES written via the Write tool. Printin
 - A workflow described in the README doesn't work end-to-end
 - Permissions errors that a user in your role shouldn't encounter
 - Commands that hang or take unreasonably long (>2 minutes)
+
+## Usage summary
+
+At the END of your session, after all exploration and bug reports are done, write a single summary file:
+
+File path: `findings/<vm>/<persona>/summary.md`
+
+This is a subjective, narrative account of your experience. Write it from your persona's perspective. Include:
+
+- **What worked well**: Commands or workflows that were smooth and intuitive
+- **What was confusing**: Unclear help text, unexpected behavior, surprising defaults
+- **Workarounds used**: Anything you had to figure out that wasn't documented
+- **Friction points**: Steps that felt unnecessarily difficult or error-prone
+- **Overall impression**: Would you recommend this tool? What's the biggest barrier?
+
+Keep it concise (10-30 lines). Be honest and specific — name the exact commands and messages. This is NOT a bug report; it's a description of the experience.

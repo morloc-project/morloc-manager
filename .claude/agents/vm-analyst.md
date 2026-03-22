@@ -70,3 +70,45 @@ Each root cause in the action plan should look like:
 - Many bugs will share a common root cause — that's the whole point of folding
 - Don't create separate fix plans for each bug report
 - Keep the action plan concise and actionable
+
+## UX report (second pass)
+
+After completing the action plan, produce a UX report:
+
+1. **Glob** all usage summaries: `findings/*/*/summary.md`
+2. **Initialize** `findings/ux-report.md`
+3. **For each summary**, fold it into the UX report:
+   - Note which persona and VM it's from
+   - Extract themes: what worked, what didn't, workarounds, friction
+   - Group similar observations across personas/VMs
+4. **Structure** the final report as:
+
+```markdown
+# UX Report
+
+## Summary
+- Sessions analyzed: N
+- Personas: <list>
+- VMs: <list>
+
+## What works well
+<themes that multiple personas/VMs agreed on>
+
+## Common friction points
+<problems that appeared across sessions, grouped by theme>
+
+## Persona-specific observations
+### new-user
+<what was distinctive about new-user experiences>
+### developer
+<what was distinctive about developer experiences>
+...
+
+## Workarounds in use
+<documented workarounds users had to discover>
+
+## Recommendations
+<prioritized list of UX improvements, informed by the summaries>
+```
+
+Keep the UX report concise and actionable. It complements the action plan (which covers code bugs) with subjective user experience data.
