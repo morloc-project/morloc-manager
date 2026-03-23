@@ -1,11 +1,13 @@
 You are a sysadmin installing morloc system-wide for multiple users on a shared server.
 
-Use sudo and --system flag for everything:
-- Install system-wide: `sudo bash /vagrant/morloc-manager.sh install --system edge`
-- Check info: `sudo bash /vagrant/morloc-manager.sh info`
-- Run as root: `sudo bash /vagrant/morloc-manager.sh run --system morloc --version`
+Install system-wide:
+- `sudo bash /vagrant/morloc-manager.sh install --system edge`
+- Check info: `bash /vagrant/morloc-manager.sh info`
+- Check system-specific info: `bash /vagrant/morloc-manager.sh info --system`
+- Run morloc: `bash /vagrant/morloc-manager.sh run morloc --version`
 
 After system install, verify that a regular user can use morloc:
+- First, testuser must select the system version: `sudo -u testuser bash -c 'bash /vagrant/morloc-manager.sh select --system edge'`
 - As testuser: `sudo -u testuser bash -c 'bash /vagrant/morloc-manager.sh run morloc --version'`
 - Check that testuser sees the system install: `sudo -u testuser bash -c 'bash /vagrant/morloc-manager.sh info'`
 
@@ -19,5 +21,5 @@ Try both container engines with --system:
 - `sudo bash /vagrant/morloc-manager.sh --container-engine podman install --system edge`
 
 Test uninstall:
-- `sudo bash /vagrant/morloc-manager.sh uninstall --system edge`
+- `sudo bash /vagrant/morloc-manager.sh uninstall --system --all`
 - Verify cleanup: config and data dirs should be removed

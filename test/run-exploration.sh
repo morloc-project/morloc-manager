@@ -188,6 +188,7 @@ The morloc-manager script is at /vagrant/morloc-manager.sh inside the VM.
 Run it as: $SSH_CMD \"cd /vagrant && bash morloc-manager.sh <subcommand>\"
 For sudo commands: $SSH_CMD \"cd /vagrant && sudo bash morloc-manager.sh <subcommand>\"
 For testuser commands: $SSH_CMD \"sudo -u testuser bash -c 'cd /vagrant && bash morloc-manager.sh <subcommand>'\"
+For multi-step workflows inside one container session: $SSH_CMD \"cd ~/myproject && bash /vagrant/morloc-manager.sh run bash -c 'morloc init && morloc make foo.loc'\"
 
 Your persona: $persona
 Write bug reports to: $FINDINGS_DIR/$vm/$persona/bug-NNN.md

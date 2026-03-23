@@ -241,8 +241,6 @@ sudo morloc-manager uninstall --system --all  # remove system versions
 ```
 
 `uninstall --all` removes version data, container images, and configuration.
-Scripts in `~/.local/bin/` are not removed — the output tells you how to
-delete them.
 
 
 ## Troubleshooting
@@ -274,18 +272,18 @@ Fix with:
 sudo chown -R $(id -u):$(id -g) ~/.local/share/morloc/
 ```
 
-### Shell completion paths from `morloc init` are wrong
+### Shell completion paths from `morloc init`
 
-After install, `morloc init` (running inside the container) prints `source`
-lines for shell completions. **Do not follow these instructions** — the printed
-paths are container-internal and do not exist on the host. The actual completion
-files are at:
+After install, `morloc init` prints `source` lines for shell completions. These
+paths are relative to the container filesystem, so they work as-is inside
+`morloc-manager shell`. If you want completions on the host (outside the
+container), use the host-side paths instead:
 
 ```
 ~/.local/share/morloc/versions/<version>/completions/
 ```
 
-For example, to enable bash completions for version 0.68.0:
+For example, to enable bash completions on the host for version 0.68.0:
 
 ```sh
 source ~/.local/share/morloc/versions/0.68.0/completions/morloc-completions.bash

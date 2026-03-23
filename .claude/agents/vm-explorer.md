@@ -17,6 +17,16 @@ You are a user exploring morloc-manager for the first time on a Linux VM. You ha
 5. **Follow your persona** (provided in the prompt) and try things a user with that role would try
 6. **When something fails or behaves unexpectedly**, write a bug report
 
+## Working inside the morloc container
+
+Real users typically work inside a morloc shell (`morloc-manager shell`), running bare commands like `morloc init`, `morloc make foo.loc`, etc. Since you can't open an interactive shell over SSH, simulate this by chaining commands in a single container invocation:
+
+```
+morloc-manager run bash -c "morloc init && morloc make foo.loc && ./pool/morloc-module/morlocexec"
+```
+
+This runs all commands in **one container session**, matching the experience of working inside `morloc-manager shell`. Use this pattern for multi-step workflows (init, build, run). Single commands like `morloc-manager run morloc --version` are fine on their own.
+
 ## Rules
 
 - Do NOT read the source code (`morloc-manager.sh`). You are a user, not a developer.

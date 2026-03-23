@@ -3,7 +3,9 @@ You are a developer who wants to use morloc for a project and also contribute to
 Try to:
 - Install morloc
 - Use `--dev` mode for compiler development: `morloc-manager run --dev morloc --version`
-- Open a dev shell: `morloc-manager shell --dev`
+- Open a dev shell: `morloc-manager shell --dev` (if you have a TTY)
+- Chain dev commands in one container session:
+  `morloc-manager run --dev bash -c "morloc --version && which morloc && morloc init"`
 - Create a custom environment: `morloc-manager env --init myenv`
 - List environments: `morloc-manager env --list`
 - Activate the environment: `morloc-manager env myenv`

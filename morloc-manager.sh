@@ -382,11 +382,20 @@ write_config() {
     _wc_file="${3:-$(config_root)/config}"
     _wc_sudo=""
     [ "${4:-}" = "--sudo" ] && _wc_sudo="sudo "
-    $_wc_sudo mkdir -p "$(dirname "$_wc_file")"
+    if ! $_wc_sudo mkdir -p "$(dirname "$_wc_file")"; then
+        print_error "Failed to create config directory: $(dirname "$_wc_file")"
+        return 1
+    fi
     if [ -f "$_wc_file" ] && grep -q "^${_wc_key}=" "$_wc_file" 2>/dev/null; then
-        $_wc_sudo sed -i "s|^${_wc_key}=.*|${_wc_key}=${_wc_value}|" "$_wc_file"
+        if ! $_wc_sudo sed -i "s|^${_wc_key}=.*|${_wc_key}=${_wc_value}|" "$_wc_file"; then
+            print_error "Failed to update config key '$_wc_key' in $_wc_file"
+            return 1
+        fi
     else
-        printf '%s=%s\n' "$_wc_key" "$_wc_value" | $_wc_sudo tee -a "$_wc_file" > /dev/null
+        if ! printf '%s=%s\n' "$_wc_key" "$_wc_value" | $_wc_sudo tee -a "$_wc_file" > /dev/null; then
+            print_error "Failed to write config key '$_wc_key' to $_wc_file"
+            return 1
+        fi
     fi
 }
 
@@ -480,24 +489,36 @@ write_version_config() {
     [ "$_wvc_scope" = "system" ] && _wvc_sudo="--sudo"
 
     if [ -n "$_wvc_sudo" ]; then
-        sudo mkdir -p "$_wvc_cfgdir/environments"
+        if ! sudo mkdir -p "$_wvc_cfgdir/environments"; then
+            print_error "Failed to create config directory: $_wvc_cfgdir/environments"
+            return 1
+        fi
     else
-        mkdir -p "$_wvc_cfgdir/environments"
+        if ! mkdir -p "$_wvc_cfgdir/environments"; then
+            print_error "Failed to create config directory: $_wvc_cfgdir/environments"
+            return 1
+        fi
     fi
 
     _wvc_cfg="$_wvc_cfgdir/config"
-    write_config "image" "${CONTAINER_BASE_FULL}:${_wvc_ver}" "$_wvc_cfg" $_wvc_sudo
-    write_config "host_dir" "$_wvc_datadir" "$_wvc_cfg" $_wvc_sudo
-    write_config "container_engine" "$CONTAINER_ENGINE" "$_wvc_cfg" $_wvc_sudo
-    write_config "shm_size" "$SHARED_MEMORY_SIZE" "$_wvc_cfg" $_wvc_sudo
+    write_config "image" "${CONTAINER_BASE_FULL}:${_wvc_ver}" "$_wvc_cfg" $_wvc_sudo || return 1
+    write_config "host_dir" "$_wvc_datadir" "$_wvc_cfg" $_wvc_sudo || return 1
+    write_config "container_engine" "$CONTAINER_ENGINE" "$_wvc_cfg" $_wvc_sudo || return 1
+    write_config "shm_size" "$SHARED_MEMORY_SIZE" "$_wvc_cfg" $_wvc_sudo || return 1
 
     # Create base.conf environment if it doesn't exist
     _wvc_base="$_wvc_cfgdir/environments/base.conf"
     if [ ! -f "$_wvc_base" ]; then
         if [ -n "$_wvc_sudo" ]; then
-            printf 'image=%s\n' "${CONTAINER_BASE_FULL}:${_wvc_ver}" | sudo tee "$_wvc_base" > /dev/null
+            if ! printf 'image=%s\n' "${CONTAINER_BASE_FULL}:${_wvc_ver}" | sudo tee "$_wvc_base" > /dev/null; then
+                print_error "Failed to write base environment config"
+                return 1
+            fi
         else
-            printf 'image=%s\n' "${CONTAINER_BASE_FULL}:${_wvc_ver}" > "$_wvc_base"
+            if ! printf 'image=%s\n' "${CONTAINER_BASE_FULL}:${_wvc_ver}" > "$_wvc_base"; then
+                print_error "Failed to write base environment config"
+                return 1
+            fi
         fi
     fi
 
@@ -505,14 +526,14 @@ write_version_config() {
     if [ "$_wvc_scope" = "system" ]; then
         # System install: write to system config only, never touch user config
         _wvc_sys_cfg="$(config_root --system)/config"
-        write_config "active_version" "$_wvc_ver" "$_wvc_sys_cfg" --sudo
-        write_config "active_scope" "system" "$_wvc_sys_cfg" --sudo
-        write_config "active_env" "base" "$_wvc_sys_cfg" --sudo
+        write_config "active_version" "$_wvc_ver" "$_wvc_sys_cfg" --sudo || return 1
+        write_config "active_scope" "system" "$_wvc_sys_cfg" --sudo || return 1
+        write_config "active_env" "base" "$_wvc_sys_cfg" --sudo || return 1
     else
         _wvc_user_cfg="$(config_root)/config"
-        write_config "active_version" "$_wvc_ver" "$_wvc_user_cfg"
-        write_config "active_scope" "$_wvc_scope" "$_wvc_user_cfg"
-        write_config "active_env" "base" "$_wvc_user_cfg"
+        write_config "active_version" "$_wvc_ver" "$_wvc_user_cfg" || return 1
+        write_config "active_scope" "$_wvc_scope" "$_wvc_user_cfg" || return 1
+        write_config "active_env" "base" "$_wvc_user_cfg" || return 1
     fi
 
     print_success "Wrote version config for $_wvc_ver ($_wvc_scope)"
@@ -538,49 +559,6 @@ read_flags_file() {
 
 # }}}
 # {{{ setup Morloc bin folder
-
-# Ensure the morloc bin directory exists and is in PATH, advising the user if not.
-# Never modifies shell rc files.
-ensure_morloc_bin() {
-    # Create bin dir if needed
-    create_directory "$MORLOC_BIN" || return 1
-
-    # In system scope, /usr/bin is standard FHS — skip PATH advice
-    if [ "${MORLOC_SCOPE:-}" = "system" ]; then
-        return 0
-    fi
-
-    # Already in PATH — nothing to do
-    if is_in_path "$MORLOC_BIN"; then
-        print_success "$MORLOC_BIN is in PATH"
-        return 0
-    fi
-
-    # Check if ~/.profile or similar will add it on next login
-    _emb_home=$(real_home)
-    for f in "$_emb_home/.profile" "$_emb_home/.bash_profile" "$_emb_home/.zprofile"; do
-        if [ -f "$f" ] && grep -q '\.local/bin' "$f" 2>/dev/null; then
-            print_warning "$MORLOC_BIN is not yet in your PATH, but will be on next login"
-            print_info "To use morloc now, run:  export PATH=\"$MORLOC_BIN:\$PATH\""
-            export PATH="$MORLOC_BIN:$PATH"
-            return 0
-        fi
-    done
-
-    # Advise user
-    print_warning "$MORLOC_BIN is not in your PATH"
-    echo ""
-    print_info "Add it to your shell configuration:"
-    echo ""
-    echo "  bash/zsh/ksh:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.profile"
-    echo "  fish:          fish_add_path ~/.local/bin"
-    echo ""
-    print_info "Then restart your shell, or run:  export PATH=\"$MORLOC_BIN:\$PATH\""
-
-    # Set for current session so install can proceed
-    export PATH="$MORLOC_BIN:$PATH"
-    return 0
-}
 
 # }}}
 # {{{ script generation helpers
@@ -664,11 +642,16 @@ ${BOLD}EXAMPLES${RESET}:
   $(basename "$0") run --shell
   $(basename "$0") run --dev stack build
   $(basename "$0") run -x "--gpus all" python train.py
+
+${BOLD}NOTE${RESET}:
+  Use -- before the command when it has flags that could be confused
+  with morloc-manager options (e.g., run -- morloc make -o out foo.loc).
+  It is optional when the command has no ambiguous flags.
 EOF
 }
 
 # Run a command inside the morloc container
-# Usage: cmd_run [--dev] [--shell] [--system|--local] [-x FLAG]... [--] CMD...
+# Usage: cmd_run [--dev] [--shell] [-x FLAG]... [--] CMD...
 cmd_run() {
     _cr_dev=""
     _cr_shell=""
@@ -750,6 +733,13 @@ cmd_run() {
         _cr_engine="$CONTAINER_ENGINE"
     else
         _cr_engine=$(read_config "container_engine" "$_cr_vcfg/config")
+        if [ -n "$_cr_engine" ] && ! command -v "$_cr_engine" >/dev/null 2>&1; then
+            print_warning "Stored engine '$_cr_engine' not found; using '$CONTAINER_ENGINE'"
+            _cr_engine="$CONTAINER_ENGINE"
+        elif [ -n "$_cr_engine" ] && ! $SUDO_PREFIX$_cr_engine info >/dev/null 2>&1; then
+            print_warning "Stored engine '$_cr_engine' not accessible; using '$CONTAINER_ENGINE'"
+            _cr_engine="$CONTAINER_ENGINE"
+        fi
         [ -z "$_cr_engine" ] && _cr_engine="$CONTAINER_ENGINE"
     fi
 
@@ -775,9 +765,13 @@ cmd_run() {
         _cr_container_home="/root"
     fi
 
-    # Detect SELinux
+    # Detect SELinux — skip :z for system scope (pre-labeled at install time)
     detect_selinux
-    _cr_z="$SELINUX_SUFFIX"
+    if [ "$_cr_scope" = "system" ]; then
+        _cr_z=""
+    else
+        _cr_z="$SELINUX_SUFFIX"
+    fi
 
     export MORLOC_WORK_DIR="$PWD"
 
@@ -1096,21 +1090,11 @@ cmd_install() {
     if [ "$version" = "undefined" ]; then
         print_info "Detecting latest available version..."
         tag="edge"
-        dev_tag="latest"
+        dev_tag="edge"
     else
         print_info "Installing Morloc v$version"
         tag=$version
         dev_tag=$version
-    fi
-
-    ensure_morloc_bin || exit 1
-
-    print_info "Copying this install script to $MORLOC_BIN"
-    if [ "$(resolve_path "$MORLOC_BIN/$PROGRAM_NAME")" = "$(resolve_path "$0")" ]
-    then
-        print_point "$(basename "$0") is already on there!"
-    else
-        $SUDO_PREFIX cp "$0" "$MORLOC_BIN/$PROGRAM_NAME"
     fi
 
     print_info "Looking for a container engine"
@@ -1170,19 +1154,22 @@ cmd_install() {
         print_error "Failed to create morloc home directory at '$morloc_data_home'"
         exit 1
     fi
-    create_directory "$morloc_data_home/bin"
-    create_directory "$morloc_data_home/include"
-    create_directory "$morloc_data_home/lib"
-    create_directory "$morloc_data_home/opt"
-    create_directory "$morloc_data_home/src/morloc/plane"
-    create_directory "$morloc_data_home/tmp"
+    for _inst_subdir in bin include lib opt src/morloc/plane tmp; do
+        create_directory "$morloc_data_home/$_inst_subdir" || {
+            print_error "Failed to create directory: $morloc_data_home/$_inst_subdir"
+            exit 1
+        }
+    done
 
     print_info "Created $morloc_data_home"
 
     # Create dev container directories (persistent mounts for /home/dev inside container)
     if [ "$install_dev" = "true" ]; then
-        $SUDO_PREFIX mkdir -p "$morloc_data_home/home/.local/bin"
-        $SUDO_PREFIX mkdir -p "$morloc_data_home/home/.stack"
+        if ! $SUDO_PREFIX mkdir -p "$morloc_data_home/home/.local/bin" || \
+           ! $SUDO_PREFIX mkdir -p "$morloc_data_home/home/.stack"; then
+            print_error "Failed to create dev container directories"
+            exit 1
+        fi
     fi
 
     # Warn about legacy docker-compose.override.yml
@@ -1197,14 +1184,29 @@ cmd_install() {
     [ "${MORLOC_SCOPE:-}" = "system" ] && _inst_scope="system"
 
     # Write version config
-    write_version_config "$version" "$_inst_scope"
+    if ! write_version_config "$version" "$_inst_scope"; then
+        print_error "Failed to write version config"
+        exit 1
+    fi
 
     # Write dev_image config only when --dev was requested
     if [ "$install_dev" = "true" ]; then
         _inst_vcfg=$(version_config_root "$version" "$_inst_scope")
         _inst_sudo=""
         [ "$_inst_scope" = "system" ] && _inst_sudo="--sudo"
-        write_config "dev_image" "${CONTAINER_BASE_TEST}:${dev_tag}" "$_inst_vcfg/config" $_inst_sudo
+        if ! write_config "dev_image" "${CONTAINER_BASE_TEST}:${dev_tag}" "$_inst_vcfg/config" $_inst_sudo; then
+            print_error "Failed to write dev image config"
+            exit 1
+        fi
+    fi
+
+    # Pre-label system data dirs for SELinux so non-root users don't need :z relabeling
+    if [ "$_inst_scope" = "system" ]; then
+        detect_selinux
+        if [ -n "$SELINUX_SUFFIX" ]; then
+            print_info "Pre-labeling system data directory for SELinux"
+            chcon -R -t container_file_t "$morloc_data_home" 2>/dev/null || true
+        fi
     fi
 
     if [ "$no_init" = "false" ]; then
@@ -1218,7 +1220,7 @@ cmd_install() {
               _MORLOC_NO_EXEC=1 cmd_run -x "--user $(id -u):$(id -g)" -- morloc init -f
           fi
       else
-          _MORLOC_NO_EXEC=1 cmd_run morloc init -f
+          _MORLOC_NO_EXEC=1 cmd_run --system morloc init -f
       fi
       if [ $? -ne 0 ]
       then
@@ -1353,12 +1355,13 @@ show_uninstall_help() {
     cat << EOF
 ${BOLD}USAGE${RESET}: $(basename "$0") uninstall [OPTIONS] [VERSION]...
 
-Remove Morloc home (or specific versions) and all associated containers
+Remove Morloc home (or specific versions) and all associated containers.
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help     Show this help message
   -a, --all      Remove all Morloc versions
       --system   Target system scope
+      --local    Target local scope
 
 ${BOLD}ARGUMENTS${RESET}:
   VERSION        Version to remove, may specify multiple versions
@@ -1366,8 +1369,7 @@ ${BOLD}ARGUMENTS${RESET}:
 ${BOLD}EXAMPLES${RESET}:
   $(basename "$0") uninstall --all
   $(basename "$0") uninstall 0.55.7
-  $(basename "$0") uninstall --system 0.55.7
-  $(basename "$0") uninstall 0.53.6 0.53.7
+  sudo $(basename "$0") uninstall --system --all
 EOF
 }
 
@@ -1388,6 +1390,10 @@ cmd_uninstall() {
                 MORLOC_SCOPE="system"
                 SUDO_PREFIX="sudo "
                 set_paths
+                shift
+                ;;
+            --local)
+                _uninst_scope="local"
                 shift
                 ;;
             -a|--all)
@@ -1467,7 +1473,8 @@ cmd_uninstall() {
                 # Clear active version in user config
                 _uninst_user_cfg="$(config_root)/config"
                 if [ -f "$_uninst_user_cfg" ]; then
-                    write_config "active_version" "" "$_uninst_user_cfg"
+                    write_config "active_version" "" "$_uninst_user_cfg" || _uninst_all_err=1
+                    write_config "active_env" "base" "$_uninst_user_cfg" || _uninst_all_err=1
                 fi
 
                 # Clean up directories (use rm -rf for config root since it may contain stale config files)
@@ -1535,7 +1542,13 @@ cmd_uninstall() {
                 # Clear active version if it was the uninstalled one
                 _uninst_active=$(active_version)
                 if [ "$_uninst_active" = "$version" ]; then
-                    write_config "active_version" "" "$(config_root)/config"
+                    if [ "$_uninst_scope" = "system" ]; then
+                        write_config "active_version" "" "$(config_root --system)/config" --sudo || _uninst_err=1
+                        write_config "active_env" "base" "$(config_root --system)/config" --sudo || _uninst_err=1
+                    else
+                        write_config "active_version" "" "$(config_root)/config" || _uninst_err=1
+                        write_config "active_env" "base" "$(config_root)/config" || _uninst_err=1
+                    fi
                 fi
 
                 remove_containers_for_version "$version"
@@ -1572,6 +1585,7 @@ ${BOLD}OPTIONS${RESET}:
       --dev      Clean dev container cache (GHC, stack build cache)
       --all      Clean all version data and dev cache
       --system   Target system scope
+      --local    Target local scope
       --dry-run  List what would be deleted without deleting
 
 ${BOLD}ARGUMENTS${RESET}:
@@ -1601,6 +1615,10 @@ cmd_clean() {
             --system)
                 _cl_scope="system"
                 SUDO_PREFIX="sudo "
+                shift
+                ;;
+            --local)
+                _cl_scope="local"
                 shift
                 ;;
             --dev)
@@ -1980,19 +1998,28 @@ cmd_select() {
 
     # Write active version to user config
     _sel_user_cfg="$(config_root)/config"
-    write_config "active_scope" "$_sel_scope" "$_sel_user_cfg"
+    if ! write_config "active_scope" "$_sel_scope" "$_sel_user_cfg"; then
+        print_error "Failed to write active scope config"
+        exit 1
+    fi
     if [ "$_sel_scope" = "system" ] && [ -z "$_sel_explicit_scope" ]; then
         # Don't overwrite local active_version with a system-only version
         :
     else
-        write_config "active_version" "$version" "$_sel_user_cfg"
+        if ! write_config "active_version" "$version" "$_sel_user_cfg"; then
+            print_error "Failed to write active version config"
+            exit 1
+        fi
     fi
 
     # Reset active env when switching versions (env images are version-tagged)
     _sel_prev_version=$(read_config "active_version" "$_sel_user_cfg")
     _sel_prev_env=$(read_config "active_env" "$_sel_user_cfg")
     if [ -n "$_sel_prev_env" ] && [ "$_sel_prev_env" != "base" ]; then
-        write_config "active_env" "base" "$_sel_user_cfg"
+        if ! write_config "active_env" "base" "$_sel_user_cfg"; then
+            print_error "Failed to reset active environment config"
+            exit 1
+        fi
         print_warning "Reset active environment to 'base' (rebuild '$_sel_prev_env' for version $version with: $(basename "$0") env $_sel_prev_env)"
     fi
 
@@ -2008,12 +2035,12 @@ show_info_help() {
     cat << EOF
 ${BOLD}USAGE${RESET}: $(basename "$0") info [OPTIONS]
 
-Print info on Morloc versions and check containers
+Print info on Morloc versions and check containers.
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help   Show this help message
-      --system Target system scope
-      --local  Target local scope
+      --system Show system-scope info
+      --local  Show local-scope info
 
 ${BOLD}EXAMPLES${RESET}:
   $(basename "$0") info
@@ -2176,7 +2203,7 @@ update_environment() {
       base_container="${CONTAINER_BASE_FULL}:${version}"
       user_container="morloc-env:${version}-${envname}"
       build_environment "$envname" "$envfile" "$user_container" "$base_container" "$extra_args" || return $?
-      write_config "image" "$user_container" "$_ue_vcfg/config" $_ue_sudo
+      write_config "image" "$user_container" "$_ue_vcfg/config" $_ue_sudo || return 1
       print_success "Switched user environment to $version-$envname"
   fi
 
@@ -2185,37 +2212,49 @@ update_environment() {
       _ue_dev_base=$(read_config "dev_image" "$_ue_vcfg/config")
       [ -z "$_ue_dev_base" ] && _ue_dev_base="${CONTAINER_BASE_TEST}:${version}"
       build_environment "$envname" "$envfile" "$dev_container" "$_ue_dev_base" "$extra_args" || return $?
-      write_config "dev_image" "$dev_container" "$_ue_vcfg/config" $_ue_sudo
+      write_config "dev_image" "$dev_container" "$_ue_vcfg/config" $_ue_sudo || return 1
       print_success "Switched dev environment to ${version}-dev-$envname"
   fi
 
   # Write environment config file to version-specific environments dir
   if [ "$_ue_scope" = "system" ]; then
-      sudo mkdir -p "$_ue_vcfg/environments"
+      if ! sudo mkdir -p "$_ue_vcfg/environments"; then
+          print_error "Failed to create environments directory"
+          return 1
+      fi
   else
-      mkdir -p "$_ue_vcfg/environments"
+      if ! mkdir -p "$_ue_vcfg/environments"; then
+          print_error "Failed to create environments directory"
+          return 1
+      fi
   fi
   _ue_env_conf="$_ue_vcfg/environments/${envname}.conf"
   if [ "$update_usr" = "true" ]; then
-      write_config "image" "$user_container" "$_ue_env_conf" $_ue_sudo
+      write_config "image" "$user_container" "$_ue_env_conf" $_ue_sudo || return 1
   fi
 
   # Copy flags file to version environments dir if it exists
   flags_file="$MORLOC_DEPENDENCY_DIR/${envname}.flags"
   if [ -f "$flags_file" ]; then
       if [ "$_ue_scope" = "system" ]; then
-          sudo cp "$flags_file" "$_ue_vcfg/environments/${envname}.flags"
+          if ! sudo cp "$flags_file" "$_ue_vcfg/environments/${envname}.flags"; then
+              print_error "Failed to copy environment flags file"
+              return 1
+          fi
       else
-          cp "$flags_file" "$_ue_vcfg/environments/${envname}.flags"
+          if ! cp "$flags_file" "$_ue_vcfg/environments/${envname}.flags"; then
+              print_error "Failed to copy environment flags file"
+              return 1
+          fi
       fi
       print_info "Activated environment flags: $flags_file"
   fi
 
   # Set active environment in the correct scope config
   if [ "$_ue_scope" = "system" ]; then
-      write_config "active_env" "$envname" "$(config_root --system)/config" --sudo
+      write_config "active_env" "$envname" "$(config_root --system)/config" --sudo || return 1
   else
-      write_config "active_env" "$envname" "$(config_root)/config"
+      write_config "active_env" "$envname" "$(config_root)/config" || return 1
   fi
 
   return 0
@@ -2238,20 +2277,20 @@ reset_environment() {
   [ "$_re_scope" = "system" ] && _re_sudo="--sudo"
 
   if [ "$reset_update_usr" = "true" ]; then
-      write_config "image" "${CONTAINER_BASE_FULL}:${version}" "$_re_vcfg/config" $_re_sudo
+      write_config "image" "${CONTAINER_BASE_FULL}:${version}" "$_re_vcfg/config" $_re_sudo || return 1
       print_success "Successfully reset user environment to default"
   fi
 
   if [ "$reset_update_dev" = "true" ]; then
-      write_config "dev_image" "${CONTAINER_BASE_TEST}:${version}" "$_re_vcfg/config" $_re_sudo
+      write_config "dev_image" "${CONTAINER_BASE_TEST}:${version}" "$_re_vcfg/config" $_re_sudo || return 1
       print_success "Successfully reset dev environment to default"
   fi
 
   # Reset active env to base in the correct scope config
   if [ "$_re_scope" = "system" ]; then
-      write_config "active_env" "base" "$(config_root --system)/config" --sudo
+      write_config "active_env" "base" "$(config_root --system)/config" --sudo || return 1
   else
-      write_config "active_env" "base" "$(config_root)/config"
+      write_config "active_env" "base" "$(config_root)/config" || return 1
   fi
   print_info "Reset active environment to base"
 
@@ -2260,30 +2299,23 @@ reset_environment() {
 
 list_local_environment() {
 
-    # Check if directory doesn't exist
-    if [ ! -d "$MORLOC_DEPENDENCY_DIR" ]; then
-        print_info "No dependency environments defined. To add an environment, create a Dockerfile in the $MORLOC_DEPENDENCY_DIR directory"
-        return 0
-    fi
-
-    # Check if directory is empty or has no .Dockerfile files
-    found=0
-    for file in "$MORLOC_DEPENDENCY_DIR"/*.Dockerfile; do
-        if [ -e "$file" ]; then
-            found=1
-            break
-        fi
-    done
-
-    if [ "$found" -eq 0 ]; then
-        print_info "No dependency environments defined"
-        return 0
-    fi
-
     current_env=$(read_config "active_env")
 
-    # List all .Dockerfile files
     printf "Available environments:\n"
+
+    # Always show base environment first
+    if [ "$current_env" = "base" ] || [ -z "$current_env" ]; then
+        printf "  * %-20s (active)\n" "base"
+    else
+        printf "    %-20s\n" "base"
+    fi
+
+    # Check if custom environments directory exists
+    if [ ! -d "$MORLOC_DEPENDENCY_DIR" ]; then
+        return 0
+    fi
+
+    # List all .Dockerfile files
     for file in "$MORLOC_DEPENDENCY_DIR"/*.Dockerfile; do
         if [ -e "$file" ]; then
             _le_base="${file##*/}"
