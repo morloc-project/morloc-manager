@@ -32,7 +32,7 @@ sudo mv morloc-manager /usr/bin
 If necessary, update the path:
 
 ```sh
-PATH="~/.local/bin:$PATH"
+PATH="$HOME/.local/bin:$PATH"
 ```
 
 Then install Morloc:
@@ -70,6 +70,9 @@ morloc-manager run -- morloc make foo.loc
 morloc-manager run -- ./foo -h              # view usage statement
 morloc-manager run -- ./foo 21              # output: 42
 ```
+
+**Note (Fedora/RHEL):** On SELinux-enforcing systems, project files must be
+under your home directory, not `/tmp` or other system directories.
 
 ### Interactive shell
 
@@ -208,3 +211,44 @@ morloc-manager uninstall --all    # remove everything
 `uninstall --all` removes version data, compose files, and container images.
 The override file (if any) is preserved with a warning. Scripts in
 `~/.local/bin/` are not removed — the output tells you how to delete them.
+
+
+## Troubleshooting
+
+### "Failed to build morloc libraries" during install
+
+The `morloc init` step inside the container may fail due to file permission
+issues. You can skip it and run it manually later:
+
+```sh
+morloc-manager install --no-init
+morloc-manager run -- morloc init -f
+```
+
+### `morloc-nexus: not found` when running compiled programs
+
+The morloc libraries were not initialized. Run:
+
+```sh
+morloc-manager run -- morloc init -f
+```
+
+### Permission denied errors (root-owned files)
+
+Container processes may have created root-owned files in the data directory.
+Fix with:
+
+```sh
+sudo chown -R $(id -u):$(id -g) ~/.local/share/morloc/
+```
+
+### SELinux bind-mount errors on Fedora/RHEL
+
+Working from `/tmp` or other system directories is blocked by SELinux. Move
+your project under your home directory:
+
+```sh
+mkdir -p ~/project && cp -r /tmp/myproject/* ~/project/
+cd ~/project
+morloc-manager run -- morloc make foo.loc
+```

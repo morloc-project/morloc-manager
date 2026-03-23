@@ -9,6 +9,7 @@ VERSION="0.10.0-2"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
+CONTAINER_ENGINE_CLI_OVERRIDE=""
 
 SHARED_MEMORY_SIZE=512m
 
@@ -38,6 +39,7 @@ set_container_engine() {
         exit 1
     fi
     CONTAINER_ENGINE="$1"
+    CONTAINER_ENGINE_CLI_OVERRIDE=1
     CONTAINER_ENGINE_VERSION=$($CONTAINER_ENGINE --version 2>/dev/null | sed 's/.*version \([0-9.]*\).*/\1/')
 }
 
@@ -75,6 +77,8 @@ detect_selinux() {
 MORLOC_LIBRARY_RELDIR="src/modules"
 MORLOC_DEFAULT_PLANE="default"
 MORLOC_DEFAULT_PLANE_GITHUB_ORG="morloclib"
+# Legacy sentinel: the old dev container data was stored under versions/local/.
+# Used only to filter this directory from version listings and block it in select.
 LOCAL_VERSION="local"
 
 # Initialize all paths based on MORLOC_SCOPE. Subcommands set MORLOC_SCOPE
@@ -497,11 +501,19 @@ write_version_config() {
         fi
     fi
 
-    # Update user-level active version (never needs sudo)
-    _wvc_user_cfg="$(config_root)/config"
-    write_config "active_version" "$_wvc_ver" "$_wvc_user_cfg"
-    write_config "active_scope" "$_wvc_scope" "$_wvc_user_cfg"
-    write_config "active_env" "base" "$_wvc_user_cfg"
+    # Update active version in the appropriate scope config
+    if [ "$_wvc_scope" = "system" ]; then
+        # System install: write to system config only, never touch user config
+        _wvc_sys_cfg="$(config_root --system)/config"
+        write_config "active_version" "$_wvc_ver" "$_wvc_sys_cfg" --sudo
+        write_config "active_scope" "system" "$_wvc_sys_cfg" --sudo
+        write_config "active_env" "base" "$_wvc_sys_cfg" --sudo
+    else
+        _wvc_user_cfg="$(config_root)/config"
+        write_config "active_version" "$_wvc_ver" "$_wvc_user_cfg"
+        write_config "active_scope" "$_wvc_scope" "$_wvc_user_cfg"
+        write_config "active_env" "base" "$_wvc_user_cfg"
+    fi
 
     print_success "Wrote version config for $_wvc_ver ($_wvc_scope)"
 }
@@ -676,8 +688,17 @@ cmd_run() {
         esac
     done
 
-    # Resolve version and scope from config
+    # Resolve scope first so we can check the right config for version
+    if [ -z "$_cr_scope" ]; then
+        _cr_scope=$(active_scope)
+    fi
+
+    # Resolve version from config
     _cr_version=$(active_version)
+    if [ -z "$_cr_version" ] && [ "$_cr_scope" = "system" ]; then
+        # Try reading from system config directly
+        _cr_version=$(read_config "active_version" "$(config_root --system)/config")
+    fi
     if [ -z "$_cr_version" ]; then
         # Check if a system version is available before erroring
         _cr_sys_versions=$(list_versions --system 2>/dev/null)
@@ -689,8 +710,11 @@ cmd_run() {
         exit 1
     fi
 
-    if [ -z "$_cr_scope" ]; then
-        _cr_scope=$(active_scope)
+    # Require either --shell or a command
+    if [ -z "$_cr_shell" ] && [ $# -eq 0 ]; then
+        print_error "No command specified. Use 'run --shell' for interactive mode or provide a command."
+        show_run_help
+        exit 1
     fi
 
     # Read version config
@@ -705,20 +729,28 @@ cmd_run() {
     _cr_image=$(read_config "image" "$_cr_vcfg/config")
     _cr_dev_image=$(read_config "dev_image" "$_cr_vcfg/config")
     [ -z "$_cr_image" ] && _cr_image="${CONTAINER_BASE_FULL}:${_cr_version}"
-    [ -z "$_cr_dev_image" ] && _cr_dev_image="${CONTAINER_BASE_TEST}:latest"
+    [ -z "$_cr_dev_image" ] && _cr_dev_image="${CONTAINER_BASE_TEST}:${_cr_version}"
 
-    # Read active environment
-    _cr_user_cfg="$(config_root)/config"
-    _cr_env=$(read_config "active_env" "$_cr_user_cfg")
+    # Read active environment from the correct scope config
+    if [ "$_cr_scope" = "system" ]; then
+        _cr_scope_cfg="$(config_root --system)/config"
+    else
+        _cr_scope_cfg="$(config_root)/config"
+    fi
+    _cr_env=$(read_config "active_env" "$_cr_scope_cfg")
     if [ -n "$_cr_env" ] && [ "$_cr_env" != "base" ]; then
         _cr_env_conf="$_cr_vcfg/environments/${_cr_env}.conf"
         _cr_env_image=$(read_config "image" "$_cr_env_conf")
         [ -n "$_cr_env_image" ] && _cr_image="$_cr_env_image"
     fi
 
-    # Read container engine: CLI flag > version config > auto-detected
-    _cr_engine=$(read_config "container_engine" "$_cr_vcfg/config")
-    [ -z "$_cr_engine" ] && _cr_engine="$CONTAINER_ENGINE"
+    # Read container engine: CLI --container-engine > version config > auto-detected
+    if [ -n "$CONTAINER_ENGINE_CLI_OVERRIDE" ]; then
+        _cr_engine="$CONTAINER_ENGINE"
+    else
+        _cr_engine=$(read_config "container_engine" "$_cr_vcfg/config")
+        [ -z "$_cr_engine" ] && _cr_engine="$CONTAINER_ENGINE"
+    fi
 
     # Read shared memory size from version config, fall back to default
     _cr_shm=$(read_config "shm_size" "$_cr_vcfg/config")
@@ -747,8 +779,8 @@ cmd_run() {
 
         _cr_mk=""
         [ "$_cr_scope" = "system" ] && _cr_mk="sudo "
-        ${_cr_mk}mkdir -p "$_cr_versions_dir/${LOCAL_VERSION}/home/.local/bin"
-        ${_cr_mk}mkdir -p "$_cr_versions_dir/${LOCAL_VERSION}/home/.stack"
+        ${_cr_mk}mkdir -p "$_cr_versions_dir/${_cr_version}/home/.local/bin"
+        ${_cr_mk}mkdir -p "$_cr_versions_dir/${_cr_version}/home/.stack"
 
         # Map host UID into the container so bind mounts are writable.
         # Rootless podman uses user namespaces where --user remaps UIDs
@@ -767,9 +799,9 @@ cmd_run() {
             fi
             _cr_flags="--user ${_cr_uid}:${_cr_gid}"
         fi
-        _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${LOCAL_VERSION}:${_cr_dev_home}/.local/share/morloc${_cr_z}"
-        _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${LOCAL_VERSION}/home/.local/bin:${_cr_dev_home}/.local/bin${_cr_z}"
-        _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${LOCAL_VERSION}/home/.stack:${_cr_dev_home}/.stack${_cr_z}"
+        _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${_cr_version}:${_cr_dev_home}/.local/share/morloc${_cr_z}"
+        _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${_cr_version}/home/.local/bin:${_cr_dev_home}/.local/bin${_cr_z}"
+        _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${_cr_version}/home/.stack:${_cr_dev_home}/.stack${_cr_z}"
         _cr_flags="$_cr_flags -e HOME=${_cr_dev_home}"
         _cr_flags="$_cr_flags -e PATH=/opt/.ghcup/bin:${_cr_dev_home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -834,9 +866,10 @@ cmd_run() {
         [ -n "$_cr_lf" ] && _cr_user_flags="$_cr_user_flags $_cr_lf"
     fi
 
-    # Build sudo prefix
+    # Build sudo prefix — only use sudo when explicitly running as root for system scope.
+    # Regular users should have docker group membership or use rootless podman.
     _cr_sudo=""
-    if [ "$_cr_scope" = "system" ]; then
+    if [ "$_cr_scope" = "system" ] && [ "$(id -u)" = "0" ]; then
         _cr_sudo="sudo"
     fi
 
@@ -1057,7 +1090,7 @@ cmd_install() {
     _pull_if_missing "$CONTAINER_BASE_TINY:${tag}" "tiny" || exit 1
     _pull_if_missing "$CONTAINER_BASE_FULL:${tag}" "full" || exit 1
     if [ "$install_dev" = "true" ]; then
-        _pull_if_missing "$CONTAINER_BASE_TEST:latest" "dev" || exit 1
+        _pull_if_missing "$CONTAINER_BASE_TEST:${tag}" "dev" || exit 1
     fi
 
     # get Morloc version from container
@@ -1103,8 +1136,8 @@ cmd_install() {
 
     # Create dev container directories (persistent mounts for /home/dev inside container)
     if [ "$install_dev" = "true" ]; then
-        $SUDO_PREFIX mkdir -p "$MORLOC_HOST_VERSION_DIR/${LOCAL_VERSION}/home/.local/bin"
-        $SUDO_PREFIX mkdir -p "$MORLOC_HOST_VERSION_DIR/${LOCAL_VERSION}/home/.stack"
+        $SUDO_PREFIX mkdir -p "$MORLOC_HOST_VERSION_DIR/${tag}/home/.local/bin"
+        $SUDO_PREFIX mkdir -p "$MORLOC_HOST_VERSION_DIR/${tag}/home/.stack"
     fi
 
     # Warn about legacy docker-compose.override.yml
@@ -1126,19 +1159,29 @@ cmd_install() {
         _inst_vcfg=$(version_config_root "$version" "$_inst_scope")
         _inst_sudo=""
         [ "$_inst_scope" = "system" ] && _inst_sudo="--sudo"
-        write_config "dev_image" "${CONTAINER_BASE_TEST}:latest" "$_inst_vcfg/config" $_inst_sudo
+        write_config "dev_image" "${CONTAINER_BASE_TEST}:${tag}" "$_inst_vcfg/config" $_inst_sudo
     fi
 
     if [ "$no_init" = "false" ]; then
       print_info "Initializing morloc libraries"
-      # Use --user to avoid creating root-owned files in local scope
+      # Use --userns=keep-id for rootless podman (matches cmd_run logic);
+      # use --user UID:GID for docker/rootful podman to avoid root-owned files
       if [ "$_inst_scope" = "local" ]; then
-          _MORLOC_NO_EXEC=1 cmd_run -x "--user $(id -u):$(id -g)" -- morloc init -f
+          if [ "$CONTAINER_ENGINE" = "podman" ] && [ "$(id -u)" != "0" ]; then
+              _MORLOC_NO_EXEC=1 cmd_run -x "--userns=keep-id" -- morloc init -f
+          else
+              _MORLOC_NO_EXEC=1 cmd_run -x "--user $(id -u):$(id -g)" -- morloc init -f
+          fi
       else
           _MORLOC_NO_EXEC=1 cmd_run morloc init -f
       fi
       if [ $? -ne 0 ]
       then
+          # Recover file ownership so user can retry or uninstall cleanly
+          if [ "$_inst_scope" = "local" ] && [ -d "$morloc_data_home" ]; then
+              print_info "Attempting to recover file ownership in $morloc_data_home"
+              sudo chown -R "$(id -u):$(id -g)" "$morloc_data_home" 2>/dev/null || true
+          fi
           print_error "Failed to build morloc libraries"
           exit 1
       fi
@@ -1285,14 +1328,37 @@ cmd_uninstall() {
                 ;;
             -a|--all)
                 _uninst_all_err=0
+
+                # Read engines from all version configs BEFORE deleting anything
+                _uninst_cfg_root_pre=$(config_root)
+                [ "$_uninst_scope" = "system" ] && _uninst_cfg_root_pre=$(config_root --system)
+                if [ -d "$_uninst_cfg_root_pre/versions" ]; then
+                    for _uninst_vdir in "$_uninst_cfg_root_pre"/versions/*/; do
+                        [ -d "$_uninst_vdir" ] || continue
+                        _uninst_veng=$(read_config "container_engine" "$_uninst_vdir/config" 2>/dev/null)
+                        if [ -n "$_uninst_veng" ] && command -v "$_uninst_veng" >/dev/null 2>&1; then
+                            CONTAINER_ENGINE="$_uninst_veng"
+                        fi
+                    done
+                fi
+
                 morloc_home="$MORLOC_HOST_VERSION_DIR"
                 if [ -d "$morloc_home" ]
                 then
                     $SUDO_PREFIX rm -rf "$morloc_home"
                     if [ $? -ne 0 ]
                     then
-                        print_error "Failed to remove morloc home directory '$morloc_home'"
-                        _uninst_all_err=1
+                        # Container may have created root-owned files; retry with sudo
+                        if [ -z "$SUDO_PREFIX" ]; then
+                            print_info "Retrying removal with sudo (root-owned files from container)"
+                            sudo rm -rf "$morloc_home"
+                        fi
+                        if [ -d "$morloc_home" ]; then
+                            print_error "Failed to remove morloc home directory '$morloc_home'"
+                            _uninst_all_err=1
+                        else
+                            print_success "Removed morloc home directory '$morloc_home'"
+                        fi
                     else
                         print_success "Removed morloc home directory '$morloc_home'"
                     fi
@@ -1304,6 +1370,18 @@ cmd_uninstall() {
                 remove_all_containers_and_images "$CONTAINER_BASE_FULL" || _uninst_all_err=1
                 remove_all_containers_and_images "$CONTAINER_BASE_TINY" || _uninst_all_err=1
                 remove_all_containers_and_images "$CONTAINER_BASE_TEST" || _uninst_all_err=1
+
+                # Remove custom environment images (morloc-env:*)
+                if [ -n "$CONTAINER_ENGINE" ]; then
+                    _uninst_env_imgs=$($SUDO_PREFIX$CONTAINER_ENGINE images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep '^morloc-env:' || true)
+                    if [ -n "$_uninst_env_imgs" ]; then
+                        print_info "Removing custom environment images..."
+                        echo "$_uninst_env_imgs" | while IFS= read -r _uninst_img; do
+                            $SUDO_PREFIX$CONTAINER_ENGINE rmi -f "$_uninst_img" 2>/dev/null || true
+                        done
+                        print_success "Removed custom environment images"
+                    fi
+                fi
 
                 # Clean up config directories
                 _uninst_cfg_root=$(config_root)
@@ -1328,6 +1406,10 @@ cmd_uninstall() {
                     write_config "active_version" "" "$_uninst_user_cfg"
                 fi
 
+                # Clean up empty parent directories
+                $SUDO_PREFIX rmdir "$MORLOC_DATA_HOME" 2>/dev/null || true
+                $SUDO_PREFIX rmdir "$_uninst_cfg_root" 2>/dev/null || true
+
                 exit $_uninst_all_err
                 ;;
             -*)
@@ -1345,13 +1427,23 @@ cmd_uninstall() {
                     $SUDO_PREFIX rm -rf "$morloc_home"
                     if [ $? -ne 0 ]
                     then
-                        print_error "Failed to remove morloc home directory '$morloc_home'"
-                        _uninst_err=1
+                        # Container may have created root-owned files; retry with sudo
+                        if [ -z "$SUDO_PREFIX" ]; then
+                            print_info "Retrying removal with sudo (root-owned files from container)"
+                            sudo rm -rf "$morloc_home"
+                        fi
+                        if [ -d "$morloc_home" ]; then
+                            print_error "Failed to remove morloc home directory '$morloc_home'"
+                            _uninst_err=1
+                        else
+                            print_success "Removed morloc directory '$morloc_home'"
+                        fi
                     else
                         print_success "Removed morloc directory '$morloc_home'"
                     fi
                 else
                     print_warning "Cannot remove morloc directory '$morloc_home', it does not exist"
+                    _uninst_err=1
                 fi
 
                 # Read engine from version config before removing it
@@ -1492,19 +1584,35 @@ cmd_clean() {
         fi
     }
 
-    # --dev: clean stack/GHC cache
+    # --dev: clean stack/GHC cache in each version's dev home
     if [ -n "$_cl_dev" ] || [ -n "$_cl_all" ]; then
-        _cl_dev_home="$_cl_versions_dir/${LOCAL_VERSION}/home"
-        if [ -d "$_cl_dev_home" ]; then
-            _clean_remove "$_cl_dev_home/.stack"
-            _clean_remove "$_cl_dev_home/.local/bin"
-            if [ -z "$_cl_dry_run" ]; then
-                $SUDO_PREFIX mkdir -p "$_cl_dev_home/.stack"
-                $SUDO_PREFIX mkdir -p "$_cl_dev_home/.local/bin"
-                print_info "Recreated empty dev cache directories"
-            fi
+        _cl_found_dev=""
+        if [ -d "$_cl_versions_dir" ]; then
+            for _cl_vdir in "$_cl_versions_dir"/*/; do
+                [ -d "$_cl_vdir" ] || continue
+                _cl_dev_home="$_cl_vdir/home"
+                if [ -d "$_cl_dev_home" ]; then
+                    _cl_found_dev=1
+                    _clean_remove "$_cl_dev_home/.stack"
+                    _clean_remove "$_cl_dev_home/.local/bin"
+                    if [ -z "$_cl_dry_run" ]; then
+                        $SUDO_PREFIX mkdir -p "$_cl_dev_home/.stack"
+                        $SUDO_PREFIX mkdir -p "$_cl_dev_home/.local/bin"
+                    fi
+                fi
+            done
+        fi
+        # Also clean legacy local/ dev home if it exists
+        _cl_legacy_dev="$_cl_versions_dir/local/home"
+        if [ -d "$_cl_legacy_dev" ]; then
+            _cl_found_dev=1
+            _clean_remove "$_cl_legacy_dev/.stack"
+            _clean_remove "$_cl_legacy_dev/.local/bin"
+        fi
+        if [ -n "$_cl_found_dev" ]; then
+            [ -z "$_cl_dry_run" ] && print_info "Recreated empty dev cache directories"
         else
-            print_info "No dev cache found at $_cl_dev_home"
+            print_info "No dev cache found"
         fi
     fi
 
@@ -1512,10 +1620,6 @@ cmd_clean() {
     if [ -n "$_cl_all" ]; then
         if [ -d "$_cl_versions_dir" ]; then
             for _cl_d in "$_cl_versions_dir"/*/; do
-                # Skip the local/ dir (already handled by --dev above)
-                case "$_cl_d" in
-                    */"${LOCAL_VERSION}"/) continue ;;
-                esac
                 [ -d "$_cl_d" ] && _clean_remove "$_cl_d"
             done
         else
@@ -1543,20 +1647,39 @@ cmd_clean() {
 # Help for update subcommand
 show_update_help() {
     cat << EOF
-${BOLD}USAGE${RESET}: $(basename "$0") update
+${BOLD}USAGE${RESET}: $(basename "$0") update [OPTIONS]
 
 Update this install script
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help           Show this help message
+      --force          Allow downgrade to an older version
 
 ${BOLD}EXAMPLES${RESET}:
   $(basename "$0") update
+  $(basename "$0") update --force
 EOF
 }
 
+# Compare two version strings (major.minor.patch format).
+# Returns 0 (true) if $1 < $2, 1 otherwise.
+_version_lt() {
+    # Strip leading 'v' if present
+    _vlt_a=$(printf '%s' "$1" | sed 's/^v//')
+    _vlt_b=$(printf '%s' "$2" | sed 's/^v//')
+    # Use sort -V if available, otherwise fall back to string comparison
+    if printf '%s\n%s\n' "$_vlt_a" "$_vlt_b" | sort -V >/dev/null 2>&1; then
+        _vlt_smallest=$(printf '%s\n%s\n' "$_vlt_a" "$_vlt_b" | sort -V | head -n1)
+        [ "$_vlt_smallest" = "$_vlt_a" ] && [ "$_vlt_a" != "$_vlt_b" ]
+    else
+        # Fallback: simple string comparison
+        [ "$_vlt_a" != "$_vlt_b" ] && [ "$(printf '%s\n%s\n' "$_vlt_a" "$_vlt_b" | sort | head -n1)" = "$_vlt_a" ]
+    fi
+}
 
 cmd_update() {
+    _upd_force=""
+
     # Parse update subcommand arguments
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1564,15 +1687,27 @@ cmd_update() {
                 show_update_help
                 exit 0
                 ;;
+            --force)
+                _upd_force=1
+                shift
+                ;;
             *)
-                print_error "Unexpected argument"
+                print_error "Unexpected argument: $1"
                 show_update_help
                 exit 1
                 ;;
         esac
     done
 
-    old_version=$("$0" --version)
+    # Resolve absolute path for self-invocation (avoid "command not found" when
+    # the script is invoked via a relative path not in $PATH)
+    _upd_self="$0"
+    case "$_upd_self" in
+        /*) ;; # already absolute
+        *)  _upd_self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+    esac
+
+    old_version=$(sh "$_upd_self" --version 2>/dev/null)
     if [ $? -ne 0 ]; then
       print_info "No current version detected"
       old_version=""
@@ -1610,7 +1745,7 @@ cmd_update() {
         exit 1
     fi
 
-    nlinesdiff=$(diff "$tmp_script" "$0" | wc -l)
+    nlinesdiff=$(diff "$tmp_script" "$_upd_self" | wc -l)
     if [ "$nlinesdiff" -ne 0 ]
     then
         print_info "Successfully pulled '$THIS_SCRIPT_URL'"
@@ -1629,10 +1764,20 @@ cmd_update() {
         exit 1
     fi
 
-    new_version=$("$tmp_script" --version)
+    new_version=$(sh "$tmp_script" --version 2>/dev/null)
 
-    print_info "Replacing current script at '$0'"
-    mv "$tmp_script" "$0"
+    # Refuse to downgrade unless --force is given
+    if [ -n "$old_version" ] && [ -n "$new_version" ] && [ -z "$_upd_force" ]; then
+        if _version_lt "$new_version" "$old_version"; then
+            print_warning "Remote version ($new_version) is older than current ($old_version)"
+            print_info "Use 'update --force' to downgrade"
+            rm -f "$tmp_script"
+            exit 1
+        fi
+    fi
+
+    print_info "Replacing current script at '$_upd_self'"
+    mv "$tmp_script" "$_upd_self"
     if [ $? -ne 0 ]
     then
         print_error "Failed to replace current script, exiting"
@@ -1780,6 +1925,8 @@ EOF
 
 cmd_info() {
 
+    _info_scope_override=""
+
     # Parse info subcommand arguments
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1788,12 +1935,14 @@ cmd_info() {
                 exit 0
                 ;;
             --system)
+                _info_scope_override="system"
                 MORLOC_SCOPE="system"
                 SUDO_PREFIX="sudo "
                 set_paths
                 shift
                 ;;
             --local)
+                _info_scope_override="local"
                 MORLOC_SCOPE="local"
                 SUDO_PREFIX=""
                 set_paths
@@ -1807,10 +1956,22 @@ cmd_info() {
         esac
     done
 
-    # Read from structured config
-    _info_version=$(active_version)
-    _info_scope=$(active_scope)
-    _info_env=$(read_config "active_env")
+    # Read from structured config; honor explicit --system/--local override
+    if [ -n "$_info_scope_override" ]; then
+        _info_scope="$_info_scope_override"
+        # Read version from the overridden scope's config
+        if [ "$_info_scope" = "system" ]; then
+            _info_version=$(read_config "active_version" "$(config_root --system)/config")
+            _info_env=$(read_config "active_env" "$(config_root --system)/config")
+        else
+            _info_version=$(read_config "active_version" "$(config_root)/config")
+            _info_env=$(read_config "active_env" "$(config_root)/config")
+        fi
+    else
+        _info_version=$(active_version)
+        _info_scope=$(active_scope)
+        _info_env=$(read_config "active_env")
+    fi
     [ -z "$_info_version" ] && _info_version="none"
     [ -z "$_info_env" ] && _info_env="base"
 
@@ -1906,9 +2067,12 @@ update_environment() {
   _ue_sudo=""
   [ "$_ue_scope" = "system" ] && _ue_sudo="--sudo"
 
-  # Use the engine from version config to avoid mismatch on dual-engine systems
-  _ue_engine=$(read_config "container_engine" "$_ue_vcfg/config")
-  [ -n "$_ue_engine" ] && CONTAINER_ENGINE="$_ue_engine"
+  # Use the engine from version config to avoid mismatch on dual-engine systems,
+  # but CLI --container-engine always takes precedence
+  if [ -z "$CONTAINER_ENGINE_CLI_OVERRIDE" ]; then
+      _ue_engine=$(read_config "container_engine" "$_ue_vcfg/config")
+      [ -n "$_ue_engine" ] && CONTAINER_ENGINE="$_ue_engine"
+  fi
 
   if [ "$update_usr" = "true" ]; then
       base_container="${CONTAINER_BASE_FULL}:${version}"
@@ -1919,10 +2083,10 @@ update_environment() {
   fi
 
   if [ "$update_dev" = "true" ]; then
-      dev_container="morloc-env:local-${envname}"
-      build_environment "$envname" "$envfile" "$dev_container" "$CONTAINER_BASE_TEST" "$extra_args" || return $?
+      dev_container="morloc-env:${version}-dev-${envname}"
+      build_environment "$envname" "$envfile" "$dev_container" "${CONTAINER_BASE_TEST}:${version}" "$extra_args" || return $?
       write_config "dev_image" "$dev_container" "$_ue_vcfg/config" $_ue_sudo
-      print_success "Switched dev environment to local-$envname"
+      print_success "Switched dev environment to ${version}-dev-$envname"
   fi
 
   # Write environment config file to version-specific environments dir
@@ -1947,8 +2111,12 @@ update_environment() {
       print_info "Activated environment flags: $flags_file"
   fi
 
-  # Set active environment in user config
-  write_config "active_env" "$envname" "$(config_root)/config"
+  # Set active environment in the correct scope config
+  if [ "$_ue_scope" = "system" ]; then
+      write_config "active_env" "$envname" "$(config_root --system)/config" --sudo
+  else
+      write_config "active_env" "$envname" "$(config_root)/config"
+  fi
 
   return 0
 }
@@ -1975,12 +2143,16 @@ reset_environment() {
   fi
 
   if [ "$reset_update_dev" = "true" ]; then
-      write_config "dev_image" "${CONTAINER_BASE_TEST}:latest" "$_re_vcfg/config" $_re_sudo
+      write_config "dev_image" "${CONTAINER_BASE_TEST}:${version}" "$_re_vcfg/config" $_re_sudo
       print_success "Successfully reset dev environment to default"
   fi
 
-  # Reset active env to base
-  write_config "active_env" "base" "$(config_root)/config"
+  # Reset active env to base in the correct scope config
+  if [ "$_re_scope" = "system" ]; then
+      write_config "active_env" "base" "$(config_root --system)/config" --sudo
+  else
+      write_config "active_env" "base" "$(config_root)/config"
+  fi
   print_info "Reset active environment to base"
 
   return 0
@@ -2045,7 +2217,7 @@ init_environment() {
     $SUDO_PREFIX tee "$envfile" > /dev/null << EOF
 # Automatically generated section, DO NOT MODIFY
 # ----------------------------------------------
-ARG CONTAINER_BASE
+ARG CONTAINER_BASE=scratch
 FROM \${CONTAINER_BASE}
 LABEL morloc.environment="$envname"
 ENV MORLOC_ENV_NAME="$envname"
