@@ -9,7 +9,11 @@ Handle Morloc installation, version management, and custom environments.
 
 You need a container engine: [Docker](https://docs.docker.com/engine/install/) (v20+) or [Podman](https://podman.io/docs/installation) (v3+). No Compose plugin is required.
 
-The manager auto-detects whichever is available. You can override the choice with `--container-engine` or the `MORLOC_CONTAINER_ENGINE` environment variable.
+When both are installed, the manager prefers **podman** over docker. You can
+override with `--container-engine docker`, the `MORLOC_CONTAINER_ENGINE`
+environment variable, or by setting `container_engine` in
+`~/.config/morloc/config`. Note that images pulled by one engine are not visible
+to the other — if you switch engines, images will be re-pulled.
 
 
 ## Installation
@@ -124,7 +128,7 @@ Edit it to add your dependencies:
 
 ```dockerfile
 # Automatically generated section, DO NOT MODIFY
-ARG CONTAINER_BASE
+ARG CONTAINER_BASE=scratch
 FROM ${CONTAINER_BASE}
 LABEL morloc.environment="ml"
 ENV MORLOC_ENV_NAME="ml"
@@ -202,11 +206,38 @@ morloc-manager info
 Shows installed versions, which one is selected, container engine, and
 SELinux status.
 
+### Cleaning build artifacts
+
+Remove dev container caches (stack, GHC) without uninstalling:
+
+```sh
+morloc-manager clean --dev            # clean dev caches for all versions
+morloc-manager clean --dev --dry-run  # preview what would be removed
+morloc-manager clean --all            # clean everything (dev caches + build artifacts)
+morloc-manager clean 0.58.3           # clean a specific version only
+```
+
+### System-wide installs (multi-user)
+
+A sysadmin can install Morloc system-wide:
+
+```sh
+sudo morloc-manager install --system
+```
+
+After the system install, **each user** must individually select the system
+version before morloc will work for them:
+
+```sh
+morloc-manager select --system <version>
+```
+
 ### Uninstall
 
 ```sh
-morloc-manager uninstall 0.58.3   # remove a specific version
-morloc-manager uninstall --all    # remove everything
+morloc-manager uninstall 0.58.3          # remove a specific version
+morloc-manager uninstall --all           # remove all local versions
+sudo morloc-manager uninstall --system --all  # remove system versions
 ```
 
 `uninstall --all` removes version data, container images, and configuration.
@@ -242,6 +273,25 @@ Fix with:
 ```sh
 sudo chown -R $(id -u):$(id -g) ~/.local/share/morloc/
 ```
+
+### Shell completion paths from `morloc init` are wrong
+
+After install, `morloc init` (running inside the container) prints `source`
+lines for shell completions. **Do not follow these instructions** — the printed
+paths are container-internal and do not exist on the host. The actual completion
+files are at:
+
+```
+~/.local/share/morloc/versions/<version>/completions/
+```
+
+For example, to enable bash completions for version 0.68.0:
+
+```sh
+source ~/.local/share/morloc/versions/0.68.0/completions/morloc-completions.bash
+```
+
+You can find your active version with `morloc-manager info`.
 
 ### SELinux bind-mount errors on Fedora/RHEL
 

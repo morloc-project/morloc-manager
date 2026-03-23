@@ -594,31 +594,25 @@ build_environment() {
     container_base=$4
     _be_extra=${5:-}
 
-    # Check if image already exists
+    # Hash-based rebuild detection: store a SHA of the Dockerfile after each
+    # successful build and skip the rebuild when the hash matches.
+    _be_hash_file="${dockerfile%.Dockerfile}.sha256"
+    _be_current_hash=""
+    if [ -f "$dockerfile" ]; then
+        _be_current_hash=$(sha256sum "$dockerfile" 2>/dev/null | cut -d' ' -f1)
+        [ -z "$_be_current_hash" ] && _be_current_hash=$(shasum -a 256 "$dockerfile" 2>/dev/null | cut -d' ' -f1)
+    fi
+
+    # Check if image already exists and Dockerfile is unchanged
     if $SUDO_PREFIX$CONTAINER_ENGINE image inspect "$envtag" >/dev/null 2>&1; then
-        # Get the modification time of the Dockerfile
         if [ -f "$dockerfile" ]; then
-            dockerfile_mtime=$(stat -c %Y "$dockerfile" 2>/dev/null || stat -f %m "$dockerfile" 2>/dev/null)
-            # Get image creation time (Unix timestamp)
-            # Docker and Podman both support this format
-            image_created=$($SUDO_PREFIX$CONTAINER_ENGINE image inspect "$envtag" --format '{{.Created}}' 2>/dev/null)
-
-            # Convert image created time to Unix timestamp
-            # Strip nanoseconds and timezone offset for portable parsing
-            # (podman emits full RFC 3339 with nanos, e.g. 2026-03-22T19:48:56.123456789+00:00)
-            _be_created_norm=$(printf '%s' "$image_created" | sed 's/\.[0-9]*//' | sed 's/[+-][0-9:]*$//')
-            if command -v date >/dev/null 2>&1; then
-                image_timestamp=$(date -d "$_be_created_norm" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "$_be_created_norm" +%s 2>/dev/null)
-            fi
-
-            # Compare timestamps - rebuild if Dockerfile is newer
-            # Default to rebuilding when comparison fails (empty values or arithmetic errors)
-            if [ -n "$dockerfile_mtime" ] && [ -n "$image_timestamp" ] && \
-               [ "$dockerfile_mtime" -le "$image_timestamp" ] 2>/dev/null; then
+            _be_stored_hash=""
+            [ -f "$_be_hash_file" ] && _be_stored_hash=$(cat "$_be_hash_file")
+            if [ -n "$_be_current_hash" ] && [ "$_be_current_hash" = "$_be_stored_hash" ]; then
                 print_info "Image '$envtag' is up to date"
                 return 0
             else
-                print_info "Dockerfile has been modified (or timestamp comparison failed), rebuilding image '$envtag'"
+                print_info "Dockerfile has been modified, rebuilding image '$envtag'"
             fi
         else
             print_warning "Dockerfile '$dockerfile' not found, but image exists. Using existing image."
@@ -633,6 +627,12 @@ build_environment() {
     if ! $SUDO_PREFIX$CONTAINER_ENGINE build --build-arg CONTAINER_BASE="$container_base" --tag "$envtag" --file "$dockerfile" $_be_extra "$(dirname "$dockerfile")"; then
         print_error "Failed to build image '$envtag' from '$dockerfile'"
         return 1
+    fi
+
+    # Store Dockerfile hash for future rebuild detection
+    if [ -n "$_be_current_hash" ]; then
+        printf '%s\n' "$_be_current_hash" > "$_be_hash_file" 2>/dev/null || \
+            $SUDO_PREFIX sh -c "printf '%s\n' '$_be_current_hash' > '$_be_hash_file'" 2>/dev/null || true
     fi
 
     print_success "Built image '$envtag'"
@@ -703,8 +703,9 @@ cmd_run() {
         # Check if a system version is available before erroring
         _cr_sys_versions=$(list_versions --system 2>/dev/null)
         if [ -n "$_cr_sys_versions" ]; then
+            _cr_sys_first=$(echo "$_cr_sys_versions" | head -n1 | cut -f1)
             print_info "No active version set, but a system version is available."
-            print_info "Run: $(basename "$0") select --system <version>"
+            print_info "Run: $(basename "$0") select --system $_cr_sys_first"
         fi
         print_error "No active version set. Run 'install' or 'select' first."
         exit 1
@@ -752,6 +753,17 @@ cmd_run() {
         [ -z "$_cr_engine" ] && _cr_engine="$CONTAINER_ENGINE"
     fi
 
+    # Check that the selected image exists in the current engine's store
+    _cr_check_image="$_cr_image"
+    [ -n "$_cr_dev" ] && _cr_check_image="$_cr_dev_image"
+    if [ -n "$_cr_env" ] && [ "$_cr_env" != "base" ]; then
+        if ! $SUDO_PREFIX$_cr_engine image inspect "$_cr_check_image" >/dev/null 2>&1; then
+            print_error "Image '$_cr_check_image' not found in $_cr_engine's image store."
+            print_info "Rebuild it with: $(basename "$0") env $_cr_env"
+            exit 1
+        fi
+    fi
+
     # Read shared memory size from version config, fall back to default
     _cr_shm=$(read_config "shm_size" "$_cr_vcfg/config")
     _cr_shm="${_cr_shm:-$SHARED_MEMORY_SIZE}"
@@ -771,6 +783,11 @@ cmd_run() {
 
     # Build base flags
     if [ -n "$_cr_dev" ]; then
+        if ! $SUDO_PREFIX$_cr_engine image inspect "$_cr_dev_image" >/dev/null 2>&1; then
+            print_error "Dev container image '$_cr_dev_image' is not installed."
+            print_info "Run: $(basename "$0") install --dev"
+            exit 1
+        fi
         _cr_use_image="$_cr_dev_image"
 
         # Dev container uses /home/dev as HOME so files are writable by
@@ -1010,7 +1027,7 @@ _pull_if_missing() {
     $SUDO_PREFIX$CONTAINER_ENGINE pull "$_pim_image" 2>&1 | tee "$_pim_tmpfile"
     # POSIX: can't get pipe exit status reliably; check if image is now present
     if ! $SUDO_PREFIX$CONTAINER_ENGINE image inspect "$_pim_image" >/dev/null 2>&1; then
-        print_error "Failed to pull container '$_pim_label'"
+        print_error "Failed to pull container '$_pim_label' ($_pim_image)"
         if grep -qi "no space left on device" "$_pim_tmpfile" 2>/dev/null; then
             echo "  Disk space is insufficient. Free space and retry."
             echo "  Run '$(basename "$0") clean' to remove cached data."
@@ -1079,9 +1096,11 @@ cmd_install() {
     if [ "$version" = "undefined" ]; then
         print_info "Detecting latest available version..."
         tag="edge"
+        dev_tag="latest"
     else
         print_info "Installing Morloc v$version"
         tag=$version
+        dev_tag=$version
     fi
 
     ensure_morloc_bin || exit 1
@@ -1116,7 +1135,7 @@ cmd_install() {
     _pull_if_missing "$CONTAINER_BASE_TINY:${tag}" "tiny" || exit 1
     _pull_if_missing "$CONTAINER_BASE_FULL:${tag}" "full" || exit 1
     if [ "$install_dev" = "true" ]; then
-        _pull_if_missing "$CONTAINER_BASE_TEST:${tag}" "dev" || exit 1
+        _pull_if_missing "$CONTAINER_BASE_TEST:${dev_tag}" "dev" || exit 1
     fi
 
     # get Morloc version from container
@@ -1162,8 +1181,8 @@ cmd_install() {
 
     # Create dev container directories (persistent mounts for /home/dev inside container)
     if [ "$install_dev" = "true" ]; then
-        $SUDO_PREFIX mkdir -p "$MORLOC_HOST_VERSION_DIR/${tag}/home/.local/bin"
-        $SUDO_PREFIX mkdir -p "$MORLOC_HOST_VERSION_DIR/${tag}/home/.stack"
+        $SUDO_PREFIX mkdir -p "$morloc_data_home/home/.local/bin"
+        $SUDO_PREFIX mkdir -p "$morloc_data_home/home/.stack"
     fi
 
     # Warn about legacy docker-compose.override.yml
@@ -1185,7 +1204,7 @@ cmd_install() {
         _inst_vcfg=$(version_config_root "$version" "$_inst_scope")
         _inst_sudo=""
         [ "$_inst_scope" = "system" ] && _inst_sudo="--sudo"
-        write_config "dev_image" "${CONTAINER_BASE_TEST}:${tag}" "$_inst_vcfg/config" $_inst_sudo
+        write_config "dev_image" "${CONTAINER_BASE_TEST}:${dev_tag}" "$_inst_vcfg/config" $_inst_sudo
     fi
 
     if [ "$no_init" = "false" ]; then
@@ -1238,21 +1257,40 @@ remove_containers_for_version() {
 
     print_info "Removing containers for $version using $CONTAINER_ENGINE ..."
 
+    _rcfv_removed=0
+
     # Remove containers using this version
     ids=$($SUDO_PREFIX$CONTAINER_ENGINE ps -a --filter "ancestor=$CONTAINER_BASE_FULL:$version" --format '{{.ID}}')
-    [ -n "$ids" ] && echo "$ids" | xargs $SUDO_PREFIX$CONTAINER_ENGINE rm -f
+    if [ -n "$ids" ]; then
+        echo "$ids" | xargs $SUDO_PREFIX$CONTAINER_ENGINE rm -f
+        _rcfv_removed=$((_rcfv_removed + 1))
+    fi
     ids=$($SUDO_PREFIX$CONTAINER_ENGINE ps -a --filter "ancestor=$CONTAINER_BASE_TINY:$version" --format '{{.ID}}')
-    [ -n "$ids" ] && echo "$ids" | xargs $SUDO_PREFIX$CONTAINER_ENGINE rm -f
+    if [ -n "$ids" ]; then
+        echo "$ids" | xargs $SUDO_PREFIX$CONTAINER_ENGINE rm -f
+        _rcfv_removed=$((_rcfv_removed + 1))
+    fi
 
     # Remove environment images for this version
     ids=$($SUDO_PREFIX$CONTAINER_ENGINE images --filter "reference=morloc-env:$version-*" --format '{{.ID}}')
-    [ -n "$ids" ] && echo "$ids" | xargs $SUDO_PREFIX$CONTAINER_ENGINE rmi -f
+    if [ -n "$ids" ]; then
+        echo "$ids" | xargs $SUDO_PREFIX$CONTAINER_ENGINE rmi -f
+        _rcfv_removed=$((_rcfv_removed + 1))
+    fi
 
-    # Remove base image
-    $SUDO_PREFIX$CONTAINER_ENGINE rmi -f "$CONTAINER_BASE_FULL:$version"
-    $SUDO_PREFIX$CONTAINER_ENGINE rmi -f "$CONTAINER_BASE_TINY:$version"
+    # Remove base images
+    if $SUDO_PREFIX$CONTAINER_ENGINE rmi -f "$CONTAINER_BASE_FULL:$version" >/dev/null 2>&1; then
+        _rcfv_removed=$((_rcfv_removed + 1))
+    fi
+    if $SUDO_PREFIX$CONTAINER_ENGINE rmi -f "$CONTAINER_BASE_TINY:$version" >/dev/null 2>&1; then
+        _rcfv_removed=$((_rcfv_removed + 1))
+    fi
 
-    print_success "All containers and images removed for $version"
+    if [ "$_rcfv_removed" -gt 0 ]; then
+        print_success "Removed containers and images for $version"
+    else
+        print_info "No containers or images found for $version (already clean)"
+    fi
 
 }
 
@@ -1292,7 +1330,7 @@ remove_all_containers_and_images() {
 
     # Step 2: Find and remove all images with this base name (all tags)
     print_info "Step 2: Removing images (this may take a moment) ..."
-    image_ids=$($SUDO_PREFIX$CONTAINER_ENGINE images --filter "reference=$base_image" --format '{{.ID}}' 2>/dev/null)
+    image_ids=$($SUDO_PREFIX$CONTAINER_ENGINE images --filter "reference=$base_image" --format '{{.ID}}' 2>/dev/null | sort -u)
 
     if [ -n "$image_ids" ]; then
         print_info "Found images: $image_ids"
@@ -1432,9 +1470,20 @@ cmd_uninstall() {
                     write_config "active_version" "" "$_uninst_user_cfg"
                 fi
 
-                # Clean up empty parent directories
+                # Clean up directories (use rm -rf for config root since it may contain stale config files)
                 $SUDO_PREFIX rmdir "$MORLOC_DATA_HOME" 2>/dev/null || true
-                $SUDO_PREFIX rmdir "$_uninst_cfg_root" 2>/dev/null || true
+                $SUDO_PREFIX rm -rf "$_uninst_cfg_root" 2>/dev/null || true
+
+                # Warn about system versions that were not removed
+                if [ "$_uninst_scope" = "local" ]; then
+                    _uninst_sys_versions=$(list_versions --system 2>/dev/null)
+                    if [ -n "$_uninst_sys_versions" ]; then
+                        print_warning "System-scope versions were NOT removed (run with --system --all and sudo to remove them):"
+                        echo "$_uninst_sys_versions" | while IFS='	' read -r _sv_v _sv_s; do
+                            print_point "$_sv_v"
+                        done
+                    fi
+                fi
 
                 exit $_uninst_all_err
                 ;;
@@ -1616,7 +1665,7 @@ cmd_clean() {
         if [ -d "$_cl_versions_dir" ]; then
             for _cl_vdir in "$_cl_versions_dir"/*/; do
                 [ -d "$_cl_vdir" ] || continue
-                _cl_dev_home="$_cl_vdir/home"
+                _cl_dev_home="${_cl_vdir%/}/home"
                 if [ -d "$_cl_dev_home" ]; then
                     _cl_found_dev=1
                     _clean_remove "$_cl_dev_home/.stack"
@@ -1842,15 +1891,23 @@ EOF
 }
 
 cmd_select() {
+    # Check for --help before sudo guard (help doesn't write anything)
+    for _sel_arg in "$@"; do
+        case "$_sel_arg" in
+            -h|--help) show_select_help; exit 0 ;;
+        esac
+    done
+
     # select only writes to user config — sudo would write to root's config
     if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
-        print_error "Do not run 'select' with sudo — it writes to your user config"
+        print_error "Do not run 'select' with sudo — it writes to the real user's config, not root's"
         print_info "Run without sudo: $(basename "$0") select $*"
         exit 1
     fi
 
     version="undefined"
     _sel_scope=""
+    _sel_explicit_scope=""
 
     # Parse select subcommand arguments
     while [ $# -gt 0 ]; do
@@ -1861,10 +1918,12 @@ cmd_select() {
                 ;;
             --system)
                 _sel_scope="system"
+                _sel_explicit_scope="system"
                 shift
                 ;;
             --local)
                 _sel_scope="local"
+                _sel_explicit_scope="local"
                 shift
                 ;;
             *)
@@ -1921,8 +1980,21 @@ cmd_select() {
 
     # Write active version to user config
     _sel_user_cfg="$(config_root)/config"
-    write_config "active_version" "$version" "$_sel_user_cfg"
     write_config "active_scope" "$_sel_scope" "$_sel_user_cfg"
+    if [ "$_sel_scope" = "system" ] && [ -z "$_sel_explicit_scope" ]; then
+        # Don't overwrite local active_version with a system-only version
+        :
+    else
+        write_config "active_version" "$version" "$_sel_user_cfg"
+    fi
+
+    # Reset active env when switching versions (env images are version-tagged)
+    _sel_prev_version=$(read_config "active_version" "$_sel_user_cfg")
+    _sel_prev_env=$(read_config "active_env" "$_sel_user_cfg")
+    if [ -n "$_sel_prev_env" ] && [ "$_sel_prev_env" != "base" ]; then
+        write_config "active_env" "base" "$_sel_user_cfg"
+        print_warning "Reset active environment to 'base' (rebuild '$_sel_prev_env' for version $version with: $(basename "$0") env $_sel_prev_env)"
+    fi
 
     print_success "Switched to Morloc version '$version' ($_sel_scope)"
     exit 0
@@ -2110,7 +2182,9 @@ update_environment() {
 
   if [ "$update_dev" = "true" ]; then
       dev_container="morloc-env:${version}-dev-${envname}"
-      build_environment "$envname" "$envfile" "$dev_container" "${CONTAINER_BASE_TEST}:${version}" "$extra_args" || return $?
+      _ue_dev_base=$(read_config "dev_image" "$_ue_vcfg/config")
+      [ -z "$_ue_dev_base" ] && _ue_dev_base="${CONTAINER_BASE_TEST}:${version}"
+      build_environment "$envname" "$envfile" "$dev_container" "$_ue_dev_base" "$extra_args" || return $?
       write_config "dev_image" "$dev_container" "$_ue_vcfg/config" $_ue_sudo
       print_success "Switched dev environment to ${version}-dev-$envname"
   fi
@@ -2209,20 +2283,15 @@ list_local_environment() {
     current_env=$(read_config "active_env")
 
     # List all .Dockerfile files
+    printf "Available environments:\n"
     for file in "$MORLOC_DEPENDENCY_DIR"/*.Dockerfile; do
         if [ -e "$file" ]; then
             _le_base="${file##*/}"
             _le_base="${_le_base%.Dockerfile}"
-            flags_file="$MORLOC_DEPENDENCY_DIR/${_le_base}.flags"
-            if [ -f "$flags_file" ]; then
-                flags_status="flags:yes"
-            else
-                flags_status="flags:no"
-            fi
             if [ "$_le_base" = "$current_env" ]; then
-                printf "%s\t%s\t%s\t(current)\n" "$_le_base" "$file" "$flags_status"
+                printf "  * %-20s (active)\n" "$_le_base"
             else
-                printf "%s\t%s\t%s\n" "$_le_base" "$file" "$flags_status"
+                printf "    %-20s\n" "$_le_base"
             fi
         fi
     done
@@ -2243,7 +2312,7 @@ init_environment() {
     $SUDO_PREFIX tee "$envfile" > /dev/null << EOF
 # Automatically generated section, DO NOT MODIFY
 # ----------------------------------------------
-ARG CONTAINER_BASE
+ARG CONTAINER_BASE=scratch
 FROM \${CONTAINER_BASE}
 LABEL morloc.environment="$envname"
 ENV MORLOC_ENV_NAME="$envname"
@@ -2445,7 +2514,7 @@ main() {
         run)       shift; cmd_run "$@" ;;
         env)       shift; cmd_env "$@" ;;
         info)      shift; cmd_info "$@" ;;
-        shell)     print_info "Did you mean 'run --shell'?"; exit 1 ;;
+        shell)     print_info "'shell' has been replaced — use: $(basename "$0") run --shell"; exit 0 ;;
         "")        show_help; exit 0 ;;
         *)         print_error "Unknown command: $1"; show_help; exit 1 ;;
     esac
