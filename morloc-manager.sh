@@ -10,7 +10,7 @@ VERSION="0.10.0-2"
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
 
-SHARED_MEMORY_SIZE=4g
+SHARED_MEMORY_SIZE=512m
 
 CONTAINER_BASE_FULL=ghcr.io/morloc-project/morloc/morloc-full
 CONTAINER_BASE_TINY=ghcr.io/morloc-project/morloc/morloc-tiny
@@ -460,6 +460,7 @@ write_version_config() {
     write_config "dev_image" "${CONTAINER_BASE_TEST}:latest" "$_wvc_cfg" $_wvc_sudo
     write_config "host_dir" "$_wvc_datadir" "$_wvc_cfg" $_wvc_sudo
     write_config "container_engine" "$CONTAINER_ENGINE" "$_wvc_cfg" $_wvc_sudo
+    write_config "shm_size" "$SHARED_MEMORY_SIZE" "$_wvc_cfg" $_wvc_sudo
 
     # Create base.conf environment if it doesn't exist
     _wvc_base="$_wvc_cfgdir/environments/base.conf"
@@ -687,6 +688,10 @@ cmd_run() {
     _cr_engine=$(read_config "container_engine" "$_cr_vcfg/config")
     [ -z "$_cr_engine" ] && _cr_engine="$CONTAINER_ENGINE"
 
+    # Read shared memory size from version config, fall back to default
+    _cr_shm=$(read_config "shm_size" "$_cr_vcfg/config")
+    _cr_shm="${_cr_shm:-$SHARED_MEMORY_SIZE}"
+
     # Determine container home — use invoking user's home, not root's
     _cr_real_home=$(real_home)
     _cr_container_home="$_cr_real_home"
@@ -812,22 +817,22 @@ cmd_run() {
         fi
         if [ "${_MORLOC_NO_EXEC:-}" = "1" ]; then
             # shellcheck disable=SC2086
-            $_cr_sudo "$_cr_engine" run --rm -it --shm-size ${SHARED_MEMORY_SIZE} -w "$_cr_workdir" \
+            $_cr_sudo "$_cr_engine" run --rm -it --shm-size ${_cr_shm} -w "$_cr_workdir" \
                 $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" /bin/bash
             return $?
         fi
         # shellcheck disable=SC2086
-        exec $_cr_sudo "$_cr_engine" run --rm -it --shm-size ${SHARED_MEMORY_SIZE} -w "$_cr_workdir" \
+        exec $_cr_sudo "$_cr_engine" run --rm -it --shm-size ${_cr_shm} -w "$_cr_workdir" \
             $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" /bin/bash
     else
         if [ "${_MORLOC_NO_EXEC:-}" = "1" ]; then
             # shellcheck disable=SC2086
-            $_cr_sudo "$_cr_engine" run --rm --shm-size ${SHARED_MEMORY_SIZE} -w "$_cr_workdir" \
+            $_cr_sudo "$_cr_engine" run --rm --shm-size ${_cr_shm} -w "$_cr_workdir" \
                 $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" "$@"
             return $?
         fi
         # shellcheck disable=SC2086
-        exec $_cr_sudo "$_cr_engine" run --rm --shm-size ${SHARED_MEMORY_SIZE} -w "$_cr_workdir" \
+        exec $_cr_sudo "$_cr_engine" run --rm --shm-size ${_cr_shm} -w "$_cr_workdir" \
             $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" "$@"
     fi
 }
@@ -889,6 +894,7 @@ ${BOLD}OPTIONS${RESET}:
   -h, --help           Show this help message
       --system         Install to system scope (rootful)
       --no-init        Do not run 'morloc init'
+      --shm-size SIZE  Container shared memory size (default: 512m)
 
 ${BOLD}ARGUMENTS${RESET}:
   version        Version to install
@@ -943,6 +949,10 @@ cmd_install() {
             --no-init)
                 no_init="true"
                 shift
+                ;;
+            --shm-size)
+                SHARED_MEMORY_SIZE="$2"
+                shift 2
                 ;;
             -*)
                 print_error "Unknown option for install: $1"
