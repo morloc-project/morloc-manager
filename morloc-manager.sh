@@ -5,7 +5,7 @@
 # {{{ constants and system info
 
 PROGRAM_NAME="morloc-manager"
-VERSION="0.10.0-2"
+VERSION="0.10.0-3"
 
 CONTAINER_ENGINE_VERSION=""
 CONTAINER_ENGINE=""
@@ -823,7 +823,25 @@ cmd_run() {
         morloc) [ "${2:-}" = "init" ] && _cr_need_workdir=false ;;
     esac
     if $_cr_need_workdir; then
-        # SELinux prevents relabeling system directories like /tmp
+        # IMPORTANT: SELinux `:z` relabeling restrictions
+        # -------------------------------------------
+        # When SELinux is enforcing/permissive, we mount volumes with `:z`
+        # so the container can access them. However, SELinux *forbids*
+        # relabeling certain directories:
+        #
+        #   1. System directories: /tmp, /var/tmp, etc.
+        #   2. The user's home directory root itself ($HOME) — because
+        #      relabeling $HOME would change labels on *all* dotfiles,
+        #      SSH keys, shell configs, etc., which breaks the system.
+        #
+        # Subdirectories of $HOME (e.g. ~/project/) are fine — SELinux
+        # only blocks relabeling the home dir *root*.
+        #
+        # Do NOT weaken these checks (e.g. by dropping `:z`) — that
+        # would cause silent "Permission denied" failures inside the
+        # container on SELinux systems. The correct fix is always to
+        # require users to work in a subdirectory.
+        # -------------------------------------------
         if [ -n "$_cr_z" ]; then
             case "$MORLOC_WORK_DIR" in
                 /tmp/*|/tmp|/var/tmp/*|/var/tmp)
@@ -832,9 +850,17 @@ cmd_run() {
                     exit 1
                     ;;
             esac
-        fi
-        if [ "$MORLOC_WORK_DIR" = "$_cr_real_home" ]; then
-            print_warning "Running from home directory: only morloc-specific subdirs (.local/share/morloc, .local/bin) are mounted inside the container."
+            # Block mounting $HOME itself — SELinux forbids relabeling it.
+            # This is the #1 first-run failure on Fedora/RHEL; keep this
+            # check even if the error message from the container engine
+            # changes in future versions.
+            if [ "$MORLOC_WORK_DIR" = "$_cr_real_home" ]; then
+                print_error "Cannot bind-mount your home directory ('$MORLOC_WORK_DIR') with SELinux."
+                print_info "SELinux does not allow relabeling your home directory root."
+                print_info "Create a project subdirectory and run from there:"
+                print_info "  mkdir -p ~/project && cd ~/project"
+                exit 1
+            fi
         fi
         _cr_flags="$_cr_flags -v ${MORLOC_WORK_DIR}:${MORLOC_WORK_DIR}${_cr_z}"
         _cr_workdir="${MORLOC_WORK_DIR}"
@@ -2217,7 +2243,7 @@ init_environment() {
     $SUDO_PREFIX tee "$envfile" > /dev/null << EOF
 # Automatically generated section, DO NOT MODIFY
 # ----------------------------------------------
-ARG CONTAINER_BASE=scratch
+ARG CONTAINER_BASE
 FROM \${CONTAINER_BASE}
 LABEL morloc.environment="$envname"
 ENV MORLOC_ENV_NAME="$envname"

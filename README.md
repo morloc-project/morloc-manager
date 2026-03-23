@@ -71,8 +71,9 @@ morloc-manager run -- ./foo -h              # view usage statement
 morloc-manager run -- ./foo 21              # output: 42
 ```
 
-**Note (Fedora/RHEL):** On SELinux-enforcing systems, project files must be
-under your home directory, not `/tmp` or other system directories.
+**Note (Fedora/RHEL):** On SELinux-enforcing systems, you must work in a
+subdirectory of your home directory (e.g. `~/project/`), not `~` itself,
+`/tmp`, or other system directories.
 
 ### Interactive shell
 
@@ -198,8 +199,8 @@ morloc-manager run -x "--gpus all" -- morloc make foo.loc
 morloc-manager info
 ```
 
-Shows installed versions, which one is selected, compose file locations,
-container engine, and SELinux status.
+Shows installed versions, which one is selected, container engine, and
+SELinux status.
 
 ### Uninstall
 
@@ -208,9 +209,9 @@ morloc-manager uninstall 0.58.3   # remove a specific version
 morloc-manager uninstall --all    # remove everything
 ```
 
-`uninstall --all` removes version data, compose files, and container images.
-The override file (if any) is preserved with a warning. Scripts in
-`~/.local/bin/` are not removed — the output tells you how to delete them.
+`uninstall --all` removes version data, container images, and configuration.
+Scripts in `~/.local/bin/` are not removed — the output tells you how to
+delete them.
 
 
 ## Troubleshooting
@@ -244,8 +245,9 @@ sudo chown -R $(id -u):$(id -g) ~/.local/share/morloc/
 
 ### SELinux bind-mount errors on Fedora/RHEL
 
-Working from `/tmp` or other system directories is blocked by SELinux. Move
-your project under your home directory:
+Working from `/tmp`, other system directories, or your home directory root
+(`~`) is blocked by SELinux. You must work in a subdirectory of your home
+directory:
 
 ```sh
 mkdir -p ~/project && cp -r /tmp/myproject/* ~/project/
