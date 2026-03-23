@@ -162,7 +162,7 @@ for vm in $VMS; do
         log "Resetting VM state for $persona"
         vagrant ssh "$vm" -c "
             sudo rm -rf /etc/morloc /usr/local/share/morloc
-            rm -rf ~/.config/morloc ~/.local/share/morloc ~/.local/bin/morloc-manager
+            sudo rm -rf ~/.config/morloc ~/.local/share/morloc ~/.local/bin/morloc-manager
             if id testuser &>/dev/null; then
                 sudo userdel -r testuser
             fi
