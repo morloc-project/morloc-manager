@@ -41,6 +41,27 @@ set_container_engine() {
     CONTAINER_ENGINE_VERSION=$($CONTAINER_ENGINE --version 2>/dev/null | sed 's/.*version \([0-9.]*\).*/\1/')
 }
 
+# Check if the container engine is accessible (daemon running, permissions OK)
+check_engine_accessible() {
+    if [ -z "$CONTAINER_ENGINE" ]; then
+        return 1
+    fi
+    if $SUDO_PREFIX$CONTAINER_ENGINE info >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ "$CONTAINER_ENGINE" = "docker" ]; then
+        print_error "Cannot connect to Docker daemon."
+        print_info "Either start the Docker service or add your user to the 'docker' group:"
+        print_info "  sudo usermod -aG docker \$USER && newgrp docker"
+    elif [ "$CONTAINER_ENGINE" = "podman" ]; then
+        print_error "Cannot connect to Podman."
+        print_info "Check that podman is properly installed: podman info"
+    else
+        print_error "Cannot connect to container engine '$CONTAINER_ENGINE'."
+    fi
+    return 1
+}
+
 detect_selinux() {
     if command -v getenforce >/dev/null 2>&1; then
         case "$(getenforce 2>/dev/null)" in
@@ -303,6 +324,9 @@ is_in_path() {
 config_root() {
     if [ "${1:-}" = "--system" ]; then
         echo "/etc/morloc"
+    elif [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        # Under sudo, XDG vars belong to root; use real user's home
+        echo "$(real_home)/.config/morloc"
     else
         echo "${XDG_CONFIG_HOME:-$(real_home)/.config}/morloc"
     fi
@@ -313,6 +337,8 @@ config_root() {
 data_root() {
     if [ "${1:-}" = "--system" ]; then
         echo "/usr/local/share/morloc"
+    elif [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        echo "$(real_home)/.local/share/morloc"
     else
         echo "${XDG_DATA_HOME:-$(real_home)/.local/share}/morloc"
     fi
@@ -457,7 +483,6 @@ write_version_config() {
 
     _wvc_cfg="$_wvc_cfgdir/config"
     write_config "image" "${CONTAINER_BASE_FULL}:${_wvc_ver}" "$_wvc_cfg" $_wvc_sudo
-    write_config "dev_image" "${CONTAINER_BASE_TEST}:latest" "$_wvc_cfg" $_wvc_sudo
     write_config "host_dir" "$_wvc_datadir" "$_wvc_cfg" $_wvc_sudo
     write_config "container_engine" "$CONTAINER_ENGINE" "$_wvc_cfg" $_wvc_sudo
     write_config "shm_size" "$SHARED_MEMORY_SIZE" "$_wvc_cfg" $_wvc_sudo
@@ -654,6 +679,12 @@ cmd_run() {
     # Resolve version and scope from config
     _cr_version=$(active_version)
     if [ -z "$_cr_version" ]; then
+        # Check if a system version is available before erroring
+        _cr_sys_versions=$(list_versions --system 2>/dev/null)
+        if [ -n "$_cr_sys_versions" ]; then
+            print_info "No active version set, but a system version is available."
+            print_info "Run: $(basename "$0") select --system <version>"
+        fi
         print_error "No active version set. Run 'install' or 'select' first."
         exit 1
     fi
@@ -677,6 +708,7 @@ cmd_run() {
     [ -z "$_cr_dev_image" ] && _cr_dev_image="${CONTAINER_BASE_TEST}:latest"
 
     # Read active environment
+    _cr_user_cfg="$(config_root)/config"
     _cr_env=$(read_config "active_env" "$_cr_user_cfg")
     if [ -n "$_cr_env" ] && [ "$_cr_env" != "base" ]; then
         _cr_env_conf="$_cr_vcfg/environments/${_cr_env}.conf"
@@ -893,6 +925,7 @@ After installation, use:
 ${BOLD}OPTIONS${RESET}:
   -h, --help           Show this help message
       --system         Install to system scope (rootful)
+      --dev            Also pull the dev container image (for compiler development)
       --no-init        Do not run 'morloc init'
       --shm-size SIZE  Container shared memory size (default: 512m)
 
@@ -914,16 +947,24 @@ _pull_if_missing() {
         print_info "Image '$_pim_image' already present, skipping pull"
         return 0
     fi
-    $SUDO_PREFIX$CONTAINER_ENGINE pull "$_pim_image"
-    _pim_rc=$?
-    if [ $_pim_rc -ne 0 ]; then
+    _pim_tmpfile=$(mktemp 2>/dev/null || echo "/tmp/morloc-pull.$$")
+    $SUDO_PREFIX$CONTAINER_ENGINE pull "$_pim_image" 2>&1 | tee "$_pim_tmpfile"
+    # POSIX: can't get pipe exit status reliably; check if image is now present
+    if ! $SUDO_PREFIX$CONTAINER_ENGINE image inspect "$_pim_image" >/dev/null 2>&1; then
         print_error "Failed to pull container '$_pim_label'"
-        echo "  Are you sure this Morloc version is defined?"
-        echo "  If you are behind a corporate firewall or proxy, configure your container engine:"
-        echo "    docker: set HTTPS_PROXY environment variable"
-        echo "    podman: set HTTPS_PROXY or configure in /etc/containers/registries.conf"
+        if grep -qi "no space left on device" "$_pim_tmpfile" 2>/dev/null; then
+            echo "  Disk space is insufficient. Free space and retry."
+            echo "  Run '$(basename "$0") clean' to remove cached data."
+        else
+            echo "  Are you sure this Morloc version is defined?"
+            echo "  If you are behind a corporate firewall or proxy, configure your container engine:"
+            echo "    docker: set HTTPS_PROXY environment variable"
+            echo "    podman: set HTTPS_PROXY or configure in /etc/containers/registries.conf"
+        fi
+        rm -f "$_pim_tmpfile"
         return 1
     fi
+    rm -f "$_pim_tmpfile"
 }
 
 # Install subcommand
@@ -932,6 +973,7 @@ cmd_install() {
     version="undefined"
     tag="undefined"
     no_init="false"
+    install_dev="false"
 
     # Parse install subcommand arguments
     while [ $# -gt 0 ]; do
@@ -944,6 +986,10 @@ cmd_install() {
                 MORLOC_SCOPE="system"
                 SUDO_PREFIX="sudo "
                 set_paths
+                shift
+                ;;
+            --dev)
+                install_dev="true"
                 shift
                 ;;
             --no-init)
@@ -972,7 +1018,7 @@ cmd_install() {
     done
 
     if [ "$version" = "undefined" ]; then
-        print_info "Detecting latest stable version..."
+        print_info "Detecting latest available version..."
         tag="edge"
     else
         print_info "Installing Morloc v$version"
@@ -999,6 +1045,8 @@ cmd_install() {
         print_info "Using $CONTAINER_ENGINE $CONTAINER_ENGINE_VERSION as container engine"
     fi
 
+    check_engine_accessible || exit 1
+
     if [ "$version" = "undefined" ]
     then
         print_info "Attempting to pull containers for Morloc tag '$tag'"
@@ -1008,7 +1056,9 @@ cmd_install() {
 
     _pull_if_missing "$CONTAINER_BASE_TINY:${tag}" "tiny" || exit 1
     _pull_if_missing "$CONTAINER_BASE_FULL:${tag}" "full" || exit 1
-    _pull_if_missing "$CONTAINER_BASE_TEST:latest" "dev" || exit 1
+    if [ "$install_dev" = "true" ]; then
+        _pull_if_missing "$CONTAINER_BASE_TEST:latest" "dev" || exit 1
+    fi
 
     # get Morloc version from container
     # filter out the carriage return that podman helpfully provided
@@ -1052,8 +1102,10 @@ cmd_install() {
     print_info "Created $morloc_data_home"
 
     # Create dev container directories (persistent mounts for /home/dev inside container)
-    $SUDO_PREFIX mkdir -p "$MORLOC_HOST_VERSION_DIR/${LOCAL_VERSION}/home/.local/bin"
-    $SUDO_PREFIX mkdir -p "$MORLOC_HOST_VERSION_DIR/${LOCAL_VERSION}/home/.stack"
+    if [ "$install_dev" = "true" ]; then
+        $SUDO_PREFIX mkdir -p "$MORLOC_HOST_VERSION_DIR/${LOCAL_VERSION}/home/.local/bin"
+        $SUDO_PREFIX mkdir -p "$MORLOC_HOST_VERSION_DIR/${LOCAL_VERSION}/home/.stack"
+    fi
 
     # Warn about legacy docker-compose.override.yml
     if [ -f "$MORLOC_DATA_HOME/docker-compose.override.yml" ]; then
@@ -1069,9 +1121,22 @@ cmd_install() {
     # Write version config
     write_version_config "$version" "$_inst_scope"
 
+    # Write dev_image config only when --dev was requested
+    if [ "$install_dev" = "true" ]; then
+        _inst_vcfg=$(version_config_root "$version" "$_inst_scope")
+        _inst_sudo=""
+        [ "$_inst_scope" = "system" ] && _inst_sudo="--sudo"
+        write_config "dev_image" "${CONTAINER_BASE_TEST}:latest" "$_inst_vcfg/config" $_inst_sudo
+    fi
+
     if [ "$no_init" = "false" ]; then
       print_info "Initializing morloc libraries"
-      _MORLOC_NO_EXEC=1 cmd_run morloc init -f
+      # Use --user to avoid creating root-owned files in local scope
+      if [ "$_inst_scope" = "local" ]; then
+          _MORLOC_NO_EXEC=1 cmd_run -x "--user $(id -u):$(id -g)" -- morloc init -f
+      else
+          _MORLOC_NO_EXEC=1 cmd_run morloc init -f
+      fi
       if [ $? -ne 0 ]
       then
           print_error "Failed to build morloc libraries"
@@ -1202,6 +1267,7 @@ EOF
 cmd_uninstall() {
     version=""
     _uninst_scope="local"
+    _uninst_err=0
 
     # Parse remove subcommand arguments
     while [ $# -gt 0 ]; do
@@ -1212,10 +1278,13 @@ cmd_uninstall() {
                 ;;
             --system)
                 _uninst_scope="system"
+                MORLOC_SCOPE="system"
                 SUDO_PREFIX="sudo "
+                set_paths
                 shift
                 ;;
             -a|--all)
+                _uninst_all_err=0
                 morloc_home="$MORLOC_HOST_VERSION_DIR"
                 if [ -d "$morloc_home" ]
                 then
@@ -1223,6 +1292,7 @@ cmd_uninstall() {
                     if [ $? -ne 0 ]
                     then
                         print_error "Failed to remove morloc home directory '$morloc_home'"
+                        _uninst_all_err=1
                     else
                         print_success "Removed morloc home directory '$morloc_home'"
                     fi
@@ -1231,9 +1301,9 @@ cmd_uninstall() {
                 fi
 
                 # remove all containers/images for all Morloc tags
-                remove_all_containers_and_images "$CONTAINER_BASE_FULL"
-                remove_all_containers_and_images "$CONTAINER_BASE_TINY"
-                remove_all_containers_and_images "$CONTAINER_BASE_TEST"
+                remove_all_containers_and_images "$CONTAINER_BASE_FULL" || _uninst_all_err=1
+                remove_all_containers_and_images "$CONTAINER_BASE_TINY" || _uninst_all_err=1
+                remove_all_containers_and_images "$CONTAINER_BASE_TEST" || _uninst_all_err=1
 
                 # Clean up config directories
                 _uninst_cfg_root=$(config_root)
@@ -1258,7 +1328,7 @@ cmd_uninstall() {
                     write_config "active_version" "" "$_uninst_user_cfg"
                 fi
 
-                exit 0
+                exit $_uninst_all_err
                 ;;
             -*)
                 print_error "Unknown option for uninstall: $1"
@@ -1276,6 +1346,7 @@ cmd_uninstall() {
                     if [ $? -ne 0 ]
                     then
                         print_error "Failed to remove morloc home directory '$morloc_home'"
+                        _uninst_err=1
                     else
                         print_success "Removed morloc directory '$morloc_home'"
                     fi
@@ -1283,8 +1354,12 @@ cmd_uninstall() {
                     print_warning "Cannot remove morloc directory '$morloc_home', it does not exist"
                 fi
 
-                # Remove version config directory
+                # Read engine from version config before removing it
                 _uninst_vcfg=$(version_config_root "$version" "$_uninst_scope")
+                _uninst_engine=$(read_config "container_engine" "$_uninst_vcfg/config")
+                [ -n "$_uninst_engine" ] && CONTAINER_ENGINE="$_uninst_engine"
+
+                # Remove version config directory
                 if [ -d "$_uninst_vcfg" ]; then
                     $SUDO_PREFIX rm -rf "$_uninst_vcfg"
                     print_success "Removed config directory '$_uninst_vcfg'"
@@ -1305,6 +1380,11 @@ cmd_uninstall() {
     if [ -z "$version" ]; then
         print_error "No version given, to uninstall everything call with --all option"
         show_uninstall_help
+        exit 1
+    fi
+
+    if [ "$_uninst_err" -ne 0 ]; then
+        print_warning "Uninstall completed with errors"
         exit 1
     fi
 
@@ -1683,15 +1763,18 @@ cmd_select() {
 # Help for info subcommand
 show_info_help() {
     cat << EOF
-${BOLD}USAGE${RESET}: $(basename "$0") info
+${BOLD}USAGE${RESET}: $(basename "$0") info [OPTIONS]
 
 Print info on Morloc versions and check containers
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help   Show this help message
+      --system Target system scope
+      --local  Target local scope
 
 ${BOLD}EXAMPLES${RESET}:
   $(basename "$0") info
+  $(basename "$0") info --system
 EOF
 }
 
@@ -1704,8 +1787,20 @@ cmd_info() {
                 show_info_help
                 exit 0
                 ;;
+            --system)
+                MORLOC_SCOPE="system"
+                SUDO_PREFIX="sudo "
+                set_paths
+                shift
+                ;;
+            --local)
+                MORLOC_SCOPE="local"
+                SUDO_PREFIX=""
+                set_paths
+                shift
+                ;;
             *)
-                print_error "Unexpected argument"
+                print_error "Unexpected argument: $1"
                 show_info_help
                 exit 1
                 ;;
@@ -1810,6 +1905,10 @@ update_environment() {
   _ue_vcfg=$(version_config_root "$version" "$_ue_scope")
   _ue_sudo=""
   [ "$_ue_scope" = "system" ] && _ue_sudo="--sudo"
+
+  # Use the engine from version config to avoid mismatch on dual-engine systems
+  _ue_engine=$(read_config "container_engine" "$_ue_vcfg/config")
+  [ -n "$_ue_engine" ] && CONTAINER_ENGINE="$_ue_engine"
 
   if [ "$update_usr" = "true" ]; then
       base_container="${CONTAINER_BASE_FULL}:${version}"
@@ -2016,7 +2115,7 @@ EOF
 cmd_env() {
     # Parse env subcommand arguments
     env=""
-    update_dev="true"
+    update_dev="false"
     update_usr="true"
     reset="false"
     extra_args=""
@@ -2090,16 +2189,17 @@ cmd_env() {
             print_warning "Ignoring environment name '$env' with --reset"
         fi
         reset_environment "$update_dev" "$update_usr"
+        exit $?
     else
         if [ -z "$env" ]; then
           print_error "No environment specified"
           show_env_help
+          exit 1
         else
           update_environment "$env" "$update_dev" "$update_usr" "$extra_args"
+          exit $?
         fi
     fi
-
-    exit 0
 }
 # }}}
 # {{{ main
@@ -2147,6 +2247,7 @@ main() {
         run)       shift; cmd_run "$@" ;;
         env)       shift; cmd_env "$@" ;;
         info)      shift; cmd_info "$@" ;;
+        shell)     print_info "Did you mean 'run --shell'?"; exit 1 ;;
         "")        show_help; exit 0 ;;
         *)         print_error "Unknown command: $1"; show_help; exit 1 ;;
     esac

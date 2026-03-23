@@ -6,7 +6,7 @@ Try these scenarios:
 
 2. **Scope coexistence**: Install the same version both locally and system-wide:
    - `bash /vagrant/morloc-manager.sh install edge` (local)
-   - `sudo bash /vagrant/morloc-manager.sh --system install edge` (system)
+   - `sudo bash /vagrant/morloc-manager.sh install --system  edge` (system)
    - Check which one wins: `bash /vagrant/morloc-manager.sh info`
    - Check with explicit scope: `bash /vagrant/morloc-manager.sh --local info` vs `sudo bash /vagrant/morloc-manager.sh --system info`
 

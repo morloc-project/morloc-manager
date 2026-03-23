@@ -82,9 +82,11 @@ morloc-manager run --shell
 
 ### Compiler development
 
-The dev container includes Haskell tools for building the compiler from source:
+The dev container includes Haskell tools for building the compiler from source.
+It is not pulled by default — install with `--dev` to enable it:
 
 ```sh
+morloc-manager install --dev               # pull dev container image
 morloc-manager run --dev -- stack build     # build the compiler
 morloc-manager run --dev -- stack test      # run the test suite
 morloc-manager run --dev --shell            # interactive dev shell
@@ -157,8 +159,8 @@ morloc-manager env --list
 ### Other options
 
 ```sh
-morloc-manager env ml --dev            # apply only to the dev container
-morloc-manager env ml --usr            # apply only to the user container
+morloc-manager env ml --dev            # apply to the dev container instead
+morloc-manager env ml --usr            # apply to the user container (default)
 ```
 
 
