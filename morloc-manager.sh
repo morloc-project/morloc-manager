@@ -508,7 +508,10 @@ write_version_config() {
     _wvc_cfg="$_wvc_cfgdir/config"
     write_config "image" "${CONTAINER_BASE_FULL}:${_wvc_ver}" "$_wvc_cfg" $_wvc_sudo || return 1
     write_config "host_dir" "$_wvc_datadir" "$_wvc_cfg" $_wvc_sudo || return 1
-    write_config "container_engine" "$CONTAINER_ENGINE" "$_wvc_cfg" $_wvc_sudo || return 1
+    # Only persist engine if not a one-shot CLI override (RC-3)
+    if [ -z "$CONTAINER_ENGINE_CLI_OVERRIDE" ]; then
+        write_config "container_engine" "$CONTAINER_ENGINE" "$_wvc_cfg" $_wvc_sudo || return 1
+    fi
     write_config "shm_size" "$SHARED_MEMORY_SIZE" "$_wvc_cfg" $_wvc_sudo || return 1
 
     # Create base.conf environment if it doesn't exist
@@ -615,7 +618,8 @@ build_environment() {
     # Store Dockerfile hash for future rebuild detection
     if [ -n "$_be_current_hash" ]; then
         printf '%s\n' "$_be_current_hash" > "$_be_hash_file" 2>/dev/null || \
-            $SUDO_PREFIX sh -c "printf '%s\n' '$_be_current_hash' > '$_be_hash_file'" 2>/dev/null || true
+            $SUDO_PREFIX sh -c "printf '%s\n' '$_be_current_hash' > '$_be_hash_file'" 2>/dev/null || \
+            print_warning "Could not save Dockerfile hash; rebuild detection disabled for '$envname'"
     fi
 
     print_success "Built image '$envtag'"
@@ -748,7 +752,9 @@ cmd_run() {
             print_warning "Stored engine '$_cr_engine' not found; using '$CONTAINER_ENGINE'"
             _cr_engine="$CONTAINER_ENGINE"
         elif [ -n "$_cr_engine" ] && ! $SUDO_PREFIX$_cr_engine info >/dev/null 2>&1; then
-            print_warning "Stored engine '$_cr_engine' not accessible; using '$CONTAINER_ENGINE'"
+            if [ "$_cr_engine" != "$CONTAINER_ENGINE" ]; then
+                print_warning "Stored engine '$_cr_engine' not accessible; using '$CONTAINER_ENGINE'"
+            fi
             _cr_engine="$CONTAINER_ENGINE"
         fi
         [ -z "$_cr_engine" ] && _cr_engine="$CONTAINER_ENGINE"
@@ -781,6 +787,11 @@ cmd_run() {
         _cr_z=""
     else
         _cr_z="$SELINUX_SUFFIX"
+    fi
+
+    if [ ! -r "$PWD" ] || [ ! -x "$PWD" ]; then
+        print_error "Current directory '$PWD' is not accessible by $(id -un). Run from a directory you own."
+        exit 1
     fi
 
     export MORLOC_WORK_DIR="$PWD"
@@ -958,11 +969,13 @@ ${BOLD}OPTIONS${RESET}:
       --shm-size SIZE  Container shared memory size (default: 512m)
 
 ${BOLD}ARGUMENTS${RESET}:
-  version        Version to install
+  version        Version to install (e.g., 0.54.2, latest, edge)
+                 'edge' is a rolling tag that tracks the latest development build
 
 ${BOLD}EXAMPLES${RESET}:
   $(basename "$0") install
   $(basename "$0") install 0.54.2
+  $(basename "$0") install edge
   $(basename "$0") install --system 0.54.2
 EOF
 }
@@ -1138,7 +1151,7 @@ cmd_install() {
     fi
 
     if [ "$no_init" = "false" ] && [ -f "$morloc_data_home/lib/libmorloc.so" ]; then
-      print_info "Morloc libraries already initialized, skipping (use --no-init + manual 'run -- morloc init -f' to force)"
+      print_info "Morloc libraries already initialized, skipping (use 'run -- morloc init -f' to force rebuild)"
       no_init="true"
     fi
 
@@ -1169,16 +1182,29 @@ cmd_install() {
       print_info "Note: paths shown above by 'morloc init' are container-internal."
       print_info "Host-side data directory: $morloc_data_home"
       if [ -d "$morloc_data_home/completions" ]; then
-          print_info "Shell completions on the host:"
-          print_info "  bash: source $morloc_data_home/completions/morloc-completions.bash"
-          print_info "  zsh:  source $morloc_data_home/completions/morloc-completions.zsh"
-          print_info "  fish: source $morloc_data_home/completions/morloc-completions.fish"
+          _inst_has_comp=false
+          for _comp_file in "$morloc_data_home/completions"/*; do
+              [ -f "$_comp_file" ] || continue
+              if ! $_inst_has_comp; then
+                  print_info "Shell completions on the host:"
+                  _inst_has_comp=true
+              fi
+              case "$_comp_file" in
+                  *.bash) print_info "  bash: source $_comp_file" ;;
+                  *_completions|*.zsh) print_info "  zsh:  fpath+=($morloc_data_home/completions) && autoload -U compinit && compinit" ;;
+                  *.fish) print_info "  fish: source $_comp_file" ;;
+              esac
+          done
       fi
     else
       print_info "Skipping morloc init step"
     fi
 
     print_success "Morloc $(fmt_version "$version") installed successfully"
+
+    if [ "$_inst_scope" = "system" ]; then
+        print_info "Each user must run '$(basename "$0") select --system $version' before first use"
+    fi
 
     # Remind about PATH if morloc-manager isn't accessible by name
     _inst_self_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
@@ -1416,9 +1442,9 @@ cmd_uninstall() {
                 $SUDO_PREFIX rm -f "$MORLOC_DATA_HOME/morloc.flags"
                 $SUDO_PREFIX rm -f "$MORLOC_DATA_HOME/docker-compose.yml"
 
-                # Clean up environment flags
+                # Clean up environment files (Dockerfiles, flags, hashes)
                 if [ -d "$MORLOC_DEPENDENCY_DIR" ]; then
-                    $SUDO_PREFIX rm -f "$MORLOC_DEPENDENCY_DIR"/*.flags
+                    $SUDO_PREFIX rm -rf "$MORLOC_DEPENDENCY_DIR"
                 fi
 
                 # Clear active version in user config
@@ -1506,7 +1532,7 @@ cmd_uninstall() {
                     fi
                 fi
 
-                remove_containers_for_version "$version"
+                remove_containers_for_version "$version" || _uninst_err=1
                 shift
                 ;;
         esac
@@ -1778,7 +1804,7 @@ cmd_update() {
     # Skip update if remote is older (e.g. dev-branch user checking main)
     if [ -n "$old_version" ] && [ -n "$new_version" ] && [ -z "$_upd_force" ]; then
         if _version_lt "$new_version" "$old_version"; then
-            print_info "Already up to date (current: $old_version, remote: $new_version)"
+            print_info "Current version ($old_version) is newer than remote ($new_version); no update needed"
             print_info "Use 'update --force' to downgrade"
             rm -f "$tmp_script"
             exit 0
@@ -1912,8 +1938,12 @@ cmd_select() {
     # Use resolved scope if not forced
     [ -z "$_sel_scope" ] && _sel_scope="$_sel_resolved"
 
-    # Write active version to user config
+    # Read previous state BEFORE writing new values (RC-11)
     _sel_user_cfg="$(config_root)/config"
+    _sel_prev_version=$(read_config "active_version" "$_sel_user_cfg")
+    _sel_prev_env=$(read_config "active_env" "$_sel_user_cfg")
+
+    # Write active version to user config
     if ! write_config "active_scope" "$_sel_scope" "$_sel_user_cfg"; then
         print_error "Failed to write active scope config"
         exit 1
@@ -1928,10 +1958,8 @@ cmd_select() {
         fi
     fi
 
-    # Reset active env when switching versions (env images are version-tagged)
-    _sel_prev_version=$(read_config "active_version" "$_sel_user_cfg")
-    _sel_prev_env=$(read_config "active_env" "$_sel_user_cfg")
-    if [ -n "$_sel_prev_env" ] && [ "$_sel_prev_env" != "base" ]; then
+    # Reset active env only when the version actually changed (env images are version-tagged)
+    if [ "$_sel_prev_version" != "$version" ] && [ -n "$_sel_prev_env" ] && [ "$_sel_prev_env" != "base" ]; then
         if ! write_config "active_env" "base" "$_sel_user_cfg"; then
             print_error "Failed to reset active environment config"
             exit 1
@@ -2024,6 +2052,10 @@ cmd_info() {
         _info_engine=""
     fi
     [ -z "$_info_engine" ] && _info_engine="${CONTAINER_ENGINE:-none}"
+    # Show CLI override if active (RC-4)
+    if [ -n "$CONTAINER_ENGINE_CLI_OVERRIDE" ]; then
+        _info_engine="$CONTAINER_ENGINE (cli override)"
+    fi
 
     # Display scope and SELinux info
     detect_selinux
@@ -2046,7 +2078,12 @@ cmd_info() {
     printf "Engine:         %s\n" "$_info_engine"
     printf "Config root:    %s\n" "$(config_root $_info_scope_flag)"
     printf "Data root:      %s\n" "$(data_root $_info_scope_flag)"
-    printf "Bin dir:        %s\n" "$(bin_root $_info_scope_flag)"
+    _info_bin=$(bin_root $_info_scope_flag)
+    if [ -d "$_info_bin" ]; then
+        printf "Bin dir:        %s\n" "$_info_bin"
+    else
+        printf "Bin dir:        %s (does not exist)\n" "$_info_bin"
+    fi
 
     # Show local versions
     printf "\nLocal versions:\n"
@@ -2331,6 +2368,18 @@ cmd_env() {
                     show_env_help
                     exit 1
                 fi
+                # Validate environment name (RC-12)
+                if [ "$1" = "base" ]; then
+                    print_error "Cannot use reserved name 'base' for a custom environment"
+                    exit 1
+                fi
+                if ! printf '%s\n' "$1" | grep -q '^[a-zA-Z0-9_-][a-zA-Z0-9_-]*$'; then
+                    print_error "Environment name must contain only alphanumeric characters, hyphens, and underscores"
+                    exit 1
+                fi
+                # env --init always creates in user-local deps dir (RC-7)
+                MORLOC_DEPENDENCY_DIR="$(data_root)/deps"
+                SUDO_PREFIX=""
                 init_environment "$1"
                 exit 0
                 ;;
@@ -2372,6 +2421,15 @@ cmd_env() {
           show_env_help
           exit 1
         else
+          # Validate environment name (RC-12)
+          if [ "$env" = "base" ]; then
+              print_error "Cannot use reserved name 'base' for a custom environment"
+              exit 1
+          fi
+          if ! printf '%s\n' "$env" | grep -q '^[a-zA-Z0-9_-][a-zA-Z0-9_-]*$'; then
+              print_error "Environment name must contain only alphanumeric characters, hyphens, and underscores"
+              exit 1
+          fi
           update_environment "$env" "$extra_args"
           exit $?
         fi

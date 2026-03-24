@@ -183,12 +183,18 @@ for vm in $VMS; do
 
         PROMPT="You are exploring morloc-manager on the '$vm' VM.
 
-SSH into the VM with: $SSH_CMD \"<your command>\"
+SSH into the VM with: $SSH_CMD '<your command>'
 The morloc-manager script is at /vagrant/morloc-manager.sh inside the VM.
-Run it as: $SSH_CMD \"cd /vagrant && bash morloc-manager.sh <subcommand>\"
-For sudo commands: $SSH_CMD \"cd /vagrant && sudo bash morloc-manager.sh <subcommand>\"
-For testuser commands: $SSH_CMD \"sudo -u testuser bash -c 'cd /vagrant && bash morloc-manager.sh <subcommand>'\"
-For multi-step workflows inside one container session: $SSH_CMD \"cd ~/myproject && bash /vagrant/morloc-manager.sh run bash -c 'morloc init && morloc make foo.loc'\"
+Run it as: $SSH_CMD 'cd /vagrant && bash morloc-manager.sh <subcommand>'
+For sudo commands: $SSH_CMD 'cd /vagrant && sudo bash morloc-manager.sh <subcommand>'
+For testuser commands: $SSH_CMD 'sudo -u testuser bash -c \"cd /vagrant && bash morloc-manager.sh <subcommand>\"'
+For multi-step workflows inside one container session: $SSH_CMD 'cd ~/myproject && bash /vagrant/morloc-manager.sh run bash -c \"morloc init && morloc make foo.loc\"'
+
+IMPORTANT — checking exit codes through SSH:
+  Use SINGLE quotes around the remote command so that \$? is expanded on the VM, not locally.
+  Correct:   $SSH_CMD 'bash /vagrant/morloc-manager.sh foobar; echo exit=\$?'
+  WRONG:     $SSH_CMD \"bash /vagrant/morloc-manager.sh foobar; echo exit=\$?\"
+  The wrong form expands \$? to 0 locally before SSH sends the command.
 
 Your persona: $persona
 Write bug reports to: $FINDINGS_DIR/$vm/$persona/bug-NNN.md

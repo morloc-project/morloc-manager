@@ -35,6 +35,21 @@ This runs all commands in **one container session**, matching the experience of 
 - Try both `docker` and `podman` as container engines where relevant
 - Be methodical: try one thing at a time, observe the output, then decide what to try next
 
+## CRITICAL: SSH quoting for exit codes
+
+When checking exit codes through SSH, you MUST use **single quotes** around the remote command:
+
+```
+ssh host 'bash /vagrant/morloc-manager.sh foobar; echo exit=$?'
+```
+
+Do NOT use double quotes — `$?` inside double quotes is expanded by YOUR local shell (always 0), not by the remote shell:
+
+```
+# WRONG — $? expanded locally to 0:
+ssh host "bash /vagrant/morloc-manager.sh foobar; echo exit=$?"
+```
+
 ## Bug report format
 
 When you encounter something that fails, gives an error, or behaves differently than the README or help text says it should, write a bug report using the Write tool.
