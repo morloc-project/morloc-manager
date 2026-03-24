@@ -15,7 +15,6 @@ SHARED_MEMORY_SIZE=512m
 
 CONTAINER_BASE_FULL=ghcr.io/morloc-project/morloc/morloc-full
 CONTAINER_BASE_TINY=ghcr.io/morloc-project/morloc/morloc-tiny
-CONTAINER_BASE_TEST=ghcr.io/morloc-project/morloc/morloc-test
 
 THIS_SCRIPT_URL="https://raw.githubusercontent.com/morloc-project/morloc-manager/refs/heads/main/morloc-manager.sh"
 
@@ -77,8 +76,8 @@ detect_selinux() {
 MORLOC_LIBRARY_RELDIR="src/modules"
 MORLOC_DEFAULT_PLANE="default"
 MORLOC_DEFAULT_PLANE_GITHUB_ORG="morloclib"
-# Legacy sentinel: the old dev container data was stored under versions/local/.
-# Used only to filter this directory from version listings and block it in select.
+# Legacy sentinel: old dev container data was stored under versions/local/.
+# Filter this directory from version listings.
 LOCAL_VERSION="local"
 
 # Initialize all paths based on MORLOC_SCOPE. Subcommands set MORLOC_SCOPE
@@ -629,7 +628,6 @@ Run a command inside the morloc container.
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help       Show this help message
-      --dev        Use the dev container (has Haskell toolchain, stack, ghcup)
       --shell      Open an interactive bash shell in the container
       --system     Use system-scope version
       --local      Use local-scope version
@@ -640,7 +638,6 @@ ${BOLD}EXAMPLES${RESET}:
   $(basename "$0") run morloc --version
   $(basename "$0") run morloc make -o foo foo.loc
   $(basename "$0") run --shell
-  $(basename "$0") run --dev stack build
   $(basename "$0") run -x "--gpus all" python train.py
 
 ${BOLD}NOTE${RESET}:
@@ -651,9 +648,8 @@ EOF
 }
 
 # Run a command inside the morloc container
-# Usage: cmd_run [--dev] [--shell] [-x FLAG]... [--] CMD...
+# Usage: cmd_run [--shell] [-x FLAG]... [--] CMD...
 cmd_run() {
-    _cr_dev=""
     _cr_shell=""
     _cr_scope=""
     _cr_extra=""
@@ -661,7 +657,6 @@ cmd_run() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)    show_run_help; exit 0 ;;
-            --dev)        _cr_dev=1; shift ;;
             --shell)      _cr_shell=1; shift ;;
             --system)     _cr_scope="system"; shift ;;
             --local)      _cr_scope="local"; shift ;;
@@ -711,9 +706,7 @@ cmd_run() {
 
     # Read image from version config
     _cr_image=$(read_config "image" "$_cr_vcfg/config")
-    _cr_dev_image=$(read_config "dev_image" "$_cr_vcfg/config")
     [ -z "$_cr_image" ] && _cr_image="${CONTAINER_BASE_FULL}:${_cr_version}"
-    [ -z "$_cr_dev_image" ] && _cr_dev_image="${CONTAINER_BASE_TEST}:${_cr_version}"
 
     # Read active environment from the correct scope config
     if [ "$_cr_scope" = "system" ]; then
@@ -745,7 +738,6 @@ cmd_run() {
 
     # Check that the selected image exists in the current engine's store
     _cr_check_image="$_cr_image"
-    [ -n "$_cr_dev" ] && _cr_check_image="$_cr_dev_image"
     if [ -n "$_cr_env" ] && [ "$_cr_env" != "base" ]; then
         if ! $SUDO_PREFIX$_cr_engine image inspect "$_cr_check_image" >/dev/null 2>&1; then
             print_error "Image '$_cr_check_image' not found in $_cr_engine's image store."
@@ -776,56 +768,12 @@ cmd_run() {
     export MORLOC_WORK_DIR="$PWD"
 
     # Build base flags
-    if [ -n "$_cr_dev" ]; then
-        if ! $SUDO_PREFIX$_cr_engine image inspect "$_cr_dev_image" >/dev/null 2>&1; then
-            print_error "Dev container image '$_cr_dev_image' is not installed."
-            print_info "Run: $(basename "$0") install --dev"
-            exit 1
-        fi
-        _cr_use_image="$_cr_dev_image"
+    _cr_use_image="$_cr_image"
 
-        # Dev container uses /home/dev as HOME so files are writable by
-        # the host user. ghcup stays at /opt/.ghcup/bin (read-only via PATH).
-        _cr_dev_home="/home/dev"
-
-        _cr_mk=""
-        [ "$_cr_scope" = "system" ] && _cr_mk="sudo "
-        ${_cr_mk}mkdir -p "$_cr_versions_dir/${_cr_version}/home/.local/bin"
-        ${_cr_mk}mkdir -p "$_cr_versions_dir/${_cr_version}/home/.stack"
-
-        # Map host UID into the container so bind mounts are writable.
-        # Rootless podman uses user namespaces where --user remaps UIDs
-        # through /etc/subuid, breaking bind mount permissions.
-        # --userns=keep-id preserves the host UID:GID 1:1 instead.
-        # Docker and rootful podman use --user directly.
-        if [ "$_cr_engine" = "podman" ] && [ "$(id -u)" != "0" ]; then
-            _cr_flags="--userns=keep-id"
-        else
-            if [ -n "${SUDO_USER:-}" ]; then
-                _cr_uid=$(id -u "$SUDO_USER")
-                _cr_gid=$(id -g "$SUDO_USER")
-            else
-                _cr_uid=$(id -u)
-                _cr_gid=$(id -g)
-            fi
-            _cr_flags="--user ${_cr_uid}:${_cr_gid}"
-        fi
-        _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${_cr_version}:${_cr_dev_home}/.local/share/morloc${_cr_z}"
-        _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${_cr_version}/home/.local/bin:${_cr_dev_home}/.local/bin${_cr_z}"
-        _cr_flags="$_cr_flags -v ${_cr_versions_dir}/${_cr_version}/home/.stack:${_cr_dev_home}/.stack${_cr_z}"
-        _cr_flags="$_cr_flags -e HOME=${_cr_dev_home}"
-        _cr_flags="$_cr_flags -e PATH=/opt/.ghcup/bin:${_cr_dev_home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-        # Override container_home for work dir mount below
-        _cr_container_home="$_cr_dev_home"
-    else
-        _cr_use_image="$_cr_image"
-
-        _cr_flags="-v ${_cr_vdata}:${_cr_container_home}/.local/share/morloc${_cr_z}"
-        _cr_flags="$_cr_flags -v ${_cr_vdata}/bin:${_cr_container_home}/.local/bin${_cr_z}"
-        _cr_flags="$_cr_flags -e HOME=${_cr_container_home}"
-        _cr_flags="$_cr_flags -e PATH=${_cr_container_home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    fi
+    _cr_flags="-v ${_cr_vdata}:${_cr_container_home}/.local/share/morloc${_cr_z}"
+    _cr_flags="$_cr_flags -v ${_cr_vdata}/bin:${_cr_container_home}/.local/bin${_cr_z}"
+    _cr_flags="$_cr_flags -e HOME=${_cr_container_home}"
+    _cr_flags="$_cr_flags -e PATH=${_cr_container_home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
     # Mount working directory (skip for "morloc init" which doesn't need it —
     # mounting $HOME triggers SELinux relabeling errors)
@@ -990,12 +938,10 @@ of Morloc or for the specified version.
 After installation, use:
   $(basename "$0") run morloc make -o foo foo.loc   Run a command in the container
   $(basename "$0") run --shell                      Interactive shell
-  $(basename "$0") run --dev stack build            Dev container command
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help           Show this help message
       --system         Install to system scope (rootful)
-      --dev            Also pull the dev container image (for compiler development)
       --no-init        Do not run 'morloc init'
       --shm-size SIZE  Container shared memory size (default: 512m)
 
@@ -1043,7 +989,6 @@ cmd_install() {
     version="undefined"
     tag="undefined"
     no_init="false"
-    install_dev="false"
 
     # Parse install subcommand arguments
     while [ $# -gt 0 ]; do
@@ -1056,10 +1001,6 @@ cmd_install() {
                 MORLOC_SCOPE="system"
                 SUDO_PREFIX="sudo "
                 set_paths
-                shift
-                ;;
-            --dev)
-                install_dev="true"
                 shift
                 ;;
             --no-init)
@@ -1090,11 +1031,9 @@ cmd_install() {
     if [ "$version" = "undefined" ]; then
         print_info "Detecting latest available version..."
         tag="edge"
-        dev_tag="edge"
     else
         print_info "Installing Morloc v$version"
         tag=$version
-        dev_tag=$version
     fi
 
     print_info "Looking for a container engine"
@@ -1118,9 +1057,6 @@ cmd_install() {
 
     _pull_if_missing "$CONTAINER_BASE_TINY:${tag}" "tiny" || exit 1
     _pull_if_missing "$CONTAINER_BASE_FULL:${tag}" "full" || exit 1
-    if [ "$install_dev" = "true" ]; then
-        _pull_if_missing "$CONTAINER_BASE_TEST:${dev_tag}" "dev" || exit 1
-    fi
 
     # get Morloc version from container
     # filter out the carriage return that podman helpfully provided
@@ -1163,15 +1099,6 @@ cmd_install() {
 
     print_info "Created $morloc_data_home"
 
-    # Create dev container directories (persistent mounts for /home/dev inside container)
-    if [ "$install_dev" = "true" ]; then
-        if ! $SUDO_PREFIX mkdir -p "$morloc_data_home/home/.local/bin" || \
-           ! $SUDO_PREFIX mkdir -p "$morloc_data_home/home/.stack"; then
-            print_error "Failed to create dev container directories"
-            exit 1
-        fi
-    fi
-
     # Warn about legacy docker-compose.override.yml
     if [ -f "$MORLOC_DATA_HOME/docker-compose.override.yml" ]; then
         print_warning "Found legacy docker-compose.override.yml in $MORLOC_DATA_HOME"
@@ -1187,17 +1114,6 @@ cmd_install() {
     if ! write_version_config "$version" "$_inst_scope"; then
         print_error "Failed to write version config"
         exit 1
-    fi
-
-    # Write dev_image config only when --dev was requested
-    if [ "$install_dev" = "true" ]; then
-        _inst_vcfg=$(version_config_root "$version" "$_inst_scope")
-        _inst_sudo=""
-        [ "$_inst_scope" = "system" ] && _inst_sudo="--sudo"
-        if ! write_config "dev_image" "${CONTAINER_BASE_TEST}:${dev_tag}" "$_inst_vcfg/config" $_inst_sudo; then
-            print_error "Failed to write dev image config"
-            exit 1
-        fi
     fi
 
     # Pre-label system data dirs for SELinux so non-root users don't need :z relabeling
@@ -1439,7 +1355,6 @@ cmd_uninstall() {
                 # remove all containers/images for all Morloc tags
                 remove_all_containers_and_images "$CONTAINER_BASE_FULL" || _uninst_all_err=1
                 remove_all_containers_and_images "$CONTAINER_BASE_TINY" || _uninst_all_err=1
-                remove_all_containers_and_images "$CONTAINER_BASE_TEST" || _uninst_all_err=1
 
                 # Remove custom environment images (morloc-env:*)
                 if [ -n "$CONTAINER_ENGINE" ]; then
@@ -1582,8 +1497,7 @@ Remove build artifacts without removing container images.
 
 ${BOLD}OPTIONS${RESET}:
   -h, --help     Show this help message
-      --dev      Clean dev container cache (GHC, stack build cache)
-      --all      Clean all version data and dev cache
+      --all      Clean all version data
       --system   Target system scope
       --local    Target local scope
       --dry-run  List what would be deleted without deleting
@@ -1592,17 +1506,15 @@ ${BOLD}ARGUMENTS${RESET}:
   VERSION        Clean runtime artifacts for a specific version
 
 ${BOLD}EXAMPLES${RESET}:
-  $(basename "$0") clean --dev              Remove stack/GHC cache
-  $(basename "$0") clean --dev --dry-run    Show what --dev would remove
   $(basename "$0") clean 0.55.0            Remove runtime data for 0.55.0
-  $(basename "$0") clean --all             Remove all version data + dev cache
+  $(basename "$0") clean --all             Remove all version data
+  $(basename "$0") clean --all --dry-run   Show what would be removed
 EOF
 }
 
 cmd_clean() {
     _cl_scope="local"
     _cl_dry_run=""
-    _cl_dev=""
     _cl_all=""
     _cl_version=""
 
@@ -1619,10 +1531,6 @@ cmd_clean() {
                 ;;
             --local)
                 _cl_scope="local"
-                shift
-                ;;
-            --dev)
-                _cl_dev=1
                 shift
                 ;;
             --all)
@@ -1649,11 +1557,11 @@ cmd_clean() {
         esac
     done
 
-    if [ -z "$_cl_dev" ] && [ -z "$_cl_all" ] && [ -z "$_cl_version" ]; then
+    if [ -z "$_cl_all" ] && [ -z "$_cl_version" ]; then
         if [ -n "$_cl_dry_run" ]; then
             _cl_all=1
         else
-            print_error "Specify --dev, --all, or a VERSION to clean"
+            print_error "Specify --all or a VERSION to clean"
             show_clean_help
             exit 1
         fi
@@ -1676,38 +1584,6 @@ cmd_clean() {
             print_success "Removed $1"
         fi
     }
-
-    # --dev: clean stack/GHC cache in each version's dev home
-    if [ -n "$_cl_dev" ] || [ -n "$_cl_all" ]; then
-        _cl_found_dev=""
-        if [ -d "$_cl_versions_dir" ]; then
-            for _cl_vdir in "$_cl_versions_dir"/*/; do
-                [ -d "$_cl_vdir" ] || continue
-                _cl_dev_home="${_cl_vdir%/}/home"
-                if [ -d "$_cl_dev_home" ]; then
-                    _cl_found_dev=1
-                    _clean_remove "$_cl_dev_home/.stack"
-                    _clean_remove "$_cl_dev_home/.local/bin"
-                    if [ -z "$_cl_dry_run" ]; then
-                        $SUDO_PREFIX mkdir -p "$_cl_dev_home/.stack"
-                        $SUDO_PREFIX mkdir -p "$_cl_dev_home/.local/bin"
-                    fi
-                fi
-            done
-        fi
-        # Also clean legacy local/ dev home if it exists
-        _cl_legacy_dev="$_cl_versions_dir/local/home"
-        if [ -d "$_cl_legacy_dev" ]; then
-            _cl_found_dev=1
-            _clean_remove "$_cl_legacy_dev/.stack"
-            _clean_remove "$_cl_legacy_dev/.local/bin"
-        fi
-        if [ -n "$_cl_found_dev" ]; then
-            [ -z "$_cl_dry_run" ] && print_info "Recreated empty dev cache directories"
-        else
-            print_info "No dev cache found"
-        fi
-    fi
 
     # --all: clean every version data directory
     if [ -n "$_cl_all" ]; then
@@ -1958,7 +1834,7 @@ cmd_select() {
 
     if [ "$version" = "$LOCAL_VERSION" ]
     then
-        print_error "Cannot set to '${LOCAL_VERSION}' version, please use dev containers"
+        print_error "Cannot select reserved version '${LOCAL_VERSION}'"
         exit 1
     fi
 
@@ -2165,8 +2041,6 @@ cmd_info() {
 
 update_environment() {
   envname=$1; shift
-  update_dev=$1; shift
-  update_usr=$1; shift
   extra_args=${1:-}
   envfile="$MORLOC_DEPENDENCY_DIR/$envname.Dockerfile"
 
@@ -2199,22 +2073,11 @@ update_environment() {
       [ -n "$_ue_engine" ] && CONTAINER_ENGINE="$_ue_engine"
   fi
 
-  if [ "$update_usr" = "true" ]; then
-      base_container="${CONTAINER_BASE_FULL}:${version}"
-      user_container="morloc-env:${version}-${envname}"
-      build_environment "$envname" "$envfile" "$user_container" "$base_container" "$extra_args" || return $?
-      write_config "image" "$user_container" "$_ue_vcfg/config" $_ue_sudo || return 1
-      print_success "Switched user environment to $version-$envname"
-  fi
-
-  if [ "$update_dev" = "true" ]; then
-      dev_container="morloc-env:${version}-dev-${envname}"
-      _ue_dev_base=$(read_config "dev_image" "$_ue_vcfg/config")
-      [ -z "$_ue_dev_base" ] && _ue_dev_base="${CONTAINER_BASE_TEST}:${version}"
-      build_environment "$envname" "$envfile" "$dev_container" "$_ue_dev_base" "$extra_args" || return $?
-      write_config "dev_image" "$dev_container" "$_ue_vcfg/config" $_ue_sudo || return 1
-      print_success "Switched dev environment to ${version}-dev-$envname"
-  fi
+  base_container="${CONTAINER_BASE_FULL}:${version}"
+  user_container="morloc-env:${version}-${envname}"
+  build_environment "$envname" "$envfile" "$user_container" "$base_container" "$extra_args" || return $?
+  write_config "image" "$user_container" "$_ue_vcfg/config" $_ue_sudo || return 1
+  print_success "Switched environment to $version-$envname"
 
   # Write environment config file to version-specific environments dir
   if [ "$_ue_scope" = "system" ]; then
@@ -2229,9 +2092,7 @@ update_environment() {
       fi
   fi
   _ue_env_conf="$_ue_vcfg/environments/${envname}.conf"
-  if [ "$update_usr" = "true" ]; then
-      write_config "image" "$user_container" "$_ue_env_conf" $_ue_sudo || return 1
-  fi
+  write_config "image" "$user_container" "$_ue_env_conf" $_ue_sudo || return 1
 
   # Copy flags file to version environments dir if it exists
   flags_file="$MORLOC_DEPENDENCY_DIR/${envname}.flags"
@@ -2261,9 +2122,6 @@ update_environment() {
 }
 
 reset_environment() {
-  reset_update_dev="$1"
-  reset_update_usr="$2"
-
   version=$(active_version)
   _re_scope=$(active_scope)
   if [ -z "$version" ]; then
@@ -2276,15 +2134,8 @@ reset_environment() {
   _re_sudo=""
   [ "$_re_scope" = "system" ] && _re_sudo="--sudo"
 
-  if [ "$reset_update_usr" = "true" ]; then
-      write_config "image" "${CONTAINER_BASE_FULL}:${version}" "$_re_vcfg/config" $_re_sudo || return 1
-      print_success "Successfully reset user environment to default"
-  fi
-
-  if [ "$reset_update_dev" = "true" ]; then
-      write_config "dev_image" "${CONTAINER_BASE_TEST}:${version}" "$_re_vcfg/config" $_re_sudo || return 1
-      print_success "Successfully reset dev environment to default"
-  fi
+  write_config "image" "${CONTAINER_BASE_FULL}:${version}" "$_re_vcfg/config" $_re_sudo || return 1
+  print_success "Successfully reset environment to default"
 
   # Reset active env to base in the correct scope config
   if [ "$_re_scope" = "system" ]; then
@@ -2400,8 +2251,6 @@ ${BOLD}OPTIONS${RESET}:
       --init ENV  Create stub Dockerfile and flags file
       --reset     Reset to the default environment (clears env flags)
   -x, --extra ARG Extra arguments for the container
-      --dev       Act only on the dev profiles
-      --usr       Act only on the user profiles
 
 ${BOLD}EXAMPLES${RESET}:
   $(basename "$0") env --list
@@ -2414,8 +2263,6 @@ EOF
 cmd_env() {
     # Parse env subcommand arguments
     env=""
-    update_dev="false"
-    update_usr="true"
     reset="false"
     extra_args=""
 
@@ -2451,16 +2298,6 @@ cmd_env() {
                 shift
                 reset="true"
                 ;;
-            --dev)
-                shift
-                update_dev="true"
-                update_usr="false"
-                ;;
-            --usr)
-                shift
-                update_dev="false"
-                update_usr="true"
-                ;;
             -x|--extra)
                 shift
                 extra_args="${extra_args}${1} "
@@ -2487,7 +2324,7 @@ cmd_env() {
         if [ -n "$env" ]; then
             print_warning "Ignoring environment name '$env' with --reset"
         fi
-        reset_environment "$update_dev" "$update_usr"
+        reset_environment
         exit $?
     else
         if [ -z "$env" ]; then
@@ -2495,7 +2332,7 @@ cmd_env() {
           show_env_help
           exit 1
         else
-          update_environment "$env" "$update_dev" "$update_usr" "$extra_args"
+          update_environment "$env" "$extra_args"
           exit $?
         fi
     fi

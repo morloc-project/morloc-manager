@@ -88,18 +88,6 @@ support for Python, R, C++ as well niceties like vim
 morloc-manager run --shell
 ```
 
-### Compiler development
-
-The dev container includes Haskell tools for building the compiler from source.
-It is not pulled by default — install with `--dev` to enable it:
-
-```sh
-morloc-manager install --dev               # pull dev container image
-morloc-manager run --dev -- stack build     # build the compiler
-morloc-manager run --dev -- stack test      # run the test suite
-morloc-manager run --dev --shell            # interactive dev shell
-```
-
 ### Switching versions
 
 You can install multiple versions side-by-side and switch between them.
@@ -164,14 +152,6 @@ morloc-manager env --reset
 morloc-manager env --list
 ```
 
-### Other options
-
-```sh
-morloc-manager env ml --dev            # apply to the dev container instead
-morloc-manager env ml --usr            # apply to the user container (default)
-```
-
-
 ## Advanced usage
 
 ### How it works
@@ -179,8 +159,8 @@ morloc-manager env ml --usr            # apply to the user container (default)
 The manager uses directory-based structured config under `~/.config/morloc/`
 (local scope) or `/etc/morloc/` (system scope). Key config entries include
 `active_version`, `active_scope`, `active_env`, and `container_engine`.
-Per-version config lives under `versions/<ver>/config` with `image`,
-`dev_image`, and `host_dir`. Custom environments are stored under
+Per-version config lives under `versions/<ver>/config` with `image`
+and `host_dir`. Custom environments are stored under
 `versions/<ver>/environments/`.
 
 `morloc-manager run` invokes `docker run` / `podman run` directly (no Compose
@@ -208,12 +188,11 @@ SELinux status.
 
 ### Cleaning build artifacts
 
-Remove dev container caches (stack, GHC) without uninstalling:
+Remove build artifacts without uninstalling:
 
 ```sh
-morloc-manager clean --dev            # clean dev caches for all versions
-morloc-manager clean --dev --dry-run  # preview what would be removed
-morloc-manager clean --all            # clean everything (dev caches + build artifacts)
+morloc-manager clean --all            # clean all version data
+morloc-manager clean --all --dry-run  # preview what would be removed
 morloc-manager clean 0.58.3           # clean a specific version only
 ```
 
@@ -275,9 +254,9 @@ sudo chown -R $(id -u):$(id -g) ~/.local/share/morloc/
 ### Shell completion paths from `morloc init`
 
 After install, `morloc init` prints `source` lines for shell completions. These
-paths are relative to the container filesystem, so they work as-is inside
-`morloc-manager shell`. If you want completions on the host (outside the
-container), use the host-side paths instead:
+paths are relative to the container filesystem, so they work as-is inside the
+shell (`morloc-manager run --shell`). If you want completions on the host
+(outside the container), use the host-side paths instead:
 
 ```
 ~/.local/share/morloc/versions/<version>/completions/

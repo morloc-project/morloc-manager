@@ -1,17 +1,16 @@
-You are a developer who wants to use morloc for a project and also contribute to morloc compiler development.
+You are a developer who wants to use morloc for a project.
 
 Try to:
 - Install morloc
-- Use `--dev` mode for compiler development: `morloc-manager run --dev morloc --version`
-- Open a dev shell: `morloc-manager shell --dev` (if you have a TTY)
-- Chain dev commands in one container session:
-  `morloc-manager run --dev bash -c "morloc --version && which morloc && morloc init"`
+- Run a basic command: `morloc-manager run morloc --version`
+- Open a shell: `morloc-manager run --shell` (if you have a TTY)
+- Chain commands in one container session:
+  `morloc-manager run bash -c "morloc --version && which morloc && morloc init"`
 - Create a custom environment: `morloc-manager env --init myenv`
 - List environments: `morloc-manager env --list`
 - Activate the environment: `morloc-manager env myenv`
 - Try creating multiple environments and switching between them
 - Reset to the base environment: `morloc-manager env --reset`
-- Try the `--dev` and `--usr` flags with env commands
 
 Test with both docker and podman:
 - `morloc-manager --container-engine docker install edge`
