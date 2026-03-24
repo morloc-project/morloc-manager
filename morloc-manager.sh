@@ -229,6 +229,15 @@ print_point() {
     printf "  %s\n" "$1"
 }
 
+# Format a version string for display: prefix "v" only for numeric versions
+# e.g. "0.68.0" -> "v0.68.0", "edge" -> "edge"
+fmt_version() {
+    case "$1" in
+        [0-9]*) printf 'v%s' "$1" ;;
+        *)      printf '%s' "$1" ;;
+    esac
+}
+
 # }}}
 # {{{ helper functions
 
@@ -237,17 +246,14 @@ create_directory() {
     DIR=$1
 
     if [ -d "$DIR" ]; then
-        print_warning "Directory $DIR already exists"
         return 0
     fi
 
-    print_info "Creating directory: $DIR"
     if ! $SUDO_PREFIX mkdir -p "$DIR" 2>/dev/null; then
         print_error "Failed to create directory: $DIR"
         return 1
     fi
 
-    print_success "Created directory: $DIR"
     return 0
 }
 
@@ -704,6 +710,18 @@ cmd_run() {
     _cr_vdata=$(version_data_root "$_cr_version" "$_cr_scope")
     _cr_versions_dir="$(data_root $_cr_scope_flag)/versions"
 
+    # Detect stale scope: version directory doesn't exist for the active scope
+    if [ ! -d "$_cr_vdata" ]; then
+        print_error "Version '$_cr_version' not found in $_cr_scope scope (directory $_cr_vdata does not exist)."
+        if [ "$_cr_scope" = "system" ]; then
+            print_info "The system version may have been uninstalled. Reset with:"
+            print_info "  $(basename "$0") select --local <version>"
+        else
+            print_info "Run '$(basename "$0") install $_cr_version' or '$(basename "$0") select' to fix."
+        fi
+        exit 1
+    fi
+
     # Read image from version config
     _cr_image=$(read_config "image" "$_cr_vcfg/config")
     [ -z "$_cr_image" ] && _cr_image="${CONTAINER_BASE_FULL}:${_cr_version}"
@@ -865,25 +883,19 @@ cmd_run() {
             print_info "If connecting over SSH, use: ssh -t <host> morloc-manager run --shell"
             exit 1
         fi
-        if [ "${_MORLOC_NO_EXEC:-}" = "1" ]; then
-            # shellcheck disable=SC2086
-            $_cr_sudo "$_cr_engine" run --rm -it --shm-size ${_cr_shm} -w "$_cr_workdir" \
-                $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" /bin/bash
-            return $?
-        fi
         # shellcheck disable=SC2086
-        exec $_cr_sudo "$_cr_engine" run --rm -it --shm-size ${_cr_shm} -w "$_cr_workdir" \
+        $_cr_sudo "$_cr_engine" run --rm -it --shm-size ${_cr_shm} -w "$_cr_workdir" \
             $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" /bin/bash
+        _cr_rc=$?
+        [ "${_MORLOC_NO_EXEC:-}" = "1" ] && return $_cr_rc
+        exit $_cr_rc
     else
-        if [ "${_MORLOC_NO_EXEC:-}" = "1" ]; then
-            # shellcheck disable=SC2086
-            $_cr_sudo "$_cr_engine" run --rm --shm-size ${_cr_shm} -w "$_cr_workdir" \
-                $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" "$@"
-            return $?
-        fi
         # shellcheck disable=SC2086
-        exec $_cr_sudo "$_cr_engine" run --rm --shm-size ${_cr_shm} -w "$_cr_workdir" \
+        $_cr_sudo "$_cr_engine" run --rm --shm-size ${_cr_shm} -w "$_cr_workdir" \
             $_cr_flags $_cr_user_flags $_cr_extra "$_cr_use_image" "$@"
+        _cr_rc=$?
+        [ "${_MORLOC_NO_EXEC:-}" = "1" ] && return $_cr_rc
+        exit $_cr_rc
     fi
 }
 
@@ -1032,7 +1044,7 @@ cmd_install() {
         print_info "Detecting latest available version..."
         tag="edge"
     else
-        print_info "Installing Morloc v$version"
+        print_info "Installing Morloc $(fmt_version "$version")"
         tag=$version
     fi
 
@@ -1075,7 +1087,7 @@ cmd_install() {
             print_error "No Morloc version found - something went wrong"
             exit 1
         fi
-        print_info "Detected Morloc v$detected_version in retrieved container"
+        print_info "Detected Morloc $(fmt_version "$detected_version") in retrieved container"
         version=$detected_version
     fi
 
@@ -1097,7 +1109,7 @@ cmd_install() {
         }
     done
 
-    print_info "Created $morloc_data_home"
+    print_info "Data directory: $morloc_data_home"
 
     # Warn about legacy docker-compose.override.yml
     if [ -f "$MORLOC_DATA_HOME/docker-compose.override.yml" ]; then
@@ -1125,6 +1137,11 @@ cmd_install() {
         fi
     fi
 
+    if [ "$no_init" = "false" ] && [ -f "$morloc_data_home/lib/libmorloc.so" ]; then
+      print_info "Morloc libraries already initialized, skipping (use --no-init + manual 'run -- morloc init -f' to force)"
+      no_init="true"
+    fi
+
     if [ "$no_init" = "false" ]; then
       print_info "Initializing morloc libraries"
       # Use --userns=keep-id for rootless podman (matches cmd_run logic);
@@ -1148,11 +1165,30 @@ cmd_install() {
           print_error "Failed to build morloc libraries"
           exit 1
       fi
+      # Print correct host-side paths (morloc init prints container-internal paths)
+      print_info "Note: paths shown above by 'morloc init' are container-internal."
+      print_info "Host-side data directory: $morloc_data_home"
+      if [ -d "$morloc_data_home/completions" ]; then
+          print_info "Shell completions on the host:"
+          print_info "  bash: source $morloc_data_home/completions/morloc-completions.bash"
+          print_info "  zsh:  source $morloc_data_home/completions/morloc-completions.zsh"
+          print_info "  fish: source $morloc_data_home/completions/morloc-completions.fish"
+      fi
     else
       print_info "Skipping morloc init step"
     fi
 
-    print_success "Morloc v$version installed successfully"
+    print_success "Morloc $(fmt_version "$version") installed successfully"
+
+    # Remind about PATH if morloc-manager isn't accessible by name
+    _inst_self_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+    case ":$PATH:" in
+        *":$_inst_self_dir:"*) ;;
+        *)
+            print_info "Reminder: add morloc-manager to your PATH:"
+            print_info "  export PATH=\"$_inst_self_dir:\$PATH\""
+            ;;
+    esac
 }
 
 # }}}
@@ -1390,6 +1426,10 @@ cmd_uninstall() {
                 if [ -f "$_uninst_user_cfg" ]; then
                     write_config "active_version" "" "$_uninst_user_cfg" || _uninst_all_err=1
                     write_config "active_env" "base" "$_uninst_user_cfg" || _uninst_all_err=1
+                    # Reset scope to local when removing system install
+                    if [ "$_uninst_scope" = "system" ]; then
+                        write_config "active_scope" "local" "$_uninst_user_cfg" || _uninst_all_err=1
+                    fi
                 fi
 
                 # Clean up directories (use rm -rf for config root since it may contain stale config files)
@@ -1735,13 +1775,13 @@ cmd_update() {
 
     new_version=$(sh "$tmp_script" --version 2>/dev/null)
 
-    # Refuse to downgrade unless --force is given
+    # Skip update if remote is older (e.g. dev-branch user checking main)
     if [ -n "$old_version" ] && [ -n "$new_version" ] && [ -z "$_upd_force" ]; then
         if _version_lt "$new_version" "$old_version"; then
-            print_warning "Remote version ($new_version) is older than current ($old_version)"
+            print_info "Already up to date (current: $old_version, remote: $new_version)"
             print_info "Use 'update --force' to downgrade"
             rm -f "$tmp_script"
-            exit 1
+            exit 0
         fi
     fi
 
@@ -2060,7 +2100,7 @@ update_environment() {
       print_error "No active version — run 'install' first"
       return 1
   fi
-  print_info "Currently using morloc v$version"
+  print_info "Currently using morloc $(fmt_version "$version")"
 
   _ue_vcfg=$(version_config_root "$version" "$_ue_scope")
   _ue_sudo=""
@@ -2128,7 +2168,7 @@ reset_environment() {
       print_error "No active version — nothing to reset"
       return 1
   fi
-  print_info "Currently using morloc v$version"
+  print_info "Currently using morloc $(fmt_version "$version")"
 
   _re_vcfg=$(version_config_root "$version" "$_re_scope")
   _re_sudo=""
@@ -2383,7 +2423,7 @@ main() {
         run)       shift; cmd_run "$@" ;;
         env)       shift; cmd_env "$@" ;;
         info)      shift; cmd_info "$@" ;;
-        shell)     print_info "'shell' has been replaced — use: $(basename "$0") run --shell"; exit 0 ;;
+        shell)     print_error "'shell' has been removed — use: $(basename "$0") run --shell"; exit 1 ;;
         "")        show_help; exit 0 ;;
         *)         print_error "Unknown command: $1"; show_help; exit 1 ;;
     esac

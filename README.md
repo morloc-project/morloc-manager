@@ -211,6 +211,16 @@ version before morloc will work for them:
 morloc-manager select --system <version>
 ```
 
+**Note on rootless podman:** With rootless podman, each user maintains their own
+image store. This means the container image will be pulled separately for each
+user on first run (~1.4 GB). System uninstall does not remove per-user image
+stores. To reclaim disk space for a specific user:
+
+```sh
+podman rmi ghcr.io/morloc-project/morloc/morloc-full:<version>
+podman rmi ghcr.io/morloc-project/morloc/morloc-tiny:<version>
+```
+
 ### Uninstall
 
 ```sh
