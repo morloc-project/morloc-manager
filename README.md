@@ -1,293 +1,386 @@
-# Morloc Manager
+# morloc-manager testing
 
-Handle Morloc installation, version management, and custom environments.
+Cross-environment testing for the morloc-manager binary. The binary itself lives
+in the compiler repo (`morloc-workspace/compiler/morloc/data/rust/morloc-manager/`); this
+repo provides Vagrant VMs and agent-based exploratory testing to validate it
+across Linux distributions and security models.
 
- <img src="assets/install.png" alt="morloc install example" class="center">
+For morloc language documentation, see the official [docs](https://morloc-project.github.io).
 
+For quick usage information, call `morloc-manager -h` for global usage or
+`morloc-manager <subcommand> -h` for subcommand usage.
 
-## Prerequisites
+## Using morloc-manager
 
-You need a container engine: [Docker](https://docs.docker.com/engine/install/) (v20+) or [Podman](https://podman.io/docs/installation) (v3+). No Compose plugin is required.
-
-When both are installed, the manager prefers **podman** over docker. You can
-override with `--container-engine docker`, the `MORLOC_CONTAINER_ENGINE`
-environment variable, or by setting `container_engine` in
-`~/.config/morloc/config`. Note that images pulled by one engine are not visible
-to the other — if you switch engines, images will be re-pulled.
-
-
-## Installation
-
-Download the manager and place it on your PATH:
+### Setup (first time only)
 
 ```sh
-BRANCH=dev
-curl -o morloc-manager https://raw.githubusercontent.com/morloc-project/morloc-manager/refs/heads/${BRANCH}/morloc-manager.sh
-chmod +x morloc-manager
+# Pick a default container engine (podman or docker)
+morloc-manager setup --engine podman
 
-# if using local containers:
-mkdir -p ~/.local/bin
-mv morloc-manager ~/.local/bin/
-
-# if using system containers:
-sudo mv morloc-manager /usr/bin
+# Check current config
+morloc-manager setup
 ```
 
-If necessary, update the path:
+If only one container engine is installed, `new` auto-detects it. If both are
+installed, you must run `setup` first.
+
+### Creating an environment
 
 ```sh
-PATH="$HOME/.local/bin:$PATH"
-```
+# Interactive wizard (prompts for name, base image)
+morloc-manager new
 
-Then install Morloc:
+# Non-interactive: create from a specific morloc version
+morloc-manager new myenv --version 0.73.0
 
-```sh
-morloc-manager install          # latest version
-morloc-manager install 0.58.3   # specific version
-```
+# Default (when --version and --image are both omitted): pulls the :edge image
+# from the morloc registry and records the resolved version
 
-This pulls the container images and sets up the local configuration.
+# With a custom Dockerfile layer
+morloc-manager new myenv --version 0.73.0 --dockerfile ./Dockerfile
 
+# With a stub Dockerfile for later customization
+morloc-manager new myenv --version 0.73.0 --dockerfile-stub
 
-## Usage
+# Include files in the Dockerfile build context
+morloc-manager new myenv --version 0.73.0 --dockerfile ./Dockerfile -i ./data.csv
 
-`morloc-manager run` executes commands within the morloc container.
-
-### Compile and run a program
-
-Given the morloc program:
-
-```morloc
-module foo (double)
-
-import root-py
-
-double :: Int -> Int
-double x = 2 * x
-```
-
-You can install the required module with
-
-```sh
-morloc-manager run -- morloc install root-py
-morloc-manager run -- morloc make foo.loc
-morloc-manager run -- ./foo -h              # view usage statement
-morloc-manager run -- ./foo 21              # output: 42
-```
-
-**Note (Fedora/RHEL):** On SELinux-enforcing systems, you must work in a
-subdirectory of your home directory (e.g. `~/project/`), not `~` itself,
-`/tmp`, or other system directories.
-
-### Interactive shell
-
-Drop into a container shell with the full Morloc toolchain. Including language
-support for Python, R, C++ as well niceties like vim
-
-```sh
-morloc-manager run --shell
-```
-
-### Switching versions
-
-You can install multiple versions side-by-side and switch between them.
-
-```sh
-morloc-manager install 0.67.0    # install a new version
-morloc-manager select 0.67.0     # switch to it
-morloc-manager select 0.58.3     # switch to old version
-morloc-manager info              # view installed versions
-```
-
-
-## Custom environments
-
-If your project needs additional system packages or language libraries, you can
-create a custom environment that layers on top of the base Morloc image.
-
-### Create a new environment
-
-```sh
-morloc-manager env --init ml
-```
-
-This creates a stub Dockerfile at `~/.local/share/morloc/deps/ml.Dockerfile`.
-Edit it to add your dependencies:
-
-```dockerfile
-# Automatically generated section, DO NOT MODIFY
-ARG CONTAINER_BASE=scratch
-FROM ${CONTAINER_BASE}
-LABEL morloc.environment="ml"
-ENV MORLOC_ENV_NAME="ml"
-# End of automatically generated section
-
-# Add custom setup below this line
-RUN pip install scikit-learn matplotlib pandas
-```
-
-### Activate the environment
-
-```sh
-morloc-manager env ml
-```
-
-This builds the custom image (if needed) and updates the active environment. All
-subsequent `morloc-manager run` calls use the custom environment — no flag
-changes required:
-
-```sh
-morloc-manager run -- morloc make -o pipeline pipeline.loc   # runs in the ml environment
-```
-
-### Reset to the base environment
-
-```sh
-morloc-manager env --reset
-```
-
-### List available environments
-
-```sh
-morloc-manager env --list
-```
-
-## Advanced usage
-
-### How it works
-
-The manager uses directory-based structured config under `~/.config/morloc/`
-(local scope) or `/etc/morloc/` (system scope). Key config entries include
-`active_version`, `active_scope`, `active_env`, and `container_engine`.
-Per-version config lives under `versions/<ver>/config` with `image`
-and `host_dir`. Custom environments are stored under
-`versions/<ver>/environments/`.
-
-`morloc-manager run` invokes `docker run` / `podman run` directly (no Compose
-required), bind-mounting the version data directory and your current working
-directory into the container.
-
-### Extra container flags
-
-For changes that go beyond image selection — port mapping, GPU passthrough,
-extra volumes — use the `-x` flag to pass additional arguments to the container
-engine:
-
-```sh
-morloc-manager run -x "--gpus all" -- morloc make foo.loc
-```
-
-### Info and diagnostics
-
-```sh
+# Check what's installed
 morloc-manager info
 ```
 
-Shows installed versions, which one is selected, container engine, and
-SELinux status.
+### Running morloc inside the container
 
-### Cleaning build artifacts
+Once an environment is created and selected, use `morloc-manager run` to execute
+commands inside the container. The current working directory is bind-mounted
+automatically.
 
-Remove build artifacts without uninstalling:
-
-```sh
-morloc-manager clean --all            # clean all version data
-morloc-manager clean --all --dry-run  # preview what would be removed
-morloc-manager clean 0.58.3           # clean a specific version only
-```
-
-### System-wide installs (multi-user)
-
-A sysadmin can install Morloc system-wide:
+Use `--` to separate `morloc-manager` flags from inner command flags. Without
+`--`, flags like `-o` or `--version` are consumed by `morloc-manager run`
+itself rather than passed to the inner command.
 
 ```sh
-sudo morloc-manager install --system
+# Install a standard library module
+morloc-manager run -- morloc install root
+
+# Build a morloc program (-- is required so -o goes to morloc, not to run)
+morloc-manager run -- morloc make -o hello hello.loc
+
+# Run the compiled program (no flags to inner command, so -- is optional)
+morloc-manager run ./hello foo '["x","y"]'
+
+# Open an interactive shell in the container
+morloc-manager run --shell
 ```
 
-After the system install, **each user** must individually select the system
-version before morloc will work for them:
+### Managing environments
 
 ```sh
-morloc-manager select --system <version>
+# List all environments
+morloc-manager ls
+
+# Switch to a different environment
+morloc-manager select myenv
+
+# Show detailed info for an environment
+morloc-manager info myenv
+
+# Remove an environment
+morloc-manager rm myenv
 ```
 
-**Note on rootless podman:** With rootless podman, each user maintains their own
-image store. This means the container image will be pulled separately for each
-user on first run (~1.4 GB). System uninstall does not remove per-user image
-stores. To reclaim disk space for a specific user:
+### Updating environments
+
+The `update` command modifies an existing environment. It accepts the same flags
+as `new` but defaults to keeping existing values.
 
 ```sh
-podman rmi ghcr.io/morloc-project/morloc/morloc-full:<version>
-podman rmi ghcr.io/morloc-project/morloc/morloc-tiny:<version>
+# Rebuild the active environment (after editing its Dockerfile)
+morloc-manager update
+
+# Change shared memory size
+morloc-manager update --shm-size 1g
+
+# Replace the Dockerfile and rebuild
+morloc-manager update --dockerfile ./new.Dockerfile
+
+# Add files to the build context
+morloc-manager update -i ./newdata.txt
+
+# Re-run morloc init (e.g., after changing the base image)
+morloc-manager update --version 0.74.0 --reinit
 ```
 
-### Uninstall
+### Serving
+
+`start` launches a network service for an environment using bind-mounted
+state. It's fast, works with any environment, and requires no build step.
 
 ```sh
-morloc-manager uninstall 0.58.3          # remove a specific version
-morloc-manager uninstall --all           # remove all local versions
-sudo morloc-manager uninstall --system --all  # remove system versions
+# Serve the active environment on :8080
+morloc-manager start
+
+# Serve a specific environment on a custom port
+morloc-manager start myenv -p 9090:8080
+
+# List running servers, stop
+morloc-manager status
+morloc-manager stop myenv
 ```
 
-`uninstall --all` removes version data, container images, and configuration.
+### Freezing (exporting for external deployment)
 
-
-## Troubleshooting
-
-### "Failed to build morloc libraries" during install
-
-The `morloc init` step inside the container may fail due to file permission
-issues. You can skip it and run it manually later:
+`freeze` packages an environment's state as a portable tarball. `unfreeze`
+turns that tarball into a standalone Docker image suitable for registries
+or Kubernetes.
 
 ```sh
-morloc-manager install --no-init
-morloc-manager run -- morloc init -f
+# Export state from the active environment (requires compiled programs)
+morloc-manager freeze -o ./my-freeze/
+
+# Build a portable serve image (bakes state into the image)
+morloc-manager unfreeze --from ./my-freeze/state.tar.gz --tag my-app:v1
+
+# Deploy externally (docker push, helm install, etc.)
+# The resulting image runs morloc-nexus on :8080 as its entrypoint.
+docker run -d -p 8080:8080 my-app:v1
 ```
 
-### `morloc-nexus: not found` when running compiled programs
+`freeze`/`unfreeze` produce images intended for **external** deployment.
+For local serving, use `start` directly — no freeze step needed.
 
-The morloc libraries were not initialized. Run:
+### System-wide environments
+
+System-wide environments (`--system`) are stored under `/etc/morloc/` and
+`/usr/local/share/morloc/` and are useful for shared servers. An admin creates
+and builds the environment; regular users can select and run it.
 
 ```sh
-morloc-manager run -- morloc init -f
+# Admin creates and builds a system environment
+sudo morloc-manager new shared-env --version 0.76.0 --system
+
+# Regular user selects and uses it
+morloc-manager select shared-env
+morloc-manager run -- morloc --version
 ```
 
-### Permission denied errors (root-owned files)
-
-Container processes may have created root-owned files in the data directory.
-Fix with:
+**Podman note.** Podman stores images per-user, so root's images are not
+visible to regular users by default. On Fedora and Debian (where
+`/var/lib/containers/storage` is the rootful graphroot), the commonly suggested
+`additionalimagestores` workaround causes locking conflicts. For system
+environments, use Docker instead:
 
 ```sh
-sudo chown -R $(id -u):$(id -g) ~/.local/share/morloc/
+sudo morloc-manager setup --engine docker
+sudo usermod -aG docker $USER
 ```
 
-### Shell completion paths from `morloc init`
+Docker's socket-based model shares images across users without storage
+conflicts.
 
-After install, `morloc init` prints `source` lines for shell completions. These
-paths are relative to the container filesystem, so they work as-is inside the
-shell (`morloc-manager run --shell`). If you want completions on the host
-(outside the container), use the host-side paths instead:
+**Write permissions.** System environment data directories are read-only for
+regular users. Operations that write to the module store -- `morloc install`
+and `morloc make --install` -- will fail with permission denied. Plain
+`morloc make` still works: it writes the nexus binary and pool files to the
+current working directory, not to the system data directory. Users who need
+to install new modules should create a local environment
+(`morloc-manager new myproject`) alongside the system one.
 
-```
-~/.local/share/morloc/versions/<version>/completions/
-```
+## Morloc language examples
 
-For example, to enable bash completions on the host for version 0.68.0:
+These examples show what morloc programs look like. To run them, save the
+`.loc` file and any supporting source files in the same directory, then:
 
 ```sh
-source ~/.local/share/morloc/versions/0.68.0/completions/morloc-completions.bash
+morloc-manager run -- morloc install root root-py root-cpp
+morloc-manager run -- morloc make -o example main.loc
+morloc-manager run ./example <subcommand> <args>
 ```
 
-You can find your active version with `morloc-manager info`.
+### Arithmetic (pure morloc + Python)
 
-### SELinux bind-mount errors on Fedora/RHEL
+A minimal example using Python arithmetic operators via `root-py`:
 
-Working from `/tmp`, other system directories, or your home directory root
-(`~`) is blocked by SELinux. You must work in a subdirectory of your home
-directory:
+```morloc
+-- main.loc
+module main (foo)
+
+import root-py
+
+foo x = x + 2.0 * 20.0
+```
 
 ```sh
-mkdir -p ~/project && cp -r /tmp/myproject/* ~/project/
-cd ~/project
-morloc-manager run -- morloc make foo.loc
+$ morloc-manager run ./example foo 2
+42
+```
+
+### Function composition (Python)
+
+Compose functions with the `.` operator, just like Haskell:
+
+```morloc
+-- main.loc
+module main (foo, bar)
+
+import root-py
+
+source py from "paste.py" (
+    "morloc_paste" as paste
+    )
+
+source py ("abs")
+
+abs :: Real -> Real
+paste :: Str -> Str -> Str
+
+foo :: [Str] -> [Str]
+foo xs = map (paste "a" . paste "b" . paste "c") xs
+
+bar :: Real -> Real
+bar = abs . (-) 1.0 . abs
+```
+
+```python
+# paste.py
+def morloc_paste(x, y):
+    return x + y
+```
+
+```sh
+$ morloc-manager run ./example foo '["x","y"]'
+["abcx","abcy"]
+$ morloc-manager run ./example bar -5
+1
+```
+
+### Cross-language recursion (Python + C++)
+
+A factorial function where multiplication is in Python and subtraction is in
+C++. Morloc handles the cross-language calls and serialization automatically:
+
+```morloc
+-- main.loc
+module main (fact)
+
+import root-py
+import root-cpp
+
+source Py from "py_helpers.py" ("py_mul" as mul)
+mul :: Int -> Int -> Int
+
+source Cpp from "cpp_helpers.hpp" ("cpp_sub" as sub)
+sub :: Int -> Int -> Int
+
+fact :: Int -> Int
+fact n
+  ? n == 0 = 1
+  : mul n (fact (sub n 1))
+```
+
+```python
+# py_helpers.py
+def py_mul(a, b):
+    return a * b
+```
+
+```cpp
+// cpp_helpers.hpp
+int cpp_sub(int a, int b) {
+    return a - b;
+}
+```
+
+```sh
+$ morloc-manager run ./example fact 0
+1
+$ morloc-manager run ./example fact 1
+1
+$ morloc-manager run ./example fact 5
+120
+```
+
+### Records and pure evaluation
+
+Morloc supports records and can evaluate pure expressions (no imports needed)
+directly in the nexus:
+
+```morloc
+-- main.loc
+module main (greeting, point, getX)
+
+record Point = Point { x :: Int, y :: Int }
+
+greeting :: Str
+greeting = let name = "world" in "hello"
+
+point :: Point
+point = let p = { x = 10, y = 20 } in p
+
+getX :: Int
+getX = let p = { x = 10, y = 20 } in .x p
+```
+
+```sh
+$ morloc-manager run ./example greeting
+"hello"
+$ morloc-manager run ./example point
+{"x":10,"y":20}
+$ morloc-manager run ./example getX
+10
+```
+
+## Prerequisites
+
+- [Vagrant](https://www.vagrantup.com/) with the
+  [vagrant-libvirt](https://github.com/vagrant-libvirt/vagrant-libvirt) plugin
+- [Claude Code](https://claude.ai/code) CLI (`claude`)
+- A container engine on the host: Docker or Podman (for Vagrant provisioning)
+
+## Quick start
+
+```sh
+# Run exploration on all VMs (overnight, sequential)
+make explore
+
+# Single VM
+make explore-vm VM=fedora
+
+# Just start the VMs for manual testing
+make vm-up
+```
+
+
+## How it works
+
+Autonomous Claude Code agents SSH into Vagrant VMs and exercise
+morloc-manager as different user personas (new user, developer, sysadmin,
+power user). Each persona runs real workflows on a fresh VM with both Docker
+and Podman installed, logging any bugs found.
+
+Three VMs cover different Linux security models:
+
+| VM | Distro | Primary concern |
+|----|--------|-----------------|
+| fedora | Fedora 40 | SELinux enforcing, cgroup v2 |
+| ubuntu | Ubuntu 22.04 | AppArmor |
+| debian | Debian 12 | cgroup v1 |
+
+Results land in `findings/`. After all VMs complete, an analyst agent
+consolidates bug reports into `findings/action-plan.md` (grouped by root
+cause) and `findings/ux-report.md`.
+
+See [TESTING.md](TESTING.md) for details on personas and methodology.
+
+
+## Make targets
+
+```
+make explore       Run all personas on all VMs (overnight, sequential)
+make explore-vm    Run all personas on one VM (e.g., VM=fedora)
+make vm-up         Start Vagrant VMs
+make vm-destroy    Destroy Vagrant VMs
+make clean         Remove exploration findings
+make help          Show available targets
 ```

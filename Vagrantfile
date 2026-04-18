@@ -28,11 +28,12 @@ Vagrant.configure("2") do |config|
   config.vm.provider :libvirt do |lv|
     lv.memory = 4096
     lv.cpus = 2
-    lv.machine_virtual_size = 60
+    lv.machine_virtual_size = 30
   end
 
   config.vm.synced_folder ".", "/vagrant", type: "rsync",
-    rsync__exclude: [".git/", "findings/"]
+    rsync__exclude: [".git/", "findings/"],
+    rsync__args: ["--verbose", "--archive", "--delete", "-z", "--copy-links"]
 
   # ---------- Fedora 40 ----------
   # Primary: SELinux enforcing, cgroup v2
