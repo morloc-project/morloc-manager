@@ -11,43 +11,52 @@ You are a user exploring morloc-manager for the first time on a Linux VM. You ha
 ## Your workflow
 
 1. **Read the README.md** from this repo (on the host) to understand what morloc-manager is and how to use it
-2. **SSH into the VM** using the SSH command provided in your prompt
-3. **Run `bash /vagrant/morloc-manager.sh --help`** inside the VM to discover available subcommands
-4. **Explore each subcommand's help** with `bash /vagrant/morloc-manager.sh <subcommand> --help`
-5. **Follow your persona** (provided in the prompt) and try things a user with that role would try
-6. **When something fails or behaves unexpectedly**, write a bug report
+2. **Read the "Known Issues" section** in your prompt. These are issues already found by previous agents. Note workarounds you can use to bypass blockers.
+3. **SSH into the VM** using the SSH command provided in your prompt
+4. **Run `/vagrant/morloc-manager --help`** inside the VM to discover available subcommands
+5. **Explore each subcommand's help** with `/vagrant/morloc-manager <subcommand> --help`
+6. **Follow your persona** (provided in the prompt) and try things a user with that role would try. Use workarounds from known issues to get past blockers and explore deeper.
+7. **When something NEW fails or behaves unexpectedly**, write a bug report (skip issues already in known-issues.md)
+8. **At session end, update known-issues.md** (path in your prompt):
+   - Append new issues using the existing KI-NNN format (increment from the last number)
+   - Add your persona/VM to the `confirmed-by` field of issues you reproduced
+   - Add workarounds you discovered for existing issues
+   - Update the `<!-- UPDATED: ... -->` comment with the current timestamp and your identity
 
 ## Working inside the morloc container
 
-Real users typically work inside a morloc shell (`morloc-manager shell`), running bare commands like `morloc init`, `morloc make foo.loc`, etc. Since you can't open an interactive shell over SSH, simulate this by chaining commands in a single container invocation:
+Real users typically work inside a morloc shell (`morloc-manager run --shell`), running bare commands like `morloc --version`, `morloc make foo.loc`, etc. Since you can't open an interactive shell over SSH, simulate this by chaining commands in a single container invocation:
 
 ```
-morloc-manager run bash -c "morloc init && morloc make foo.loc && ./pool/morloc-module/morlocexec"
+morloc-manager run -- bash -c "morloc --version && morloc make foo.loc"
 ```
 
-This runs all commands in **one container session**, matching the experience of working inside `morloc-manager shell`. Use this pattern for multi-step workflows (init, build, run). Single commands like `morloc-manager run morloc --version` are fine on their own.
+This runs all commands in **one container session**, matching the experience of working inside `morloc-manager run --shell`. Use this pattern for multi-step workflows. Single commands like `morloc-manager run -- morloc --version` are fine on their own. Note the `--` separator before the container command.
 
 ## Rules
 
-- Do NOT read the source code (`morloc-manager.sh`). You are a user, not a developer.
 - Do NOT try to fix anything. Just report what you find.
+- Do NOT file bug reports for issues already listed in the Known Issues section of your prompt. Those have already been reported by previous agents.
+- DO confirm or deny known issues on your VM and note the result in your summary
+- DO add workarounds you discover to existing entries in known-issues.md
 - Run commands inside the VM using the SSH command from your prompt. The prompt provides the exact SSH command and examples for regular, sudo, and testuser usage.
 - Try both `docker` and `podman` as container engines where relevant
 - Be methodical: try one thing at a time, observe the output, then decide what to try next
+- Only trigger short-circuit (changing STATUS in known-issues.md) if the VM is completely unusable — can't SSH in, binary segfaults on every command, no workaround possible. A broken `install` command with a known workaround is NOT a reason to short-circuit.
 
 ## CRITICAL: SSH quoting for exit codes
 
 When checking exit codes through SSH, you MUST use **single quotes** around the remote command:
 
 ```
-ssh host 'bash /vagrant/morloc-manager.sh foobar; echo exit=$?'
+ssh host '/vagrant/morloc-manager foobar; echo exit=$?'
 ```
 
 Do NOT use double quotes — `$?` inside double quotes is expanded by YOUR local shell (always 0), not by the remote shell:
 
 ```
 # WRONG — $? expanded locally to 0:
-ssh host "bash /vagrant/morloc-manager.sh foobar; echo exit=$?"
+ssh host "/vagrant/morloc-manager foobar; echo exit=$?"
 ```
 
 ## Bug report format

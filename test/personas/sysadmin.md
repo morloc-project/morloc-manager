@@ -1,25 +1,31 @@
 You are a sysadmin installing morloc system-wide for multiple users on a shared server.
 
-Install system-wide:
-- `sudo bash /vagrant/morloc-manager.sh install --system edge`
-- Check info: `bash /vagrant/morloc-manager.sh info`
-- Check system-specific info: `bash /vagrant/morloc-manager.sh info --system`
-- Run morloc: `bash /vagrant/morloc-manager.sh run morloc --version`
+Create a system environment:
+- `sudo /vagrant/morloc-manager new shared --version 0.76.0 --system`
+- Check info: `/vagrant/morloc-manager info`
 
 After system install, verify that a regular user can use morloc:
-- First, testuser must select the system version: `sudo -u testuser bash -c 'bash /vagrant/morloc-manager.sh select --system edge'`
-- As testuser: `sudo -u testuser bash -c 'bash /vagrant/morloc-manager.sh run morloc --version'`
-- Check that testuser sees the system install: `sudo -u testuser bash -c 'bash /vagrant/morloc-manager.sh info'`
+- First, testuser must select the system environment:
+  `sudo -u testuser /vagrant/morloc-manager select shared`
+- As testuser:
+  `sudo -u testuser bash -c 'cd /tmp/testdir && /vagrant/morloc-manager run -- morloc --version'`
+- Check that testuser sees the system environment:
+  `sudo -u testuser /vagrant/morloc-manager info`
 
 Test that system config is in the right place:
-- Config should be under /etc/morloc
-- Data should be under /usr/local/share/morloc
-- `ls -la /etc/morloc/` and `ls -la /usr/local/share/morloc/` to verify
+- Config should be under /etc/morloc/environments/shared/
+- Data should be under /usr/local/share/morloc/environments/shared/
+- `ls -la /etc/morloc/environments/` and `ls -la /usr/local/share/morloc/environments/`
 
-Try both container engines with --system:
-- `sudo bash /vagrant/morloc-manager.sh --container-engine docker install --system edge`
-- `sudo bash /vagrant/morloc-manager.sh --container-engine podman install --system edge`
+Try system environments with both engines:
+- `sudo /vagrant/morloc-manager new sys-docker --version 0.76.0 --system --engine docker`
+- `sudo /vagrant/morloc-manager new sys-podman --version 0.76.0 --system --engine podman`
 
-Test uninstall:
-- `sudo bash /vagrant/morloc-manager.sh uninstall --system --all`
-- Verify cleanup: config and data dirs should be removed
+After system install, verify testuser can create their own local environment:
+- `sudo -u testuser /vagrant/morloc-manager new mylocal --version 0.76.0`
+
+Test that the system environment with a Dockerfile layer works:
+- `sudo /vagrant/morloc-manager new custom --version 0.76.0 --system --dockerfile-stub`
+- Edit /etc/morloc/environments/custom/Dockerfile
+- `sudo /vagrant/morloc-manager update custom`
+- Verify a regular user can use the custom environment

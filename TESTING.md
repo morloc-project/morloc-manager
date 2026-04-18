@@ -1,17 +1,11 @@
 ## Testing
 
-### Static analysis
-
-```sh
-make lint     # runs ShellCheck
-```
-
 ### Agent-based exploratory testing
 
 Testing uses autonomous Claude Code agents that SSH into Vagrant VMs and explore
-morloc-manager as different user personas (new user, developer, sysadmin, power
-user). Each persona tries real workflows on a fresh VM with both Docker and
-Podman, logging any bugs found.
+the morloc-manager binary as different user personas (new user, developer,
+sysadmin, power user). Each persona tries real workflows on a fresh VM with both
+Docker and Podman, logging any bugs found.
 
 Three VMs cover different Linux security models:
 
@@ -25,7 +19,7 @@ To run the full exploration overnight (one VM at a time, disk-friendly):
 
 ```sh
 ./test/run-exploration.sh                  # all VMs
-./test/run-exploration.sh fedora           # single VM
+./test/run-exploration.sh --vms fedora     # single VM
 ```
 
 Results land in `findings/`. After all VMs complete, an analyst agent folds
