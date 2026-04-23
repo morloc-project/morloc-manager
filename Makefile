@@ -1,114 +1,90 @@
-.PHONY: rust-build build-images build-all up up-fast down sync push quick-test \
-       export-image load-image push-image explore explore-vm explore-fast clean help
+# morloc-manager testing infrastructure
+#
+# Usage:
+#   make up VM=fedora          Start a VM
+#   make explore VM=fedora PROMPT=test/prompts/full-exploration.md
+#   make push VM=fedora        Rebuild binary + rsync into running VM
+#   make quick-test VM=fedora  Push + smoke test
+#   make down VM=fedora        Destroy a VM
 
-BUILD_SCRIPT := ../../compiler/morloc/scripts/build-rust.sh
 MORLOC_VERSION ?= edge
-IMAGE_TAR := /tmp/morloc-full-$(MORLOC_VERSION).tar
-IMAGE_REF := ghcr.io/morloc-project/morloc/morloc-full:$(MORLOC_VERSION)
+VM ?=
+PROMPT ?=
 
-## ---- Build (delegates to compiler repo) ----
+# Require VM= for targets that need it
+check-vm:
+	@if [ -z "$(VM)" ]; then \
+		echo "ERROR: VM= is required (e.g., make $@ VM=fedora)" >&2; \
+		exit 1; \
+	fi
 
-## Build static Rust binaries -> compiler/morloc/out/
-rust-build:
-	MORLOC_VERSION=$(MORLOC_VERSION) $(BUILD_SCRIPT) rust
+# Require PROMPT= for targets that need it
+check-prompt:
+	@if [ -z "$(PROMPT)" ]; then \
+		echo "ERROR: PROMPT= is required (e.g., make $@ PROMPT=test/prompts/full-exploration.md)" >&2; \
+		exit 1; \
+	fi
 
-## Build morloc-tiny + morloc-full containers locally
-build-images:
-	MORLOC_VERSION=$(MORLOC_VERSION) $(BUILD_SCRIPT) tiny
-	MORLOC_VERSION=$(MORLOC_VERSION) $(BUILD_SCRIPT) full
+## VM management
 
-## Build everything (binaries + containers)
-build-all:
-	MORLOC_VERSION=$(MORLOC_VERSION) $(BUILD_SCRIPT) all
-
-## ---- VM management ----
-
-## Start VM(s) with provisioning (e.g., make up VM=fedora)
-up:
+up: check-vm ## Start a VM
 	vagrant up $(VM)
 
-## Start VM(s) without re-provisioning
-up-fast:
-	vagrant up $(VM) --no-provision
-
-## Destroy VM(s)
-down:
+down: check-vm ## Destroy a VM
 	vagrant destroy -f $(VM)
 
-## ---- Fast dev cycle ----
+ssh: check-vm ## SSH into a VM
+	vagrant ssh $(VM)
 
-## Sync updated binary + out/ files into running VM
-sync:
+sync: check-vm ## Rsync files into a running VM
 	vagrant rsync $(VM)
 
-## Build Rust binaries + sync into VM
-push: rust-build sync
+## Build pipeline (delegated to compiler repo)
 
-## Quick smoke test after push
-quick-test: push
-	vagrant ssh $(VM) -c '/vagrant/morloc-manager --version'
+rust-build: ## Build static Rust binaries via the compiler repo
+	./scripts/build-rust.sh
 
-## ---- Container image loading ----
+build-images: ## Build morloc-tiny + morloc-full containers locally
+	./scripts/build-images.sh
 
-## Export image to tarball
-export-image:
-	MORLOC_VERSION=$(MORLOC_VERSION) $(BUILD_SCRIPT) export
+build-all: rust-build build-images ## Build everything (binaries + containers)
 
-## Load image tarball into VM's Docker + Podman (e.g., make load-image VM=fedora)
-load-image:
-	cat $(IMAGE_TAR) | vagrant ssh $(VM) -c 'sudo docker load'
-	cat $(IMAGE_TAR) | vagrant ssh $(VM) -c 'podman load'
+## Binary distribution
 
-## Build images locally + export + load into VM
-push-image: build-images export-image load-image
+push: check-vm rust-build sync ## Rebuild binary + rsync into running VM
 
-## ---- Agent exploration ----
+push-image: check-vm build-images export-image load-image ## Build + export + load images into a VM
 
-## Full overnight exploration (original behavior)
-explore:
-	bash test/run-exploration.sh
+export-image: ## Export container images to tarballs
+	./scripts/export-image.sh
 
-## Exploration on a single VM (e.g., make explore-vm VM=fedora)
-explore-vm:
-	bash test/run-exploration.sh --vms $(VM)
+load-image: check-vm ## Load exported images into a VM
+	./scripts/load-image.sh $(VM)
 
-## Exploration on already-running VMs (no create/destroy)
-explore-fast:
-	vagrant rsync $(VM)
-	bash test/run-exploration.sh --persistent --vms $(VM)
+## Testing
 
-## ---- Cleanup ----
+explore: check-vm check-prompt ## Run all personas on a VM
+	./test/run-exploration.sh --vm $(VM) $(PROMPT)
 
-## Remove exploration findings
-clean:
+explore-sync: check-vm check-prompt ## Sync + run all personas on a VM
+	./test/run-exploration.sh --vm $(VM) --sync $(PROMPT)
+
+quick-test: check-vm push ## Push binary + smoke test
+	vagrant ssh $(VM) -c '/vagrant/morloc-manager --help'
+
+## Cleanup
+
+clean: ## Remove exploration findings
 	rm -rf findings/*/
 
-## ---- Help ----
+pristine: clean ## Remove all findings including known-issues
+	rm -f findings/known-issues.md findings/action-plan.md findings/report.md findings/analyst-session.log
 
-help:
-	@echo "Build targets (delegates to compiler repo):"
-	@echo "  rust-build     Build static Rust binaries"
-	@echo "  build-images   Build morloc-tiny + morloc-full containers"
-	@echo "  build-all      Build everything"
-	@echo ""
-	@echo "VM management:"
-	@echo "  up             Start VMs (with provisioning)"
-	@echo "  up-fast        Start VMs (skip provisioning)"
-	@echo "  down           Destroy VMs"
-	@echo ""
-	@echo "Fast dev cycle:"
-	@echo "  sync           Rsync files into running VM"
-	@echo "  push           Build binaries + sync"
-	@echo "  quick-test     Build + sync + smoke test"
-	@echo ""
-	@echo "Container images:"
-	@echo "  export-image   Save image to tarball"
-	@echo "  load-image     Load tarball into VM"
-	@echo "  push-image     Build + export + load (full pipeline)"
-	@echo ""
-	@echo "Exploration:"
-	@echo "  explore        Full overnight run"
-	@echo "  explore-vm     Single VM (VM=fedora)"
-	@echo "  explore-fast   On already-running VMs"
-	@echo ""
-	@echo "Variables: VM=fedora MORLOC_VERSION=edge"
+## Help
+
+help: ## Show available targets
+	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*## "}; {printf "  %-16s %s\n", $$1, $$2}'
+
+.PHONY: check-vm check-prompt up down ssh sync rust-build build-images build-all push push-image export-image load-image explore explore-sync quick-test clean pristine help
+.DEFAULT_GOAL := help

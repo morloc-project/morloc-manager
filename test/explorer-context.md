@@ -1,23 +1,28 @@
 Focus on morloc-manager issues
 
-Only report issues that effect the LATEST edge version of morloc and
-morloc-manager. You should test version switching, but do not report non-edge
-issues.
+You may select older versions of morloc when testing environment creation, but
+do NOT report errors in old morloc versions.
 
 Always list the morloc versions used (accessible through `morloc-manager run --
 morloc --version`)
-
-Do not focus on perceived bugs in morloc, such as no messages printed when `morloc
-make` is run or the design decision to name the generated executable after the
-module not the filename
 
 Explore as much as possible searching for clear bugs, but if none are found, do
 not invent issues to report.
 
 ## Important
 
- * ALL diagnostics, messages (whether successful or failing), and logs should go
-   to STDERR, not STDOUT.
+ * Informational commands (`ls`, `info`, `status`, `doctor`) return data on
+   STDOUT -- this is their logical return value. Mutational commands (`start`,
+   `stop`, `freeze`, `nuke`, `update`) have no return value; all their output
+   (progress, success messages, errors) goes to STDERR. Errors and warnings
+   always go to STDERR regardless of command type. If a command violates this
+   convention, that is a bug.
+
+ * Always create and work from a dedicated project directory. Do not place
+   project files directly in `$HOME` or run `morloc make` from the home
+   directory -- this is user error, not a bug. Similarly, when using `sudo -u`,
+   always `cd` to the target user's directory first; inheriting an inaccessible
+   CWD is standard Linux behavior.
 
  * Failure should ALWAYS return a non-zero exit code
 
@@ -27,22 +32,9 @@ not invent issues to report.
 ## CLI structure
 
 Commands are grouped into Development and Deployment.
-Use `morloc-manager --help` to see the full list.
-
-Key commands:
-- `new`, `run`, `rm`, `ls`, `info`, `select`, `update` (Development)
-- `start`, `stop`, `freeze`, `unfreeze`, `status`, `logs` (Deployment)
-
-There are no separate "versions" or "workspaces" -- everything is an
-**environment**. Each environment has a name, a base container image, optional
-Dockerfile customizations, engine flags, and its own data directories.
-
-Note: the old `install`, `uninstall`, `setup`, `env`, `new` (workspace),
-`delete` commands no longer exist. Use `new` to create environments, `rm` to
-remove them, `update` to modify them.
-
-Note: the old `--scope SCOPE` flag no longer exists. Local scope is the
-default. Use `--system` to target the system scope (e.g., `new --system`).
+Use `morloc-manager --help` to see the full list. Read the usage documentation
+to learn what the commands do. And see the `morloc-manage <subcommand> --help`
+usage statements for detailed info.
 
 ## Known-issues.md format
 
