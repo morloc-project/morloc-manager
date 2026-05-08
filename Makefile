@@ -63,11 +63,19 @@ load-image: check-vm ## Load exported images into a VM
 
 ## Testing
 
-explore: check-vm check-prompt ## Run all personas on a VM
-	./test/run-exploration.sh --vm $(VM) $(PROMPT)
+EXPLORE_TUNING_ARGS = \
+    $(if $(MODEL),--model $(MODEL)) \
+    $(if $(EXPLORER_MODEL),--explorer-model $(EXPLORER_MODEL)) \
+    $(if $(ANALYST_MODEL),--analyst-model $(ANALYST_MODEL)) \
+    $(if $(MAX_TURNS),--max-turns $(MAX_TURNS)) \
+    $(if $(EXPLORER_MAX_TURNS),--explorer-max-turns $(EXPLORER_MAX_TURNS)) \
+    $(if $(ANALYST_MAX_TURNS),--analyst-max-turns $(ANALYST_MAX_TURNS))
+
+explore: check-vm check-prompt ## Run all personas on a VM (vars: MODEL, *_MODEL, MAX_TURNS, *_MAX_TURNS)
+	./test/run-exploration.sh --vm $(VM) $(EXPLORE_TUNING_ARGS) $(PROMPT)
 
 explore-sync: check-vm check-prompt ## Sync + run all personas on a VM
-	./test/run-exploration.sh --vm $(VM) --sync $(PROMPT)
+	./test/run-exploration.sh --vm $(VM) --sync $(EXPLORE_TUNING_ARGS) $(PROMPT)
 
 quick-test: check-vm push ## Push binary + smoke test
 	vagrant ssh $(VM) -c '/vagrant/morloc-manager --help'
@@ -77,8 +85,8 @@ quick-test: check-vm push ## Push binary + smoke test
 clean: ## Remove exploration findings
 	rm -rf findings/*/
 
-pristine: clean ## Remove all findings including known-issues
-	rm -f findings/known-issues.md findings/action-plan.md findings/report.md findings/analyst-session.log
+pristine: clean ## Remove all findings including the shared log and final report
+	rm -f findings/log.md findings/report.md findings/HALT findings/analyst-session.log
 
 ## Help
 

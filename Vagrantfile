@@ -1,9 +1,13 @@
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
 
-# Vagrantfile for VM-based testing of morloc-manager
-# 3 VMs: each gets Docker + Podman, per-persona user accounts,
-# and morloc images pulled during provisioning.
+# Vagrantfile for VM-based testing of morloc-manager.
+#
+# Provisions Docker + Podman + tools and pulls morloc images. Persona user
+# accounts are NOT provisioned here -- they are created on demand at run time
+# by test/run-exploration.sh, with names taken directly from the filenames
+# under test/personas/. This keeps the persona list as a single source of
+# truth.
 #
 # | VM     | Distro        | Primary concern          | Also tests                    |
 # |--------|---------------|--------------------------|-------------------------------|
@@ -11,47 +15,20 @@
 # | ubuntu | Ubuntu 22.04  | AppArmor                 | Docker+Podman rootless/rootful|
 # | debian | Debian 12     | cgroup v1                | Docker+Podman rootless/rootful|
 #
-# Each VM provisions 4 user accounts (one per persona) so that all personas
-# can SSH in without resetting state between runs. Agents start in a dirty
-# session with possible artifacts from past runs.
-#
 # Prerequisites:
 #   vagrant plugin install vagrant-libvirt
 #
 # Usage:
 #   vagrant up fedora                   # Start a single VM
 #   vagrant ssh fedora                  # SSH into a VM
-#   ./test/run-exploration.sh --vm fedora
+#   ./test/run-exploration.sh --vm fedora <prompt>
 #   vagrant destroy -f fedora           # Clean up
 
 MORLOC_IMAGE = "ghcr.io/morloc-project/morloc/morloc-full:edge"
 
-# Persona users provisioned on each VM. Each gets their own home directory,
-# subuid/subgid ranges for rootless containers, and docker group membership.
-PERSONA_USERS = {
-  "newuser"       => { uid_start: 100000 },
-  "developer"     => { uid_start: 200000 },
-  "sysadmin"      => { uid_start: 300000 },
-  "poweruser"     => { uid_start: 400000 },
-  "mathematician" => { uid_start: 500000 },
-}
-
-# Shared provisioning script: creates persona users, installs engines, pulls images
-PROVISION_USERS = <<-SHELL
-  # Create persona user accounts
-  #{PERSONA_USERS.map { |user, opts|
-    <<~USR
-      if ! id #{user} &>/dev/null; then
-        useradd -m -s /bin/bash #{user}
-      fi
-      grep -q '^#{user}:' /etc/subuid || echo "#{user}:#{opts[:uid_start]}:65536" >> /etc/subuid
-      grep -q '^#{user}:' /etc/subgid || echo "#{user}:#{opts[:uid_start]}:65536" >> /etc/subgid
-      loginctl enable-linger #{user} || true
-      usermod -aG docker #{user} 2>/dev/null || true
-    USR
-  }.join("\n")}
-
-  # Also set up vagrant user for direct SSH
+# Add the vagrant user to the docker group so the orchestration script can
+# pull images and run docker commands without sudo.
+PROVISION_VAGRANT_USER = <<-SHELL
   usermod -aG docker vagrant 2>/dev/null || true
 SHELL
 
@@ -85,7 +62,7 @@ Vagrant.configure("2") do |config|
       # Dev tools
       dnf install -y git ShellCheck
 
-      #{PROVISION_USERS}
+      #{PROVISION_VAGRANT_USER}
 
       # Pull morloc images on both engines
       docker pull #{MORLOC_IMAGE} || echo "WARNING: docker pull failed"
@@ -132,7 +109,7 @@ Vagrant.configure("2") do |config|
       # Dev tools
       apt-get install -y git shellcheck
 
-      #{PROVISION_USERS}
+      #{PROVISION_VAGRANT_USER}
 
       # Pull morloc images
       docker pull #{MORLOC_IMAGE} || echo "WARNING: docker pull failed"
@@ -182,7 +159,7 @@ Vagrant.configure("2") do |config|
       # Dev tools
       apt-get install -y git shellcheck
 
-      #{PROVISION_USERS}
+      #{PROVISION_VAGRANT_USER}
 
       # Pull morloc images
       docker pull #{MORLOC_IMAGE} || echo "WARNING: docker pull failed"
