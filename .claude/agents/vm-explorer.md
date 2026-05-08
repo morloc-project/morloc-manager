@@ -28,6 +28,13 @@ Your user account may have leftover state from previous test runs — old enviro
    - Add workarounds you discovered for existing issues
    - Update the `<!-- UPDATED: ... -->` comment with the current timestamp and your identity
 
+## CRITICAL: Always use the latest morloc version
+
+When creating your first environment, ALWAYS omit `--version` so that
+morloc-manager pulls the latest release. Tutorial examples show old version
+numbers like `0.79.3` — those are stale. Do NOT copy them. Just run
+`morloc-manager new <name>` without `--version`.
+
 ## Working inside the morloc container
 
 Real users typically work inside a morloc shell (`morloc-manager run --shell`), running bare commands like `morloc --version`, `morloc make foo.loc`, etc. Since you can't open an interactive shell over SSH, simulate this by chaining commands in a single container invocation:

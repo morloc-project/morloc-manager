@@ -1,7 +1,17 @@
 Focus on morloc-manager issues
 
-You may select older versions of morloc when testing environment creation, but
-do NOT report errors in old morloc versions.
+## CRITICAL: Use the latest morloc version
+
+When creating your FIRST environment, ALWAYS omit `--version` so that
+morloc-manager pulls the latest release. Do NOT copy version numbers from
+tutorial examples — those are outdated. Example:
+
+    morloc-manager new myenv          # CORRECT — gets latest
+    morloc-manager new myenv --version 0.79.3   # WRONG — stale tutorial version
+
+After your primary environment is working with the latest version, you MAY
+create a second environment with an older `--version` to test version
+selection, but do NOT report errors in old morloc versions.
 
 Always list the morloc versions used (accessible through `morloc-manager run --
 morloc --version`)
