@@ -11,9 +11,9 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-FINDINGS_DIR="findings"
 
 # Defaults applied when no override is passed.
+DEFAULT_OUTPUT_DIR="findings"
 DEFAULT_MODEL="sonnet"
 DEFAULT_EXPLORER_MAX_TURNS=50
 DEFAULT_ANALYST_MAX_TURNS=80
@@ -32,7 +32,10 @@ Options:
   --info                     List available personas and VMs.
   --vm VM                    VM to test on (required).
   --personas LIST            Comma-separated personas (default: all).
-  --fresh                    Remove findings/log.md before starting.
+  --output DIR               Output directory for reports, logs, and the
+                             analyst report (default: $DEFAULT_OUTPUT_DIR).
+                             Use distinct values to run concurrently.
+  --fresh                    Remove <output>/log.md before starting.
   --sync                     Rsync files into the VM before starting.
   --model MODEL              Model for both agents (default: $DEFAULT_MODEL).
   --explorer-model MODEL     Override model for explorer only.
@@ -70,6 +73,7 @@ show_info() {
 PROMPT_FILE=""
 PERSONAS=""
 VM=""
+OUTPUT_DIR=""
 FRESH=""
 SYNC=""
 MODEL=""
@@ -85,6 +89,7 @@ while [ $# -gt 0 ]; do
         --info) show_info; exit 0 ;;
         --vm) VM="$2"; shift 2 ;;
         --personas) PERSONAS=$(echo "$2" | tr ',' ' '); shift 2 ;;
+        --output) OUTPUT_DIR="$2"; shift 2 ;;
         --fresh) FRESH=1; shift ;;
         --sync) SYNC=1; shift ;;
         --model) MODEL="$2"; shift 2 ;;
@@ -101,6 +106,8 @@ while [ $# -gt 0 ]; do
             shift ;;
     esac
 done
+
+OUTPUT_DIR="${OUTPUT_DIR:-$DEFAULT_OUTPUT_DIR}"
 
 # Resolve per-agent settings. Precedence: per-agent flag > shared flag > default.
 EXPLORER_MODEL="${EXPLORER_MODEL:-${MODEL:-$DEFAULT_MODEL}}"
@@ -121,10 +128,13 @@ cd "$REPO_DIR"
     exit 1
 }
 
-mkdir -p "$FINDINGS_DIR"
-rm -f "$FINDINGS_DIR/HALT"
-if [ -n "$FRESH" ]; then rm -f "$FINDINGS_DIR/log.md"; fi
-[ -f "$FINDINGS_DIR/log.md" ] || : > "$FINDINGS_DIR/log.md"
+mkdir -p "$OUTPUT_DIR"
+# Resolve to absolute path so paths in agent prompts are unambiguous and
+# distinct concurrent runs can coexist regardless of working directory.
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+rm -f "$OUTPUT_DIR/HALT"
+if [ -n "$FRESH" ]; then rm -f "$OUTPUT_DIR/log.md"; fi
+[ -f "$OUTPUT_DIR/log.md" ] || : > "$OUTPUT_DIR/log.md"
 
 log() { echo "=== $(date '+%Y-%m-%d %H:%M:%S') $* ==="; }
 
@@ -136,7 +146,7 @@ vagrant ssh "$VM" -c "echo '$VM ready'" >/dev/null 2>&1 || {
 }
 
 # Extract SSH config so the agent can run ssh directly.
-SSH_DIR="$FINDINGS_DIR/.ssh"
+SSH_DIR="$OUTPUT_DIR/.ssh"
 mkdir -p "$SSH_DIR"
 SSH_CONFIG=$(vagrant ssh-config "$VM")
 SSH_HOST=$(echo "$SSH_CONFIG" | awk '/HostName/ {print $2}')
@@ -183,7 +193,7 @@ for persona in $PERSONAS; do
     [ -f "$PERSONA_FILE" ] || { log "WARN: $PERSONA_FILE missing, skipping"; continue; }
 
     log "Persona: $persona on $VM"
-    PERSONA_DIR="$FINDINGS_DIR/$persona"
+    PERSONA_DIR="$OUTPUT_DIR/$persona"
     mkdir -p "$PERSONA_DIR"
 
     log "Ensuring VM user '$persona' exists"
@@ -206,9 +216,13 @@ $(cat "$PERSONA_FILE")
 
 # Paths
 
+The paths below are the authoritative locations for this run. Use these
+exact paths — they override any \`findings/...\` paths mentioned elsewhere
+in this prompt or context.
+
 - Report (write here):  $PERSONA_DIR/report.md
-- Shared log (read+append): $FINDINGS_DIR/log.md
-- HALT sentinel (write only on setup-blocker): $FINDINGS_DIR/HALT
+- Shared log (read+append): $OUTPUT_DIR/log.md
+- HALT sentinel (write only on setup-blocker): $OUTPUT_DIR/HALT
 
 # Task
 
@@ -225,7 +239,7 @@ $TASK"
 
     log "Done: $persona"
 
-    if [ -f "$FINDINGS_DIR/HALT" ]; then
+    if [ -f "$OUTPUT_DIR/HALT" ]; then
         log "HALT sentinel present. Skipping remaining personas."
         break
     fi
@@ -237,12 +251,16 @@ ANALYST_PROMPT="$ANALYST_CONTEXT
 
 # Paths
 
-- Per-persona reports: $FINDINGS_DIR/<persona>/report.md
-- Shared log: $FINDINGS_DIR/log.md
-- HALT sentinel (if present): $FINDINGS_DIR/HALT
+The paths below are the authoritative locations for this run. Use these
+exact paths — they override any \`findings/...\` paths mentioned elsewhere
+in this prompt or context.
+
+- Per-persona reports: $OUTPUT_DIR/<persona>/report.md
+- Shared log: $OUTPUT_DIR/log.md
+- HALT sentinel (if present): $OUTPUT_DIR/HALT
 - Source (read-only): morloc/
 - Docs (read-only): morloc-project.github.io/
-- Final report (write here): $FINDINGS_DIR/report.md
+- Final report (write here): $OUTPUT_DIR/report.md
 
 # Task
 
@@ -255,10 +273,10 @@ claude -p "$ANALYST_PROMPT" \
     --allowedTools "Read,Write,Glob,Grep" \
     --no-session-persistence \
     --output-format text \
-    < /dev/null 2>&1 | tee "$FINDINGS_DIR/analyst-session.log"
+    < /dev/null 2>&1 | tee "$OUTPUT_DIR/analyst-session.log"
 
 rm -rf "$SSH_DIR"
 
-log "Exploration complete. Results in $FINDINGS_DIR/"
-log "Final report: $FINDINGS_DIR/report.md"
-log "Shared log: $FINDINGS_DIR/log.md"
+log "Exploration complete. Results in $OUTPUT_DIR/"
+log "Final report: $OUTPUT_DIR/report.md"
+log "Shared log: $OUTPUT_DIR/log.md"

@@ -64,6 +64,7 @@ load-image: check-vm ## Load exported images into a VM
 ## Testing
 
 EXPLORE_TUNING_ARGS = \
+    $(if $(OUTPUT),--output $(OUTPUT)) \
     $(if $(MODEL),--model $(MODEL)) \
     $(if $(EXPLORER_MODEL),--explorer-model $(EXPLORER_MODEL)) \
     $(if $(ANALYST_MODEL),--analyst-model $(ANALYST_MODEL)) \
@@ -71,7 +72,7 @@ EXPLORE_TUNING_ARGS = \
     $(if $(EXPLORER_MAX_TURNS),--explorer-max-turns $(EXPLORER_MAX_TURNS)) \
     $(if $(ANALYST_MAX_TURNS),--analyst-max-turns $(ANALYST_MAX_TURNS))
 
-explore: check-vm check-prompt ## Run all personas on a VM (vars: MODEL, *_MODEL, MAX_TURNS, *_MAX_TURNS)
+explore: check-vm check-prompt ## Run all personas on a VM (vars: OUTPUT, MODEL, *_MODEL, MAX_TURNS, *_MAX_TURNS)
 	./test/run-exploration.sh --vm $(VM) $(EXPLORE_TUNING_ARGS) $(PROMPT)
 
 explore-sync: check-vm check-prompt ## Sync + run all personas on a VM

@@ -8,5 +8,4 @@ morloc. Separate your report into two sections: 1) issues in the documentation,
 inaccuracies, grammatical errors, missing information, etc; 2) issues with the
 morloc langage such as bugs, poorly designed features, or missing features.
 
-Extra requirements:
- 1. your environment doesn't propagate exit codes correctly, do not report on unexpected exit codes from running morloc
+Be sure you are using the very latest version of morloc.
