@@ -9,3 +9,7 @@ inaccuracies, grammatical errors, missing information, etc; 2) issues with the
 morloc langage such as bugs, poorly designed features, or missing features.
 
 Be sure you are using the very latest version of morloc.
+
+Ignore any aparent errors in exit codes and DO NOT REPORT THEM, these are the
+result of your environment stack (VM and morloc-manager). Morloc exit codes are
+all correct.

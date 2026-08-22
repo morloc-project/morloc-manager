@@ -1,0 +1,13 @@
+First work through the tutorial-development.asc tutorial to setup your morloc
+environment. This tutorial is the most up-to-date material on morloc
+startup. Then look in the morloc-project.github.io folder to find the official
+morloc docs. Here find the sections 1-3 (Intro, Why Morloc, and Getting Started)
+and work through it. Explore any code. Study the text. Explore beyond what the
+documentation covers. In Getting Started, find any area where the official docs
+are out of date or poorly explained. You're goal is to find bugs and
+undocumented features in the morloc. Separate your report into two sections: 1)
+issues in the documentation, inaccuracies, grammatical errors, missing
+information, etc; 2) issues with the morloc langage such as bugs, poorly
+designed features, or missing features.
+
+Be sure you are using the very latest version of morloc.
