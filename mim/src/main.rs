@@ -3540,8 +3540,25 @@ fn resolve_new_env_name(
 /// Read a line from stdin after showing `prompt` with a bracketed `default`.
 /// Returns the trimmed input, or `default` when the user just presses enter.
 /// Prompts go to stderr; stdout is reserved for machine-readable output.
-fn prompt_line(prompt: &str, default: &str) -> String {
-    eprint!("{prompt} [{default}]: ");
+/// Bold-green a question title so each interactive prompt group stands out from
+/// the option lists, defaults, and selection lines around it. Raw SGR escapes,
+/// emitted through anstream, which strips them when stderr is not a terminal.
+fn prompt_title(text: &str) -> String {
+    format!("\x1b[1;32m{text}\x1b[0m")
+}
+
+/// Print a colored question title on its own line, heading a group whose options
+/// and selection line follow. For menu questions (backend, scope, the confirm
+/// summary) whose selection line does not carry the title.
+fn print_prompt_title(text: &str) {
+    anstream::eprintln!("{}", prompt_title(text));
+}
+
+/// Emit `prompt [default]: `, read a line, and return it (or `default` when
+/// blank). Routes through anstream so any SGR escapes in `prompt` are stripped
+/// when stderr is not a terminal.
+fn prompt_read(prompt: &str, default: &str) -> String {
+    anstream::eprint!("{prompt} [{default}]: ");
     io::stderr().flush().ok();
     let mut buf = String::new();
     if io::stdin().read_line(&mut buf).is_err() {
@@ -3549,6 +3566,18 @@ fn prompt_line(prompt: &str, default: &str) -> String {
     }
     let trimmed = buf.trim();
     if trimmed.is_empty() { default.to_string() } else { trimmed.to_string() }
+}
+
+/// A titled inline question: the prompt text is the orange title and the
+/// `[default]` stays plain. Use for questions with no separate menu/options.
+fn prompt_line(prompt: &str, default: &str) -> String {
+    prompt_read(&prompt_title(prompt), default)
+}
+
+/// A bare (uncolored) selection line, sitting under an already-printed title and
+/// its options (see `print_prompt_title`).
+fn prompt_select(prompt: &str, default: &str) -> String {
+    prompt_read(prompt, default)
 }
 
 /// True if the user's answer is affirmative ("y"/"yes", case-insensitive).
@@ -3671,6 +3700,7 @@ fn backend_options(container_only: bool) -> Vec<BackendOption> {
 fn interactive_choose_backend(container_only: bool) -> Result<Backend> {
     let opts = backend_options(container_only);
     let width = opts.iter().map(|o| o.label.len()).max().unwrap_or(0);
+    print_prompt_title("Runtime engine:");
     for (i, o) in opts.iter().enumerate() {
         match &o.disabled {
             None => anstream::eprintln!("  [{i}] {}", o.label),
@@ -3688,7 +3718,7 @@ fn interactive_choose_backend(container_only: bool) -> Result<Backend> {
         )
     })?;
     loop {
-        let choice = prompt_line("Enter choice", &default_ix.to_string());
+        let choice = prompt_select("Enter choice", &default_ix.to_string());
         match choice.parse::<usize>() {
             Ok(ix) if ix < opts.len() => {
                 if let Some(reason) = &opts[ix].disabled {
@@ -3711,6 +3741,7 @@ fn interactive_choose_backend(container_only: bool) -> Result<Backend> {
 /// shown greyed. Shown only for container backends (see `interactive_new_session`).
 fn interactive_choose_scope() -> Scope {
     let system_writable = check_system_write_access().is_ok();
+    print_prompt_title("Scope:");
     anstream::eprintln!("  [0] local   (~/.config/morloc)");
     if system_writable {
         anstream::eprintln!("  [1] system  (/etc/morloc)");
@@ -3718,7 +3749,7 @@ fn interactive_choose_scope() -> Scope {
         anstream::eprintln!("  \x1b[2m[1] system  (/etc/morloc, requires root)\x1b[0m");
     }
     loop {
-        match prompt_line("Enter scope", "0").as_str() {
+        match prompt_select("Enter scope", "0").as_str() {
             "0" | "local" => return Scope::Local,
             "1" | "system" if system_writable => return Scope::System,
             "1" | "system" => eprintln!("  System scope requires root. Re-run with sudo to use it."),
@@ -3992,12 +4023,13 @@ fn interactive_confirm(plan: &mut NewPlan) -> bool {
     loop {
         let fields = confirm_fields(plan);
         let n = fields.len();
-        eprintln!("\nWill create environment");
+        eprintln!();
+        print_prompt_title("Will create environment");
         for (i, f) in fields.iter().enumerate() {
             eprintln!(" [{}] {}: {}", i + 1, f.label(plan), f.value(plan));
         }
         eprintln!();
-        let answer = prompt_line(&format!("Enter 1-{n} to update a setting or y/n"), "y");
+        let answer = prompt_select(&format!("Enter 1-{n} to update a setting or y/n"), "y");
         if is_yes(&answer) {
             return true;
         }

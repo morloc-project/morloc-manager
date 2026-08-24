@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "mim"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "anstream",
  "chrono",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "mim-env"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "clap",
  "morloc-deps",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "morloc-deps"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "serde",
  "serde_json",
