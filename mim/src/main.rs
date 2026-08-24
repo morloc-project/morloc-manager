@@ -3182,7 +3182,22 @@ fn resolve_env_requirements(
     let tag = requested_version
         .map(|v| v.to_string())
         .unwrap_or_else(resolve_release_tag);
-    let (runtime_dir, version) = provision::provision_runtime(scope, &tag)?;
+    // The runtime triple follows the BUILD target, not the host: a container
+    // backend builds and runs the compiler inside a Linux image (matching the
+    // host arch), so on a macOS host it needs the Linux runtime, not the
+    // (possibly unpublished) macOS one. Native builds on the host itself.
+    let triple = match engine {
+        Some(_) => provision::release_triple("linux", std::env::consts::ARCH),
+        None => provision::host_release_triple(),
+    }
+    .ok_or_else(|| {
+        ManagerError::BackendUnsupported(format!(
+            "no prebuilt morloc runtime is published for this platform ({}/{})",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+    })?;
+    let (runtime_dir, version) = provision::provision_runtime(scope, &tag, triple)?;
     let morloc_bin = provision::runtime_morloc_bin(&runtime_dir);
     // `engine` lets the table be generated in a container when the host cannot
     // run the compiler (native passes None; it runs on the host by definition).

@@ -441,21 +441,21 @@ pub fn fetch_manifest(tag: &str) -> Result<ReleaseManifest> {
     ReleaseManifest::from_json(&text)
 }
 
-/// Provision the native runtime into `runtimes/<version>/` and return that
+/// Provision the runtime for `triple` into `runtimes/<version>/` and return that
 /// directory (its `rust/` subdir is `morloc init`'s MORLOC_RUST_DIR). Downloads
 /// the version-matched morloc compiler plus the rust sources; `morloc init`
 /// builds libmorloc.so, morloc-nexus, and rustmorloc locally from that source.
 /// The already-installed `morloc-manager` bootstrap is not re-fetched.
-pub fn provision_runtime(scope: Scope, requested: &str) -> Result<(PathBuf, String)> {
-    let triple = host_release_triple().ok_or_else(|| {
-        ManagerError::BackendUnsupported(format!(
-            "no prebuilt native runtime is published for this platform ({}/{}); \
-             use a container backend",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ))
-    })?;
-
+///
+/// `triple` is the release triple the artifacts must target: the host's for a
+/// native backend, but the CONTAINER's Linux triple for a container backend
+/// (the compiler runs, and libmorloc is built, inside the image -- so on a macOS
+/// host a Linux/arm64 container needs the linux-arm64 runtime, not macos-arm64).
+pub fn provision_runtime(
+    scope: Scope,
+    requested: &str,
+    triple: &str,
+) -> Result<(PathBuf, String)> {
     // Resolve "latest"/a bare version to a concrete download tag (asset URLs need
     // the real tag, not the "latest" alias).
     let tag = resolve_tag(requested)?;
@@ -464,7 +464,7 @@ pub fn provision_runtime(scope: Scope, requested: &str) -> Result<(PathBuf, Stri
     let version = manifest.version.clone();
     let assets = manifest.assets_for(triple).ok_or_else(|| {
         ManagerError::BackendUnsupported(format!(
-            "release {tag} publishes no native runtime for {triple}; use a container backend"
+            "release {tag} publishes no runtime for {triple}; use a container backend"
         ))
     })?;
 
