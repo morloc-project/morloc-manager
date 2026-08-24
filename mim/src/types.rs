@@ -716,6 +716,12 @@ pub struct NativeRuntime {
     /// drift.
     #[serde(default)]
     pub manager_version: Option<String>,
+    /// Absolute path of this env's provisioned morloc compiler
+    /// (`runtimes/<version>/morloc`). Exported as MORLOC_BIN on a managed `run` so
+    /// the build hook's reverse `morloc lang-support` call resolves the exact
+    /// compiler without relying on PATH. `None` for records predating this field.
+    #[serde(default)]
+    pub morloc_bin: Option<std::path::PathBuf>,
 }
 
 /// Persisted requirement inputs for an environment (native or container), kept

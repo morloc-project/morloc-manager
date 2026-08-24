@@ -16,6 +16,8 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use morloc_deps::version::{ENVSPEC_VERSION, LANG_SCHEMA_MAJOR, MANIFEST_SCHEMA};
+
 use crate::config;
 use crate::error::{ManagerError, Result};
 use crate::types::Scope;
@@ -37,19 +39,67 @@ pub const PIXI_VERSION: &str = "0.76.2";
 const LANG_SUPPORT_ASSET: &str = "morloc-lang-support.json";
 /// Filename of the downloaded lang-support table inside `runtimes/<version>/`.
 pub const LANG_SUPPORT_FILE: &str = "lang-support.json";
-/// Highest release-manifest schema this build understands. v2 dropped the
-/// prebuilt `libmorloc`/`nexus` assets: the runtime is now built from source at
-/// `morloc init` with the env's toolchain (ABI coherence), so a release ships
-/// only the compiler + static manager per platform.
-const SUPPORTED_MANIFEST_SCHEMA: u32 = 2;
-
-/// The per-platform prebuilt binaries in a release: the morloc compiler and the
-/// static morloc-manager. libmorloc.so + morloc-nexus are NOT here -- they are
-/// built from the (platform-independent) Rust source at `morloc init`.
+/// The per-platform prebuilt binaries in a release: just the morloc compiler.
+/// libmorloc.so + morloc-nexus are NOT here -- they are built from the
+/// (platform-independent) Rust source at `morloc init`. The manager (mim) is
+/// released and installed from its own repository, never bundled here.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct TripleAssets {
     pub morloc: String,
-    pub manager: String,
+}
+
+/// The contract/ABI versions a release emits, inlined into the manifest from the
+/// compiler's `morloc versions` output. Lets the manager gate on compatibility
+/// BEFORE downloading anything. Fields are the versions the COMPILER controls;
+/// the manager compares them against its own supported versions
+/// (`morloc-deps::version`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct MorlocVersions {
+    pub morloc_version: String,
+    /// morloc C ABI version. RECORDED (for doctor / frozen-image coherence), not
+    /// gated at install: libmorloc is built from source at `morloc init`, so a
+    /// native runtime is ABI-coherent by construction.
+    pub abi_version: u32,
+    /// `envspec.json` schema version (integer).
+    pub envspec_version: u32,
+    /// `morloc lang-support` schema version (semver "MAJOR.MINOR").
+    pub lang_support_schema: String,
+}
+
+impl MorlocVersions {
+    /// Reject a release whose contract versions exceed what this manager
+    /// understands, so the failure surfaces as an actionable "upgrade mim" at
+    /// install time rather than an opaque parse error mid-build. The comparison is
+    /// `declared > supported` (never equality): the manager versions independently
+    /// of the compiler, so a matched pair is the common -- not the required -- case.
+    pub fn check_supported(&self) -> Result<()> {
+        if self.envspec_version > ENVSPEC_VERSION {
+            return Err(ManagerError::EnvError(format!(
+                "this morloc release writes envspec_version {} but this mim understands \
+                 up to {}; upgrade mim.",
+                self.envspec_version, ENVSPEC_VERSION
+            )));
+        }
+        let lang_major = self
+            .lang_support_schema
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .ok_or_else(|| {
+                ManagerError::EnvError(format!(
+                    "release lang_support_schema '{}' is not a MAJOR.MINOR version",
+                    self.lang_support_schema
+                ))
+            })?;
+        if lang_major > LANG_SCHEMA_MAJOR {
+            return Err(ManagerError::EnvError(format!(
+                "this morloc release writes lang-support schema {} but this mim understands \
+                 major {}.x; upgrade mim.",
+                self.lang_support_schema, LANG_SCHEMA_MAJOR
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// The native-install manifest attached to a release.
@@ -58,14 +108,15 @@ pub struct ReleaseManifest {
     pub schema: u32,
     pub version: String,
     pub rust_src: String,
+    /// The contract/ABI versions this release emits (see `MorlocVersions`).
+    pub versions: MorlocVersions,
     /// Release-triple ("linux-x86_64", ...) -> its prebuilt assets. Only triples
     /// with a complete, tested asset set are present.
     pub triples: BTreeMap<String, TripleAssets>,
-    /// Asset filename -> lowercase hex SHA-256. Every downloaded artifact whose
-    /// name appears here is verified after fetch; artifacts absent from the map
-    /// (older releases that predate digest publishing) are fetched atomically but
-    /// not verified. Defaulted so pre-digest manifests still parse.
-    #[serde(default)]
+    /// Asset filename -> lowercase hex SHA-256, published for every asset. Each
+    /// downloaded artifact is verified against its digest after fetch; an asset
+    /// with no digest here is refused, since there is nothing to verify it
+    /// against (a missing digest must never silently disable verification).
     pub sha256: BTreeMap<String, String>,
 }
 
@@ -73,13 +124,14 @@ impl ReleaseManifest {
     pub fn from_json(text: &str) -> Result<Self> {
         let m: ReleaseManifest = serde_json::from_str(text)
             .map_err(|e| ManagerError::EnvError(format!("Failed to parse {MANIFEST_ASSET}: {e}")))?;
-        if m.schema > SUPPORTED_MANIFEST_SCHEMA {
+        if m.schema > MANIFEST_SCHEMA {
             return Err(ManagerError::EnvError(format!(
                 "{MANIFEST_ASSET} schema {} is newer than this morloc-manager supports \
-                 (up to {SUPPORTED_MANIFEST_SCHEMA}); upgrade morloc-manager.",
+                 (up to {MANIFEST_SCHEMA}); upgrade morloc-manager.",
                 m.schema
             )));
         }
+        m.versions.check_supported()?;
         Ok(m)
     }
 
@@ -278,10 +330,10 @@ fn part_path(dest: &Path) -> PathBuf {
 }
 
 /// Download `asset` of release `tag` to `dest` atomically, verifying its SHA-256
-/// against `digests` when a digest is published for that asset name. The body
+/// against `digests` (an asset with no published digest is refused). The body
 /// lands on a temporary `.part` path and is renamed into place only after the
-/// download (and any verification) succeeds, so an interrupted or corrupt fetch
-/// never leaves a file that a presence check would bless as valid.
+/// download and verification succeed, so an interrupted, corrupt, or unverifiable
+/// fetch never leaves a file that a presence check would bless as valid.
 fn download_asset(
     tag: &str,
     asset: &str,
@@ -291,14 +343,17 @@ fn download_asset(
     let part = part_path(dest);
     let result = (|| {
         curl_download(&asset_url(tag, asset), &part)?;
-        if let Some(expected) = digests.get(asset) {
-            let actual = file_sha256(&part)?;
-            if !actual.eq_ignore_ascii_case(expected) {
-                return Err(ManagerError::EnvError(format!(
-                    "checksum mismatch for {asset}: expected {expected}, got {actual} \
-                     (corrupt or tampered download)"
-                )));
-            }
+        let expected = digests.get(asset).ok_or_else(|| {
+            ManagerError::EnvError(format!(
+                "no SHA-256 published for asset {asset}; refusing an unverified download"
+            ))
+        })?;
+        let actual = file_sha256(&part)?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(ManagerError::EnvError(format!(
+                "checksum mismatch for {asset}: expected {expected}, got {actual} \
+                 (corrupt or tampered download)"
+            )));
         }
         std::fs::rename(&part, dest).map_err(|e| {
             ManagerError::EnvError(format!("cannot finalize {}: {e}", dest.display()))
@@ -332,11 +387,21 @@ pub fn runtime_morloc_bin(dir: &Path) -> PathBuf {
     dir.join("morloc")
 }
 
-/// The in-environment dependency agent within a provisioned runtime store. It
-/// sits next to the compiler so the compiler finds it as a sibling (and on
-/// PATH) for the dependency callback.
-pub fn runtime_morloc_env_bin(dir: &Path) -> PathBuf {
-    dir.join("morloc-env")
+/// The `mim-env` dependency agent staged within a provisioned runtime store. Used
+/// by the container backend, where the build hook (MORLOC_BUILD_HOOK) points at
+/// this in-image path. Natively the hook points at mim's own sibling agent
+/// (`sibling_mim_env`) instead, since the agent is versioned with mim.
+pub fn runtime_mim_env_bin(dir: &Path) -> PathBuf {
+    dir.join("mim-env")
+}
+
+/// The `mim-env` dependency agent shipped alongside THIS `mim` executable. The
+/// native build hook points here: the agent is versioned with mim, so mim's own
+/// sibling is always the matching one and needs no staging into the runtime.
+pub fn sibling_mim_env() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("mim-env")))
 }
 
 /// The Rust workspace source within a provisioned runtime store; this is
@@ -595,13 +660,12 @@ pub fn stage_runtime(src: &Path, dest: &Path) -> Result<()> {
     let morloc_dest = runtime_morloc_bin(dest);
     copy_file(&from, &morloc_dest)?;
     make_executable(&morloc_dest)?;
-    // Stage the in-env dependency agent alongside the compiler when present, so
-    // the in-container compiler finds it (sibling on PATH) for the dep callback.
-    // (`copy_file` follows a symlink, so a dev-staged symlink copies the real
-    // binary into the image.)
-    let agent = runtime_morloc_env_bin(src);
+    // Stage the mim-env dependency agent into the image alongside the compiler, so
+    // an in-container `morloc make` can run it via MORLOC_BUILD_HOOK. (`copy_file`
+    // follows a symlink, so a dev-staged symlink copies the real binary in.)
+    let agent = runtime_mim_env_bin(src);
     if agent.is_file() {
-        let agent_dest = runtime_morloc_env_bin(dest);
+        let agent_dest = runtime_mim_env_bin(dest);
         copy_file(&agent, &agent_dest)?;
         make_executable(&agent_dest)?;
     }
@@ -621,14 +685,23 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = r#"{
-      "schema": 2,
+      "schema": 1,
       "version": "0.98.3",
       "rust_src": "morloc-rust-src.tar.gz",
+      "versions": {
+        "morloc_version": "0.98.3",
+        "abi_version": 1,
+        "envspec_version": 1,
+        "lang_support_schema": "1.0"
+      },
       "triples": {
         "linux-x86_64": {
-          "morloc": "morloc-linux-x86_64",
-          "manager": "morloc-manager-linux-x86_64"
+          "morloc": "morloc-linux-x86_64"
         }
+      },
+      "sha256": {
+        "morloc-linux-x86_64": "aa",
+        "morloc-rust-src.tar.gz": "cc"
       }
     }"#;
 
@@ -639,15 +712,33 @@ mod tests {
         assert_eq!(m.rust_src, "morloc-rust-src.tar.gz");
         let a = m.assets_for("linux-x86_64").unwrap();
         assert_eq!(a.morloc, "morloc-linux-x86_64");
-        assert_eq!(a.manager, "morloc-manager-linux-x86_64");
+        assert_eq!(m.versions.envspec_version, 1);
+        assert_eq!(m.versions.lang_support_schema, "1.0");
         // A triple with no published runtime is absent.
         assert!(m.assets_for("macos-arm64").is_none());
     }
 
     #[test]
     fn rejects_future_schema() {
-        let j = r#"{"schema":999,"version":"9.9.9","rust_src":"x","triples":{}}"#;
+        let j = r#"{"schema":999,"version":"9.9.9","rust_src":"x",
+          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":1,"lang_support_schema":"1.0"},
+          "triples":{},"sha256":{}}"#;
         assert!(ReleaseManifest::from_json(j).is_err());
+    }
+
+    #[test]
+    fn rejects_incompatible_contract_versions() {
+        // A release whose envspec_version exceeds what this mim supports is refused
+        // at manifest-parse (install) time with an actionable message.
+        let j = r#"{"schema":1,"version":"9.9.9","rust_src":"x",
+          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":2,"lang_support_schema":"1.0"},
+          "triples":{},"sha256":{}}"#;
+        assert!(ReleaseManifest::from_json(j).is_err());
+        // A newer lang-support MAJOR is likewise refused.
+        let k = r#"{"schema":1,"version":"9.9.9","rust_src":"x",
+          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":1,"lang_support_schema":"2.0"},
+          "triples":{},"sha256":{}}"#;
+        assert!(ReleaseManifest::from_json(k).is_err());
     }
 
     #[test]
@@ -730,15 +821,21 @@ mod tests {
     }
 
     #[test]
-    fn manifest_parses_sha256_and_defaults_empty() {
-        let j = r#"{"schema":1,"version":"1.0.0","rust_src":"r","triples":{},
-          "sha256":{"morloc-linux-x86_64":"abc123"}}"#;
-        let m = ReleaseManifest::from_json(j).unwrap();
+    fn manifest_requires_sha256() {
+        let vers = r#""versions":{"morloc_version":"1","abi_version":1,"envspec_version":1,"lang_support_schema":"1.0"}"#;
+        let j = format!(
+            r#"{{"schema":1,"version":"1.0.0","rust_src":"r",{vers},"triples":{{}},
+          "sha256":{{"morloc-linux-x86_64":"abc123"}}}}"#
+        );
+        let m = ReleaseManifest::from_json(&j).unwrap();
         assert_eq!(
             m.sha256.get("morloc-linux-x86_64").map(|s| s.as_str()),
             Some("abc123")
         );
-        // A manifest predating digest publishing parses with an empty map.
-        assert!(ReleaseManifest::from_json(SAMPLE).unwrap().sha256.is_empty());
+        // The digest map is mandatory: a manifest omitting it is refused rather
+        // than silently installing unverified downloads.
+        let no_digests =
+            format!(r#"{{"schema":1,"version":"1.0.0","rust_src":"r",{vers},"triples":{{}}}}"#);
+        assert!(ReleaseManifest::from_json(&no_digests).is_err());
     }
 }

@@ -12,13 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DepsError, Result};
-
-/// The lowest and highest `envspec_version` this build understands. Both bounds
-/// are enforced: an older schema lacks fields this build needs (the program must
-/// be rebuilt), a newer one carries fields this build cannot honor (upgrade the
-/// manager).
-pub const MIN_ENVSPEC_VERSION: u32 = 2;
-pub const SUPPORTED_ENVSPEC_VERSION: u32 = 3;
+use crate::version::ENVSPEC_VERSION;
 
 /// The package database a dependency is drawn from. Names WHERE a package comes
 /// from, never the tool that fetches it.
@@ -104,18 +98,18 @@ impl EnvSpec {
         let peek: VersionPeek = serde_json::from_str(text).map_err(|e| {
             DepsError::Env(format!("Failed to parse envspec.json: {e}"))
         })?;
-        if peek.envspec_version < MIN_ENVSPEC_VERSION {
+        if peek.envspec_version < ENVSPEC_VERSION {
             return Err(DepsError::Env(format!(
                 "envspec.json is version {} but this morloc-manager requires version {}. \
                  Rebuild the program with a current morloc (morloc make).",
-                peek.envspec_version, MIN_ENVSPEC_VERSION
+                peek.envspec_version, ENVSPEC_VERSION
             )));
         }
-        if peek.envspec_version > SUPPORTED_ENVSPEC_VERSION {
+        if peek.envspec_version > ENVSPEC_VERSION {
             return Err(DepsError::Env(format!(
                 "envspec.json is version {} but this morloc-manager understands only \
                  up to version {}. Upgrade morloc-manager.",
-                peek.envspec_version, SUPPORTED_ENVSPEC_VERSION
+                peek.envspec_version, ENVSPEC_VERSION
             )));
         }
         serde_json::from_str(text).map_err(|e| {
@@ -137,7 +131,7 @@ impl EnvSpec {
     /// are modeled as a spec with no packages/system/modules.
     pub fn from_languages(morloc_version: &str, languages: Vec<LangReq>) -> EnvSpec {
         EnvSpec {
-            envspec_version: SUPPORTED_ENVSPEC_VERSION,
+            envspec_version: ENVSPEC_VERSION,
             morloc_version: morloc_version.to_string(),
             languages,
             packages: std::collections::BTreeMap::new(),
@@ -178,12 +172,12 @@ mod tests {
     // Exactly the shape emitted by the compiler's renderEnvSpec (sorted package
     // map keys; a bare language entry with neither constraint nor std). Each
     // package carries an explicit source.
-    const SAMPLE: &str = r#"{"envspec_version":2,"morloc_version":"0.98.2","languages":[{"lang":"py","constraint":">=3.10"},{"lang":"cpp","std":"c++20"},{"lang":"rust"}],"packages":{"cpp":[{"name":"opencv","constraint":">=4.8","source":"conda"}],"py":[{"name":"numpy","constraint":">=2,<3","source":"conda"},{"name":"requests","constraint":"*","source":"pypi"}],"rust":[{"name":"ndarray","constraint":"0.16","source":"crates"}]},"system":[{"name":"blas","provider":"unspecified"}],"modules":[{"name":"tensor-cpp","git_hash":"abc123"}]}"#;
+    const SAMPLE: &str = r#"{"envspec_version":1,"morloc_version":"0.98.2","languages":[{"lang":"py","constraint":">=3.10"},{"lang":"cpp","std":"c++20"},{"lang":"rust"}],"packages":{"cpp":[{"name":"opencv","constraint":">=4.8","source":"conda"}],"py":[{"name":"numpy","constraint":">=2,<3","source":"conda"},{"name":"requests","constraint":"*","source":"pypi"}],"rust":[{"name":"ndarray","constraint":"0.16","source":"crates"}]},"system":[{"name":"blas","provider":"unspecified"}],"modules":[{"name":"tensor-cpp","git_hash":"abc123"}]}"#;
 
     #[test]
     fn parses_compiler_output() {
         let s = EnvSpec::from_json(SAMPLE).unwrap();
-        assert_eq!(s.envspec_version, 2);
+        assert_eq!(s.envspec_version, 1);
         assert_eq!(s.morloc_version, "0.98.2");
 
         assert_eq!(s.languages.len(), 3);
@@ -210,10 +204,10 @@ mod tests {
 
     #[test]
     fn parses_channel_field() {
-        // A v3 spec: a conda package on a non-conda-forge channel carries the
-        // channel; a channel-less conda package defaults to None (conda-forge).
-        const V3: &str = r#"{"envspec_version":3,"morloc_version":"0","packages":{"py":[{"name":"samtools","constraint":"*","source":"conda","channel":"bioconda"},{"name":"numpy","constraint":">=2","source":"conda"}]}}"#;
-        let s = EnvSpec::from_json(V3).unwrap();
+        // A conda package on a non-conda-forge channel carries the channel; a
+        // channel-less conda package defaults to None (conda-forge).
+        const S: &str = r#"{"envspec_version":1,"morloc_version":"0","packages":{"py":[{"name":"samtools","constraint":"*","source":"conda","channel":"bioconda"},{"name":"numpy","constraint":">=2","source":"conda"}]}}"#;
+        let s = EnvSpec::from_json(S).unwrap();
         let py = &s.packages["py"];
         assert_eq!(py[0].name, "samtools");
         assert_eq!(py[0].channel.as_deref(), Some("bioconda"));
@@ -222,17 +216,17 @@ mod tests {
     }
 
     #[test]
-    fn v2_spec_still_parses_without_channel() {
-        // A pre-channel (v2) spec has no channel field; MIN_ENVSPEC_VERSION stays
-        // 2 so it parses, with every channel defaulting to None (conda-forge).
+    fn spec_without_channel_defaults_to_none() {
+        // A package with no channel field defaults every channel to None
+        // (conda-forge).
         let s = EnvSpec::from_json(SAMPLE).unwrap();
-        assert_eq!(s.envspec_version, 2);
+        assert_eq!(s.envspec_version, 1);
         assert!(s.packages["py"].iter().all(|p| p.channel.is_none()));
     }
 
     #[test]
     fn empty_collections_default() {
-        let s = EnvSpec::from_json(r#"{"envspec_version":2,"morloc_version":"0.0.0"}"#).unwrap();
+        let s = EnvSpec::from_json(r#"{"envspec_version":1,"morloc_version":"0.0.0"}"#).unwrap();
         assert!(s.languages.is_empty());
         assert!(s.packages.is_empty());
         assert!(s.system.is_empty());
@@ -247,15 +241,15 @@ mod tests {
 
     #[test]
     fn rejects_stale_version() {
-        // A v1 envspec.json (pre-source schema) must fail with a clear message,
-        // not an opaque serde error over the missing `source` field.
-        let r = EnvSpec::from_json(r#"{"envspec_version":1,"morloc_version":"0.0.0"}"#);
+        // A pre-1 envspec.json must fail with a clear "rebuild the program"
+        // message, not an opaque serde error over a missing field.
+        let r = EnvSpec::from_json(r#"{"envspec_version":0,"morloc_version":"0.0.0"}"#);
         assert!(r.is_err());
     }
 
     fn spec_with_system(system_json: &str) -> EnvSpec {
         EnvSpec::from_json(&format!(
-            r#"{{"envspec_version":2,"morloc_version":"0.0.0","system":{system_json}}}"#
+            r#"{{"envspec_version":1,"morloc_version":"0.0.0","system":{system_json}}}"#
         ))
         .unwrap()
     }
@@ -283,7 +277,7 @@ mod tests {
 
     #[test]
     fn native_blockers_empty_when_no_system_deps() {
-        let s = EnvSpec::from_json(r#"{"envspec_version":2,"morloc_version":"0.0.0"}"#).unwrap();
+        let s = EnvSpec::from_json(r#"{"envspec_version":1,"morloc_version":"0.0.0"}"#).unwrap();
         assert!(s.native_blockers().is_empty());
     }
 }

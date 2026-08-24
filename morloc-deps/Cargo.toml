@@ -1,8 +1,8 @@
 [package]
 name = "morloc-deps"
-version = "0.25.0"
-edition = "2021"
-description = "Dependency-resolution kernel shared by morloc-manager and morloc-env"
+version.workspace = true
+edition.workspace = true
+description = "Dependency-resolution kernel shared by mim and mim-env"
 
 [dependencies]
 serde = { workspace = true }

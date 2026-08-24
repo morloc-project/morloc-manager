@@ -397,11 +397,11 @@ fn validate_program_name(program: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    // Minimal valid v2 specs (the version guard requires >= 2); the program name
-    // is carried by the file name, not the spec body.
+    // Minimal valid specs (envspec_version 1); the program name is carried by the
+    // file name, not the spec body.
     fn spec(langs: &str) -> String {
         format!(
-            r#"{{"envspec_version":2,"morloc_version":"0.0.0","languages":[{langs}]}}"#
+            r#"{{"envspec_version":1,"morloc_version":"0.0.0","languages":[{langs}]}}"#
         )
     }
 
@@ -533,11 +533,12 @@ mod tests {
     #[test]
     fn write_spec_rejects_stale_schema_version() {
         let (_d, ctx) = ctx();
-        // v1 predates the `source` field; the store must not accept it.
+        // A pre-1 schema version is stale; the store must not accept a spec it
+        // cannot understand.
         let r = ctx.write_spec(
             "old",
             Provenance::Scratch,
-            r#"{"envspec_version":1,"morloc_version":"0.0.0"}"#,
+            r#"{"envspec_version":0,"morloc_version":"0.0.0"}"#,
         );
         assert!(r.is_err());
     }

@@ -1,11 +1,11 @@
 [package]
-name = "morloc-env"
-version = "0.25.0"
-edition = "2021"
-description = "In-environment dependency agent for Morloc (sync/clean/spec over the shared dependency kernel)"
+name = "mim-env"
+version.workspace = true
+edition.workspace = true
+description = "In-environment dependency agent for Morloc"
 
 [[bin]]
-name = "morloc-env"
+name = "mim-env"
 path = "src/main.rs"
 
 [dependencies]

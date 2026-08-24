@@ -2,6 +2,10 @@
 members = ["morloc-deps", "mim-env", "mim"]
 resolver = "2"
 
+[workspace.package]
+version = "0.26.0"
+edition = "2021"
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }

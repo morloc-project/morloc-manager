@@ -1,11 +1,11 @@
 [package]
-name = "morloc-manager"
-version = "0.25.0"
-edition = "2021"
-description = "Container lifecycle manager for Morloc"
+name = "mim"
+version.workspace = true
+edition.workspace = true
+description = "Morloc installation and environment manager"
 
 [[bin]]
-name = "morloc-manager"
+name = "mim"
 path = "src/main.rs"
 
 [dependencies]

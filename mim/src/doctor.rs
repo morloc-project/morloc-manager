@@ -667,29 +667,29 @@ fn check_staleness(c: &mut Counts, ec: &EnvironmentConfig, rt: &NativeRuntime) {
         None => {}
     }
 
-    // The in-env dependency agent vs the running manager (same tooling lane).
-    if let Some(dir) = &runtime_dir {
-        let agent = crate::provision::runtime_morloc_env_bin(dir);
-        if agent.is_file() {
+    // The dependency agent (mim-env) mim runs for a managed `morloc make`. Natively
+    // the build hook points at mim's own sibling mim-env (versioned with mim), so
+    // the check confirms it is present next to mim and version-coherent.
+    match crate::provision::sibling_mim_env() {
+        Some(agent) if agent.is_file() => {
             match run_with_activation(&rt.activation_env, &agent, &["--version"]) {
                 Some(out) if out.status.success() => {
                     let s = String::from_utf8_lossy(&out.stdout);
                     let tok = s.split_whitespace().last().unwrap_or("").trim();
                     if tok == running {
-                        c.pass(&format!("morloc-env agent matches the manager ({running})"));
+                        c.pass(&format!("mim-env agent matches the manager ({running})"));
                     } else {
                         c.warn(&format!(
-                            "morloc-env agent is {tok} but the manager is {running} -- dep-sync may misbehave; re-run: morloc-manager update"
+                            "mim-env agent is {tok} but the manager is {running} -- dependency provisioning may misbehave; reinstall mim"
                         ));
                     }
                 }
-                _ => c.skip("morloc-env agent version not reported (predates --version)"),
+                _ => c.skip("mim-env agent version not reported (predates --version)"),
             }
-        } else {
-            c.warn(
-                "morloc-env agent missing from the runtime store -- `morloc make` cannot provision deps",
-            );
         }
+        _ => c.warn(
+            "mim-env agent not found next to mim -- `morloc make` cannot provision deps; reinstall mim so mim-env sits alongside it",
+        ),
     }
 }
 
@@ -1356,6 +1356,7 @@ mod native_health_tests {
         NativeRuntime {
             activation_env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             manager_version: None,
+            morloc_bin: None,
         }
     }
 

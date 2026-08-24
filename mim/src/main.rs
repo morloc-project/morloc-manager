@@ -923,6 +923,26 @@ pub(crate) fn locate_pixi(scope: Scope) -> Option<std::path::PathBuf> {
         })
 }
 
+/// The managed-environment marker trio the compiler's build hook depends on,
+/// ALWAYS produced together so they cannot drift apart: MORLOC_ENV (the gate
+/// `morloc make`'s dependency callback checks), MORLOC_BUILD_HOOK (the mim-env
+/// agent it runs to provision dependencies), and MORLOC_BIN (the env's compiler,
+/// so the agent's reverse `morloc lang-support` resolves without PATH). Every site
+/// that marks a process as running inside a managed environment uses this, so the
+/// invariant "MORLOC_ENV set => hook and bin set" holds by construction rather
+/// than by remembering three vars at each call site.
+fn managed_env_vars(
+    env_name: &str,
+    morloc_bin: &std::path::Path,
+    mim_env: &std::path::Path,
+) -> Vec<(String, String)> {
+    vec![
+        ("MORLOC_ENV".to_string(), env_name.to_string()),
+        ("MORLOC_BUILD_HOOK".to_string(), mim_env.display().to_string()),
+        ("MORLOC_BIN".to_string(), morloc_bin.display().to_string()),
+    ]
+}
+
 /// The env-related variables a `run`/`serve` process sees, with the values it
 /// sees them as: host paths natively, in-container paths under a container.
 /// Mirrors the exports set by `native_run_env` and `run_with_config`; kept here
@@ -2805,14 +2825,21 @@ pub(crate) fn native_run_env(
     // caller's `--env` overrides last so `-e KEY=VAL` always wins.
     apply_activation(&mut cmd, &runtime.activation_env);
     cmd.env("MORLOC_HOME", &mh);
-    // Managed-env marker: the boolean signal the compiler's dependency callback
-    // gates on. Distinct from MORLOC_HOME (a general config-home override a user
-    // may export anywhere) -- MORLOC_ENV is set ONLY when running inside a
-    // managed environment, so a bare `morloc make` on the host never triggers a
-    // dependency sync. Its value is the environment name (informative).
-    cmd.env("MORLOC_ENV", &env.name);
-    // The pixi binary, so the in-env `morloc-env` agent re-solves without
-    // rediscovering it. Best-effort: pixi was already provisioned at materialize.
+    // Managed-env markers, set as a UNIT (see `managed_env_vars`) so the compiler
+    // never sees MORLOC_ENV without a resolvable build hook. MORLOC_ENV is the gate
+    // the dependency callback checks -- set ONLY inside a managed environment, so a
+    // bare host `morloc make` never triggers a sync. The build hook is mim's own
+    // sibling mim-env (versioned with mim); MORLOC_BIN is this env's compiler.
+    let hook = provision::sibling_mim_env().unwrap_or_else(|| std::path::PathBuf::from("mim-env"));
+    let morloc_bin = runtime
+        .morloc_bin
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("morloc"));
+    for (k, v) in managed_env_vars(&env.name, &morloc_bin, &hook) {
+        cmd.env(k, v);
+    }
+    // The pixi binary, so the in-env mim-env agent re-solves without rediscovering
+    // it. Best-effort: pixi was already provisioned at materialize.
     if let Ok(pixi) = provision::provision_pixi(env.scope) {
         cmd.env("MORLOC_PIXI", pixi);
     }
@@ -3306,6 +3333,7 @@ fn materialize_native_env(
         &NativeRuntime {
             activation_env: activation,
             manager_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            morloc_bin: Some(req.morloc_bin.clone()),
         },
     )?;
     // Record the cache key (manifest + compiler identity) as successfully

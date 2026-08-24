@@ -712,7 +712,7 @@ mod tests {
     use super::*;
 
     fn sample_spec() -> EnvSpec {
-        const SAMPLE: &str = r#"{"envspec_version":2,"morloc_version":"0.98.2","languages":[{"lang":"py","constraint":">=3.10"},{"lang":"cpp","std":"c++20"},{"lang":"rust"}],"packages":{"cpp":[{"name":"opencv","constraint":">=4.8","source":"conda"}],"py":[{"name":"numpy","constraint":">=2,<3","source":"conda"},{"name":"requests","constraint":"*","source":"pypi"}],"rust":[{"name":"ndarray","constraint":"0.16","source":"crates"}]},"system":[{"name":"blas","provider":"unspecified"}],"modules":[]}"#;
+        const SAMPLE: &str = r#"{"envspec_version":1,"morloc_version":"0.98.2","languages":[{"lang":"py","constraint":">=3.10"},{"lang":"cpp","std":"c++20"},{"lang":"rust"}],"packages":{"cpp":[{"name":"opencv","constraint":">=4.8","source":"conda"}],"py":[{"name":"numpy","constraint":">=2,<3","source":"conda"},{"name":"requests","constraint":"*","source":"pypi"}],"rust":[{"name":"ndarray","constraint":"0.16","source":"crates"}]},"system":[{"name":"blas","provider":"unspecified"}],"modules":[]}"#;
         EnvSpec::from_json(SAMPLE).unwrap()
     }
 
@@ -788,7 +788,7 @@ platforms = [\"linux-64\"]
 
     #[test]
     fn r_packages_get_conda_prefix() {
-        const R: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"r"}],"packages":{"r":[{"name":"data.table","constraint":"*","source":"conda"}]}}"#;
+        const R: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"r"}],"packages":{"r":[{"name":"data.table","constraint":"*","source":"conda"}]}}"#;
         let spec = EnvSpec::from_json(R).unwrap();
         let support = sample_support();
         let (conda, _) = aggregate(std::slice::from_ref(&spec), &support).unwrap();
@@ -813,7 +813,7 @@ platforms = [\"linux-64\"]
     fn bioconda_channel_renders_inline_table_and_workspace_union() {
         // A conda dep on bioconda lowers to a pixi inline table AND adds bioconda
         // to the workspace channels (conda-forge stays first).
-        const S: &str = r#"{"envspec_version":3,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"samtools","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
+        const S: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"samtools","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
         let manifest = render_with(EnvSpec::from_json(S).unwrap());
         assert!(manifest.contains("channels = [\"conda-forge\", \"bioconda\"]"), "{manifest}");
         assert!(
@@ -826,7 +826,7 @@ platforms = [\"linux-64\"]
     fn conda_forge_dep_stays_flat_and_channel_list_unchanged() {
         // A conda-forge dep (no channel on the wire) keeps the flat form and does
         // not perturb the workspace channel list -- byte-identical to pre-channel.
-        const S: &str = r#"{"envspec_version":3,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"numpy","constraint":">=2","source":"conda"}]}}"#;
+        const S: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"numpy","constraint":">=2","source":"conda"}]}}"#;
         let manifest = render_with(EnvSpec::from_json(S).unwrap());
         assert!(manifest.contains("channels = [\"conda-forge\"]"), "{manifest}");
         // flat form (`= "`), not an inline table (`= {`), and no channel key.
@@ -838,7 +838,7 @@ platforms = [\"linux-64\"]
     fn r_bioconda_name_passes_literally() {
         // An R dep on a non-conda-forge channel is NOT r-prefixed; the author's
         // exact conda name is used and the channel rides through.
-        const S: &str = r#"{"envspec_version":3,"morloc_version":"0","languages":[{"lang":"r"}],"packages":{"r":[{"name":"bioconductor-deseq2","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
+        const S: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"r"}],"packages":{"r":[{"name":"bioconductor-deseq2","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
         let manifest = render_with(EnvSpec::from_json(S).unwrap());
         assert!(
             manifest.contains("\"bioconductor-deseq2\" = { version = \"*\", channel = \"bioconda\" }"),
@@ -851,8 +851,8 @@ platforms = [\"linux-64\"]
     fn conflicting_channels_across_specs_error() {
         // Two programs drawing the same conda package from different channels is a
         // hard conflict (a channel is a provenance choice, not intersectable).
-        const A: &str = r#"{"envspec_version":3,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
-        const B: &str = r#"{"envspec_version":3,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":"*","source":"conda","channel":"custom"}]}}"#;
+        const A: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
+        const B: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":"*","source":"conda","channel":"custom"}]}}"#;
         let specs = vec![EnvSpec::from_json(A).unwrap(), EnvSpec::from_json(B).unwrap()];
         let r = aggregate(&specs, &sample_support());
         assert!(r.is_err());
@@ -862,8 +862,8 @@ platforms = [\"linux-64\"]
     fn explicit_channel_beats_omitted_default() {
         // The same package with an explicit channel in one spec and no channel in
         // another coalesces to the explicit channel (no conflict).
-        const A: &str = r#"{"envspec_version":3,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
-        const B: &str = r#"{"envspec_version":3,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":">=1","source":"conda"}]}}"#;
+        const A: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
+        const B: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":">=1","source":"conda"}]}}"#;
         let specs = vec![EnvSpec::from_json(A).unwrap(), EnvSpec::from_json(B).unwrap()];
         let (conda, _) = aggregate(&specs, &sample_support()).unwrap();
         // constraint `*` yields to the real `>=1`; the explicit bioconda channel
@@ -876,7 +876,7 @@ platforms = [\"linux-64\"]
         // A python program with a permissive author floor gets morloc's supported
         // range added (clamp) plus the non-optional binder deps; optional deps
         // (pyarrow) are omitted; the core toolchain is always present.
-        const PY: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py","constraint":">=3.11"}]}"#;
+        const PY: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py","constraint":">=3.11"}]}"#;
         let spec = EnvSpec::from_json(PY).unwrap();
         let (conda, _) = aggregate(std::slice::from_ref(&spec), &sample_support()).unwrap();
         // clamp: author >=3.11 intersected with morloc's >=3.10,<3.14
@@ -896,7 +896,7 @@ platforms = [\"linux-64\"]
         // A program requiring a language the support table does not describe (and
         // with no built-in toolchain fallback) fails closed, rather than silently
         // omitting its toolchain and under-provisioning the environment.
-        const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"cobol"}]}"#;
+        const S: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"cobol"}]}"#;
         let spec = EnvSpec::from_json(S).unwrap();
         let r = aggregate(std::slice::from_ref(&spec), &sample_support());
         assert!(r.is_err());
@@ -906,7 +906,7 @@ platforms = [\"linux-64\"]
     fn unprovisionable_source_fails_closed() {
         // A package source this build cannot lower (cran/bioconductor) returns an
         // actionable error, never a panic.
-        const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"r"}],"packages":{"r":[{"name":"DESeq2","constraint":"*","source":"bioconductor"}]}}"#;
+        const S: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"r"}],"packages":{"r":[{"name":"DESeq2","constraint":"*","source":"bioconductor"}]}}"#;
         let spec = EnvSpec::from_json(S).unwrap();
         let r = aggregate(std::slice::from_ref(&spec), &sample_support());
         assert!(r.is_err());

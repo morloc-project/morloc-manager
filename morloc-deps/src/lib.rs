@@ -20,3 +20,4 @@ pub mod langsupport;
 pub mod layout;
 pub mod pixi;
 pub mod platform;
+pub mod version;

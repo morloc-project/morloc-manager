@@ -69,6 +69,10 @@ pub struct LangEntry {
 /// The whole language-support table for a morloc release.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LangSupport {
+    /// Contract version, semver "MAJOR.MINOR". Absent when built from a source
+    /// tree; defaults to the current schema. Enforced in `from_json`.
+    #[serde(default = "crate::version::lang_schema_version")]
+    pub schema_version: String,
     #[serde(default)]
     pub morloc_version: String,
     /// Core toolchain, always required (libmorloc + any shim).
@@ -86,11 +90,37 @@ pub struct LangSupport {
 }
 
 impl LangSupport {
-    /// Parse the table from `morloc lang-support` JSON output.
+    /// Parse the table from `morloc lang-support` JSON output, rejecting a schema
+    /// MAJOR this build does not understand.
     pub fn from_json(text: &str) -> Result<Self> {
-        serde_json::from_str(text).map_err(|e| {
+        let table: LangSupport = serde_json::from_str(text).map_err(|e| {
             DepsError::Env(format!("Failed to parse the language-support table: {e}"))
-        })
+        })?;
+        table.check_schema()?;
+        Ok(table)
+    }
+
+    /// Reject a table whose schema MAJOR this build does not understand.
+    fn check_schema(&self) -> Result<()> {
+        let major = self
+            .schema_version
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .ok_or_else(|| {
+                DepsError::Env(format!(
+                    "lang-support schema_version '{}' is not a MAJOR.MINOR version",
+                    self.schema_version
+                ))
+            })?;
+        if major != crate::version::LANG_SCHEMA_MAJOR {
+            return Err(DepsError::Env(format!(
+                "lang-support schema_version {} is incompatible with this mim \
+                 (supports {}.x); upgrade mim or morloc.",
+                self.schema_version, crate::version::LANG_SCHEMA_MAJOR
+            )));
+        }
+        Ok(())
     }
 
     /// Build the table by parsing a morloc SOURCE tree's requirement YAMLs
@@ -135,6 +165,7 @@ impl LangSupport {
             );
         }
         Ok(LangSupport {
+            schema_version: crate::version::lang_schema_version(),
             morloc_version: morloc_version.to_string(),
             toolchain: core.toolchain,
             dev_apt: core.dev_apt,
@@ -147,7 +178,7 @@ impl LangSupport {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = r#"{"morloc_version":"0.99.0",
+    const SAMPLE: &str = r#"{"schema_version":"1.0","morloc_version":"0.99.0",
       "toolchain":[{"package":"c-compiler","constraint":"*","phase":"build","optional":false},
                    {"package":"rust","constraint":"*","phase":"build","optional":false}],
       "languages":{
@@ -161,6 +192,7 @@ mod tests {
     #[test]
     fn parses_the_table() {
         let t = LangSupport::from_json(SAMPLE).unwrap();
+        assert_eq!(t.schema_version, "1.0");
         assert_eq!(t.morloc_version, "0.99.0");
         assert_eq!(t.toolchain.len(), 2);
         let py = t.languages.get("py").unwrap();
@@ -177,9 +209,20 @@ mod tests {
     #[test]
     fn missing_fields_default() {
         let t = LangSupport::from_json(r#"{"morloc_version":"0"}"#).unwrap();
+        // Absent schema_version defaults to the current schema (from the central
+        // version module), so a table that omits it still parses.
+        assert_eq!(t.schema_version, "1.0");
         assert!(t.toolchain.is_empty());
         assert!(t.dev_apt.is_empty());
         assert!(t.languages.is_empty());
+    }
+
+    #[test]
+    fn rejects_incompatible_major() {
+        // A future MAJOR (2.x) is refused; a MINOR bump within MAJOR 1 is accepted
+        // (older consumers ignore fields they do not know).
+        assert!(LangSupport::from_json(r#"{"schema_version":"2.0","morloc_version":"0"}"#).is_err());
+        assert!(LangSupport::from_json(r#"{"schema_version":"1.7","morloc_version":"0"}"#).is_ok());
     }
 
     /// Parse the actual repo `data/lang/*.yaml` (three levels up from this crate).
