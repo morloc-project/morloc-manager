@@ -1,158 +1,210 @@
-# morloc-manager agentic testing
+# Morloc Installation Manager (mim)
 
-Cross-environment exploratory testing of the `morloc-manager` binary using
-Claude Code agents. The binary itself lives in the compiler repo; this repo
-provides Vagrant VMs and the agent harness that exercises the binary across
-Linux distros and security models.
+`mim` handles morloc installation and dependencies.
 
-## How it works
 
-Several persona-based **tester agents** take turns probing `morloc-manager`
-on a single VM, each tackling the same task from a different perspective
-(new user, developer, sysadmin, power user, mathematician). After all
-testers finish, an **analyst agent** folds their per-persona reports and
-the shared issue log into one consolidated final report, validating
-findings against the morloc compiler source.
+## Contracts with the morloc compiler
 
-The fold:
+`mim` and `mim-env` are coupled to the morloc compiler only across process
+boundaries. There is no linking, or FFI. There are four contracts: two JSON
+documents, one CLI/behavioral contract, and one release-manifest.
 
-```
-task prompt ──► tester₁ ──► tester₂ ──► … ──► testerₙ ──► analyst ──► findings/report.md
-                  │            │                  │
-                  └─── findings/log.md ◄──────────┘
-                       (cross-tester issue log)
-                  └─── findings/<persona>/report.md
-                       (per-persona narrative)
-```
+1. envspec.json: a program's declared environment requirements
 
-Each tester reads `findings/log.md` first so it can skip blockers that
-earlier testers already hit. If a tester encounters a setup-level disaster
-that makes work impossible, it writes a `findings/HALT` sentinel; the
-orchestration script then skips remaining testers but still runs the
-analyst on whatever was collected.
+  - Producer: the morloc compiler (morloc make, morloc envspec)
 
-Three VMs cover different Linux security models:
+  - Consumer: morloc-deps, lowered to a pixi manifest.
 
-| VM     | Distro       | Primary concern              |
-|--------|--------------|------------------------------|
-| fedora | Fedora 40    | SELinux enforcing, cgroup v2 |
-| ubuntu | Ubuntu 22.04 | AppArmor                     |
-| debian | Debian 12    | cgroup v1                    |
+  - Transport: a JSON file written into the program's build dir; handed to the
+    build hook as --spec envspec.json.
 
-You run one VM per session. Persona Linux users (`developer`, `newbie`,
-`poweruser`, `sysadmin`, `mathematician`) are created on demand at run
-time — their names come straight from `test/personas/*.md`, the single
-source of truth.
+  - Versioning: integer `envspec_version`..
 
-## Prerequisites
-
-- [Vagrant](https://www.vagrantup.com/) with the
-  [vagrant-libvirt](https://github.com/vagrant-libvirt/vagrant-libvirt) plugin
-- [Claude Code](https://claude.ai/code) CLI (`claude`)
-- Docker or Podman on the host (for Vagrant provisioning)
-
-## Setup
-
-Three symlinks at the repo root (all gitignored):
-
-```sh
-ln -s /path/to/morloc-workspace/compiler/morloc/out/morloc-manager morloc-manager
-ln -s /path/to/morloc-workspace/compiler/morloc morloc
-ln -s /path/to/morloc-project.github.io morloc-project.github.io
+```json
+{
+  "envspec_version": 1,
+  "morloc_version": "0.98.2",
+  "languages": [
+    { "lang": "py",  "constraint": ">=3.10" },
+    { "lang": "cpp", "std": "c++20" },
+    { "lang": "rust" }
+  ],
+  "packages": {
+    "py":   [ { "name": "numpy",    "constraint": ">=2,<3", "source": "conda" },
+              { "name": "requests", "constraint": "*",      "source": "pypi"  } ],
+    "cpp":  [ { "name": "opencv",   "constraint": ">=4.8",  "source": "conda" } ],
+    "rust": [ { "name": "ndarray",  "constraint": "0.16",   "source": "crates" } ]
+  },
+  "system":  [ { "name": "blas", "provider": "unspecified" } ],
+  "modules": [ { "name": "tensor-cpp", "git_hash": "abc123" } ]
+}
 ```
 
-The first is the binary under test. The latter two give the analyst
-read-only access to compiler source and docs for bug validation.
+  |      Field      |         Type         |                             Notes                             |
+  | --------------- | -------------------- | ------------------------------------------------------------- |
+  | envspec_version | int (required)       | Contract version.                                             |
+  | --------------- | -------------------- | ------------------------------------------------------------- |
+  | morloc_version  | string (required)    | The compiler that emitted it.                                 |
+  | --------------- | -------------------- | ------------------------------------------------------------- |
+  | languages       | array                | { lang, constraint?, std? }                                   |
+  | --------------- | -------------------- | ------------------------------------------------------------- |
+  | packages        | [PackageReq]         | PackageReq = { name, constraint, source, channel? }.          |
+  | --------------- | -------------------- | ------------------------------------------------------------- |
+  | system          | array                | { name, provider }                                            |
+  | --------------- | -------------------- | ------------------------------------------------------------- |
+  | modules         | array                | { name, git_hash? }                                           |
 
-## Quick start
+ - language:
+   - lang: is a canonical name (py/r/cpp/rust/julia)
+   - constraint: a version match-spec
+   - std: a C++ standard (cpp only)
+ - packages:
+   - `channel` is conda channel where "conda-forge" is default
+   - `source` ∈ conda | pypi | cran | bioconductor | crates | pkg
+ - system:
+   - provider ∈ conda-forge | host | vcpkg | unspecified
 
-```sh
-make up VM=fedora                                            # provision the VM
-make push VM=fedora                                          # build binary + rsync
-make explore VM=fedora PROMPT=path/to/your-task-prompt.md    # run the fold
-make down VM=fedora                                          # destroy when done
+
+2. morloc lang-support — morloc's own environment dependencies
+
+  - Producer: the compiler subcommand `morloc lang-support`. `mim` can also
+    derive it from a morloc source tree for a dev env with no compiler yet
+
+  - Consumer: morloc-deps, intersected with each program's envspec (clamps
+    runtime versions, injects binder deps)
+
+  - Transport: stdout of `morloc lang-support` (invoked by `mim-env` via
+    `MORLOC_BIN`); cached as `lang-support.json` in the runtime store.
+
+  - Versioning: semver `schema_version` "MAJOR.MINOR". Adding a language/field
+    is a minor bump (consumers ignore what they don't know); a breaking change
+    is major.
+
+```json
+{
+  "schema_version": "1.0",
+  "morloc_version": "0.99.0",
+  "toolchain": [
+    { "package": "c-compiler", "constraint": "*", "optional": false },
+    { "package": "rust",       "constraint": "*", "optional": false }
+  ],
+  "languages": {
+    "py":  { "runtime": { "package": "python", "version": ">=3.10,<3.14", "default": "3.12" },
+             "requires": [ { "package": "numpy",   "constraint": ">=1.22,<3", "optional": false },
+                           { "package": "pyarrow", "constraint": "*",         "optional": true } ] },
+    "cpp": { "runtime": null,
+             "requires": [ { "package": "cxx-compiler", "constraint": "*", "optional": false } ] },
+    "futhark": { "runtime": null, "requires": [], "install_script": "#!/bin/sh ... futhark-lang.org ..." }
+  }
+}
 ```
 
-A task prompt is just a markdown file describing what you want the testers
-to investigate (e.g., "Test the freeze/thaw lifecycle on rootless
-podman."). The testers and analyst supply their own context — your prompt
-only specifies the task.
+  |     Field      |       Type      |                          Notes                           |
+  |----------------|-----------------|----------------------------------------------------------|
+  | schema_version | string (semver) | Contract version.                                        |
+  |----------------|-----------------|----------------------------------------------------------|
+  | morloc_version | string          | Release the table describes.                             |
+  |----------------|-----------------|----------------------------------------------------------|
+  | toolchain      | [PkgReq]        | Core conda packages always required (libmorloc + shims). |
+  |----------------|-----------------|----------------------------------------------------------|
+  | languages      | [LangEntry]     | Keyed py/r/cpp/rust/futhark/…                            |
 
-### Tuning the agents
+ - PkgReq = { package, constraint, optional, phase }
+   - constraint is a conda match-spec (default "*")
+   - key is constraint, source YAML uses version)
+   - optional deps are included in a full env, omitted in a minimal one
 
-Both **model** and **max turns** can be tuned globally or per agent. Defaults:
-`sonnet` for both agents; explorer max turns = 50, analyst max turns = 80.
+ - LangEntry = { runtime?, install_script?, requires }
+   - `runtime` is { package, version, default?, std? } (std for C++)
+   - `install_script` for script-provisioned languages (e.g. futhark), which
+     contribute nothing to the conda solve and are installed by running the
+     script in an OCI image build.
+   - `requires` is a list of packages
 
-```sh
-make explore VM=fedora PROMPT=... MODEL=haiku                          # both agents on haiku
-make explore VM=fedora PROMPT=... MODEL=haiku ANALYST_MODEL=opus       # cheap testers, smart analyst
-make explore VM=fedora PROMPT=... MAX_TURNS=120                        # both agents up to 120 turns
-make explore VM=fedora PROMPT=... ANALYST_MODEL=opus ANALYST_MAX_TURNS=150
-```
+3. The build-hook CLI — how morloc make invokes the provisioner
 
-`MODEL` and `MAX_TURNS` set both agents at once. `EXPLORER_*` and `ANALYST_*`
-override individually and take precedence. The same flags exist on
-`run-exploration.sh` directly: `--model`, `--explorer-model`,
-`--analyst-model`, `--max-turns`, `--explorer-max-turns`,
-`--analyst-max-turns`. Useful because the explorer runs once per persona
-(typically 5×) while the analyst runs once — pairing a cheaper explorer
-with a stronger analyst (and a larger turn budget) is often the right
-tradeoff for hard problems.
-
-## File map
-
-| Path                          | Purpose                                                  |
-|-------------------------------|----------------------------------------------------------|
-| `Vagrantfile`                 | VM definitions (Docker, Podman, tools, image pulls)      |
-| `Makefile`                    | Build, sync, and exploration targets (`make help`)       |
-| `test/run-exploration.sh`     | Pure orchestration: discover personas, loop, run analyst |
-| `test/explorer-context.md`    | Single source of truth for tester agents                 |
-| `test/analyst-context.md`     | Single source of truth for the analyst agent             |
-| `test/personas/*.md`          | Persona descriptions (filename = VM username)            |
-| `.claude/agents/vm-*.md`      | Thin agent definitions (YAML frontmatter only)           |
-| `findings/`                   | Run output (gitignored)                                  |
-
-## Findings layout
-
-After a run:
+A behavioral contract (no JSON body of its own; it carries envspec.json). During
+morloc make, before compiling pools, the compiler runs an external provisioner:
 
 ```
-findings/
-├── <persona>/
-│   ├── report.md            # narrative, this persona's perspective
-│   └── session.log          # raw claude session log
-├── log.md                   # shared cross-tester issue log
-├── HALT                     # only if a tester aborted the run
-├── analyst-session.log
-└── report.md                # final consolidated analyst report
+"$MORLOC_BUILD_HOOK" sync --name <program-key> --spec envspec.json
 ```
 
-## Editing the harness
+|      Field      |         Type       |                             Notes                     |
+| --------------- | ------------------ | ----------------------------------------------------- |
+| envspec_version | int (required)     | Contract version.                                     |
+| --------------- | ------------------ | ----------------------------------------------------- |
+| morloc_version  | string (required)  | The compiler that emitted it.                         |
+| --------------- | ------------------ | ----------------------------------------------------- |
+|                 |                    | { lang, constraint?, std? }                           |
+|  languages      | array              | lang is a canonical name (py/r/cpp/rust/julia)        |
+|                 |                    | constraint a version match-spec                       |
+|                 |                    | std a C++ standard (cpp only)                         |
+| --------------- | ------------------ | ----------------------------------------------------- |
+| packages        | [PackageReq]       | PackageReq = { name, constraint, source, channel? }.  |                                                     │
+| --------------- | ------------------ | ----------------------------------------------------- |
+| system          | array              | { name, provider }                                    |
+|                 |                    | provider ∈ conda-forge | host | vcpkg | unspecified   |
+| --------------- | ------------------ | ----------------------------------------------------- |
+| modules         | array              | { name, git_hash? }.                                  |
 
-- **Add a persona**: drop a new `test/personas/<name>.md` describing the
-  tester's approach and perspective. The script picks it up automatically
-  and creates the matching VM user on demand. No other files need to change.
-- **Change tester instructions** (workflow, formats, mechanics): edit
-  `test/explorer-context.md`. That file is the only place these live.
-- **Change analyst instructions** (validation rules, report format): edit
-  `test/analyst-context.md`.
-- **Change orchestration** (VM list, paths, agent invocation): edit
-  `test/run-exploration.sh`. It contains no agent prose — only mechanics.
 
-## Make targets
+  "modules": [ { "name": "tensor-cpp", "git_hash": "abc123" } ]
 
+
+ - PackageReq.source ∈ conda | pypi | cran | bioconductor | crates | pkg
+ - channel is conda-only, set only for a non-conda-forge channel (e.g. bioconda)
+ - consumer routing:
+   - conda -> pixi [dependencies] (R feedstocks become r-<lowercase> on conda-forge)
+   - pypi -> [pypi-dependencies]
+   - crates/pkg -> excluded (cargo/Pkg.jl resolve them at pool build; only the
+     toolchain is injected);
+   - cran/bioconductor -> not yet provisioned (fail-closed with an actionable error).
+
+
+4. morloc-release-manifest.json -- the native-install download manifest
+
+  - Producer: morloc's release CI (attached to each morloc GitHub release).
+
+  - Consumer: mim (provision.rs), which fetches it to discover + SHA-verify the
+    prebuilt assets for a native install.
+
+  - Transport: a release asset fetched from
+    github.com/morloc-project/morloc/releases/<tag>.
+
+  - Versioning: integer schema (mim accepts up to SUPPORTED_MANIFEST_SCHEMA; a
+    higher value yields a clean "upgrade mim" error). current: mim supports 2;
+    morloc now emits 3 as the transition marker — WS5 makes mim schema-3-aware
+    and renames the manager asset to mim + adds mim-env.
+
+``` json
+{
+  "schema": 3,
+  "version": "0.98.3",
+  "rust_src": "morloc-rust-src.tar.gz",
+  "triples": {
+    "linux-x86_64": { "morloc": "morloc-linux-x86_64", "manager": "mim-linux-x86_64" },
+    "linux-arm64":  { "morloc": "morloc-linux-arm64",  "manager": "mim-linux-arm64"  }
+  },
+  "sha256": {
+    "morloc-linux-x86_64": "<hex>",
+    "mim-linux-x86_64":     "<hex>",
+    "morloc-rust-src.tar.gz": "<hex>"
+  }
+}
 ```
-make up VM=...                       Start a VM
-make down VM=...                     Destroy a VM
-make sync VM=...                     Rsync files into a running VM
-make push VM=...                     Rebuild binary + rsync into VM
-make build-images                    Build morloc-tiny + morloc-full containers
-make build-all                       Binaries + containers
-make push-image VM=...               Build + load image into a VM
-make explore VM=... PROMPT=...       Run all personas on a VM
-make explore-sync VM=... PROMPT=...  Sync + run all personas on a VM
-make quick-test VM=...               Push + smoke test
-make clean                           Remove per-persona findings
-make pristine                        Remove all findings (log, report, HALT)
-make help                            Show available targets
-```
+
+|  Field   |         Type        |                                       Notes                   |
+| -------- | ------------------- | ------------------------------------------------------------- |
+| schema   | int                 | Manifest contract version.                                    |
+| -------- | ------------------- | ------------------------------------------------------------- |
+| version  | string              | The release version.                                          |
+| -------- | ------------------- | ------------------------------------------------------------- |
+| rust_src | string              | Asset name of the Rust-workspace-source tarball.              |
+| -------- | ------------------- | ------------------------------------------------------------- |
+| triples  | { morloc, manager } | manager -> mim + a mim_env asset after WS5.                   |
+|          |                     | Only complete triples appear                                  |
+|          |                     | omitted (no prebuilt compiler → falls through to a container) |
+| -------- | ------------------- | ------------------------------------------------------------- |
+| sha256   | map asset → hex     | Every downloaded asset present here is verified after fetch   |
+|          | digest (default {}) | Absent entries are fetched but unverified (back-compat).      |

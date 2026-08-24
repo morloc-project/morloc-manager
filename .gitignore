@@ -1,11 +1,1 @@
-CLAUDE.md
-TODO
-.vagrant
-.claude/settings.local.json
-findings/
-archive/
-memory/
-morloc
-morloc-manager
-morloc-project.github.io
-out/
+target/
