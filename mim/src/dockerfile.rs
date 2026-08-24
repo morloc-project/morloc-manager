@@ -42,6 +42,9 @@ pub struct DockerfileInput<'a> {
     /// `COPY runtime/` step and the baked `MORLOC_RUST_DIR` are omitted;
     /// `CONTAINER_RUNTIME_BIN` becomes a mount target instead.
     pub dev: bool,
+    /// Build-context-relative path to a corporate CA PEM (e.g. "certs/corp.pem"),
+    /// or `None`. When set it is trusted before any network `RUN`. See [`crate::cert`].
+    pub cert_file: Option<&'a str>,
 }
 
 /// Render the Dockerfile text. Deterministic for a given input.
@@ -50,6 +53,16 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     out.push_str(&format!("FROM {}\n", input.base_image));
     out.push_str("ENV DEBIAN_FRONTEND=noninteractive\n");
     out.push('\n');
+
+    // Copy the corporate CA in before any network RUN; it is registered into the
+    // trust store at the apt step below. (The bookworm-slim apt mirror is plain
+    // http, so apt-get update itself needs no CA.)
+    if let Some(cert_file) = input.cert_file {
+        out.push_str("# Corporate CA bundle (trusted before any network fetch)\n");
+        out.push_str(&format!(
+            "COPY {cert_file} /usr/local/share/ca-certificates/morloc-corp.crt\n\n"
+        ));
+    }
 
     // Base tools needed to bootstrap the image before the conda env exists: curl
     // for the pixi installer, CA certs for TLS. Everything else (compilers, git,
@@ -62,8 +75,26 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
         out.push_str(&format!(" {pkg}"));
     }
     out.push_str(" \\\n");
+    if input.cert_file.is_some() {
+        // Fold the corporate CA into the system trust store now that
+        // ca-certificates is installed.
+        out.push_str(" && update-ca-certificates \\\n");
+    }
     out.push_str(" && rm -rf /var/lib/apt/lists/*\n");
     out.push('\n');
+
+    // Point the CA env vars at the merged system bundle so later RUNs and runtime
+    // processes trust the corporate CA. The bundle includes the public roots, so
+    // this cannot break public HTTPS.
+    if input.cert_file.is_some() {
+        out.push_str("# Trust the corporate CA across the toolchain\n");
+        out.push_str("ENV");
+        for var in crate::cert::CERT_ENV_VARS {
+            out.push_str(&format!(" {var}={}", crate::cert::CONTAINER_CA_BUNDLE));
+        }
+        out.push('\n');
+        out.push('\n');
+    }
 
     // Script-provisioned languages (e.g. futhark): their upstream binary is not on
     // conda-forge, so run the committed install.sh (staged into the build context)
@@ -181,6 +212,7 @@ mod tests {
             extras: &extras,
             lang_installs: &[],
             dev: false,
+            cert_file: None,
         };
         let got = generate_dockerfile(&input);
         let expected = "\
@@ -227,6 +259,7 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
             extras: &extras,
             lang_installs: &[],
             dev: false,
+            cert_file: None,
         };
         let got = generate_dockerfile(&input);
         assert!(got.contains("ca-certificates curl \\"));
@@ -244,6 +277,7 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
             extras: &extras,
             lang_installs: &installs,
             dev: false,
+            cert_file: None,
         };
         let got = generate_dockerfile(&input);
         assert!(got.contains("COPY install-futhark.sh /tmp/morloc-install-futhark.sh"));
@@ -264,6 +298,7 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
             extras: &extras,
             lang_installs: &[],
             dev: true,
+            cert_file: None,
         };
         let got = generate_dockerfile(&input);
         // Nothing is baked in: the compiler is built from a mounted source tree.
@@ -271,5 +306,37 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         assert!(!got.contains("ENV MORLOC_RUST_DIR="));
         // But CONTAINER_RUNTIME_BIN (a mount target) is still on PATH.
         assert!(got.contains(&format!("ENV PATH=\"{}:", crate::serve::CONTAINER_RUNTIME_BIN)));
+    }
+
+    #[test]
+    fn cert_bundle_is_copied_and_trusted_before_network() {
+        let extras = BuildExtras::default();
+        let input = DockerfileInput {
+            base_image: "debian:bookworm-slim",
+            pixi_version: "0.76.2",
+            morloc_home: "/opt/morloc",
+            extras: &extras,
+            lang_installs: &[],
+            dev: false,
+            cert_file: Some("certs/corp.pem"),
+        };
+        let got = generate_dockerfile(&input);
+        assert!(got.contains("COPY certs/corp.pem /usr/local/share/ca-certificates/morloc-corp.crt"));
+        assert!(got.contains("&& update-ca-certificates"));
+        assert!(got.contains(&format!(
+            "SSL_CERT_FILE={}",
+            crate::cert::CONTAINER_CA_BUNDLE
+        )));
+        assert!(got.contains(&format!(
+            "GIT_SSL_CAINFO={}",
+            crate::cert::CONTAINER_CA_BUNDLE
+        )));
+        // The CA must be trusted before the first network fetch (the pixi
+        // installer), so the COPY and the trust ENV precede it.
+        let copy_at = got.find("morloc-corp.crt").unwrap();
+        let env_at = got.find("SSL_CERT_FILE=").unwrap();
+        let pixi_at = got.find("pixi.sh/install.sh").unwrap();
+        assert!(copy_at < pixi_at);
+        assert!(env_at < pixi_at);
     }
 }

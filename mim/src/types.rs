@@ -293,7 +293,7 @@ impl Default for Config {
 
 /// Current on-disk schema version for `env.yaml`. Bump when the field set
 /// changes incompatibly and add a matching arm to `migrate_env_config`.
-pub const CURRENT_ENV_SCHEMA: u32 = 2;
+pub const CURRENT_ENV_SCHEMA: u32 = 3;
 
 /// Records written before schema versioning existed carry no `schema_version`
 /// field; they are the v1 baseline.
@@ -372,6 +372,17 @@ pub struct EnvironmentConfig {
     /// source tree (`is_dev`); `None` for a normal release env.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev: Option<DevConfig>,
+    /// Host path to a corporate CA bundle trusted by this environment's pixi
+    /// solves and (for container backends) baked into the image. `None` unless
+    /// created behind a TLS-inspection firewall. See [`crate::cert`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_bundle: Option<String>,
+    /// SHA-256 fingerprints of the certificates that were materialized/baked
+    /// from `cert_bundle`, recorded at build time. Lets `doctor` detect drift
+    /// (the source bundle changed but the environment was not rebuilt). Empty
+    /// when no cert bundle is configured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cert_fingerprints: Vec<String>,
 }
 
 fn default_shm_size() -> String {
@@ -407,6 +418,8 @@ impl EnvironmentConfig {
             morloc_version,
             system_packages,
             dev: None,
+            cert_bundle: None,
+            cert_fingerprints: Vec::new(),
         }
     }
 

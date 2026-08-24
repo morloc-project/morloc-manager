@@ -30,6 +30,17 @@ use crate::langsupport::LangSupport;
 /// omitted per-dep channel means this; it is the sole entry in `default_channels`.
 const CONDA_FORGE: &str = "conda-forge";
 
+/// Set the portable CA-bundle environment variables on a pixi/bash command so it
+/// trusts a corporate CA behind a TLS-inspection firewall. A no-op when no
+/// bundle is configured; see [`crate::cert`].
+fn apply_cert_env(cmd: &mut Command, ssl_cert_file: Option<&Path>) {
+    if let Some(path) = ssl_cert_file {
+        for (k, v) in crate::cert::cert_env_pairs(&path.to_string_lossy()) {
+            cmd.env(k, v);
+        }
+    }
+}
+
 /// Inputs for rendering an environment's pixi manifest.
 pub struct PixiManifestInput<'a> {
     pub env_name: &'a str,
@@ -360,13 +371,12 @@ pub fn write_manifest(env_dir: &Path, manifest: &str) -> Result<()> {
 /// of the impurity gate: an unresolvable package (one conda-forge cannot
 /// provide for this platform) fails here, which is the accurate verdict that a
 /// native build is impossible -- the caller escalates to a container.
-pub fn solve(env_dir: &Path, pixi_bin: &Path) -> Result<()> {
+pub fn solve(env_dir: &Path, pixi_bin: &Path, ssl_cert_file: Option<&Path>) -> Result<()> {
     let manifest = env_dir.join("pixi.toml");
-    let status = Command::new(pixi_bin)
-        .arg("install")
-        .arg("--manifest-path")
-        .arg(&manifest)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(pixi_bin);
+    cmd.arg("install").arg("--manifest-path").arg(&manifest).stdin(Stdio::null());
+    apply_cert_env(&mut cmd, ssl_cert_file);
+    let status = cmd
         .status()
         .map_err(|e| DepsError::Env(format!("could not run pixi ({}): {e}", pixi_bin.display())))?;
     if !status.success() {
@@ -385,13 +395,12 @@ pub fn solve(env_dir: &Path, pixi_bin: &Path) -> Result<()> {
 /// the host. The lock is what a container image reproduces with `pixi install
 /// --locked`, so the container's conda world is pinned to the same solve. A
 /// failure here is phase 2 of the impurity gate (a package conda cannot provide).
-pub fn lock(env_dir: &Path, pixi_bin: &Path) -> Result<()> {
+pub fn lock(env_dir: &Path, pixi_bin: &Path, ssl_cert_file: Option<&Path>) -> Result<()> {
     let manifest = env_dir.join("pixi.toml");
-    let status = Command::new(pixi_bin)
-        .arg("lock")
-        .arg("--manifest-path")
-        .arg(&manifest)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(pixi_bin);
+    cmd.arg("lock").arg("--manifest-path").arg(&manifest).stdin(Stdio::null());
+    apply_cert_env(&mut cmd, ssl_cert_file);
+    let status = cmd
         .status()
         .map_err(|e| DepsError::Env(format!("could not run pixi ({}): {e}", pixi_bin.display())))?;
     if !status.success() {
@@ -580,7 +589,11 @@ fn sh_quote(s: &str) -> String {
 /// changed. Statically parsing the hook text would silently drop `$AR` and leave
 /// native Rust builds failing with `cc-rs: failed to find tool "ar"` on any host
 /// without a bare `ar` on PATH.
-pub fn capture_activation(env_dir: &Path, pixi_bin: &Path) -> Result<Vec<(String, String)>> {
+pub fn capture_activation(
+    env_dir: &Path,
+    pixi_bin: &Path,
+    ssl_cert_file: Option<&Path>,
+) -> Result<Vec<(String, String)>> {
     let manifest = env_dir.join("pixi.toml");
     const SPLIT: &str = "__MORLOC_ACTIVATION_SPLIT__";
     // NUL-delimited dump of the exported environment via POSIX awk. `env -0` is a
@@ -607,10 +620,10 @@ pub fn capture_activation(env_dir: &Path, pixi_bin: &Path) -> Result<Vec<(String
         pixi = sh_quote(&pixi_bin.display().to_string()),
         manifest = sh_quote(&manifest.display().to_string()),
     );
-    let out = Command::new("bash")
-        .arg("-c")
-        .arg(&script)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg(&script).stdin(Stdio::null());
+    apply_cert_env(&mut cmd, ssl_cert_file);
+    let out = cmd
         .output()
         .map_err(|e| DepsError::Env(format!("could not run activation capture: {e}")))?;
     if !out.status.success() {
@@ -1106,8 +1119,8 @@ environments:
              platforms = [\"linux-64\"]\n\n[dependencies]\n\"cxx-compiler\" = \"*\"\n",
         )
         .unwrap();
-        solve(dir.path(), &pixi).expect("pixi solve");
-        let act = capture_activation(dir.path(), &pixi).expect("capture activation");
+        solve(dir.path(), &pixi, None).expect("pixi solve");
+        let act = capture_activation(dir.path(), &pixi, None).expect("capture activation");
         let get = |k: &str| act.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
         assert!(get("CONDA_PREFIX").is_some(), "no CONDA_PREFIX captured");
         let path = get("PATH").expect("PATH captured");

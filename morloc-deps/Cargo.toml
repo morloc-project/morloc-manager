@@ -8,6 +8,9 @@ description = "Dependency-resolution kernel shared by mim and mim-env"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+sha2 = { workspace = true }
+pem = "3"
+x509-parser = "0.16"
 
 [dev-dependencies]
 tempfile = "3"

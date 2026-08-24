@@ -152,6 +152,7 @@ pub fn doctor(
     check_engine(&mut c, engine);
     check_base_image(&mut c, engine, &ec.base_image);
     check_built_image(&mut c, engine, ec, scope, env_name);
+    check_cert_bundle(&mut c, ec);
     check_data_dirs(&mut c, &data_dir);
     check_file_readability(&mut c, &data_dir);
 
@@ -246,6 +247,7 @@ pub fn native_doctor(
     c.set_category("prerequisites");
     check_data_dirs(&mut c, &data_dir);
     check_file_readability(&mut c, &data_dir);
+    check_cert_bundle(&mut c, ec);
     check_native_runtime(&mut c, env_name, rt.as_ref());
     check_state(&mut c, &data_dir);
     if let Some(ref rt) = rt {
@@ -833,6 +835,28 @@ fn check_engine(c: &mut Counts, engine: ContainerEngine) {
         Err(e) => {
             c.fail(&format!("{exe} not found: {e}"));
         }
+    }
+}
+
+/// Report the corporate CA bundle's state: silent when none is configured, a
+/// pass when the source still matches what was built, and a warning when it is
+/// missing or has drifted (the built environment keeps its baked certificates
+/// until a rebuild).
+fn check_cert_bundle(c: &mut Counts, ec: &EnvironmentConfig) {
+    use crate::cert::DriftStatus::*;
+    let bundle = ec.cert_bundle.as_deref().unwrap_or_default();
+    match crate::cert::drift_status(ec) {
+        NotConfigured => {}
+        InSync => c.pass(&format!("Corporate CA bundle {bundle} matches the built environment")),
+        SourceMissing(p) => c.warn(&format!(
+            "Corporate CA bundle {p} is no longer readable; the environment keeps the \
+             certificates it was built with"
+        )),
+        Drifted => c.warn(&format!(
+            "Corporate CA bundle {bundle} changed since this environment was built\n       \
+             Rebuild to apply it: morloc-manager modify --env {} --cert-bundle {bundle}",
+            ec.name
+        )),
     }
 }
 

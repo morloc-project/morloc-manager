@@ -7,6 +7,7 @@
 //! converts it into its own error at the crate boundary.
 
 pub mod abi;
+pub mod cert;
 pub mod constraint;
 // envspec/langsupport deserialize the compiler's JSON contracts in full; not
 // every schema field is consumed yet (e.g. module pins, cpp std, default

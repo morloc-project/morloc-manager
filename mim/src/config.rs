@@ -174,6 +174,9 @@ fn migrate_env_config(mut ec: EnvironmentConfig) -> Result<EnvironmentConfig> {
             // v1 -> v2: added the optional `dev` block (defaults to None). Purely
             // additive, so bumping the version is the whole migration.
             1 => ec.schema_version = 2,
+            // v2 -> v3: added the optional `cert_bundle` path (defaults to None).
+            // Purely additive.
+            2 => ec.schema_version = 3,
             v => {
                 return Err(ManagerError::EnvError(format!(
                     "environment '{}' uses env schema v{v} with no migration path to v{}; \

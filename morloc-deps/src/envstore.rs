@@ -254,8 +254,10 @@ impl EnvContext {
         let manifest = self.rendered_manifest(specs, inputs)?;
         let pixi_dir = self.pixi_dir();
         crate::pixi::write_manifest(&pixi_dir, &manifest)?;
-        crate::pixi::solve(&pixi_dir, inputs.pixi_bin)?;
-        crate::pixi::capture_activation(&pixi_dir, inputs.pixi_bin)
+        // In-container path (mim-env): the built image already sets the CA env
+        // vars, which the pixi subprocess inherits, so no override is needed.
+        crate::pixi::solve(&pixi_dir, inputs.pixi_bin, None)?;
+        crate::pixi::capture_activation(&pixi_dir, inputs.pixi_bin, None)
     }
 
     /// Merge a program's spec into the declared world under `provenance`,

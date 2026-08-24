@@ -1,4 +1,5 @@
 mod bridge;
+mod cert;
 mod config;
 mod container;
 mod doctor;
@@ -161,6 +162,13 @@ or `latest`). With no flags on a TTY, all settings are prompted interactively.")
         /// (.bashrc, .vimrc, .config/...). Docker/podman only.
         #[arg(long)]
         dotfiles: Option<String>,
+        /// Path to a corporate CA bundle (PEM/DER) to trust for this
+        /// environment's package fetches, for use behind a TLS-inspection
+        /// firewall. The certificates are validated and normalized; the file is
+        /// pointed at by SSL_CERT_FILE for host solves and baked into container
+        /// images.
+        #[arg(long = "cert-bundle")]
+        cert_bundle: Option<String>,
         /// Create in system scope (requires root)
         #[arg(long)]
         system: bool,
@@ -393,6 +401,11 @@ Examples:
         /// docker/podman only. No rebuild.
         #[arg(long)]
         dotfiles: Option<String>,
+        /// Replace the corporate CA bundle trusted by this environment (host
+        /// path to a PEM/DER file). Re-validates the certificates and triggers a
+        /// rebuild so the new CA is applied. Use after the corporate CA rotates.
+        #[arg(long = "cert-bundle")]
+        cert_bundle: Option<String>,
         /// Tag this environment as the default (used when a command is given no
         /// explicit --env). Writes your personal (local) default, even for a
         /// system-scope env; add --system to set the machine-wide default. No rebuild.
@@ -1118,6 +1131,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             dev,
             system_package,
             dotfiles,
+            cert_bundle,
             system,
             set_default,
             no_init,
@@ -1158,17 +1172,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     let Backend::Container(eng) = plan.backend else { unreachable!() };
                     return container_new_dev(
                         plan.scope, eng, Some(plan.name), src, plan.lang, plan.system_packages,
-                        plan.dotfiles, plan.requested_version, no_init, plan.make_default,
+                        plan.dotfiles, cert_bundle, plan.requested_version, no_init, plan.make_default,
                     );
                 }
                 return match plan.backend {
                     Backend::Native => native_new(
                         plan.scope, Some(plan.name), plan.lang, plan.requested_version,
-                        no_init, plan.make_default, verbose,
+                        cert_bundle, no_init, plan.make_default, verbose,
                     ),
                     Backend::Container(eng) => container_new_derived(
                         plan.scope, eng, Some(plan.name), plan.lang, plan.system_packages,
-                        plan.dotfiles, plan.requested_version, no_init, plan.make_default,
+                        plan.dotfiles, cert_bundle, plan.requested_version, no_init, plan.make_default,
                     ),
                 };
             }
@@ -1218,7 +1232,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if dotfiles.is_some() {
                     return Err(dotfiles_not_supported());
                 }
-                return native_new(scope, name, lang, morloc_version, no_init, set_default, verbose);
+                return native_new(scope, name, lang, morloc_version, cert_bundle, no_init, set_default, verbose);
             }
 
             // Resolve engine: explicit flag > config default > auto-detect single > error
@@ -1281,7 +1295,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             if let Some(src) = dev {
                 return container_new_dev(
                     scope, resolved_engine, name, src, lang, system_package, dotfiles,
-                    morloc_version, no_init, set_default,
+                    cert_bundle, morloc_version, no_init, set_default,
                 );
             }
 
@@ -1289,8 +1303,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // built from a generated Dockerfile that runs pixi inside, sharing the
             // native backend's lowering. There is no pull/recipe/base-image path.
             container_new_derived(
-                scope, resolved_engine, name, lang, system_package, dotfiles, morloc_version,
-                no_init, set_default,
+                scope, resolved_engine, name, lang, system_package, dotfiles, cert_bundle,
+                morloc_version, no_init, set_default,
             )
         }
 
@@ -2020,6 +2034,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             system_package,
             rm_system_package,
             dotfiles,
+            cert_bundle,
             set_default,
             system,
         } => {
@@ -2034,11 +2049,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let system_package = flatten_csv(&system_package);
             let rm_system_package = flatten_csv(&rm_system_package);
             let touches_packages = !system_package.is_empty() || !rm_system_package.is_empty();
-            let will_rebuild = !lang.is_empty() || touches_packages;
+            let will_rebuild = !lang.is_empty() || touches_packages || cert_bundle.is_some();
             if !set_default && !will_rebuild && dotfiles.is_none() {
                 return Err(ManagerError::EnvError(
                     "nothing to modify: pass --set-default, --dotfiles, --lang, \
-                     --system-packages, or --rm-system-packages".to_string(),
+                     --cert-bundle, --system-packages, or --rm-system-packages".to_string(),
                 ));
             }
 
@@ -2070,6 +2085,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             if env_scope == Scope::System && (will_rebuild || dotfiles.is_some()) {
                 check_system_write_access()?;
             }
+            // Cert bundle: preflight + materialize up front so an invalid bundle
+            // aborts here -- before set-default / dotfiles run -- honoring the
+            // validate-before-side-effect contract. Snapshot the prior cert files
+            // first so a later rebuild failure can restore them exactly.
+            let cert_snapshot =
+                cert_bundle.as_ref().map(|_| cert::snapshot_certs(env_scope, &env_name));
+            let cert_prepared = match &cert_bundle {
+                Some(src) => cert::prepare_for_env(env_scope, &env_name, Some(src))?,
+                None => None,
+            };
 
             // ---- Side effects (all inputs validated) ----
             // 1. set-default (pure metadata, no rebuild): personal (local) by
@@ -2112,6 +2137,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         }
                     }
                     ec.system_packages.retain(|p| !rm_system_package.contains(p));
+                }
+                // Apply the CA bundle materialized during validation. Its new
+                // certs change the solve/image cache key, so the rebuild re-runs.
+                let cert_changed = cert_prepared.is_some();
+                if let Some(p) = cert_prepared {
+                    p.apply_to(&mut ec);
+                }
+                // Persist the mutated config once (rematerialize_env reads it from
+                // disk).
+                if touches_packages || cert_changed {
                     cfg::write_env_config(env_scope, &env_name, &ec)?;
                 }
                 if !lang.is_empty() {
@@ -2124,8 +2159,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 match rematerialize_env(env_scope, &env_name, &[], Some(keep), verbose) {
                     Ok(()) => report_rematerialized(ec.backend.is_native(), &env_name),
                     Err(e) => {
+                        // Roll back config, inputs, AND the re-materialized cert
+                        // files, so a broken build leaves no stored state (or stale
+                        // on-disk certs) that re-break later operations.
                         let _ = cfg::write_env_config(env_scope, &env_name, &prev_ec);
                         let _ = cfg::write_env_inputs(env_scope, &env_name, &prev_inputs);
+                        if let Some(snap) = &cert_snapshot {
+                            let _ = cert::restore_certs(env_scope, &env_name, snap);
+                        }
                         return Err(e);
                     }
                 }
@@ -3301,7 +3342,11 @@ fn materialize_native_env(
     // a success marker avoids a poisoned skip -- a failed solve leaves a new
     // pixi.toml on disk, but the marker still reflects the last good build, so the
     // rebuild is not falsely skipped on retry.
-    let key = cache_key(&manifest, &req.morloc_bin, &[]);
+    let key = format!(
+        "{}{}",
+        cache_key(&manifest, &req.morloc_bin, &[]),
+        cert::cache_fragment_for_env(scope, name),
+    );
     let marker = materialized_marker(scope, name, true);
     let unchanged = std::fs::read_to_string(&marker)
         .map(|prev| prev == key)
@@ -3328,9 +3373,20 @@ fn materialize_native_env(
 
     pixi::write_manifest(&pixi_dir, &manifest)?;
     let pixi_bin = provision::provision_pixi(scope)?;
+    // Behind a TLS-inspection firewall, point the pixi solve at the env's
+    // materialized CA bundle (host bundle = corp certs + public roots).
+    let ssl_cert = cert::host_bundle_if_present(scope, name);
     eprintln!("Solving native toolchain with pixi (this may take a few minutes)...");
-    pixi::solve(&pixi_dir, &pixi_bin)?;
-    let mut activation = pixi::capture_activation(&pixi_dir, &pixi_bin)?;
+    pixi::solve(&pixi_dir, &pixi_bin, ssl_cert.as_deref())?;
+    let mut activation = pixi::capture_activation(&pixi_dir, &pixi_bin, ssl_cert.as_deref())?;
+    // Persist the CA env vars into the env's run environment so a later
+    // `morloc make` (its uv/pip and any runtime egress) also trusts the CA.
+    if let Some(host) = &ssl_cert {
+        for (k, v) in cert::host_env_pairs(host) {
+            activation.retain(|(kk, _)| kk != &k);
+            activation.push((k, v));
+        }
+    }
     // Expose the env's own bin (nexus + installed program launchers) and the
     // provisioned runtime (the morloc compiler) on PATH, so `run -- <program>`
     // and `run -- morloc ...` resolve inside the env alongside the conda toolchain.
@@ -4239,11 +4295,16 @@ fn native_new(
     name: Option<String>,
     lang: Vec<String>,
     requested_version: Option<String>,
+    cert_bundle: Option<String>,
     no_init: bool,
     make_default: bool,
     verbose: bool,
 ) -> Result<()> {
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
+
+    // Preflight + materialize the CA bundle before the solve, so the host
+    // `pixi` process can trust it. Aborts on an unambiguous problem.
+    let prepared = cert::prepare_for_env(scope, &env_name, cert_bundle.as_deref())?;
 
     // A new env has no installed programs yet; its toolchain is morloc's core
     // language-support table plus any `--lang` pins. Provisioning (inside
@@ -4258,7 +4319,7 @@ fn native_new(
             .ok()
     };
 
-    let ec = EnvironmentConfig::new_backend(
+    let mut ec = EnvironmentConfig::new_backend(
         env_name,
         Backend::Native,
         String::new(),
@@ -4266,6 +4327,9 @@ fn native_new(
         morloc_version,
         Vec::new(),
     );
+    if let Some(p) = prepared {
+        p.apply_to(&mut ec);
+    }
     finalize_new_env(scope, &ec, lang_pins, make_default)
 }
 
@@ -4722,9 +4786,10 @@ fn build_requirement_derived_image(
     // pixi.toml), so a failed build cannot poison the cache, and a rebuilt dev
     // compiler forces a fresh image without a manual `podman rmi`.
     let key = format!(
-        "{}{}",
+        "{}{}{}",
         cache_key(&manifest, &req.morloc_bin, system_packages),
         lang_installs_key_fragment(&req.lang_installs),
+        cert::cache_fragment_for_env(scope, name),
     );
     let marker = materialized_marker(scope, name, false);
     let unchanged = std::fs::read_to_string(&marker)
@@ -4752,8 +4817,11 @@ fn build_requirement_derived_image(
     prime_requirements_store(&env_dir, req.lang_spec.as_ref());
     pixi::write_manifest(&pixi_host, &manifest)?;
     let pixi_bin = provision::provision_pixi(scope)?;
+    // The host `pixi lock` runs on the host, so it uses the host bundle (corp +
+    // public roots), exactly like the native path.
+    let ssl_cert = cert::host_bundle_if_present(scope, name);
     eprintln!("Solving + locking the environment with pixi...");
-    pixi::lock(&pixi_host, &pixi_bin)?;
+    pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
 
     // Build the requirement-INDEPENDENT base image (base tools + pixi + the
     // compiler/rust source). The env-specific pixi solve + `morloc init` run in a
@@ -4761,6 +4829,9 @@ fn build_requirement_derived_image(
     eprintln!("Staging the morloc runtime into the build context...");
     provision::stage_runtime(&req.runtime_dir, &context.join("runtime"))?;
     let lang_install_names = stage_lang_installs(&context, &req.lang_installs)?;
+    // Stage the corp CA into the build context (COPY-ed into the image and
+    // trusted before any network build step).
+    let cert_file = cert::stage_into_context(scope, name, &context)?;
     let extras = dockerfile::BuildExtras {
         system_packages: system_packages.to_vec(),
     };
@@ -4771,6 +4842,7 @@ fn build_requirement_derived_image(
         extras: &extras,
         lang_installs: &lang_install_names,
         dev: false,
+        cert_file: cert_file.as_deref(),
     });
     let df_path = context.join("Dockerfile");
     std::fs::write(&df_path, df_text)
@@ -4953,6 +5025,7 @@ fn build_dev_container_image(
     // Render the dev Dockerfile up front so its exact content gates the image cache:
     // any Dockerfile change (base image, pixi version, apt list, baked ghcup) then
     // invalidates the key automatically, with no hand-maintained version marker.
+    let cert_file = cert::context_cert_rel(scope, name);
     let df_text = dockerfile::generate_dockerfile(&dockerfile::DockerfileInput {
         base_image: CONTAINER_BASE_IMAGE,
         pixi_version: provision::PIXI_VERSION,
@@ -4960,13 +5033,20 @@ fn build_dev_container_image(
         extras: &dockerfile::BuildExtras { system_packages: apt_packages.clone() },
         lang_installs: &install_names,
         dev: true,
+        cert_file: cert_file.as_deref(),
     });
 
-    // Single cache key: the pixi manifest + the rendered Dockerfile. A change re-solves,
-    // rebuilds the image, and re-materializes the pixi env; nothing else does (the
-    // developer owns the compiler build). The install-script contents ride the key (the
-    // Dockerfile only names them), so editing an install.sh rebuilds the image.
-    let image_inputs = format!("{df_text}{}", lang_installs_key_fragment(&script_langs));
+    // Single cache key: the pixi manifest + the rendered Dockerfile + the CA
+    // bundle contents. A change re-solves, rebuilds the image, and re-materializes
+    // the pixi env; nothing else does (the developer owns the compiler build). The
+    // install-script contents ride the key (the Dockerfile only names them), so
+    // editing an install.sh rebuilds the image. The cert fragment rides too (the
+    // Dockerfile only names the cert path), so a rotated CA rebuilds the image.
+    let image_inputs = format!(
+        "{df_text}{}{}",
+        lang_installs_key_fragment(&script_langs),
+        cert::cache_fragment_for_env(scope, name),
+    );
     let img_key = dev_image_key(&manifest, &image_inputs);
     let marker = materialized_marker(scope, name, false);
     let up_to_date = std::fs::read_to_string(&marker).ok().as_deref() == Some(img_key.as_str());
@@ -4975,8 +5055,9 @@ fn build_dev_container_image(
         prime_requirements_store(&env_dir, lang_spec.as_ref());
         pixi::write_manifest(&pixi_host, &manifest)?;
         let pixi_bin = provision::provision_pixi(scope)?;
+        let ssl_cert = cert::host_bundle_if_present(scope, name);
         eprintln!("Solving + locking the dev environment with pixi...");
-        pixi::lock(&pixi_host, &pixi_bin)?;
+        pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
 
         std::fs::create_dir_all(&context).map_err(|e| {
             ManagerError::EnvError(format!("cannot create {}: {e}", context.display()))
@@ -4986,6 +5067,8 @@ fn build_dev_container_image(
             ManagerError::EnvError(format!("cannot write {}: {e}", df_path.display()))
         })?;
         stage_lang_installs(&context, &script_langs)?;
+        // Copy the corp CA into the context so the Dockerfile's COPY resolves.
+        cert::stage_into_context(scope, name, &context)?;
 
         eprintln!("Building the dev environment base image ({image_tag}) with {}...", engine.name());
         let cfg = crate::container::BuildConfig {
@@ -5193,11 +5276,16 @@ fn container_new_derived(
     lang: Vec<String>,
     system_packages: Vec<String>,
     dotfiles: Option<String>,
+    cert_bundle: Option<String>,
     requested_version: Option<String>,
     no_init: bool,
     make_default: bool,
 ) -> Result<()> {
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
+
+    // Preflight + materialize the CA bundle before the (host-side) pixi lock and
+    // the image build stage it. Aborts on an unambiguous problem.
+    let prepared = cert::prepare_for_env(scope, &env_name, cert_bundle.as_deref())?;
 
     // Seed the per-env home before the (multi-minute) image build so it exists
     // for hand-editing straight after `new`, and any --dotfiles error fails fast.
@@ -5222,7 +5310,7 @@ fn container_new_derived(
         (Some(image), version.parse::<Version>().ok())
     };
 
-    let ec = EnvironmentConfig::new_backend(
+    let mut ec = EnvironmentConfig::new_backend(
         env_name,
         Backend::Container(engine),
         CONTAINER_BASE_IMAGE.to_string(),
@@ -5230,6 +5318,9 @@ fn container_new_derived(
         morloc_version,
         system_packages,
     );
+    if let Some(p) = prepared {
+        p.apply_to(&mut ec);
+    }
     finalize_new_env(scope, &ec, lang_pins, make_default)
 }
 
@@ -5258,6 +5349,7 @@ fn container_new_dev(
     lang: Vec<String>,
     system_packages: Vec<String>,
     dotfiles: Option<String>,
+    cert_bundle: Option<String>,
     requested_version: Option<String>,
     no_init: bool,
     make_default: bool,
@@ -5275,6 +5367,8 @@ fn container_new_dev(
     // the version (matching the interactive default).
     let name = name.or_else(|| Some("dev".to_string()));
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
+    // Preflight + materialize the CA bundle before the image build.
+    let prepared = cert::prepare_for_env(scope, &env_name, cert_bundle.as_deref())?;
     // Seed the per-env home (and any --dotfiles) before provisioning the tooling.
     let data_dir = cfg::env_data_dir(scope, &env_name);
     cfg::ensure_env_home(&data_dir);
@@ -5295,7 +5389,7 @@ fn container_new_dev(
     };
     let dev = DevConfig { source };
 
-    let ec = EnvironmentConfig::new_backend(
+    let mut ec = EnvironmentConfig::new_backend(
         env_name,
         Backend::Container(engine),
         CONTAINER_BASE_IMAGE.to_string(),
@@ -5304,6 +5398,9 @@ fn container_new_dev(
         system_packages,
     )
     .with_dev(dev);
+    if let Some(p) = prepared {
+        p.apply_to(&mut ec);
+    }
     finalize_new_env(scope, &ec, lang_pins, make_default)
 }
 
@@ -6601,6 +6698,7 @@ mod tests {
             system_package: Vec::new(),
             rm_system_package: Vec::new(),
             dotfiles,
+            cert_bundle: None,
             set_default,
             system,
         }
@@ -6977,6 +7075,8 @@ mod tests {
             morloc_version: Some(Version::new(0, 67, 0)),
             system_packages: Vec::new(),
             dev: None,
+            cert_bundle: None,
+            cert_fingerprints: Vec::new(),
         };
         cfg::write_config(&path, &ec).unwrap();
         let ec2: EnvironmentConfig = cfg::read_config(&path).unwrap();
@@ -7412,6 +7512,8 @@ run:
             morloc_version: Some(Version::new(0, 85, 0)),
             system_packages: Vec::new(),
             dev: None,
+            cert_bundle: None,
+            cert_fingerprints: Vec::new(),
         };
         let yaml = serde_yaml::to_string(&ec).unwrap();
         std::fs::write(&path, yaml).unwrap();
@@ -7463,6 +7565,8 @@ run:
             morloc_version: None,
             system_packages: Vec::new(),
             dev: None,
+            cert_bundle: None,
+            cert_fingerprints: Vec::new(),
         };
         assert_eq!(ec.active_image(), "/layered.sif");
     }
@@ -7486,6 +7590,8 @@ run:
             morloc_version: None,
             system_packages: Vec::new(),
             dev: None,
+            cert_bundle: None,
+            cert_fingerprints: Vec::new(),
         };
         assert_eq!(ec.active_image(), "/base.sif");
     }
@@ -7534,6 +7640,8 @@ run:
                 morloc_version: None,
                 system_packages: Vec::new(),
                 dev: None,
+                cert_bundle: None,
+                cert_fingerprints: Vec::new(),
             },
         }
     }
