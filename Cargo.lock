@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "mim"
-version = "0.26.1"
+version = "0.26.3"
 dependencies = [
  "anstream",
  "chrono",
@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "mim-env"
-version = "0.26.1"
+version = "0.26.3"
 dependencies = [
  "clap",
  "morloc-deps",
@@ -544,7 +544,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "morloc-deps"
-version = "0.26.1"
+version = "0.26.3"
 dependencies = [
  "pem",
  "serde",

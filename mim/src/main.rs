@@ -6085,7 +6085,11 @@ fn run_with_config(
     let runtime_src = std::path::Path::new(v_data_dir).join("runtime");
     let mut required: Vec<(&std::path::Path, &str)> =
         vec![(pixi_src.as_path(), "conda toolchain (/env)")];
-    if !is_init {
+    // A dev env's runtime (MORLOC_HOME) is BUILT from the mounted source by the
+    // developer (`morloc init`), so it starts empty by design -- only the conda
+    // toolchain is manager-materialized. Non-dev envs bake the runtime at setup,
+    // so a missing one there is a real half-provisioned state.
+    if !is_init && dev_source.is_none() {
         required.push((runtime_src.as_path(), "morloc runtime (MORLOC_HOME)"));
     }
     for (src, what) in required {
