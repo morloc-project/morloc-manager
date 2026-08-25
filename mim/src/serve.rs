@@ -632,6 +632,29 @@ pub const CONTAINER_MORLOC_HOME: &str = "/opt/morloc";
 /// installs/builds persist without covering the runtime.
 pub const CONTAINER_MORLOC_STATE: &str = "/opt/morloc-state";
 
+/// In-container HOME for docker/podman: an env-owned, base-independent home so
+/// the identity is the same regardless of the base image's /etc/passwd. It is an
+/// in-image symlink to the mounted, writable env home under MORLOC_STATE
+/// (`/opt/morloc-state/home`), where dotfiles land. Apptainer keeps the host
+/// $HOME and does not use this.
+pub const CONTAINER_HOME: &str = "/home/morloc";
+
+/// Fixed in-container mount point + working directory for the host cwd on the
+/// run/shell/capture paths. A constant (not the literal host path) so the work
+/// dir is deterministic regardless of the host user or path: no host-named tree
+/// appears under `/`, and it cannot collide with CONTAINER_HOME when the host
+/// user happens to be named `morloc`. Safe now that pool artifacts are
+/// path-independent (they resolve relative to the manifest, not a baked cwd).
+/// Matches the image WORKDIR.
+pub const CONTAINER_WORK: &str = "/work";
+
+/// Fixed in-image path to the `libnss_wrapper.so` interposer. The Dockerfile
+/// symlinks the apt-installed library (whose real path is arch-dependent) here,
+/// so the entrypoint can LD_PRELOAD a stable, single-quote-free path. Used to
+/// synthesize a passwd/group entry for the host UID under `--userns=keep-id`,
+/// which otherwise has no /etc/passwd entry.
+pub const CONTAINER_NSS_WRAPPER_LIB: &str = "/usr/local/lib/morloc-nss-wrapper.so";
+
 /// System PATH tail appended after the morloc + toolchain dirs for every
 /// in-container invocation (run, serve, apptainer).
 pub const CONTAINER_PATH_TAIL: &str =
@@ -694,8 +717,9 @@ pub fn container_path(mh: &str) -> String {
 }
 
 /// Base env for a docker/podman in-container process. MORLOC_HOME is the baked
-/// runtime prefix; MORLOC_STATE is the mounted, writable state root; HOME lives
-/// under state so pool daemons/tools have a writable home. `morloc-nexus` finds
+/// runtime prefix; MORLOC_STATE is the mounted, writable state root; HOME is the
+/// env-owned CONTAINER_HOME (an in-image symlink to the mounted env home under
+/// state), so pool daemons/tools have a writable home. `morloc-nexus` finds
 /// `libmorloc.so` via its own baked `bin/../lib` RUNPATH (the runtime is no
 /// longer shadowed), so no `LD_LIBRARY_PATH` override is needed. Callers extend
 /// this with phase-specific vars (CARGO_HOME/MORLOC_BIN_LINK_DIR, user_env).
@@ -704,7 +728,7 @@ pub fn oci_base_env(mh: &str) -> Vec<(String, String)> {
     vec![
         ("MORLOC_HOME".to_string(), mh.to_string()),
         ("MORLOC_STATE".to_string(), CONTAINER_MORLOC_STATE.to_string()),
-        ("HOME".to_string(), format!("{CONTAINER_MORLOC_STATE}/home")),
+        ("HOME".to_string(), CONTAINER_HOME.to_string()),
         ("PATH".to_string(), container_path(mh)),
         // A UTF-8 locale (C.UTF-8 is built into the base image's glibc) so the
         // compiler and programs can emit non-ASCII to stdout; under the default C

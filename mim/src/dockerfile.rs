@@ -68,9 +68,15 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     // for the pixi installer, CA certs for TLS. Everything else (compilers, git,
     // language runtimes) comes from the pixi-solved conda env, so the base stays
     // minimal. Plus any container-only system packages conda cannot provide.
+    // libnss-wrapper is installed so the entrypoint can synthesize a passwd/group
+    // entry for the host UID under `--userns=keep-id` (which has no /etc/passwd
+    // entry of its own). Its real .so path is arch-dependent, so symlink it to a
+    // fixed location the entrypoint can reference.
     out.push_str("# Base tools + build-extras (system packages conda cannot provide)\n");
     out.push_str("RUN apt-get update \\\n");
-    out.push_str(" && apt-get install -y --no-install-recommends ca-certificates curl");
+    out.push_str(
+        " && apt-get install -y --no-install-recommends ca-certificates curl libnss-wrapper",
+    );
     for pkg in &input.extras.system_packages {
         out.push_str(&format!(" {pkg}"));
     }
@@ -80,6 +86,10 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
         // ca-certificates is installed.
         out.push_str(" && update-ca-certificates \\\n");
     }
+    out.push_str(&format!(
+        " && ln -sf \"$(dpkg -L libnss-wrapper | grep -m1 '/libnss_wrapper\\.so$')\" {} \\\n",
+        crate::serve::CONTAINER_NSS_WRAPPER_LIB
+    ));
     out.push_str(" && rm -rf /var/lib/apt/lists/*\n");
     out.push('\n');
 
@@ -94,6 +104,27 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
         }
         out.push('\n');
         out.push('\n');
+    }
+
+    // Env-owned container identity. Under `--userns=keep-id` the container runs as
+    // the host UID, so the base image's preinstalled user is neither the process
+    // owner nor a useful home. Give the env a stable HOME (`CONTAINER_HOME`) that
+    // symlinks into the mounted, writable state root, so dotfiles/caches persist.
+    out.push_str("# Env-owned home (symlink into the mounted state root)\n");
+    out.push_str(&format!(
+        "RUN mkdir -p /home && ln -sfn {}/home {}\n\n",
+        crate::serve::CONTAINER_MORLOC_STATE,
+        crate::serve::CONTAINER_HOME
+    ));
+
+    // The heavy (ubuntu) base ships a preinstalled UID/GID-1000 `ubuntu` user that
+    // collides with a host UID of 1000 under keep-id. Reclaim it so the env owns
+    // that id. Harmless if already absent. (The slim debian base has no such user.)
+    if input.base_image.contains("ubuntu") {
+        out.push_str("# Reclaim UID/GID 1000 from the preinstalled base user\n");
+        out.push_str(
+            "RUN userdel -r ubuntu 2>/dev/null || true; groupdel ubuntu 2>/dev/null || true\n\n",
+        );
     }
 
     // Script-provisioned languages (e.g. futhark): their upstream binary is not on
@@ -176,20 +207,48 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     out.push_str("# MORLOC_HOME (shims materialized into it at env setup, mounted at run)\n");
     out.push_str(&format!("ENV MORLOC_HOME={}\n", input.morloc_home));
     out.push('\n');
-    out.push_str("WORKDIR /work\n");
+    out.push_str(&format!("WORKDIR {}\n", crate::serve::CONTAINER_WORK));
     out.push('\n');
 
-    // Self-activate the conda toolchain for EVERY container process -- the
-    // interactive shell, `morloc make`, and the cargo/cc-rs it spawns (see
+    // Synthesize a passwd/group entry for the host UID via nss_wrapper, then
+    // self-activate the conda toolchain -- for EVERY container process (the
+    // interactive shell, `morloc make`, and the cargo/cc-rs it spawns; see
     // serve::conda_activate_lines for why activate.d must be sourced). The pixi
     // path is absolute because the run-time PATH does not include /opt/pixi/bin.
-    let activate: String = crate::serve::conda_activate_lines()
+    //
+    // The nss block runs only when the current UID has no passwd entry (the
+    // keep-id case); it LD_PRELOADs nss_wrapper against temp passwd/group files
+    // naming the env-owned `morloc` user. It deliberately does NOT set HOME -- HOME
+    // is supplied by the container run env (serve::oci_base_env) so the interactive
+    // and served paths agree. Lines avoid single quotes so the single-quote-wrapped
+    // printf below emits them verbatim.
+    let nss_block = [
+        format!(
+            "if [ -f {lib} ] && ! getent passwd \"$(id -u)\" >/dev/null 2>&1; then",
+            lib = crate::serve::CONTAINER_NSS_WRAPPER_LIB
+        ),
+        "  _p=\"$(mktemp)\"; _g=\"$(mktemp)\"".to_string(),
+        "  if [ -n \"$_p\" ] && [ -n \"$_g\" ]; then".to_string(),
+        format!(
+            "    printf \"morloc:x:%s:%s:morloc:{home}:/bin/bash\\n\" \"$(id -u)\" \"$(id -g)\" > \"$_p\"",
+            home = crate::serve::CONTAINER_HOME
+        ),
+        "    printf \"morloc:x:%s:\\n\" \"$(id -g)\" > \"$_g\"".to_string(),
+        format!(
+            "    export LD_PRELOAD={lib} NSS_WRAPPER_PASSWD=\"$_p\" NSS_WRAPPER_GROUP=\"$_g\" USER=morloc LOGNAME=morloc",
+            lib = crate::serve::CONTAINER_NSS_WRAPPER_LIB
+        ),
+        "  fi".to_string(),
+        "fi".to_string(),
+    ];
+    let script_lines: String = nss_block
         .iter()
+        .chain(crate::serve::conda_activate_lines().iter())
         .map(|l| format!(" '{l}'"))
         .collect();
-    out.push_str("# Self-activate the conda toolchain for every container process\n");
+    out.push_str("# Env identity (nss_wrapper) + conda activation for every container process\n");
     out.push_str(&format!(
-        "RUN printf '%s\\n' '#!/bin/bash'{activate} 'exec \"$@\"' > /usr/local/bin/morloc-activate && chmod +x /usr/local/bin/morloc-activate\n"
+        "RUN printf '%s\\n' '#!/bin/bash'{script_lines} 'exec \"$@\"' > /usr/local/bin/morloc-activate && chmod +x /usr/local/bin/morloc-activate\n"
     ));
     out.push_str("ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]\n");
 
@@ -221,8 +280,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Base tools + build-extras (system packages conda cannot provide)
 RUN apt-get update \\
- && apt-get install -y --no-install-recommends ca-certificates curl libgl1 graphviz \\
+ && apt-get install -y --no-install-recommends ca-certificates curl libnss-wrapper libgl1 graphviz \\
+ && ln -sf \"$(dpkg -L libnss-wrapper | grep -m1 '/libnss_wrapper\\.so$')\" /usr/local/lib/morloc-nss-wrapper.so \\
  && rm -rf /var/lib/apt/lists/*
+
+# Env-owned home (symlink into the mounted state root)
+RUN mkdir -p /home && ln -sfn /opt/morloc-state/home /home/morloc
 
 # Pinned pixi (conda package manager)
 ENV PIXI_HOME=/opt/pixi
@@ -242,8 +305,8 @@ ENV MORLOC_HOME=/opt/morloc
 
 WORKDIR /work
 
-# Self-activate the conda toolchain for every container process
-RUN printf '%s\\n' '#!/bin/bash' 'export CONDA_PREFIX=/env/.pixi/envs/default' 'eval \"$(/opt/pixi/bin/pixi shell-hook --manifest-path /env/pixi.toml --shell bash 2>/dev/null)\" || true' 'for f in \"$CONDA_PREFIX/etc/conda/activate.d/\"*.sh; do [ -r \"$f\" ] && . \"$f\"; done' 'exec \"$@\"' > /usr/local/bin/morloc-activate && chmod +x /usr/local/bin/morloc-activate
+# Env identity (nss_wrapper) + conda activation for every container process
+RUN printf '%s\\n' '#!/bin/bash' 'if [ -f /usr/local/lib/morloc-nss-wrapper.so ] && ! getent passwd \"$(id -u)\" >/dev/null 2>&1; then' '  _p=\"$(mktemp)\"; _g=\"$(mktemp)\"' '  if [ -n \"$_p\" ] && [ -n \"$_g\" ]; then' '    printf \"morloc:x:%s:%s:morloc:/home/morloc:/bin/bash\\n\" \"$(id -u)\" \"$(id -g)\" > \"$_p\"' '    printf \"morloc:x:%s:\\n\" \"$(id -g)\" > \"$_g\"' '    export LD_PRELOAD=/usr/local/lib/morloc-nss-wrapper.so NSS_WRAPPER_PASSWD=\"$_p\" NSS_WRAPPER_GROUP=\"$_g\" USER=morloc LOGNAME=morloc' '  fi' 'fi' 'export CONDA_PREFIX=/env/.pixi/envs/default' 'eval \"$(/opt/pixi/bin/pixi shell-hook --manifest-path /env/pixi.toml --shell bash 2>/dev/null)\" || true' 'for f in \"$CONDA_PREFIX/etc/conda/activate.d/\"*.sh; do [ -r \"$f\" ] && . \"$f\"; done' 'exec \"$@\"' > /usr/local/bin/morloc-activate && chmod +x /usr/local/bin/morloc-activate
 ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
 ";
         assert_eq!(got, expected);
@@ -262,7 +325,7 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
             cert_file: None,
         };
         let got = generate_dockerfile(&input);
-        assert!(got.contains("ca-certificates curl \\"));
+        assert!(got.contains("ca-certificates curl libnss-wrapper \\"));
         assert!(!got.contains("  \\")); // no dangling double space before continuation
     }
 
@@ -306,6 +369,54 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         assert!(!got.contains("ENV MORLOC_RUST_DIR="));
         // But CONTAINER_RUNTIME_BIN (a mount target) is still on PATH.
         assert!(got.contains(&format!("ENV PATH=\"{}:", crate::serve::CONTAINER_RUNTIME_BIN)));
+    }
+
+    #[test]
+    fn env_owned_identity_is_baked() {
+        let extras = BuildExtras::default();
+        let input = DockerfileInput {
+            base_image: "debian:bookworm-slim",
+            pixi_version: "0.76.2",
+            morloc_home: "/opt/morloc",
+            extras: &extras,
+            lang_installs: &[],
+            dev: false,
+            cert_file: None,
+        };
+        let got = generate_dockerfile(&input);
+        // nss_wrapper installed and symlinked to the fixed entrypoint path.
+        assert!(got.contains("libnss-wrapper"));
+        assert!(got.contains(crate::serve::CONTAINER_NSS_WRAPPER_LIB));
+        // Env-owned home symlinks into the mounted state root.
+        assert!(got.contains(&format!(
+            "ln -sfn {}/home {}",
+            crate::serve::CONTAINER_MORLOC_STATE,
+            crate::serve::CONTAINER_HOME
+        )));
+        // Entrypoint synthesizes the passwd entry but must NOT set HOME (that comes
+        // from the container run env).
+        assert!(got.contains("NSS_WRAPPER_PASSWD"));
+        assert!(got.contains("USER=morloc LOGNAME=morloc"));
+        assert!(!got.contains("export HOME="));
+        // The slim debian base has no preinstalled `ubuntu` user to reclaim.
+        assert!(!got.contains("userdel -r ubuntu"));
+    }
+
+    #[test]
+    fn heavy_base_reclaims_ubuntu_user() {
+        let extras = BuildExtras::default();
+        let input = DockerfileInput {
+            base_image: "ubuntu:24.04",
+            pixi_version: "0.76.2",
+            morloc_home: "/opt/morloc",
+            extras: &extras,
+            lang_installs: &[],
+            dev: false,
+            cert_file: None,
+        };
+        let got = generate_dockerfile(&input);
+        assert!(got.contains("userdel -r ubuntu 2>/dev/null || true"));
+        assert!(got.contains("groupdel ubuntu 2>/dev/null || true"));
     }
 
     #[test]

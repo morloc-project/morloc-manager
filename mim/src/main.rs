@@ -169,6 +169,10 @@ or `latest`). With no flags on a TTY, all settings are prompted interactively.")
         /// images.
         #[arg(long = "cert-bundle")]
         cert_bundle: Option<String>,
+        /// Container base image: `heavy` (ubuntu:24.04, default) or `light`
+        /// (debian:bookworm-slim). Container backends only.
+        #[arg(long, value_enum)]
+        base: Option<BaseImage>,
         /// Create in system scope (requires root)
         #[arg(long)]
         system: bool,
@@ -406,6 +410,10 @@ Examples:
         /// rebuild so the new CA is applied. Use after the corporate CA rotates.
         #[arg(long = "cert-bundle")]
         cert_bundle: Option<String>,
+        /// Switch the container base image (`heavy` = ubuntu:24.04, `light` =
+        /// debian:bookworm-slim) and rebuild. Container backends only.
+        #[arg(long, value_enum)]
+        base: Option<BaseImage>,
         /// Tag this environment as the default (used when a command is given no
         /// explicit --env). Writes your personal (local) default, even for a
         /// system-scope env; add --system to set the machine-wide default. No rebuild.
@@ -663,6 +671,28 @@ enum EngineArg {
     None,
 }
 
+/// A tested container base image. Both are Debian-family (apt / `/etc/ssl` /
+/// `update-ca-certificates`), so the generated Dockerfile is identical; they
+/// differ in size, preinstalled packages, and which apt mirror they use --
+/// which matters behind a firewall that allows one mirror host but not another.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum BaseImage {
+    /// ubuntu:24.04 -- more preinstalled, broad mirror/CA compatibility (default).
+    #[default]
+    Heavy,
+    /// debian:bookworm-slim -- minimal and smaller.
+    Light,
+}
+
+impl BaseImage {
+    fn image(self) -> &'static str {
+        match self {
+            BaseImage::Heavy => "docker.io/library/ubuntu:24.04",
+            BaseImage::Light => CONTAINER_BASE_IMAGE,
+        }
+    }
+}
+
 impl From<EngineArg> for ContainerEngine {
     fn from(e: EngineArg) -> Self {
         match e {
@@ -909,6 +939,13 @@ fn system_package_not_supported() -> ManagerError {
     )
 }
 
+fn base_not_supported() -> ManagerError {
+    ManagerError::EnvError(
+        "--base applies only to container backends; the native backend has no image"
+            .to_string(),
+    )
+}
+
 
 /// A path rendered for `info`, flagged `(MISSING)` when it is absent on disk so
 /// a half-built environment is obvious.
@@ -986,7 +1023,7 @@ fn info_env_exports(
                 ("MORLOC_STATE".to_string(), serve::CONTAINER_MORLOC_STATE.to_string()),
             ];
             if e.is_oci() {
-                v.push(("HOME".to_string(), format!("{}/home", serve::CONTAINER_MORLOC_STATE)));
+                v.push(("HOME".to_string(), serve::CONTAINER_HOME.to_string()));
                 v.extend(serve::oci_managed_markers());
             } else {
                 // Apptainer mounts the host $HOME and sets none of the OCI-only vars.
@@ -1132,6 +1169,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             system_package,
             dotfiles,
             cert_bundle,
+            base,
             system,
             set_default,
             no_init,
@@ -1172,17 +1210,24 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     let Backend::Container(eng) = plan.backend else { unreachable!() };
                     return container_new_dev(
                         plan.scope, eng, Some(plan.name), src, plan.lang, plan.system_packages,
-                        plan.dotfiles, cert_bundle, plan.requested_version, no_init, plan.make_default,
+                        plan.dotfiles, cert_bundle, base.unwrap_or_default().image().to_string(),
+                        plan.requested_version, no_init, plan.make_default,
                     );
                 }
                 return match plan.backend {
-                    Backend::Native => native_new(
-                        plan.scope, Some(plan.name), plan.lang, plan.requested_version,
-                        cert_bundle, no_init, plan.make_default, verbose,
-                    ),
+                    Backend::Native => {
+                        if base.is_some() {
+                            return Err(base_not_supported());
+                        }
+                        native_new(
+                            plan.scope, Some(plan.name), plan.lang, plan.requested_version,
+                            cert_bundle, no_init, plan.make_default, verbose,
+                        )
+                    }
                     Backend::Container(eng) => container_new_derived(
                         plan.scope, eng, Some(plan.name), plan.lang, plan.system_packages,
-                        plan.dotfiles, cert_bundle, plan.requested_version, no_init, plan.make_default,
+                        plan.dotfiles, cert_bundle, base.unwrap_or_default().image().to_string(),
+                        plan.requested_version, no_init, plan.make_default,
                     ),
                 };
             }
@@ -1231,6 +1276,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 }
                 if dotfiles.is_some() {
                     return Err(dotfiles_not_supported());
+                }
+                if base.is_some() {
+                    return Err(base_not_supported());
                 }
                 return native_new(scope, name, lang, morloc_version, cert_bundle, no_init, set_default, verbose);
             }
@@ -1292,10 +1340,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // A dev env mounts a source tree the developer builds morloc from,
             // instead of pulling a release; everything else (engine, name, langs,
             // packages) is shared.
+            // The chosen container base image (default heavy/ubuntu).
+            let base_image = base.unwrap_or_default().image().to_string();
             if let Some(src) = dev {
                 return container_new_dev(
                     scope, resolved_engine, name, src, lang, system_package, dotfiles,
-                    cert_bundle, morloc_version, no_init, set_default,
+                    cert_bundle, base_image, morloc_version, no_init, set_default,
                 );
             }
 
@@ -1304,7 +1354,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // native backend's lowering. There is no pull/recipe/base-image path.
             container_new_derived(
                 scope, resolved_engine, name, lang, system_package, dotfiles, cert_bundle,
-                morloc_version, no_init, set_default,
+                base_image, morloc_version, no_init, set_default,
             )
         }
 
@@ -2035,6 +2085,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             rm_system_package,
             dotfiles,
             cert_bundle,
+            base,
             set_default,
             system,
         } => {
@@ -2049,11 +2100,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let system_package = flatten_csv(&system_package);
             let rm_system_package = flatten_csv(&rm_system_package);
             let touches_packages = !system_package.is_empty() || !rm_system_package.is_empty();
-            let will_rebuild = !lang.is_empty() || touches_packages || cert_bundle.is_some();
+            let will_rebuild =
+                !lang.is_empty() || touches_packages || cert_bundle.is_some() || base.is_some();
             if !set_default && !will_rebuild && dotfiles.is_none() {
                 return Err(ManagerError::EnvError(
                     "nothing to modify: pass --set-default, --dotfiles, --lang, \
-                     --cert-bundle, --system-packages, or --rm-system-packages".to_string(),
+                     --cert-bundle, --base, --system-packages, or --rm-system-packages".to_string(),
                 ));
             }
 
@@ -2067,6 +2119,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                      backends; the native backend has no image to bake packages into"
                         .to_string(),
                 ));
+            }
+            if base.is_some() && ec.backend.is_native() {
+                return Err(base_not_supported());
             }
             if dotfiles.is_some() && !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
                 // Same rule as `new`: dotfiles land in a docker/podman env home;
@@ -2144,9 +2199,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if let Some(p) = cert_prepared {
                     p.apply_to(&mut ec);
                 }
+                // Switch the container base image; rematerialize_env reads it back.
+                if let Some(b) = base {
+                    ec.base_image = b.image().to_string();
+                }
                 // Persist the mutated config once (rematerialize_env reads it from
                 // disk).
-                if touches_packages || cert_changed {
+                if touches_packages || cert_changed || base.is_some() {
                     cfg::write_env_config(env_scope, &env_name, &ec)?;
                 }
                 if !lang.is_empty() {
@@ -2923,6 +2982,7 @@ fn resolve_release_tag() -> String {
 fn load_lang_support(
     runtime_dir: &std::path::Path,
     engine: Option<ContainerEngine>,
+    base_image: &str,
 ) -> Result<langsupport::LangSupport> {
     if let Ok(path) = std::env::var("MORLOC_LANG_SUPPORT") {
         if !path.is_empty() {
@@ -2943,7 +3003,7 @@ fn load_lang_support(
     // compiler at build time) and cache it next to the runtime so later runs skip
     // regeneration.
     let morloc_bin = provision::runtime_morloc_bin(runtime_dir);
-    let json = emit_lang_support(&morloc_bin, engine)?;
+    let json = emit_lang_support(&morloc_bin, engine, base_image)?;
     let _ = std::fs::write(&table, &json);
     langsupport::LangSupport::from_json(&json).map_err(Into::into)
 }
@@ -2957,6 +3017,7 @@ fn load_lang_support(
 fn emit_lang_support(
     morloc_bin: &std::path::Path,
     engine: Option<ContainerEngine>,
+    base_image: &str,
 ) -> Result<String> {
     if let Ok(out) = Command::new(morloc_bin).arg("lang-support").output() {
         if out.status.success() {
@@ -2964,7 +3025,7 @@ fn emit_lang_support(
         }
     }
     if let Some(engine) = engine {
-        return emit_lang_support_in_container(morloc_bin, engine);
+        return emit_lang_support_in_container(morloc_bin, engine, base_image);
     }
     Err(ManagerError::EnvError(
         "could not obtain the language-support table: the provisioned compiler could \
@@ -2982,6 +3043,7 @@ fn emit_lang_support(
 fn emit_lang_support_in_container(
     morloc_bin: &std::path::Path,
     engine: ContainerEngine,
+    base_image: &str,
 ) -> Result<String> {
     if matches!(engine, ContainerEngine::Apptainer) {
         return Err(ManagerError::EnvError(
@@ -3019,7 +3081,7 @@ fn emit_lang_support_in_container(
     );
     let out = Command::new(crate::container::engine_executable(engine))
         .args([
-            "run", "--rm", "-v", mount.as_str(), CONTAINER_BASE_IMAGE, "sh", "-c",
+            "run", "--rm", "-v", mount.as_str(), base_image, "sh", "-c",
             script.as_str(),
         ])
         .output()
@@ -3217,6 +3279,7 @@ fn resolve_env_requirements(
     lang_pins: &[(String, Option<String>)],
     engine: Option<ContainerEngine>,
     requested_version: Option<&str>,
+    base_image: &str,
 ) -> Result<ResolvedRequirements> {
     // An explicit per-env version (from --morloc-version, or an env's recorded
     // version on update) wins; otherwise fall back to $MORLOC_RELEASE_TAG/latest.
@@ -3242,7 +3305,7 @@ fn resolve_env_requirements(
     let morloc_bin = provision::runtime_morloc_bin(&runtime_dir);
     // `engine` lets the table be generated in a container when the host cannot
     // run the compiler (native passes None; it runs on the host by definition).
-    let support = load_lang_support(&runtime_dir, engine)?;
+    let support = load_lang_support(&runtime_dir, engine, base_image)?;
 
     // Script-provisioned languages (futhark) install via a container script, not
     // conda; reject them on non-OCI backends before the (doomed) solve/build.
@@ -3320,7 +3383,11 @@ fn materialize_native_env(
     verbose: bool,
 ) -> Result<String> {
     // Native runs on the host, so the compiler executes there -- no engine needed.
-    let req = resolve_env_requirements(scope, name, program_specs, lang_pins, None, requested_version)?;
+    // Native: the compiler runs on the host, so the base image is unused (it only
+    // matters for the container lang-support fallback, which native never hits).
+    let req = resolve_env_requirements(
+        scope, name, program_specs, lang_pins, None, requested_version, CONTAINER_BASE_IMAGE,
+    )?;
 
     // Phase 1 of the impurity gate: a fast reject on host/vcpkg system deps that
     // conda cannot provide (the pixi solve below is the accurate phase 2).
@@ -4455,7 +4522,7 @@ fn container_capture_env(
     cfg.remove_after = true;
     let mut mounts = vec![
         (v_data_dir.clone(), serve::CONTAINER_MORLOC_STATE.to_string()),
-        (cwd.clone(), cwd.clone()),
+        (cwd, serve::CONTAINER_WORK.to_string()),
     ];
     // A dev env's compiler is not baked into the image; it lives in the mounted
     // dev-bin dir (with the Rust source), so capture must mount it like run/serve.
@@ -4465,7 +4532,7 @@ fn container_capture_env(
     cfg.bind_mounts = mounts;
     cfg.env = serve::oci_base_env(serve::CONTAINER_MORLOC_HOME);
     cfg.command = Some(args.to_vec());
-    cfg.work_dir = Some(cwd);
+    cfg.work_dir = Some(serve::CONTAINER_WORK.to_string());
     cfg.selinux_suffix = volume_suffix(detect_selinux()).to_string();
     cfg.shm_size = Some(ec.shm_size.clone());
     cfg.extra_flags = engine_args.to_vec();
@@ -4716,6 +4783,7 @@ fn rematerialize_env(
         let source = std::path::PathBuf::from(&dev.source);
         let image_tag = build_dev_container_image(
             scope, name, ce, &specs, &source, &lang_pins, &ec.system_packages, &stdlib,
+            &ec.base_image,
         )?;
         let mut ec = ec;
         // Preserve the prior recorded version if the new stdlib base fails to parse
@@ -4747,6 +4815,7 @@ fn rematerialize_env(
     let ce = ec.engine()?;
     let (image_tag, mver) = build_requirement_derived_image(
         scope, name, ce, &specs, &lang_pins, &ec.system_packages, effective_version,
+        &ec.base_image,
     )?;
     let mut ec = ec;
     ec.built_image = Some(image_tag);
@@ -4767,13 +4836,16 @@ fn build_requirement_derived_image(
     lang_pins: &[(String, Option<String>)],
     system_packages: &[String],
     requested_version: Option<&str>,
+    base_image: &str,
 ) -> Result<(String, String)> {
     // Unlike native, a container HAS a build layer, so host/vcpkg system deps are
     // not a hard blocker here -- they become build-extras (a later --system-packages
     // flag). native_blockers therefore does not apply to the container path.
     // Pass the engine so the language-support table can be generated in a
     // container when the host cannot run the compiler (NixOS/musl).
-    let req = resolve_env_requirements(scope, name, program_specs, lang_pins, Some(engine), requested_version)?;
+    let req = resolve_env_requirements(
+        scope, name, program_specs, lang_pins, Some(engine), requested_version, base_image,
+    )?;
 
     let context = cfg::env_data_dir(scope, name).join(CONTAINER_BUILD_SUBDIR);
     let manifest = pixi::render_manifest(&req.requirements);
@@ -4786,7 +4858,7 @@ fn build_requirement_derived_image(
     // pixi.toml), so a failed build cannot poison the cache, and a rebuilt dev
     // compiler forces a fresh image without a manual `podman rmi`.
     let key = format!(
-        "{}{}{}",
+        "{}{}{}base:{base_image}\n",
         cache_key(&manifest, &req.morloc_bin, system_packages),
         lang_installs_key_fragment(&req.lang_installs),
         cert::cache_fragment_for_env(scope, name),
@@ -4836,7 +4908,7 @@ fn build_requirement_derived_image(
         system_packages: system_packages.to_vec(),
     };
     let df_text = dockerfile::generate_dockerfile(&dockerfile::DockerfileInput {
-        base_image: CONTAINER_BASE_IMAGE,
+        base_image,
         pixi_version: provision::PIXI_VERSION,
         morloc_home: serve::CONTAINER_MORLOC_HOME,
         extras: &extras,
@@ -4986,6 +5058,7 @@ fn build_dev_container_image(
     lang_pins: &[(String, Option<String>)],
     system_packages: &[String],
     stdlib_version: &str,
+    base_image: &str,
 ) -> Result<String> {
     morloc_deps::layout::validate_source(source).map_err(ManagerError::EnvError)?;
 
@@ -5027,7 +5100,7 @@ fn build_dev_container_image(
     // invalidates the key automatically, with no hand-maintained version marker.
     let cert_file = cert::context_cert_rel(scope, name);
     let df_text = dockerfile::generate_dockerfile(&dockerfile::DockerfileInput {
-        base_image: CONTAINER_BASE_IMAGE,
+        base_image,
         pixi_version: provision::PIXI_VERSION,
         morloc_home: serve::CONTAINER_MORLOC_HOME,
         extras: &dockerfile::BuildExtras { system_packages: apt_packages.clone() },
@@ -5277,6 +5350,7 @@ fn container_new_derived(
     system_packages: Vec<String>,
     dotfiles: Option<String>,
     cert_bundle: Option<String>,
+    base_image: String,
     requested_version: Option<String>,
     no_init: bool,
     make_default: bool,
@@ -5306,6 +5380,7 @@ fn container_new_derived(
     } else {
         let (image, version) = build_requirement_derived_image(
             scope, &env_name, engine, &[], &lang_pins, &system_packages, requested_version.as_deref(),
+            &base_image,
         )?;
         (Some(image), version.parse::<Version>().ok())
     };
@@ -5313,7 +5388,7 @@ fn container_new_derived(
     let mut ec = EnvironmentConfig::new_backend(
         env_name,
         Backend::Container(engine),
-        CONTAINER_BASE_IMAGE.to_string(),
+        base_image,
         built_image,
         morloc_version,
         system_packages,
@@ -5350,6 +5425,7 @@ fn container_new_dev(
     system_packages: Vec<String>,
     dotfiles: Option<String>,
     cert_bundle: Option<String>,
+    base_image: String,
     requested_version: Option<String>,
     no_init: bool,
     make_default: bool,
@@ -5384,6 +5460,7 @@ fn container_new_dev(
         // A brand-new env has no installed programs yet, so no program specs.
         let image_tag = build_dev_container_image(
             scope, &env_name, engine, &[], &source_path, &lang_pins, &system_packages, &stdlib,
+            &base_image,
         )?;
         (Some(image_tag), stdlib.parse::<Version>().ok())
     };
@@ -5392,7 +5469,7 @@ fn container_new_dev(
     let mut ec = EnvironmentConfig::new_backend(
         env_name,
         Backend::Container(engine),
-        CONTAINER_BASE_IMAGE.to_string(),
+        base_image,
         built_image,
         morloc_version,
         system_packages,
@@ -6032,7 +6109,7 @@ fn run_with_config(
     let work_mount = if is_init {
         Vec::new()
     } else {
-        vec![(cwd.to_string(), cwd.to_string())]
+        vec![(cwd.to_string(), serve::CONTAINER_WORK.to_string())]
     };
     // Bridge socket bind-mount goes into a fixed in-container path so
     // libmorloc.so finds it via MORLOC_BRIDGE_SOCKET (set below).
@@ -6057,7 +6134,7 @@ fn run_with_config(
     let work_dir = if is_init {
         mh.to_string()
     } else {
-        cwd.to_string()
+        serve::CONTAINER_WORK.to_string()
     };
     // The container runs as the invoking host UID (engine_specific_run_flags_io:
     // docker `--user`, podman `--userns=keep-id`), so the in-container
@@ -6073,18 +6150,19 @@ fn run_with_config(
     //
     // Docker/Podman: the host $HOME is NOT mounted, so anything HOME-relative
     // (cargo's default CARGO_HOME, `morloc init`'s bin-link mkdir) would target
-    // an unwritable path and fail. Point HOME and CARGO_HOME at the mounted,
-    // writable, host-owned data dir ($MORLOC_HOME) and skip the convenience
-    // bin-link entirely (`MORLOC_BIN_LINK_DIR=""`); the binaries are already on
-    // PATH via `$MORLOC_HOME/bin`. RUSTUP_HOME is intentionally NOT set here so
-    // the image's read-only toolchain ENV (/opt/rust/rustup) stays authoritative.
+    // an unwritable path and fail. HOME is the env-owned CONTAINER_HOME (an
+    // in-image symlink to the mounted state home) and CARGO_HOME is pinned under
+    // the mounted state; the convenience bin-link is skipped
+    // (`MORLOC_BIN_LINK_DIR=""`) since the binaries are already on PATH via
+    // `$MORLOC_HOME/bin`. RUSTUP_HOME is intentionally NOT set here so the image's
+    // read-only toolchain ENV (/opt/rust/rustup) stays authoritative.
     //
     // Either way `user_env` is appended last, so `-x --env ...` overrides win.
-    // Under docker/podman HOME is $MORLOC_HOME/home (the host $HOME is not
-    // mounted). Create it on the host bind-mount side so pool daemons/tools that
-    // touch $HOME do not hit ENOENT -- the env-create loop does not make it, and
-    // existing environments predate it. Best-effort: a failure here means the
-    // data dir is unwritable, which fails loudly downstream.
+    // CONTAINER_HOME resolves to `<state>/home`; create that dir on the host
+    // bind-mount side so pool daemons/tools that touch $HOME do not hit ENOENT --
+    // the env-create loop does not make it, and existing environments predate it.
+    // Best-effort: a failure here means the data dir is unwritable, which fails
+    // loudly downstream.
     if engine.is_oci() {
         let _ = cfg::ensure_env_home(&v_data_dir);
     }
@@ -6699,6 +6777,7 @@ mod tests {
             rm_system_package: Vec::new(),
             dotfiles,
             cert_bundle: None,
+            base: None,
             set_default,
             system,
         }
