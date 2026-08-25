@@ -164,6 +164,12 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     } else {
         out.push_str("# morloc compiler + rust source (from the build context)\n");
         out.push_str(&format!("COPY runtime/ {runtime_bin}/\n"));
+        // COPY bakes the tree root-owned, but the container runs as the host UID
+        // (keep-id) and `morloc init` builds libmorloc from this source with cargo,
+        // which writes Cargo.lock next to the workspace manifest. Make the Rust
+        // source world-writable so that in-place write succeeds (target-dir and
+        // CARGO_HOME already point at the writable state mount).
+        out.push_str(&format!("RUN chmod -R a+rwX {runtime_bin}/rust\n"));
         out.push_str(&format!("ENV MORLOC_RUST_DIR={runtime_bin}/rust\n"));
     }
     // Both variants put the compiler dir on PATH (baked COPY dest, or a mount).
@@ -294,6 +300,7 @@ RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v0.76.2 bash
 
 # morloc compiler + rust source (from the build context)
 COPY runtime/ /opt/morloc-runtime/
+RUN chmod -R a+rwX /opt/morloc-runtime/rust
 ENV MORLOC_RUST_DIR=/opt/morloc-runtime/rust
 ENV PATH=\"/opt/morloc-runtime:${PATH}\"
 
