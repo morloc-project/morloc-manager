@@ -603,12 +603,30 @@ fn copy_file(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Recursively copy `src` into `dst`, skipping any directory whose name is in
-/// `skip` (e.g. `target` build artifacts). Real directories are recursed; a
-/// symlink to a file is followed and copied as content, but a symlink to a
-/// directory is NOT recursed into -- following it could form a cycle (infinite
-/// recursion) or escape the source tree (e.g. a dotfiles dir that symlinks to
-/// `$HOME`). Existing files are overwritten (`fs::copy` semantics).
-pub fn copy_dir_excluding(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
+/// `skip` (e.g. `target` build artifacts). A symlink to a file is always followed
+/// and copied as content. A symlink to a DIRECTORY is skipped by default (a
+/// cycle/escape hazard, e.g. a dotfiles dir that symlinks to `$HOME`); pass
+/// `follow_symlinked_dirs = true` to instead recurse into its canonical target
+/// (with a visited-set cycle guard) -- used when copying a vendored local
+/// dependency, whose subpackages may legitimately be symlinks. Existing files are
+/// overwritten (`fs::copy` semantics).
+pub fn copy_dir_excluding(
+    src: &Path,
+    dst: &Path,
+    skip: &[&str],
+    follow_symlinked_dirs: bool,
+) -> Result<()> {
+    let mut visited = std::collections::HashSet::new();
+    copy_dir_inner(src, dst, skip, follow_symlinked_dirs, &mut visited)
+}
+
+fn copy_dir_inner(
+    src: &Path,
+    dst: &Path,
+    skip: &[&str],
+    follow_symlinked_dirs: bool,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> Result<()> {
     std::fs::create_dir_all(dst)
         .map_err(|e| ManagerError::EnvError(format!("cannot create {}: {e}", dst.display())))?;
     let entries = std::fs::read_dir(src)
@@ -624,17 +642,27 @@ pub fn copy_dir_excluding(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
             .map(|t| t.is_symlink())
             .unwrap_or(false);
         if is_symlink {
-            // Skip a symlinked directory (cycle/escape hazard); copy a symlinked
-            // file as its target content (fs::copy follows the link).
             if from.is_dir() {
-                continue;
+                if !follow_symlinked_dirs {
+                    continue;
+                }
+                // Recurse into the canonical target, skipping a target already
+                // seen on this copy (breaks symlink cycles).
+                let canon = std::fs::canonicalize(&from).map_err(|e| {
+                    ManagerError::EnvError(format!("cannot resolve symlink {}: {e}", from.display()))
+                })?;
+                if visited.insert(canon.clone()) {
+                    copy_dir_inner(&canon, &to, skip, follow_symlinked_dirs, visited)?;
+                }
+            } else {
+                // A symlink to a file: copy its target content (fs::copy follows).
+                copy_file(&from, &to)?;
             }
-            copy_file(&from, &to)?;
         } else if from.is_dir() {
             if skip.iter().any(|s| name.to_str() == Some(s)) {
                 continue;
             }
-            copy_dir_excluding(&from, &to, skip)?;
+            copy_dir_inner(&from, &to, skip, follow_symlinked_dirs, visited)?;
         } else {
             copy_file(&from, &to)?;
         }
@@ -676,7 +704,7 @@ pub fn stage_runtime(src: &Path, dest: &Path) -> Result<()> {
             rust.display()
         )));
     }
-    copy_dir_excluding(&rust, &runtime_rust_src(dest), &["target"])?;
+    copy_dir_excluding(&rust, &runtime_rust_src(dest), &["target"], false)?;
     Ok(())
 }
 
@@ -731,7 +759,7 @@ mod tests {
         // A release whose envspec_version exceeds what this mim supports is refused
         // at manifest-parse (install) time with an actionable message.
         let j = r#"{"schema":1,"version":"9.9.9","rust_src":"x",
-          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":2,"lang_support_schema":"1.0"},
+          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":3,"lang_support_schema":"1.0"},
           "triples":{},"sha256":{}}"#;
         assert!(ReleaseManifest::from_json(j).is_err());
         // A newer lang-support MAJOR is likewise refused.

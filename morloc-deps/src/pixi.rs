@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::envspec::{DepSource, EnvSpec};
+use crate::envspec::{EnvSpec, PackageReq};
 use crate::error::{DepsError, Result};
 use crate::langsupport::LangSupport;
 
@@ -118,10 +118,48 @@ fn merge_constraint(existing: &str, incoming: &str) -> String {
     }
 }
 
-fn insert_merged(map: &mut BTreeMap<String, String>, name: &str, constraint: &str) {
-    map.entry(name.to_string())
-        .and_modify(|c| *c = merge_constraint(c, constraint))
-        .or_insert_with(|| constraint.to_string());
+/// A pypi (`[pypi-dependencies]`) requirement: a version match-spec, or a local
+/// filesystem-path dependency (uv editable/plain install). The path is resolved
+/// to an absolute location before it reaches here (native real path, or the fixed
+/// container anchor), since pixi resolves a relative path against pixi.toml's dir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PypiReq {
+    Version(String),
+    Local { path: String, editable: bool },
+}
+
+/// Insert or merge a pypi requirement. Two version specs intersect
+/// (`merge_constraint`); two identical local paths coalesce (editable if either
+/// is); any other pairing (version vs local, or two different local paths for one
+/// name) is a hard conflict.
+fn insert_pypi(map: &mut BTreeMap<String, PypiReq>, name: &str, req: PypiReq) -> Result<()> {
+    use std::collections::btree_map::Entry;
+    match map.entry(name.to_string()) {
+        Entry::Vacant(v) => {
+            v.insert(req);
+        }
+        Entry::Occupied(mut o) => {
+            let merged = match (o.get(), &req) {
+                (PypiReq::Version(a), PypiReq::Version(b)) => PypiReq::Version(merge_constraint(a, b)),
+                (PypiReq::Local { path: a, editable: ea }, PypiReq::Local { path: b, editable: eb })
+                    if a == b =>
+                {
+                    PypiReq::Local { path: a.clone(), editable: *ea || *eb }
+                }
+                _ => {
+                    return Err(DepsError::Env(format!(
+                        "conflicting pypi requirements for '{name}': a package cannot be both a \
+                         version dependency and a local path, and two programs in one environment \
+                         cannot vendor DIFFERENT local sources under the same distribution name \
+                         '{name}'. Rename one distribution, or install them into separate \
+                         environments."
+                    )))
+                }
+            };
+            *o.get_mut() = merged;
+        }
+    }
+    Ok(())
 }
 
 /// Insert or merge a conda dependency (constraint + channel). Constraints
@@ -155,9 +193,9 @@ fn insert_merged_conda(
 fn aggregate(
     specs: &[EnvSpec],
     support: &LangSupport,
-) -> Result<(BTreeMap<String, (String, Option<String>)>, BTreeMap<String, String>)> {
+) -> Result<(BTreeMap<String, (String, Option<String>)>, BTreeMap<String, PypiReq>)> {
     let mut conda: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
-    let mut pypi: BTreeMap<String, String> = BTreeMap::new();
+    let mut pypi: BTreeMap<String, PypiReq> = BTreeMap::new();
 
     // Core toolchain: always required (libmorloc + any shim). Non-optional only.
     for p in &support.toolchain {
@@ -216,30 +254,50 @@ fn aggregate(
     for spec in specs {
         for (lang, reqs) in &spec.packages {
             for r in reqs {
-                match r.source {
+                match r {
                     // R conda feedstocks are named r-<lowercase> ONLY on
                     // conda-forge; on another channel the author's exact name is
                     // used. Other conda packages use the name as written.
-                    DepSource::Conda => {
-                        let channel = r.channel.as_deref();
-                        let name = conda_name(channel, lang.as_str(), &r.name);
-                        insert_merged_conda(&mut conda, &name, &r.constraint, channel)?;
+                    PackageReq::Conda { name, constraint, channel } => {
+                        let channel = channel.as_deref();
+                        let cname = conda_name(channel, lang.as_str(), name);
+                        insert_merged_conda(&mut conda, &cname, constraint, channel)?;
                     }
-                    DepSource::Pypi => insert_merged(&mut pypi, &r.name, &r.constraint),
+                    PackageReq::Pypi { name, constraint } => {
+                        insert_pypi(&mut pypi, name, PypiReq::Version(constraint.clone()))?
+                    }
                     // cargo and Pkg.jl own these; resolved in-world at pool build.
-                    DepSource::Crates | DepSource::Pkg => {}
+                    PackageReq::Crates { .. } | PackageReq::Pkg { .. } => {}
                     // R CRAN/Bioconductor sources are not yet provisioned. Fail
                     // closed with an actionable message: an envspec carrying a
                     // source this build cannot lower (e.g. one written by a newer
                     // morloc) must not panic or silently drop the dependency.
-                    DepSource::Cran | DepSource::Bioconductor => {
+                    PackageReq::Cran { name, .. } | PackageReq::Bioconductor { name, .. } => {
                         return Err(DepsError::Env(format!(
-                            "dependency '{}' uses package source {:?}, which this mim does \
-                             not provision (R CRAN/Bioconductor are not yet supported). \
-                             Draw it from conda-forge (source: conda) or upgrade mim.",
-                            r.name, r.source
+                            "dependency '{name}' uses an R CRAN/Bioconductor source, which \
+                             this mim does not provision (not yet supported). Draw it from \
+                             conda-forge (source: conda) or upgrade mim."
                         )))
                     }
+                    // Local (filesystem-path) deps. Python lowers to a pixi
+                    // editable/plain path entry; Rust and Julia local crates are
+                    // owned by cargo / Pkg.jl at pool build (like Crates/Pkg), so
+                    // they are dropped here. The path is already absolute (resolved
+                    // by the caller against the project root / container anchor).
+                    PackageReq::Local { name, path, editable } => match lang.as_str() {
+                        "py" => insert_pypi(
+                            &mut pypi,
+                            name,
+                            PypiReq::Local { path: path.clone(), editable: *editable },
+                        )?,
+                        "rust" | "julia" => {}
+                        other => {
+                            return Err(DepsError::Env(format!(
+                                "local dependency '{name}' for language '{other}' cannot be \
+                                 provisioned (local deps are supported for py and rust)."
+                            )))
+                        }
+                    },
                 }
             }
         }
@@ -259,7 +317,19 @@ fn aggregate(
 
 /// A TOML key, quoted (package names may contain `.`, which is illegal bare).
 fn key(name: &str) -> String {
-    format!("\"{name}\"")
+    format!("\"{}\"", toml_escape(name))
+}
+
+/// Escape a string for a double-quoted TOML basic string: backslash and double
+/// quote, so a value (a local path, a constraint) containing them cannot break the
+/// generated `pixi.toml`. Paths are the realistic case (esp. `\` on non-POSIX).
+/// Borrows unchanged for the common case (no `\`/`"`), allocating only when needed.
+fn toml_escape(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains(['\\', '"']) {
+        std::borrow::Cow::Owned(s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
 }
 
 /// The backend-neutral, structured requirement set for an environment: the union
@@ -278,8 +348,9 @@ pub struct RequirementSet {
     /// sorted. A `Some` channel is a non-conda-forge subordinate channel and
     /// lowers to a pixi inline table; `None` is conda-forge (flat form).
     pub conda: BTreeMap<String, (String, Option<String>)>,
-    /// pypi `[pypi-dependencies]`: package -> version (sorted).
-    pub pypi: BTreeMap<String, String>,
+    /// pypi `[pypi-dependencies]`: package -> requirement (version or local path),
+    /// sorted.
+    pub pypi: BTreeMap<String, PypiReq>,
 }
 
 /// The default conda channel list for morloc environments (one policy home for
@@ -337,17 +408,29 @@ pub fn render_manifest(req: &RequirementSet) -> String {
             Some(ch) => out.push_str(&format!(
                 "{} = {{ version = \"{}\", channel = \"{}\" }}\n",
                 key(name),
-                constraint,
-                ch
+                toml_escape(constraint),
+                toml_escape(ch)
             )),
-            None => out.push_str(&format!("{} = \"{}\"\n", key(name), constraint)),
+            None => out.push_str(&format!("{} = \"{}\"\n", key(name), toml_escape(constraint))),
         }
     }
 
     if !req.pypi.is_empty() {
         out.push_str("\n[pypi-dependencies]\n");
-        for (name, constraint) in &req.pypi {
-            out.push_str(&format!("{} = \"{}\"\n", key(name), constraint));
+        for (name, req) in &req.pypi {
+            match req {
+                PypiReq::Version(constraint) => {
+                    out.push_str(&format!("{} = \"{}\"\n", key(name), toml_escape(constraint)))
+                }
+                // A local dep lowers to a uv path source; `editable` keeps the
+                // source live in interactive contexts (serve/freeze pass false).
+                PypiReq::Local { path, editable } => out.push_str(&format!(
+                    "{} = {{ path = \"{}\", editable = {} }}\n",
+                    key(name),
+                    toml_escape(path),
+                    editable
+                )),
+            }
         }
     }
 
@@ -725,7 +808,7 @@ mod tests {
     use super::*;
 
     fn sample_spec() -> EnvSpec {
-        const SAMPLE: &str = r#"{"envspec_version":1,"morloc_version":"0.98.2","languages":[{"lang":"py","constraint":">=3.10"},{"lang":"cpp","std":"c++20"},{"lang":"rust"}],"packages":{"cpp":[{"name":"opencv","constraint":">=4.8","source":"conda"}],"py":[{"name":"numpy","constraint":">=2,<3","source":"conda"},{"name":"requests","constraint":"*","source":"pypi"}],"rust":[{"name":"ndarray","constraint":"0.16","source":"crates"}]},"system":[{"name":"blas","provider":"unspecified"}],"modules":[]}"#;
+        const SAMPLE: &str = r#"{"envspec_version":2,"morloc_version":"0.98.2","languages":[{"lang":"py","constraint":">=3.10"},{"lang":"cpp","std":"c++20"},{"lang":"rust"}],"packages":{"cpp":[{"name":"opencv","constraint":">=4.8","source":"conda"}],"py":[{"name":"numpy","constraint":">=2,<3","source":"conda"},{"name":"requests","constraint":"*","source":"pypi"}],"rust":[{"name":"ndarray","constraint":"0.16","source":"crates"}]},"system":[{"name":"blas","provider":"unspecified"}],"modules":[]}"#;
         EnvSpec::from_json(SAMPLE).unwrap()
     }
 
@@ -800,8 +883,37 @@ platforms = [\"linux-64\"]
     }
 
     #[test]
+    fn toml_escape_handles_quotes_and_backslashes() {
+        assert_eq!(&*toml_escape(r#"/a/b"c\d"#), r#"/a/b\"c\\d"#);
+        assert!(matches!(toml_escape("plain/path"), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn render_escapes_local_path_backslash() {
+        // A local path containing a backslash must be escaped so pixi.toml parses.
+        const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"mylib","source":"local","path":"/a/b\\d","editable":false}]}}"#;
+        let out = render_with(EnvSpec::from_json(S).unwrap());
+        assert!(out.contains(r#""mylib" = { path = "/a/b\\d", editable = false }"#), "{out}");
+    }
+
+    #[test]
+    fn py_local_dep_lowers_to_editable_pypi_path() {
+        // A python local dep becomes a uv path entry; a rust local crate is owned
+        // by cargo at pool build, so it must NOT appear in the pixi manifest. Paths
+        // are already absolute here (mim-env resolves them before this stage).
+        const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"},{"lang":"rust"}],"packages":{"py":[{"name":"mylib","source":"local","path":"/abs/mylib","editable":true}],"rust":[{"name":"mycrate","source":"local","path":"/abs/mycrate","editable":false}]}}"#;
+        let out = render_with(EnvSpec::from_json(S).unwrap());
+        assert!(
+            out.contains("\"mylib\" = { path = \"/abs/mylib\", editable = true }"),
+            "expected editable pypi path entry, got:\n{out}"
+        );
+        // The rust local crate is not a pixi dependency.
+        assert!(!out.contains("mycrate"), "rust local crate must not reach pixi:\n{out}");
+    }
+
+    #[test]
     fn r_packages_get_conda_prefix() {
-        const R: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"r"}],"packages":{"r":[{"name":"data.table","constraint":"*","source":"conda"}]}}"#;
+        const R: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"r"}],"packages":{"r":[{"name":"data.table","constraint":"*","source":"conda"}]}}"#;
         let spec = EnvSpec::from_json(R).unwrap();
         let support = sample_support();
         let (conda, _) = aggregate(std::slice::from_ref(&spec), &support).unwrap();
@@ -826,7 +938,7 @@ platforms = [\"linux-64\"]
     fn bioconda_channel_renders_inline_table_and_workspace_union() {
         // A conda dep on bioconda lowers to a pixi inline table AND adds bioconda
         // to the workspace channels (conda-forge stays first).
-        const S: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"samtools","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
+        const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"samtools","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
         let manifest = render_with(EnvSpec::from_json(S).unwrap());
         assert!(manifest.contains("channels = [\"conda-forge\", \"bioconda\"]"), "{manifest}");
         assert!(
@@ -839,7 +951,7 @@ platforms = [\"linux-64\"]
     fn conda_forge_dep_stays_flat_and_channel_list_unchanged() {
         // A conda-forge dep (no channel on the wire) keeps the flat form and does
         // not perturb the workspace channel list -- byte-identical to pre-channel.
-        const S: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"numpy","constraint":">=2","source":"conda"}]}}"#;
+        const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"numpy","constraint":">=2","source":"conda"}]}}"#;
         let manifest = render_with(EnvSpec::from_json(S).unwrap());
         assert!(manifest.contains("channels = [\"conda-forge\"]"), "{manifest}");
         // flat form (`= "`), not an inline table (`= {`), and no channel key.
@@ -851,7 +963,7 @@ platforms = [\"linux-64\"]
     fn r_bioconda_name_passes_literally() {
         // An R dep on a non-conda-forge channel is NOT r-prefixed; the author's
         // exact conda name is used and the channel rides through.
-        const S: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"r"}],"packages":{"r":[{"name":"bioconductor-deseq2","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
+        const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"r"}],"packages":{"r":[{"name":"bioconductor-deseq2","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
         let manifest = render_with(EnvSpec::from_json(S).unwrap());
         assert!(
             manifest.contains("\"bioconductor-deseq2\" = { version = \"*\", channel = \"bioconda\" }"),
@@ -864,8 +976,8 @@ platforms = [\"linux-64\"]
     fn conflicting_channels_across_specs_error() {
         // Two programs drawing the same conda package from different channels is a
         // hard conflict (a channel is a provenance choice, not intersectable).
-        const A: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
-        const B: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":"*","source":"conda","channel":"custom"}]}}"#;
+        const A: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
+        const B: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":"*","source":"conda","channel":"custom"}]}}"#;
         let specs = vec![EnvSpec::from_json(A).unwrap(), EnvSpec::from_json(B).unwrap()];
         let r = aggregate(&specs, &sample_support());
         assert!(r.is_err());
@@ -875,8 +987,8 @@ platforms = [\"linux-64\"]
     fn explicit_channel_beats_omitted_default() {
         // The same package with an explicit channel in one spec and no channel in
         // another coalesces to the explicit channel (no conflict).
-        const A: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
-        const B: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":">=1","source":"conda"}]}}"#;
+        const A: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":"*","source":"conda","channel":"bioconda"}]}}"#;
+        const B: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"pkg","constraint":">=1","source":"conda"}]}}"#;
         let specs = vec![EnvSpec::from_json(A).unwrap(), EnvSpec::from_json(B).unwrap()];
         let (conda, _) = aggregate(&specs, &sample_support()).unwrap();
         // constraint `*` yields to the real `>=1`; the explicit bioconda channel
@@ -889,7 +1001,7 @@ platforms = [\"linux-64\"]
         // A python program with a permissive author floor gets morloc's supported
         // range added (clamp) plus the non-optional binder deps; optional deps
         // (pyarrow) are omitted; the core toolchain is always present.
-        const PY: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"py","constraint":">=3.11"}]}"#;
+        const PY: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py","constraint":">=3.11"}]}"#;
         let spec = EnvSpec::from_json(PY).unwrap();
         let (conda, _) = aggregate(std::slice::from_ref(&spec), &sample_support()).unwrap();
         // clamp: author >=3.11 intersected with morloc's >=3.10,<3.14
@@ -909,7 +1021,7 @@ platforms = [\"linux-64\"]
         // A program requiring a language the support table does not describe (and
         // with no built-in toolchain fallback) fails closed, rather than silently
         // omitting its toolchain and under-provisioning the environment.
-        const S: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"cobol"}]}"#;
+        const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"cobol"}]}"#;
         let spec = EnvSpec::from_json(S).unwrap();
         let r = aggregate(std::slice::from_ref(&spec), &sample_support());
         assert!(r.is_err());
@@ -919,7 +1031,7 @@ platforms = [\"linux-64\"]
     fn unprovisionable_source_fails_closed() {
         // A package source this build cannot lower (cran/bioconductor) returns an
         // actionable error, never a panic.
-        const S: &str = r#"{"envspec_version":1,"morloc_version":"0","languages":[{"lang":"r"}],"packages":{"r":[{"name":"DESeq2","constraint":"*","source":"bioconductor"}]}}"#;
+        const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"r"}],"packages":{"r":[{"name":"DESeq2","constraint":"*","source":"bioconductor"}]}}"#;
         let spec = EnvSpec::from_json(S).unwrap();
         let r = aggregate(std::slice::from_ref(&spec), &sample_support());
         assert!(r.is_err());

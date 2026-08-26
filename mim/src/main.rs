@@ -8,6 +8,7 @@ mod environment;
 mod error;
 mod freeze;
 mod hostprobe;
+mod localdeps;
 mod provision;
 mod runner;
 mod selinux;
@@ -609,12 +610,40 @@ Examples:
         #[command(subcommand)]
         action: ExposeAction,
     },
+    /// Report environment paths for build tooling (no building is done)
+    #[command(display_order = 9)]
+    #[command(after_help = "\
+Examples:
+  morloc-manager env prefix
+  make install --prefix=$(morloc-manager env prefix)
+  R CMD INSTALL --library=$(morloc-manager env prefix --lang r) mypkg")]
+    Env {
+        #[command(subcommand)]
+        action: EnvAction,
+    },
     /// List running serve containers
     #[command(display_order = 27)]
     #[command(after_help = "\
 Examples:
   morloc-manager status")]
     Status,
+}
+
+#[derive(Subcommand)]
+enum EnvAction {
+    /// Print the install prefix where this environment expects native
+    /// dependencies. `mim` does no building; this only reports the location the
+    /// pools search. Default (no --lang) is the C++/general prefix, which holds
+    /// include/ and lib/ subdirs.
+    Prefix {
+        /// Environment name (default: the default environment)
+        #[arg(long)]
+        env: Option<String>,
+        /// Language-specific target: cpp (default; the prefix root), r
+        /// (modules/R, for R CMD INSTALL --library), py (modules/python)
+        #[arg(long)]
+        lang: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2614,6 +2643,15 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 verbose,
             )?;
 
+            // Python local (filesystem-path) deps are provisioned AFTER the build:
+            // they are runtime-only (the pool build does not import them) and their
+            // per-program copy key is not known until the program builds. Hold them
+            // back from the pre-build solve; registry deps that the build needs to
+            // compile stay.
+            let has_py_locals = localdeps::has_py_locals(&dry);
+            let mut dry = dry;
+            localdeps::strip_py_locals(&mut dry);
+
             // 2. Re-materialize so the module closure's package.yaml deps are in
             //    pixi before the build. The dry spec is ephemeral -- once the
             //    program builds, `morloc make --install` writes its real
@@ -2621,6 +2659,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    Keep the env's current morloc version -- installing a module must
             //    never bump the toolchain out from under it.
             rematerialize_env(scope, &env_name, &[dry], current_version_tag(&ec), verbose)?;
+
+            // Timestamp just before the build so the program(s) built this run can
+            // be identified by their freshly-(re)written manifest mtime -- robust to
+            // re-install, where the build overwrites an existing build dir (a new-file
+            // set-diff would miss it).
+            let env_dir = cfg::env_data_dir(scope, &env_name);
+            let build_start = std::time::SystemTime::now();
 
             // 3. Build + install into the now-complete environment. Step 2 may
             //    have rebuilt the image, so re-read the config.
@@ -2632,16 +2677,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let args = if is_dir {
                 vec![
                     "morloc".to_string(), "install".to_string(),
-                    "--build".to_string(), src,
+                    "--build".to_string(), src.clone(),
                 ]
             } else {
                 vec![
                     "morloc".to_string(), "make".to_string(),
-                    "--install".to_string(), src,
+                    "--install".to_string(), src.clone(),
                 ]
             };
             runner::run_in_env(
-                Some((env_name, scope, ec)),
+                Some((env_name.clone(), scope, ec)),
                 runner::RunRequest {
                     verbose,
                     shell: false,
@@ -2651,7 +2696,53 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     phase: Phase::Run,
                     slurm_bridge: false,
                 },
-            )
+            )?;
+
+            // 4. Provision Python local deps now that the program is built. For each
+            //    program built this run that declares py locals: resolve its spec
+            //    (copy the source into the state volume + rewrite to the state path,
+            //    plain install), write that RESOLVED spec to the store as Installed,
+            //    and supersede any prior scratch build -- all BEFORE the re-solve, so
+            //    `gather_env_specs` (which prefers the store) feeds the solve the
+            //    correct path. Rust locals need no copy (compiled into the pool binary
+            //    during step 3).
+            if has_py_locals {
+                // `ec` was moved into the build above; re-read it (cheap, and the
+                // build may have rebuilt the image) for the backend + version.
+                let ec = cfg::read_env_config(scope, &env_name)?;
+                let module_root = install_module_root(&src, is_dir)?;
+                // The location the copied sources are referenced by: the real host
+                // env dir (native) or the in-container state mount (container).
+                let state_root = if ec.backend.is_native() {
+                    env_dir.to_string_lossy().into_owned()
+                } else {
+                    serve::CONTAINER_MORLOC_STATE.to_string()
+                };
+                let store = envstore::EnvContext::new(&env_dir);
+                for (key, envspec_path) in programs_built_since(&env_dir, build_start) {
+                    let mut spec = match std::fs::read_to_string(&envspec_path)
+                        .ok()
+                        .and_then(|j| envspec::EnvSpec::from_json(&j).ok())
+                    {
+                        Some(s) if localdeps::has_py_locals(&s) => s,
+                        _ => continue,
+                    };
+                    let jobs = spec.resolve_local_deps(&envspec::LocalAnchor::Relocated {
+                        root: &module_root,
+                        copy_root: &env_dir,
+                        state_root: &state_root,
+                        key: &key,
+                    })?;
+                    localdeps::perform_copy_jobs(&jobs)?;
+                    // Store the resolved spec so the re-solve reads the state path,
+                    // and supersede any prior scratch build (its stale /work editable
+                    // path must not linger in the solve).
+                    store.write_spec(&key, envstore::Provenance::Installed, &spec.to_json()?)?;
+                    let _ = store.remove_spec(&key, envstore::Provenance::Scratch);
+                }
+                rematerialize_env(scope, &env_name, &[], current_version_tag(&ec), verbose)?;
+            }
+            Ok(())
         }
 
         // ---- expose ----
@@ -2715,6 +2806,27 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         },
 
         // ---- status ----
+        Cmd::Env { action } => match action {
+            EnvAction::Prefix { env, lang } => {
+                let (env_name, scope, _ec) = resolve_env_or_default(env)?;
+                // The install prefix is host-relative: <env data dir>/modules.
+                // Natively this is where the pools search directly; in a
+                // container it is the host side of the mounted state volume.
+                let modules = cfg::env_data_dir(scope, &env_name).join("modules");
+                let path = match lang.as_deref() {
+                    None | Some("cpp") | Some("c++") => modules,
+                    Some("r") | Some("R") => modules.join("R"),
+                    Some("py") | Some("python") => modules.join("python"),
+                    Some(other) => {
+                        return Err(ManagerError::EnvError(format!(
+                            "unknown --lang '{other}' (expected cpp, r, or py)"
+                        )));
+                    }
+                };
+                println!("{}", path.display());
+                Ok(())
+            }
+        },
         Cmd::Status => {
             let mut all_containers: Vec<serve::ServeContainerInfo> = Vec::new();
             for engine in [
@@ -3514,15 +3626,52 @@ fn build_dir_key(envspec_path: &std::path::Path) -> Option<String> {
         .map(|b| b.strip_suffix("-build").unwrap_or(b).to_string())
 }
 
+/// The (program key, its `envspec.json` path) of each installed program whose
+/// build `manifest.json` was written at or after `since` -- i.e. built by the
+/// install that just ran. `manifest.json` is rewritten on every build, so a
+/// RE-install (which overwrites an existing build dir) is detected too, unlike a
+/// new-file set-diff. Also naturally handles a package that builds several
+/// programs.
+fn programs_built_since(
+    env_dir: &std::path::Path,
+    since: std::time::SystemTime,
+) -> Vec<(String, std::path::PathBuf)> {
+    let mut out = Vec::new();
+    for envspec_path in find_envspec_files(env_dir) {
+        let Some(key) = build_dir_key(&envspec_path) else { continue };
+        let manifest = envspec_path.with_file_name("manifest.json");
+        let built = std::fs::metadata(&manifest)
+            .and_then(|m| m.modified())
+            .map(|t| t >= since)
+            .unwrap_or(false);
+        if built {
+            out.push((key, envspec_path));
+        }
+    }
+    out
+}
+
 /// Mirror each installed program's build-dir `envspec.json` into the env's
 /// requirements store under `installed/<key>.json`. The in-env `morloc-env`
 /// agent reads only the store, so this keeps its view of the installed baseline
 /// complete -- otherwise a scratch sync would solve a world missing the
 /// installed programs' deps and uninstall them. Best-effort.
+///
+/// A program ALREADY in the store is skipped: its store entry is authoritative
+/// (an install with local deps writes a resolved, state-path spec there BEFORE the
+/// re-solve). Re-mirroring the build-dir spec would downgrade that resolved spec
+/// back to raw module-relative local paths -- the very corruption to avoid. So
+/// this only mirrors programs the store does not yet describe (which never carry
+/// unresolved local deps: the install path resolves+stores them first).
 fn seed_installed_store(env_dir: &std::path::Path) {
     let ctx = envstore::EnvContext::new(env_dir);
+    let stored: std::collections::HashSet<String> =
+        ctx.program_names().unwrap_or_default().into_iter().collect();
     for path in find_envspec_files(env_dir) {
         if let (Some(key), Ok(json)) = (build_dir_key(&path), std::fs::read_to_string(&path)) {
+            if stored.contains(&key) {
+                continue;
+            }
             let _ = ctx.write_spec(&key, envstore::Provenance::Installed, &json);
         }
     }
@@ -4423,6 +4572,41 @@ const CONTAINER_BUILD_SUBDIR: &str = "container-build";
 /// native, in a fresh container of the env image for the container backend) and
 /// capturing its stdout. Running this BEFORE materialize is what lets a module's
 /// package.yaml deps reach pixi ahead of the build.
+/// The host directory an installed program's local-dep paths are resolved against:
+/// the source dir (dir target) or the entry file's parent (file target),
+/// canonicalized. Local deps must live under the current directory -- capture
+/// mounts cwd -> /work, so a source outside cwd is not reachable in the build
+/// container -- so an out-of-cwd source is rejected with an actionable error.
+fn install_module_root(src: &str, is_dir: bool) -> Result<std::path::PathBuf> {
+    let base = if is_dir {
+        std::path::PathBuf::from(src)
+    } else {
+        match std::path::Path::new(src).parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        }
+    };
+    let abs = std::fs::canonicalize(&base).map_err(|e| {
+        ManagerError::EnvError(format!("cannot resolve the project directory for '{src}': {e}"))
+    })?;
+    // Canonicalize cwd too: `abs` has symlinks resolved, so comparing against a
+    // raw current_dir() (which may contain a symlinked component, e.g. /tmp ->
+    // /private/tmp) would spuriously reject a legitimately in-cwd project.
+    let cwd = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(|e| ManagerError::EnvError(format!("cannot resolve current directory: {e}")))?;
+    if !abs.starts_with(&cwd) {
+        return Err(ManagerError::EnvError(format!(
+            "the project directory {} is not under the current directory {} -- run \
+             'morloc-manager install' from a directory containing the project so its \
+             local (filesystem-path) dependencies are reachable in the build container.",
+            abs.display(),
+            cwd.display()
+        )));
+    }
+    Ok(abs)
+}
+
 fn capture_envspec(
     target: (String, Scope, EnvironmentConfig),
     envspec_target: &str,
@@ -5225,7 +5409,7 @@ fn apply_dotfiles(
         )));
     }
     let home = cfg::ensure_env_home(data_dir);
-    provision::copy_dir_excluding(src, &home, &[])?;
+    provision::copy_dir_excluding(src, &home, &[], false)?;
     eprintln!("Copied dotfiles from {} into {}", src.display(), home.display());
     Ok(())
 }
@@ -6572,6 +6756,32 @@ mod tests {
     use super::*;
     use crate::container::{build_build_args, build_run_args, engine_executable, engine_specific_run_flags, BuildConfig};
     use clap::Parser;
+
+    #[test]
+    fn programs_built_since_selects_by_manifest_mtime() {
+        let env = tempfile::tempdir().unwrap();
+        // "alpha": a fully-built program (envspec.json + manifest.json).
+        let a = env.path().join("exe/alpha/alpha-build");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("envspec.json"), "{}").unwrap();
+        std::fs::write(a.join("manifest.json"), "{}").unwrap();
+        // "beta": an envspec.json but no manifest.json -> not a built program.
+        let b = env.path().join("exe/beta/beta-build");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(b.join("envspec.json"), "{}").unwrap();
+
+        // Since epoch: alpha (has a manifest) qualifies; beta (no manifest) does not.
+        let keys: Vec<String> = programs_built_since(env.path(), std::time::UNIX_EPOCH)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(keys.contains(&"alpha".to_string()));
+        assert!(!keys.contains(&"beta".to_string()));
+
+        // Since a future instant: nothing was built that recently.
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        assert!(programs_built_since(env.path(), future).is_empty());
+    }
 
     // ---- CLI shape: --env selector, --env-var rename, shell, no select ----
 

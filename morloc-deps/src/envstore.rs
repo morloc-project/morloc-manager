@@ -403,7 +403,7 @@ mod tests {
     // file name, not the spec body.
     fn spec(langs: &str) -> String {
         format!(
-            r#"{{"envspec_version":1,"morloc_version":"0.0.0","languages":[{langs}]}}"#
+            r#"{{"envspec_version":2,"morloc_version":"0.0.0","languages":[{langs}]}}"#
         )
     }
 

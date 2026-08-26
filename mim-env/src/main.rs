@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use clap::{Parser, Subcommand};
+use morloc_deps::envspec::{EnvSpec, LocalAnchor};
 use morloc_deps::envstore::{EnvContext, Provenance, SolveInputs};
 use morloc_deps::error::DepsError;
 use morloc_deps::langsupport::LangSupport;
@@ -51,6 +52,10 @@ enum Cmd {
         /// Path to the program's `envspec.json`
         #[arg(long)]
         spec: PathBuf,
+        /// Project root (the entry module's directory) against which local
+        /// (filesystem-path) dependency paths are resolved.
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Record as an installed program, not a transient local build
         #[arg(long)]
         installed: bool,
@@ -82,15 +87,31 @@ fn run(cli: Cli) -> Result<(), DepsError> {
     };
 
     match cli.cmd {
-        Cmd::Sync { name, spec, installed } => {
+        Cmd::Sync { name, spec, root, installed } => {
             let json = std::fs::read_to_string(&spec)
                 .map_err(|e| DepsError::Env(format!("cannot read {}: {e}", spec.display())))?;
+            // Resolve local (filesystem-path) deps to absolute paths against the
+            // project root before storing, so the stored world spec is location-
+            // independent and pixi resolves them correctly. A spec with no local
+            // deps is unchanged.
+            let mut es = EnvSpec::from_json(&json)?;
+            // Scratch/dev-loop provenance: resolve local deps to their live path
+            // (canonical real path under the project root), keeping editable. No
+            // copy jobs are produced for the Live anchor. A spec with no local deps
+            // is passed through unchanged (skip the resolve + re-serialize).
+            let resolved = if es.has_local_deps() {
+                let root = root.unwrap_or_else(|| PathBuf::from("."));
+                es.resolve_local_deps(&LocalAnchor::Live { root: &root })?;
+                es.to_json()?
+            } else {
+                json
+            };
             let provenance = if installed {
                 Provenance::Installed
             } else {
                 Provenance::Scratch
             };
-            ctx.sync(&name, provenance, &json, &inputs)?;
+            ctx.sync(&name, provenance, &resolved, &inputs)?;
             eprintln!("Environment dependencies synced for '{name}'.");
         }
         Cmd::Clean => {

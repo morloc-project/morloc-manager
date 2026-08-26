@@ -7,8 +7,9 @@
 
 /// `envspec.json` `envspec_version` (integer): the single schema version this
 /// build produces (via `EnvSpec::from_languages`) and accepts (via
-/// `EnvSpec::from_json`).
-pub const ENVSPEC_VERSION: u32 = 1;
+/// `EnvSpec::from_json`). v2 adds the `local` package source (local
+/// filesystem-path dependencies) and makes `source` a discriminated tag.
+pub const ENVSPEC_VERSION: u32 = 2;
 
 /// `morloc lang-support` `schema_version` major/minor (semver "MAJOR.MINOR").
 /// A new language or field is a MINOR bump (older consumers ignore what they do
