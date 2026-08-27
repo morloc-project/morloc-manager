@@ -3543,13 +3543,17 @@ fn resolve_env_requirements(
         // directly, and libmorloc is built from the local source, so it is coherent
         // by construction).
         let morloc_bin = provision::runtime_morloc_bin(local);
-        let version = local_runtime_version(&morloc_bin)?;
         // Emit the lang-support table FRESH from the (possibly just-rebuilt) local
         // binary. Deliberately NOT via load_lang_support: that reads/writes a cached
         // table in the runtime dir, which for a borrowed local dir would both go
         // stale across rebuilds and write into a directory we do not own.
+        // emit_lang_support runs the binary on the host, or -- for a container env
+        // whose binary the host cannot exec (NixOS/musl) -- inside the engine's base
+        // image, so the version below must come from the table it produces rather
+        // than a separate host-only `--version` probe.
         let json = emit_lang_support(&morloc_bin, engine, base_image)?;
         let support = langsupport::LangSupport::from_json(&json)?;
+        let version = local_version_tag(&support.morloc_version, &morloc_bin)?;
         (local.to_path_buf(), version, morloc_bin, support)
     } else {
         // An explicit per-env version (from --morloc-version, or an env's recorded
@@ -4319,42 +4323,24 @@ fn resolve_local_runtime(raw: &str) -> std::result::Result<std::path::PathBuf, S
     Ok(abs)
 }
 
-/// Reduce `morloc --version` output to the local-runtime version tag: the
-/// reported major.minor.patch with a `-local` prerelease suffix (any existing
-/// prerelease on the binary is dropped, so the result is always `x.y.z-local`).
-/// `ctx` names the binary for error messages. Pure; the I/O wrapper is
-/// `local_runtime_version`.
-fn local_version_tag(version_output: &str, ctx: &std::path::Path) -> Result<String> {
-    let v = Version::from_command_output(version_output).ok_or_else(|| {
+/// Reduce a reported morloc version string to the local-runtime version tag: the
+/// major.minor.patch with a `-local` prerelease suffix (any existing prerelease is
+/// dropped, so the result is always `x.y.z-local`). The input is the version the
+/// local binary reports -- taken from the lang-support table (which is emitted on
+/// the host, or in a container when the host cannot exec the binary), never from a
+/// separate host-only `--version` probe, so container envs work on NixOS/musl.
+/// This records as a valid `Version` (`Some`, never `None`), is never mistaken for
+/// a release, and is never used as a download target. `ctx` names the binary for
+/// error messages.
+fn local_version_tag(reported_version: &str, ctx: &std::path::Path) -> Result<String> {
+    let v = Version::from_command_output(reported_version).ok_or_else(|| {
         ManagerError::EnvError(format!(
-            "could not parse a morloc version from `{} --version` output: {}",
+            "could not parse a morloc version reported by {}: {}",
             ctx.display(),
-            version_output.trim()
+            reported_version.trim()
         ))
     })?;
     Ok(format!("{}.{}.{}-local", v.major, v.minor, v.patch))
-}
-
-/// The recorded morloc version for a local-runtime env: the built binary's
-/// reported major.minor.patch with a `-local` prerelease tag. This records as a
-/// valid `Version` (`Some`, never `None`), is never mistaken for a release, and
-/// is never used as a download target. Running the binary here also smoke-tests
-/// that it executes on the host at all.
-fn local_runtime_version(morloc_bin: &std::path::Path) -> Result<String> {
-    let out = Command::new(morloc_bin)
-        .arg("--version")
-        .output()
-        .map_err(|e| {
-            ManagerError::EnvError(format!("could not run {} --version: {e}", morloc_bin.display()))
-        })?;
-    if !out.status.success() {
-        return Err(ManagerError::EnvError(format!(
-            "{} --version failed: {}",
-            morloc_bin.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    local_version_tag(&String::from_utf8_lossy(&out.stdout), morloc_bin)
 }
 
 /// Resolve, and record, the `mim-env` agent source for a dev env: an explicit
