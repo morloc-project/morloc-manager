@@ -9,7 +9,11 @@
 //! Specs are stored as the raw JSON the compiler emitted -- storing verbatim
 //! avoids a second (Rust) serializer for a schema the compiler already owns.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
+
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 
 use crate::envspec::EnvSpec;
 use crate::error::{DepsError, Result};
@@ -217,6 +221,46 @@ impl EnvContext {
             .unwrap_or_else(|| self.env_home.join("pixi"))
     }
 
+    /// The per-env solve lock. Kept at the `env_home` root (never under
+    /// `requirements/`, so `gather` cannot mistake it for a program). All
+    /// processes that mutate this env share its home -- in a container the agent's
+    /// `env_home` is the host env dir via bind mount, so the same inode (hence the
+    /// same `flock`) is seen across the host/container boundary.
+    fn solve_lock_path(&self) -> PathBuf {
+        self.env_home.join(".solve.lock")
+    }
+
+    /// Take the env's exclusive solve lock, blocking until it is free. `sync` and
+    /// `clean` both render `pixi.toml` and solve into the one shared prefix, so
+    /// concurrent `morloc make`s against a single env must serialize -- otherwise
+    /// one overwrites the manifest the other is mid-solve on. The returned
+    /// [`Flock`] releases on drop (end of the caller's scope), including on the
+    /// error/rollback path. A first non-blocking attempt lets us tell the user we
+    /// are waiting rather than pausing silently.
+    fn lock_solve(&self) -> Result<Flock<File>> {
+        let path = self.solve_lock_path();
+        // env_home normally exists (it is the state root), but be defensive.
+        std::fs::create_dir_all(&self.env_home)
+            .map_err(|e| DepsError::Env(format!("cannot create {}: {e}", self.env_home.display())))?;
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|e| DepsError::Env(format!("cannot open solve lock {}: {e}", path.display())))
+        };
+        let lock_err = |e: Errno| DepsError::Env(format!("cannot lock {}: {e}", path.display()));
+        match Flock::lock(open()?, FlockArg::LockExclusiveNonblock) {
+            Ok(guard) => Ok(guard),
+            Err((file, Errno::EAGAIN)) => {
+                eprintln!("Waiting for another dependency sync on this environment to finish...");
+                Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, e)| lock_err(e))
+            }
+            Err((_, e)) => Err(lock_err(e)),
+        }
+    }
+
     /// The environment's name, taken from its home directory's final component
     /// (env homes live at `.../envs/<name>`). Used only as the pixi workspace
     /// name, so a fallback is harmless.
@@ -280,6 +324,9 @@ impl EnvContext {
         spec_json: &str,
         inputs: &SolveInputs,
     ) -> Result<Vec<(String, String)>> {
+        // Serialize concurrent solves against this env's shared prefix; held
+        // through the write/gather/solve/rollback, released when `_lock` drops.
+        let _lock = self.lock_solve()?;
         self.write_spec(program, provenance, spec_json)?;
         let mut specs = self.gather()?;
         self.append_abi_lock(&mut specs)?;
@@ -314,6 +361,7 @@ impl EnvContext {
     /// Reset the declared world to the installed baseline: drop all scratch
     /// specs, then re-solve so the prefix reflects only installed programs.
     pub fn clean(&self, inputs: &SolveInputs) -> Result<Vec<(String, String)>> {
+        let _lock = self.lock_solve()?;
         self.clear_scratch()?;
         let mut specs = self.gather_installed()?;
         self.append_abi_lock(&mut specs)?;
@@ -516,6 +564,25 @@ mod tests {
         let mut after = Vec::new();
         ctx.append_abi_lock(&mut after).unwrap();
         assert!(after.is_empty());
+    }
+
+    #[test]
+    fn solve_lock_is_exclusive() {
+        let (_d, ctx) = ctx();
+        // Hold the env's solve lock.
+        let guard = ctx.lock_solve().unwrap();
+        // A second exclusive acquire on the same lockfile (a distinct open
+        // descriptor, as a concurrent process would use) must fail non-blocking
+        // while the first is held.
+        let path = ctx.solve_lock_path();
+        let open = || std::fs::OpenOptions::new().create(true).write(true).open(&path).unwrap();
+        match Flock::lock(open(), FlockArg::LockExclusiveNonblock) {
+            Ok(_) => panic!("second lock granted while the first is held"),
+            Err((_, e)) => assert_eq!(e, Errno::EAGAIN),
+        }
+        // Releasing the first lets the next acquire succeed.
+        drop(guard);
+        assert!(Flock::lock(open(), FlockArg::LockExclusiveNonblock).is_ok());
     }
 
     #[test]
