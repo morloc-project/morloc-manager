@@ -9,6 +9,7 @@ mod error;
 mod freeze;
 mod hostprobe;
 mod localdeps;
+mod prompt;
 mod provision;
 mod runner;
 mod selinux;
@@ -18,7 +19,7 @@ mod types;
 // The dependency-resolution kernel (envspec/pixi/constraint/langsupport) lives in
 // the shared `morloc-deps` crate; re-export it so existing `crate::<mod>` paths
 // resolve unchanged.
-pub(crate) use morloc_deps::{constraint, envspec, envstore, langsupport, pixi};
+pub(crate) use morloc_deps::{constraint, envspec, envstore, langsupport, layout, pixi};
 
 use std::collections::HashSet;
 use std::fs;
@@ -162,11 +163,11 @@ or `latest`). With no flags on a TTY, all settings are prompted interactively.")
         local_runtime: Option<String>,
         /// Path to a local `mim-env` binary to stage into a dev environment.
         /// Defaults to the `mim-env` beside the running `mim`.
-        #[arg(long = "dev-mim-env")]
+        #[arg(long = "dev-mim-env", help_heading = "Advanced")]
         dev_mim_env: Option<String>,
         /// A file of apt packages to bake into the image, one per line.
         /// Container backend only.
-        #[arg(long = "system-packages-file", help_heading = "Advanced")]
+        #[arg(long = "system-packages-file")]
         system_packages_file: Option<String>,
         /// A file of conda match-specs added to the pixi solve, one per line.
         #[arg(long = "conda-packages-file")]
@@ -1269,6 +1270,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     cli_set_default: set_default,
                     cli_dev: dev,
                     cli_dev_mim_env: dev_mim_env,
+                    cli_cert_bundle: cert_bundle,
                 })? {
                     Some(p) => p,
                     None => {
@@ -1281,7 +1283,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     let Backend::Container(eng) = plan.backend else { unreachable!() };
                     return container_new_dev(
                         plan.scope, eng, Some(plan.name), src, plan.lang, plan.system_packages,
-                        plan.conda_packages, plan.dev_mim_env, plan.dotfiles, cert_bundle,
+                        plan.conda_packages, plan.dev_mim_env, plan.dotfiles, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
                         plan.requested_version, no_init, plan.make_default,
                     );
@@ -1293,12 +1295,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         }
                         native_new(
                             plan.scope, Some(plan.name), plan.lang, plan.conda_packages,
-                            plan.requested_version, None, cert_bundle, no_init, plan.make_default, verbose,
+                            plan.requested_version, None, plan.cert_bundle, no_init, plan.make_default, verbose,
                         )
                     }
                     Backend::Container(eng) => container_new_derived(
                         plan.scope, eng, Some(plan.name), plan.lang, plan.system_packages,
-                        plan.conda_packages, plan.dotfiles, cert_bundle,
+                        plan.conda_packages, plan.dotfiles, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
                         plan.requested_version, None, no_init, plan.make_default,
                     ),
@@ -3983,74 +3985,6 @@ fn resolve_new_env_name(
     Ok(env_name)
 }
 
-/// Read a line from stdin after showing `prompt` with a bracketed `default`.
-/// Returns the trimmed input, or `default` when the user just presses enter.
-/// Prompts go to stderr; stdout is reserved for machine-readable output.
-/// Bold-green a question title so each interactive prompt group stands out from
-/// the option lists, defaults, and selection lines around it. Raw SGR escapes,
-/// emitted through anstream, which strips them when stderr is not a terminal.
-fn prompt_title(text: &str) -> String {
-    format!("\x1b[1;32m{text}\x1b[0m")
-}
-
-/// Print a colored question title on its own line, heading a group whose options
-/// and selection line follow. For menu questions (backend, scope, the confirm
-/// summary) whose selection line does not carry the title.
-fn print_prompt_title(text: &str) {
-    anstream::eprintln!("{}", prompt_title(text));
-}
-
-/// Emit `prompt [default]: `, read a line, and return it (or `default` when
-/// blank). Routes through anstream so any SGR escapes in `prompt` are stripped
-/// when stderr is not a terminal.
-fn prompt_read(prompt: &str, default: &str) -> String {
-    anstream::eprint!("{prompt} [{default}]: ");
-    io::stderr().flush().ok();
-    let mut buf = String::new();
-    if io::stdin().read_line(&mut buf).is_err() {
-        return default.to_string();
-    }
-    let trimmed = buf.trim();
-    if trimmed.is_empty() { default.to_string() } else { trimmed.to_string() }
-}
-
-/// A titled inline question: the prompt text is the orange title and the
-/// `[default]` stays plain. Use for questions with no separate menu/options.
-fn prompt_line(prompt: &str, default: &str) -> String {
-    prompt_read(&prompt_title(prompt), default)
-}
-
-/// A bare (uncolored) selection line, sitting under an already-printed title and
-/// its options (see `print_prompt_title`).
-fn prompt_select(prompt: &str, default: &str) -> String {
-    prompt_read(prompt, default)
-}
-
-/// True if the user's answer is affirmative ("y"/"yes", case-insensitive).
-fn is_yes(answer: &str) -> bool {
-    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-}
-
-/// Ask a yes/no question, returning true for an affirmative answer. `default_yes`
-/// selects the answer used when the user just presses enter.
-fn prompt_yes_no(prompt: &str, default_yes: bool) -> bool {
-    is_yes(&prompt_line(prompt, if default_yes { "y" } else { "n" }))
-}
-
-/// Split a comma/space-separated prompt answer into non-empty tokens. "none" (or
-/// empty) yields no tokens.
-fn parse_token_list(answer: &str) -> Vec<String> {
-    if answer.is_empty() || answer.eq_ignore_ascii_case("none") {
-        return Vec::new();
-    }
-    answer
-        .split([',', ' ', '\t'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 /// Strip a `#` comment from a package-file line. The `#` counts as a comment only
 /// at line start or after whitespace, so a spec that itself contains `#` (rare in
 /// conda/apt names) is not silently truncated mid-token: `a # b` -> `a`, `a#b`
@@ -4089,25 +4023,54 @@ fn read_package_file(path: &str) -> Result<Vec<String>> {
     Ok(parse_package_lines(&text))
 }
 
-/// Prompt for an optional package-file path (interactive `new`); blank/"none"
-/// yields an empty list, otherwise the file is read and parsed.
-fn prompt_package_file(label: &str) -> Result<Vec<String>> {
-    let ans = prompt_line(label, "none");
-    let ans = ans.trim();
-    if ans.is_empty() || ans.eq_ignore_ascii_case("none") {
-        Ok(Vec::new())
-    } else {
-        read_package_file(ans)
+/// The terminal width for wrapping echoed lists: `$COLUMNS` when a shell exports
+/// it, else 80. Kept dependency-free (no terminal-size crate).
+fn term_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&w| w >= 20)
+        .unwrap_or(80)
+}
+
+/// Print `items` to stderr in wrapped, left-aligned columns sized to the
+/// terminal, for echoing a parsed list (e.g. a package file) back to the user.
+fn eprintln_columns(items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    let col_w = items.iter().map(|s| s.len()).max().unwrap_or(0) + 2;
+    let cols = std::cmp::max(1, term_width().saturating_sub(2) / col_w);
+    for row in items.chunks(cols) {
+        let line: String = row.iter().map(|s| format!("{s:<col_w$}")).collect();
+        eprintln!("  {}", line.trim_end());
     }
 }
 
-/// Re-prompt for a package file (confirm-screen editor) and replace `list` with
-/// its contents. A read error is printed and the current list kept -- the editor
-/// must not fail the whole session over a bad path.
-fn update_packages_from_file_prompt(label: &str, list: &mut Vec<String>) {
-    match prompt_package_file(label) {
-        Ok(l) => *list = l,
-        Err(e) => eprintln!("  {e}"),
+/// Prompt for an optional package-file path (interactive `new`); blank / "none"
+/// yields an empty list, otherwise the file is read, parsed, and its contents
+/// echoed in columns as immediate feedback. A bad path is reported and
+/// re-prompted rather than aborting the session.
+fn prompt_package_file(label: &str) -> prompt::Result<Vec<String>> {
+    loop {
+        let ans = prompt::path(label, "path to a file with one package per line")?;
+        let ans = ans.trim();
+        if ans.is_empty() || ans.eq_ignore_ascii_case("none") {
+            return Ok(Vec::new());
+        }
+        // Expand ~ like every other path prompt, so a hand-typed ~/pkgs.txt works.
+        match read_package_file(&expand_tilde(ans).to_string_lossy()) {
+            Ok(list) if list.is_empty() => {
+                eprintln!("  (file lists no packages)");
+                return Ok(list);
+            }
+            Ok(list) => {
+                eprintln!("  {} package(s):", list.len());
+                eprintln_columns(&list);
+                return Ok(list);
+            }
+            Err(e) => eprintln!("  {e}"),
+        }
     }
 }
 
@@ -4117,27 +4080,88 @@ fn update_packages_from_file_prompt(label: &str, list: &mut Vec<String>) {
 /// tried URL is shown on failure); if it cannot be verified (not found, offline,
 /// or GitHub unreachable) the user may re-enter, accept it anyway (provisioning
 /// surfaces the real error later), or fall back to latest.
-fn interactive_choose_version() -> Option<String> {
+fn interactive_choose_version(current: Option<&str>) -> prompt::Result<Option<String>> {
+    // Seed the default from the current value (when re-editing) so a bare Enter
+    // keeps it; `None` (latest) shows "latest".
+    let default = current.unwrap_or("latest");
     loop {
-        let choice = prompt_line("morloc version", "latest");
+        let choice = prompt::text("morloc version", default)?;
+        let choice = choice.trim().to_string();
         if choice.eq_ignore_ascii_case("latest") {
-            return None;
+            return Ok(None);
         }
         match provision::verify_release(&choice) {
             Ok(tag) => {
                 eprintln!("  Found release {tag}.");
-                return Some(choice);
+                return Ok(Some(choice));
             }
             Err(e) => {
                 eprintln!("  Could not verify a published morloc release for '{choice}':");
                 eprintln!("  {e}");
-                if prompt_yes_no("  Use it anyway?", false) {
-                    return Some(choice);
+                if prompt::confirm("Use it anyway?", false)? {
+                    return Ok(Some(choice));
                 }
                 // Otherwise loop and re-prompt (enter 'latest' to fall back).
             }
         }
     }
+}
+
+/// The languages offerable in the wizard, in display order: the conda-provisioned
+/// core (`py r cpp rust`) first, then script-provisioned languages (`futhark`),
+/// which need a container image build and so are offered only on an OCI backend.
+/// Derived from `layout` so the picker cannot drift from what the toolchain
+/// supports.
+fn language_shortnames(is_oci: bool) -> Vec<&'static str> {
+    let mut shorts: Vec<&'static str> = layout::LANGUAGES.to_vec();
+    if is_oci {
+        shorts.extend(layout::SCRIPT_LANGUAGES);
+    }
+    shorts
+}
+
+/// Language multi-select. Returns the chosen short names (e.g. `["py","cpp"]`).
+/// The four core conda languages are pre-checked on first entry; when re-editing,
+/// `current` (short names, possibly `lang@ver` from `--lang`) pre-checks exactly
+/// that set. Script languages start unchecked.
+fn interactive_choose_langs(is_oci: bool, current: &[String]) -> prompt::Result<Vec<String>> {
+    let shorts = language_shortnames(is_oci);
+    let labels: Vec<String> = shorts.iter().map(|s| s.to_string()).collect();
+    // Defaults: the `current` selection when re-editing (matched by the short name
+    // before any `@version`), else the core conda languages.
+    let default: Vec<usize> = if current.is_empty() {
+        (0..layout::LANGUAGES.len()).collect()
+    } else {
+        shorts
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                current
+                    .iter()
+                    .any(|c| c.split('@').next() == Some(**s))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let chosen = prompt::multiselect("Languages to provision", labels, &default)?;
+    let chosen_shorts: Vec<&str> = chosen.into_iter().map(|i| shorts[i]).collect();
+    Ok(merge_lang_pins(&chosen_shorts, current))
+}
+
+/// Reattach any `lang@version` pin carried in `current` to a chosen short name, so
+/// re-editing the language set keeps a kept language's pin while a newly-added
+/// language stays bare. Matches on the short name before the `@`.
+fn merge_lang_pins(chosen_shorts: &[&str], current: &[String]) -> Vec<String> {
+    chosen_shorts
+        .iter()
+        .map(|short| {
+            current
+                .iter()
+                .find(|c| c.split('@').next() == Some(*short))
+                .cloned()
+                .unwrap_or_else(|| short.to_string())
+        })
+        .collect()
 }
 
 /// An entry in the interactive backend menu.
@@ -4191,18 +4215,8 @@ fn backend_options(container_only: bool) -> Vec<BackendOption> {
 /// is the first selectable entry. Greyed (unsupported / not-installed) entries
 /// are rejected with a re-prompt. Errors when nothing is viable. `container_only`
 /// greys native (dev environments build in a container).
-fn interactive_choose_backend(container_only: bool) -> Result<Backend> {
+fn interactive_choose_backend(container_only: bool) -> prompt::Result<Backend> {
     let opts = backend_options(container_only);
-    let width = opts.iter().map(|o| o.label.len()).max().unwrap_or(0);
-    print_prompt_title("Runtime engine:");
-    for (i, o) in opts.iter().enumerate() {
-        match &o.disabled {
-            None => anstream::eprintln!("  [{i}] {}", o.label),
-            Some(reason) => {
-                anstream::eprintln!("  \x1b[2m[{i}] {:<width$}  ({reason})\x1b[0m", o.label)
-            }
-        }
-    }
     let default_ix = opts.iter().position(|o| o.disabled.is_none()).ok_or_else(|| {
         ManagerError::EnvError(
             "No usable backend on this host: the native backend is unavailable and no \
@@ -4211,43 +4225,45 @@ fn interactive_choose_backend(container_only: bool) -> Result<Backend> {
                 .to_string(),
         )
     })?;
+    // inquire has no native "disabled" rows, so unavailable engines keep their
+    // reason inline and are re-prompted if picked.
+    let labels: Vec<String> = opts
+        .iter()
+        .map(|o| match &o.disabled {
+            None => o.label.to_string(),
+            Some(reason) => format!("{}  (unavailable: {reason})", o.label),
+        })
+        .collect();
     loop {
-        let choice = prompt_select("Enter choice", &default_ix.to_string());
-        match choice.parse::<usize>() {
-            Ok(ix) if ix < opts.len() => {
-                if let Some(reason) = &opts[ix].disabled {
-                    eprintln!("  '{}' is not available ({reason}). Pick another.", opts[ix].label);
-                    continue;
-                }
-                let backend = opts[ix].backend;
-                if backend == Backend::Container(ContainerEngine::Docker) {
-                    check_docker_socket(ContainerEngine::Docker);
-                }
-                return Ok(backend);
-            }
-            _ => eprintln!("  Enter a number between 0 and {}.", opts.len() - 1),
+        let ix = prompt::select_indexed("Runtime engine", labels.clone(), default_ix)?;
+        if let Some(reason) = &opts[ix].disabled {
+            eprintln!("  '{}' is not available ({reason}). Pick another.", opts[ix].label);
+            continue;
         }
+        let backend = opts[ix].backend;
+        if backend == Backend::Container(ContainerEngine::Docker) {
+            check_docker_socket(ContainerEngine::Docker);
+        }
+        return Ok(backend);
     }
 }
 
 /// Prompt for the environment scope. System scope is offered only when the
 /// system config dir is writable (root / sufficient privileges); otherwise it is
 /// shown greyed. Shown only for container backends (see `interactive_new_session`).
-fn interactive_choose_scope() -> Scope {
+fn interactive_choose_scope() -> prompt::Result<Scope> {
     let system_writable = check_system_write_access().is_ok();
-    print_prompt_title("Scope:");
-    anstream::eprintln!("  [0] local   (~/.config/morloc)");
-    if system_writable {
-        anstream::eprintln!("  [1] system  (/etc/morloc)");
+    let system_label = if system_writable {
+        "system  (/etc/morloc)".to_string()
     } else {
-        anstream::eprintln!("  \x1b[2m[1] system  (/etc/morloc, requires root)\x1b[0m");
-    }
+        "system  (/etc/morloc, unavailable: requires root)".to_string()
+    };
+    let labels = vec!["local   (~/.config/morloc)".to_string(), system_label];
     loop {
-        match prompt_select("Enter scope", "0").as_str() {
-            "0" | "local" => return Scope::Local,
-            "1" | "system" if system_writable => return Scope::System,
-            "1" | "system" => eprintln!("  System scope requires root. Re-run with sudo to use it."),
-            _ => eprintln!("  Enter 0 (local) or 1 (system)."),
+        match prompt::select_indexed("Scope", labels.clone(), 0)? {
+            0 => return Ok(Scope::Local),
+            1 if system_writable => return Ok(Scope::System),
+            _ => eprintln!("  System scope requires root. Re-run with sudo to use it."),
         }
     }
 }
@@ -4399,36 +4415,143 @@ fn stage_dev_mim_env(scope: Scope, name: &str, recorded: Option<&str>) -> Result
 
 /// Prompt for an optional dotfiles directory to seed the environment's home.
 /// Empty / "none" means no dotfiles. A given path (with ~ expanded) is checked
-/// for existence and re-prompted on error. Docker/podman only.
-fn interactive_choose_dotfiles() -> Option<String> {
+/// for existence and re-prompted on error. `current` (when re-editing) is
+/// pre-filled so a bare Enter keeps it. Docker/podman only.
+fn interactive_choose_dotfiles(current: Option<&str>) -> prompt::Result<Option<String>> {
+    let msg = "Dotfiles directory (blank for none)";
+    let help = "copied into the env home";
     loop {
-        let choice = prompt_line("Dotfiles directory", "none");
+        let choice = match current {
+            Some(cur) => prompt::path_seeded(msg, help, cur)?,
+            None => prompt::path(msg, help)?,
+        };
+        let choice = choice.trim();
         if choice.is_empty() || choice.eq_ignore_ascii_case("none") {
-            return None;
+            return Ok(None);
         }
-        let expanded = expand_tilde(&choice);
+        let expanded = expand_tilde(choice);
         if expanded.is_dir() {
-            return Some(expanded.to_string_lossy().into_owned());
+            let mut names: Vec<String> = match std::fs::read_dir(&expanded) {
+                Ok(entries) => entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect(),
+                Err(e) => {
+                    eprintln!("  cannot read {}: {e}", expanded.display());
+                    continue;
+                }
+            };
+            names.sort();
+            // Guardrails against the common footguns (an empty pick, or an
+            // accidental $HOME / huge tree that would be copied wholesale).
+            if names.is_empty() {
+                eprintln!("  {} is empty; nothing would be copied. Choose another, or blank for none.", expanded.display());
+                continue;
+            }
+            // Canonicalize both sides so a symlinked / `..`-spelled home is caught.
+            let canon = std::fs::canonicalize(&expanded).ok();
+            let home_canon = dirs::home_dir().and_then(|h| std::fs::canonicalize(h).ok());
+            if canon.is_some() && canon == home_canon {
+                eprintln!("  Warning: that is your home directory; copying all of it is unusual.");
+                if !prompt::confirm("Copy the entire home directory?", false)? {
+                    continue;
+                }
+            } else if names.len() > 200 {
+                eprintln!("  That directory has {} top-level entries.", names.len());
+                if !prompt::confirm("Copy all of them into the env home?", false)? {
+                    continue;
+                }
+            }
+            // Echo the top-level entries (basenames) that will be copied in, in
+            // the same column format used for package files.
+            eprintln!("  These {} files will be copied into the env home:", names.len());
+            eprintln_columns(&names);
+            return Ok(Some(expanded.to_string_lossy().into_owned()));
         }
-        eprintln!("  Not a directory: {choice}. Enter a path, or 'none'.");
+        eprintln!("  Not a directory: {choice}.");
     }
 }
 
-/// Prompt for an optional dev-mode source tree. Empty / "no" means a normal
+/// Prompt for the CA bundle to trust for this env's package fetches. A fresh
+/// prompt gates on the "behind a corporate firewall?" question; when re-editing
+/// an existing bundle (`current` set), the current path is pre-filled so a bare
+/// Enter keeps it and erasing removes it -- inspecting the field never silently
+/// clears a CLI-supplied `--cert-bundle`. The chosen bundle is validated inline
+/// (a one-line result); the full per-certificate report is printed once when the
+/// bundle is applied at build time.
+fn interactive_choose_cert_bundle(current: Option<&str>) -> prompt::Result<Option<String>> {
+    if current.is_none()
+        && !prompt::confirm("Behind a corporate firewall (needs a custom CA bundle)?", false)?
+    {
+        return Ok(None);
+    }
+    loop {
+        let choice = match current {
+            Some(cur) => prompt::path_seeded(
+                "CA bundle path (PEM/DER; blank to remove)",
+                "trusted for package fetches",
+                cur,
+            )?,
+            None => prompt::path("CA bundle path (PEM/DER)", "trusted for package fetches; blank to skip")?,
+        };
+        let choice = choice.trim();
+        if choice.is_empty() {
+            return Ok(None);
+        }
+        let expanded = expand_tilde(choice);
+        match cert::quick_check(&expanded) {
+            Ok(n) => {
+                eprintln!("  CA bundle OK ({n} certificate{}).", if n == 1 { "" } else { "s" });
+                return Ok(Some(expanded.to_string_lossy().into_owned()));
+            }
+            Err(e) => eprintln!("  {e}"),
+        }
+    }
+}
+
+/// Prompt for an optional local `mim-env` binary to stage into a dev env. Blank
+/// uses the `mim-env` beside `mim`. `current` (when re-editing) is pre-filled so
+/// a bare Enter keeps it. The raw path is returned (validated for existence);
+/// `container_new_dev` resolves it canonically.
+fn interactive_choose_dev_mim_env(current: Option<&str>) -> prompt::Result<Option<String>> {
+    let msg = "Local mim-env binary (blank = the one beside mim)";
+    let help = "staged as the dev env's dependency agent";
+    loop {
+        let choice = match current {
+            Some(cur) => prompt::path_seeded(msg, help, cur)?,
+            None => prompt::path(msg, help)?,
+        };
+        let choice = choice.trim();
+        if choice.is_empty() {
+            return Ok(None);
+        }
+        match resolve_dev_mim_env(Some(choice)) {
+            Ok(_) => return Ok(Some(choice.to_string())),
+            Err(e) => eprintln!("  {e}"),
+        }
+    }
+}
+
+/// Prompt for an optional dev-mode source tree. A "no" answer means a normal
 /// release env; a path is validated as a morloc source tree and re-prompted on
 /// error. Returns the absolute source path when dev is chosen.
-fn interactive_choose_dev() -> Option<String> {
+fn interactive_choose_dev() -> prompt::Result<Option<String>> {
+    if !prompt::confirm("Development mode (build morloc from a source tree)?", false)? {
+        return Ok(None);
+    }
     loop {
-        let choice = prompt_line(
-            "Development mode? Enter a morloc source path to build from, or 'no'",
-            "no",
-        );
-        if choice.is_empty() || choice.eq_ignore_ascii_case("no") {
-            return None;
+        let choice = prompt::path("morloc source path", "the repo to build the compiler + runtime from")?;
+        let choice = choice.trim();
+        if choice.is_empty() {
+            return Ok(None);
         }
-        match resolve_dev_source(&choice) {
-            Ok(abs) => return Some(abs.to_string_lossy().into_owned()),
-            Err(e) => eprintln!("  {e}. Enter a morloc source path, or 'no'."),
+        // resolve_dev_source validates the tree (stack.yaml, data/lang/*, ...).
+        match resolve_dev_source(choice) {
+            Ok(abs) => {
+                eprintln!("  Valid morloc source tree: {}", abs.display());
+                return Ok(Some(abs.to_string_lossy().into_owned()));
+            }
+            Err(e) => eprintln!("  {e}. Enter a morloc source path, or leave blank."),
         }
     }
 }
@@ -4441,23 +4564,24 @@ fn interactive_choose_name(
     scope: Scope,
     requested_version: Option<&str>,
     is_dev: bool,
-) -> Option<String> {
+) -> prompt::Result<Option<String>> {
     let default_name = if is_dev {
         "dev".to_string()
     } else {
         default_env_name_for_version(requested_version)
     };
-    // First ask with the default pre-filled.
-    let mut candidate = prompt_line("Environment name", &default_name);
+    // First ask with the default pre-filled on an editable line.
+    let mut candidate = prompt::text_editable("Environment name", &default_name)?;
     loop {
-        match resolve_new_env_name(scope, Some(candidate), requested_version) {
-            Ok(name) => return Some(name),
+        match resolve_new_env_name(scope, Some(candidate.clone()), requested_version) {
+            Ok(name) => return Ok(Some(name)),
             Err(e) => eprintln!("  {e}"),
         }
         // Re-ask; a blank answer now cancels rather than re-selecting the default.
-        let next = prompt_line("Enter a different name (blank to cancel)", "");
+        let next = prompt::text("Enter a different name (blank to cancel)", "")?;
+        let next = next.trim().to_string();
         if next.is_empty() {
-            return None;
+            return Ok(None);
         }
         candidate = next;
     }
@@ -4466,12 +4590,12 @@ fn interactive_choose_name(
 /// Prompt for whether to tag the new environment as the default. Defaults to
 /// yes when no default exists yet, otherwise no (and names the current default,
 /// which choosing yes would replace).
-fn interactive_choose_set_default(current_default: Option<&str>) -> bool {
+fn interactive_choose_set_default(current_default: Option<&str>) -> prompt::Result<bool> {
     match current_default {
-        None => prompt_yes_no("Make this the default environment?", true),
+        None => prompt::confirm("Make this the default environment?", true),
         Some(cur) => {
             eprintln!("  The current default environment is '{cur}'; choosing yes replaces it.");
-            prompt_yes_no("Make this the default environment?", false)
+            prompt::confirm("Make this the default environment?", false)
         }
     }
 }
@@ -4495,6 +4619,8 @@ struct NewPlan {
     dev_source: Option<String>,
     /// `--dev-mim-env` path to the dependency agent to stage (dev envs only).
     dev_mim_env: Option<String>,
+    /// `--cert-bundle` / firewall-prompt path to a corporate CA bundle to trust.
+    cert_bundle: Option<String>,
 }
 
 /// The `new` command's inputs, threaded into the interactive session. Each
@@ -4511,6 +4637,7 @@ struct NewSessionInput {
     cli_set_default: bool,
     cli_dev: Option<String>,
     cli_dev_mim_env: Option<String>,
+    cli_cert_bundle: Option<String>,
 }
 
 /// A setting shown (and editable) in the confirmation summary. Only the fields
@@ -4522,9 +4649,11 @@ enum EditField {
     Version,
     Scope,
     Langs,
+    Cert,
     Packages,
     CondaPackages,
     Dotfiles,
+    DevMimEnv,
     Default,
 }
 
@@ -4536,10 +4665,12 @@ impl EditField {
             // For a dev env the version is the stdlib base, not the compiler.
             EditField::Version => if plan.dev_source.is_some() { "stdlib base" } else { "version" },
             EditField::Scope => "scope",
-            EditField::Langs => "language pins",
+            EditField::Langs => "languages",
+            EditField::Cert => "CA bundle",
             EditField::Packages => "system packages",
             EditField::CondaPackages => "conda packages",
             EditField::Dotfiles => "dotfiles",
+            EditField::DevMimEnv => "dev mim-env",
             EditField::Default => "default",
         }
     }
@@ -4553,59 +4684,82 @@ impl EditField {
             EditField::Version => plan.requested_version.as_deref().unwrap_or("latest").to_string(),
             EditField::Scope => if plan.scope == Scope::System { "system" } else { "local" }.to_string(),
             EditField::Langs => list_or_none(&plan.lang),
+            EditField::Cert => plan.cert_bundle.clone().unwrap_or_else(|| "none".to_string()),
             EditField::Packages => list_or_none(&plan.system_packages),
             EditField::CondaPackages => list_or_none(&plan.conda_packages),
             EditField::Dotfiles => plan.dotfiles.clone().unwrap_or_else(|| "none".to_string()),
+            EditField::DevMimEnv => plan.dev_mim_env.clone().unwrap_or_else(|| "beside mim".to_string()),
             EditField::Default => if plan.make_default { "yes" } else { "no" }.to_string(),
         }
     }
 
-    /// Re-prompt for this field, updating the plan in place.
-    fn edit(self, plan: &mut NewPlan) {
+    /// Re-prompt for this field, updating the plan in place. Esc / Ctrl-C at a
+    /// field prompt propagates as `Cancelled`, aborting the whole session.
+    fn edit(self, plan: &mut NewPlan) -> prompt::Result<()> {
         match self {
             // Re-select the source; keeps the current one if the user cancels
             // (dev-ness itself is fixed once the session starts).
             EditField::Dev => {
-                if let Some(src) = interactive_choose_dev() {
+                if let Some(src) = interactive_choose_dev()? {
                     plan.dev_source = Some(src);
                 }
             }
-            EditField::Name => loop {
-                let choice = prompt_line("name", &plan.name);
-                match resolve_new_env_name(plan.scope, Some(choice), plan.requested_version.as_deref()) {
-                    Ok(name) => {
-                        plan.name = name;
+            // Seed with the current name; a blank re-entry keeps it.
+            EditField::Name => {
+                let mut candidate = prompt::text_editable("name", &plan.name)?;
+                loop {
+                    match resolve_new_env_name(plan.scope, Some(candidate.clone()), plan.requested_version.as_deref()) {
+                        Ok(name) => {
+                            plan.name = name;
+                            break;
+                        }
+                        Err(e) => eprintln!("  {e}"),
+                    }
+                    let next = prompt::text("Enter a different name (blank to keep current)", "")?;
+                    let next = next.trim().to_string();
+                    if next.is_empty() {
                         break;
                     }
-                    Err(e) => eprintln!("  {e}"),
+                    candidate = next;
                 }
-            },
-            EditField::Version => plan.requested_version = interactive_choose_version(),
-            EditField::Scope => plan.scope = interactive_choose_scope(),
-            EditField::Langs => {
-                let cur = EditField::Langs.value(plan);
-                plan.lang = parse_token_list(&prompt_line("language pins (e.g. py@3.12 r)", &cur));
             }
-            EditField::Packages => update_packages_from_file_prompt(
-                "system (apt) packages file (path, blank for none)",
-                &mut plan.system_packages,
-            ),
-            EditField::CondaPackages => update_packages_from_file_prompt(
-                "conda packages file (path, blank for none)",
-                &mut plan.conda_packages,
-            ),
-            EditField::Dotfiles => plan.dotfiles = interactive_choose_dotfiles(),
+            EditField::Version => {
+                plan.requested_version = interactive_choose_version(plan.requested_version.as_deref())?
+            }
+            EditField::Scope => plan.scope = interactive_choose_scope()?,
+            EditField::Langs => {
+                let is_oci = matches!(plan.backend, Backend::Container(e) if e.is_oci());
+                plan.lang = interactive_choose_langs(is_oci, &plan.lang)?;
+            }
+            EditField::Cert => {
+                plan.cert_bundle = interactive_choose_cert_bundle(plan.cert_bundle.as_deref())?
+            }
+            EditField::Packages => {
+                plan.system_packages =
+                    prompt_package_file("System (apt) packages file (blank for none)")?;
+            }
+            EditField::CondaPackages => {
+                plan.conda_packages =
+                    prompt_package_file("Conda packages file (blank for none)")?;
+            }
+            EditField::Dotfiles => {
+                plan.dotfiles = interactive_choose_dotfiles(plan.dotfiles.as_deref())?
+            }
+            EditField::DevMimEnv => {
+                plan.dev_mim_env = interactive_choose_dev_mim_env(plan.dev_mim_env.as_deref())?
+            }
             EditField::Default => {
                 let current = environment::resolve_default_environment().ok().map(|(n, _, _)| n);
-                plan.make_default = interactive_choose_set_default(current.as_deref());
+                plan.make_default = interactive_choose_set_default(current.as_deref())?;
             }
         }
+        Ok(())
     }
 }
 
 /// The editable fields for a plan, in display order. Scope and system packages
-/// apply to container backends; dotfiles to docker/podman only; the dev source
-/// and (local-only) scope shape the dev case.
+/// apply to container backends; dotfiles and the dev mim-env to docker/podman
+/// and dev respectively; the dev source and (local-only) scope shape the dev case.
 fn confirm_fields(plan: &NewPlan) -> Vec<EditField> {
     let is_container = matches!(plan.backend, Backend::Container(_));
     let is_oci = matches!(plan.backend, Backend::Container(e) if e.is_oci());
@@ -4621,6 +4775,8 @@ fn confirm_fields(plan: &NewPlan) -> Vec<EditField> {
         fields.push(EditField::Scope);
     }
     fields.push(EditField::Langs);
+    // The CA bundle applies on every backend (host solves and image builds).
+    fields.push(EditField::Cert);
     if is_container {
         fields.push(EditField::Packages);
     }
@@ -4630,44 +4786,158 @@ fn confirm_fields(plan: &NewPlan) -> Vec<EditField> {
     if is_oci {
         fields.push(EditField::Dotfiles);
     }
+    if is_dev {
+        fields.push(EditField::DevMimEnv);
+    }
     fields.push(EditField::Default);
     fields
 }
 
-/// Show the resolved plan as a numbered, editable summary and let the user
-/// change any setting or confirm. Returns true to proceed, false to cancel.
-/// The chosen backend is fixed here (restart `new` to change it), so the field
-/// set is stable across edits.
-fn interactive_confirm(plan: &mut NewPlan) -> bool {
+/// Show the resolved plan as an inquire review list and let the user edit any
+/// setting or confirm. The first row confirms; the rest re-open a field's prompt.
+/// Returns true to proceed. Esc / Ctrl-C propagates as `Cancelled`. The chosen
+/// backend is fixed here (restart `new` to change it), so the field set is stable.
+fn interactive_confirm(plan: &mut NewPlan) -> prompt::Result<bool> {
     loop {
         let fields = confirm_fields(plan);
-        let n = fields.len();
-        eprintln!();
-        print_prompt_title("Will create environment");
-        for (i, f) in fields.iter().enumerate() {
-            eprintln!(" [{}] {}: {}", i + 1, f.label(plan), f.value(plan));
+        let mut rows = Vec::with_capacity(fields.len() + 1);
+        rows.push("Confirm & create".to_string());
+        for f in &fields {
+            rows.push(format!("{}: {}", f.label(plan), f.value(plan)));
         }
-        eprintln!();
-        let answer = prompt_select(&format!("Enter 1-{n} to update a setting or y/n"), "y");
-        if is_yes(&answer) {
-            return true;
+        let ix = prompt::select_indexed("Review (edit a field, or confirm)", rows, 0)?;
+        if ix == 0 {
+            return Ok(true);
         }
-        if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
-            return false;
-        }
-        match answer.parse::<usize>() {
-            Ok(ix) if (1..=n).contains(&ix) => fields[ix - 1].edit(plan),
-            _ => eprintln!("  Enter a number from 1 to {n}, or y/n."),
+        fields[ix - 1].edit(plan)?;
+    }
+}
+
+/// A flat, flag-shaped snapshot of a confirmed `new` plan, written as JSON for
+/// local reproducibility. Package lists are stored by value (self-contained);
+/// dotfiles/cert/dev entries are absolute host paths, so the file reproduces the
+/// environment only on this machine. `schema`/`mim_version` head the file for a
+/// future `--from-setup` importer.
+#[derive(serde::Serialize)]
+struct SetupFile {
+    schema: &'static str,
+    mim_version: &'static str,
+    name: String,
+    /// `None` tracks the latest release.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    morloc_version: Option<String>,
+    /// `native`, or a container engine name (`podman`/`docker`/`apptainer`).
+    engine: String,
+    scope: String,
+    languages: Vec<String>,
+    system_packages: Vec<String>,
+    conda_packages: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dotfiles: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cert_bundle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dev_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dev_mim_env: Option<String>,
+    set_default: bool,
+}
+
+impl SetupFile {
+    fn from_plan(p: &NewPlan) -> Self {
+        // Destructure without `..` so adding a NewPlan field forces a decision here
+        // rather than silently dropping it from the saved snapshot.
+        let NewPlan {
+            scope,
+            backend,
+            name,
+            requested_version,
+            lang,
+            system_packages,
+            conda_packages,
+            dotfiles,
+            make_default,
+            dev_source,
+            dev_mim_env,
+            cert_bundle,
+        } = p;
+        let engine = match backend {
+            Backend::Native => "native".to_string(),
+            Backend::Container(e) => e.name().to_string(),
+        };
+        SetupFile {
+            schema: "morloc-env-setup/1",
+            mim_version: env!("CARGO_PKG_VERSION"),
+            name: name.clone(),
+            morloc_version: requested_version.clone(),
+            engine,
+            scope: if *scope == Scope::System { "system" } else { "local" }.to_string(),
+            languages: lang.clone(),
+            system_packages: system_packages.clone(),
+            conda_packages: conda_packages.clone(),
+            dotfiles: dotfiles.clone(),
+            cert_bundle: cert_bundle.clone(),
+            dev_source: dev_source.clone(),
+            dev_mim_env: dev_mim_env.clone(),
+            set_default: *make_default,
         }
     }
 }
 
-/// Run the interactive `new` session: prompt, in order, for morloc version,
-/// backend, language pins, and system packages; then -- for container backends
-/// only -- scope and (docker/podman only) dotfiles; then the name and the
-/// default choice; and finally a confirmation. Any dimension already fixed by a
-/// flag skips its prompt. Returns `None` if the user cancels.
+/// After confirmation, optionally write the settings to a JSON file (a path is
+/// prompted, defaulting to `<name>-setup.json`) for local reuse.
+fn offer_save_setup(plan: &NewPlan) -> prompt::Result<()> {
+    if !prompt::confirm("Save these settings to a JSON file (for local reuse)?", false)? {
+        return Ok(());
+    }
+    let default = format!("{}-setup.json", plan.name);
+    let json = match serde_json::to_string_pretty(&SetupFile::from_plan(plan)) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("  could not serialize settings: {e}");
+            return Ok(());
+        }
+    };
+    let body = format!("{json}\n");
+    loop {
+        let answer = prompt::text("Setup file path", &default)?;
+        // A whitespace-only entry folds to the default (a bare Enter already
+        // returns the default via inquire's with_default).
+        let target = answer.trim();
+        let target = if target.is_empty() { default.as_str() } else { target };
+        let path = expand_tilde(target);
+        // Confirm before clobbering an existing file.
+        if path.exists()
+            && !prompt::confirm(&format!("{} exists; overwrite?", path.display()), false)?
+        {
+            continue;
+        }
+        match std::fs::write(&path, &body) {
+            Ok(()) => {
+                eprintln!("  Wrote {}", path.display());
+                return Ok(());
+            }
+            Err(e) => eprintln!("  cannot write {}: {e}", path.display()),
+        }
+    }
+}
+
+/// Run the interactive `new` session and adapt its cancel signal: a confirmed Esc
+/// cancel or Ctrl-C at any prompt returns `Ok(None)` (the caller prints
+/// "Cancelled" and exits), while a genuine prompt/validation failure propagates.
 fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
+    match run_new_session(input) {
+        Ok(plan) => Ok(Some(plan)),
+        Err(prompt::PromptError::Cancelled) => Ok(None),
+        Err(prompt::PromptError::Other(e)) => Err(e),
+    }
+}
+
+/// The prompt-driven body of the session. Prompts in order for dev source,
+/// version, backend, languages, CA bundle (firewall), system/conda packages,
+/// scope, dotfiles, dev mim-env, name, and default; any dimension fixed by a flag
+/// skips its prompt. Returns the resolved plan, or `Cancelled` if the user aborts.
+fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
     let NewSessionInput {
         name,
         cli_version,
@@ -4680,6 +4950,7 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
         cli_set_default,
         cli_dev,
         cli_dev_mim_env,
+        cli_cert_bundle,
     } = input;
 
     // 0. Dev mode (build from a mounted source tree). A dev env is container-only
@@ -4691,35 +4962,36 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
                 .to_string_lossy()
                 .into_owned(),
         ),
-        None => interactive_choose_dev(),
+        None => interactive_choose_dev()?,
     };
     let is_dev = dev_source.is_some();
 
     // 1. Version. For a dev env this is the stdlib/library base.
     let requested_version = match cli_version {
         Some(v) => Some(v),
-        None => interactive_choose_version(),
+        None => interactive_choose_version(None)?,
     };
 
     // 2. Backend. A dev env must be a container (native is greyed / rejected).
     let backend = match cli_engine {
         Some(EngineArg::None) => {
             if is_dev {
-                return Err(dev_requires_oci());
+                return Err(dev_requires_oci().into());
             }
             let profile = hostprobe::probe_host();
             if !profile.native_capable {
                 return Err(ManagerError::EnvError(format!(
                     "the native backend is not available on this host: {}",
                     profile.reason
-                )));
+                ))
+                .into());
             }
             Backend::Native
         }
         Some(e) => {
             let eng: ContainerEngine = e.into();
             if is_dev && !eng.is_oci() {
-                return Err(dev_requires_oci());
+                return Err(dev_requires_oci().into());
             }
             check_docker_socket(eng);
             Backend::Container(eng)
@@ -4729,11 +5001,17 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
     let is_container = matches!(backend, Backend::Container(_));
     let is_oci = matches!(backend, Backend::Container(e) if e.is_oci());
 
-    // 3. Language pins.
+    // 3. Languages (checkbox multi-select; the core conda languages are pre-checked).
     let lang = if cli_lang.is_empty() {
-        parse_token_list(&prompt_line("Language pins (e.g. py@3.12 r)", "none"))
+        interactive_choose_langs(is_oci, &[])?
     } else {
         cli_lang
+    };
+
+    // 3b. CA bundle (corporate firewall). Skipped when passed on the CLI.
+    let cert_bundle = match cli_cert_bundle {
+        Some(c) => Some(c),
+        None => interactive_choose_cert_bundle(None)?,
     };
 
     // 4. System packages (container backends only). Native has no image to bake
@@ -4742,11 +5020,11 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
     //    path), not a silently-dropped flag.
     let system_packages = if !cli_system_package.is_empty() {
         if !is_container {
-            return Err(system_package_not_supported());
+            return Err(system_package_not_supported().into());
         }
         cli_system_package
     } else if is_container {
-        prompt_package_file("System (apt) packages file (path, blank for none)")?
+        prompt_package_file("System (apt) packages file (blank for none)")?
     } else {
         Vec::new()
     };
@@ -4757,7 +5035,7 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
     let conda_packages = if !cli_conda_package.is_empty() {
         cli_conda_package
     } else {
-        prompt_package_file("Conda packages file (path, blank for none)")?
+        prompt_package_file("Conda packages file (blank for none)")?
     };
 
     // 5. Scope. Offered interactively only for container backends; a native env
@@ -4765,13 +5043,13 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
     //    local-scope only (they point at one user's host source checkout).
     let scope = if is_dev {
         if cli_system {
-            return Err(dev_is_local_scope_only());
+            return Err(dev_is_local_scope_only().into());
         }
         Scope::Local
     } else if cli_system {
         Scope::System
     } else if is_container {
-        interactive_choose_scope()
+        interactive_choose_scope()?
     } else {
         Scope::Local
     };
@@ -4780,19 +5058,30 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
     //    per-env home). A --dotfiles path on a non-OCI backend is an error.
     let dotfiles = match cli_dotfiles {
         Some(d) => Some(d),
-        None if is_oci => interactive_choose_dotfiles(),
+        None if is_oci => interactive_choose_dotfiles(None)?,
         None => None,
     };
     if dotfiles.is_some() && !is_oci {
-        return Err(dotfiles_not_supported());
+        return Err(dotfiles_not_supported().into());
     }
+
+    // 6b. Dev mim-env (dev envs only). The raw path is stored; container_new_dev
+    //     resolves it. Skipped when passed on the CLI.
+    let dev_mim_env = if is_dev {
+        match cli_dev_mim_env {
+            Some(p) => Some(p),
+            None => interactive_choose_dev_mim_env(None)?,
+        }
+    } else {
+        None
+    };
 
     // 7. Name (existence checked against the chosen scope).
     let name = match name {
         Some(n) => resolve_new_env_name(scope, Some(n), requested_version.as_deref())?,
-        None => match interactive_choose_name(scope, requested_version.as_deref(), is_dev) {
+        None => match interactive_choose_name(scope, requested_version.as_deref(), is_dev)? {
             Some(n) => n,
-            None => return Ok(None),
+            None => return Err(prompt::PromptError::Cancelled),
         },
     };
 
@@ -4801,7 +5090,7 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
         true
     } else {
         let current_default = environment::resolve_default_environment().ok().map(|(n, _, _)| n);
-        interactive_choose_set_default(current_default.as_deref())
+        interactive_choose_set_default(current_default.as_deref())?
     };
 
     let mut plan = NewPlan {
@@ -4815,13 +5104,18 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
         dotfiles,
         make_default,
         dev_source,
-        dev_mim_env: cli_dev_mim_env,
+        dev_mim_env,
+        cert_bundle,
     };
 
-    if !interactive_confirm(&mut plan) {
-        return Ok(None);
+    if !interactive_confirm(&mut plan)? {
+        return Err(prompt::PromptError::Cancelled);
     }
-    Ok(Some(plan))
+    // Optionally snapshot the settings for local reuse. Declining the save (answer
+    // No) proceeds; a confirmed Esc cancel or Ctrl-C here still aborts the whole
+    // wizard, honoring the documented Ctrl-C contract.
+    offer_save_setup(&plan)?;
+    Ok(plan)
 }
 
 /// Persist a freshly created environment: its `--lang` inputs, its config, a
@@ -7158,6 +7452,72 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn merge_lang_pins_keeps_pins_and_adds_bare() {
+        let current = vec!["py@3.12".to_string(), "r".to_string()];
+        // A kept, pinned language retains its pin; a newly-added one is bare.
+        assert_eq!(merge_lang_pins(&["py", "cpp"], &current), vec!["py@3.12", "cpp"]);
+        // Dropping a language yields only the chosen ones.
+        assert_eq!(merge_lang_pins(&["r"], &current), vec!["r".to_string()]);
+        // With no prior pins, everything is bare (first-pass selection).
+        assert_eq!(merge_lang_pins(&["py", "r"], &[]), vec!["py", "r"]);
+    }
+
+    #[test]
+    fn setup_file_serializes_flat_and_omits_empty_version() {
+        let plan = NewPlan {
+            scope: Scope::Local,
+            backend: Backend::Container(ContainerEngine::Podman),
+            name: "demo".to_string(),
+            requested_version: None,
+            lang: vec!["py".to_string(), "cpp".to_string()],
+            system_packages: vec!["jq".to_string()],
+            conda_packages: vec![],
+            dotfiles: None,
+            make_default: true,
+            dev_source: None,
+            dev_mim_env: None,
+            cert_bundle: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&SetupFile::from_plan(&plan)).unwrap())
+                .unwrap();
+        assert_eq!(v["schema"], "morloc-env-setup/1");
+        assert_eq!(v["engine"], "podman");
+        assert_eq!(v["scope"], "local");
+        assert_eq!(v["languages"], serde_json::json!(["py", "cpp"]));
+        assert_eq!(v["system_packages"], serde_json::json!(["jq"]));
+        assert_eq!(v["set_default"], true);
+        // `None` fields are omitted, not rendered as null.
+        assert!(v.get("morloc_version").is_none());
+        assert!(v.get("dotfiles").is_none());
+        assert!(v.get("cert_bundle").is_none());
+    }
+
+    #[test]
+    fn setup_file_records_native_engine_and_version() {
+        let plan = NewPlan {
+            scope: Scope::System,
+            backend: Backend::Native,
+            name: "v0.98.0".to_string(),
+            requested_version: Some("0.98.0".to_string()),
+            lang: vec![],
+            system_packages: vec![],
+            conda_packages: vec![],
+            dotfiles: None,
+            make_default: false,
+            dev_source: None,
+            dev_mim_env: None,
+            cert_bundle: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&SetupFile::from_plan(&plan)).unwrap())
+                .unwrap();
+        assert_eq!(v["engine"], "native");
+        assert_eq!(v["scope"], "system");
+        assert_eq!(v["morloc_version"], "0.98.0");
+    }
+
+    #[test]
     fn programs_built_since_selects_by_manifest_mtime() {
         let env = tempfile::tempdir().unwrap();
         // "alpha": a fully-built program (envspec.json + manifest.json).
@@ -8467,25 +8827,6 @@ run:
         assert_eq!(default_env_name_for_version(Some(" 0.90.0 ")), "v0.90.0");
         // Names are valid env names (alphanumeric + dots).
         assert!(environment::validate_env_name(&default_env_name_for_version(Some("0.90.0"))).is_ok());
-    }
-
-    #[test]
-    fn parse_token_list_splits_and_handles_none() {
-        assert!(parse_token_list("none").is_empty());
-        assert!(parse_token_list("NONE").is_empty());
-        assert!(parse_token_list("").is_empty());
-        assert_eq!(parse_token_list("py@3.12 r"), vec!["py@3.12", "r"]);
-        assert_eq!(parse_token_list("jq, git,  curl"), vec!["jq", "git", "curl"]);
-    }
-
-    #[test]
-    fn is_yes_recognizes_affirmatives() {
-        assert!(is_yes("y"));
-        assert!(is_yes("Y"));
-        assert!(is_yes(" yes "));
-        assert!(!is_yes("n"));
-        assert!(!is_yes(""));
-        assert!(!is_yes("nope"));
     }
 
     #[test]

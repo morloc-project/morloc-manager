@@ -1,0 +1,16 @@
+{
+  "schema": "morloc-env-setup/1",
+  "mim_version": "0.26.3",
+  "name": "foo",
+  "engine": "podman",
+  "scope": "local",
+  "languages": [
+    "py",
+    "r",
+    "cpp",
+    "rust"
+  ],
+  "system_packages": [],
+  "conda_packages": [],
+  "set_default": false
+}

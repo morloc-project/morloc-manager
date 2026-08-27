@@ -54,6 +54,14 @@ pub fn preflight(path: &Path) -> Result<CertReport> {
     }
 }
 
+/// Validate a bundle without printing the full per-certificate report -- for
+/// inline, at-prompt feedback where the detailed report would otherwise be
+/// printed again by the build-time `preflight`. Returns the certificate count on
+/// success; on failure returns the error (its message is the verdict).
+pub fn quick_check(path: &Path) -> Result<usize> {
+    load_report(path).map(|r| r.certs.len()).map_err(|(e, _)| e)
+}
+
 /// Materialize the normalized files under `<env_data_dir>/certs/`: the host
 /// bundle (corp + public roots, for `SSL_CERT_FILE`) and the corp-only file (for
 /// the container build context). Callers derive the paths by convention via
