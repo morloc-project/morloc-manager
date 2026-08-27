@@ -78,12 +78,20 @@ pub struct LangSupport {
     /// Core toolchain, always required (libmorloc + any shim).
     #[serde(default)]
     pub toolchain: Vec<PkgReq>,
-    /// APT packages a dev environment installs to build the compiler from source
-    /// (build-essential, libgmp-dev, ...). Dev-only: parsed from the source YAML's
-    /// `dev-apt` key by `from_source_dir`; released envs never apt-install, so this
-    /// is absent from the emitted lang-support JSON and defaults to empty there.
+    /// APT packages a dev environment needs at IMAGE-BUILD time, before the conda
+    /// env exists, so the ghcup + stack bootstrap binaries can install and run
+    /// (libgmp, libtinfo, ...). Dev-only: parsed from the source YAML's `dev-apt`
+    /// key by `from_source_dir`; released envs never apt-install, so this is absent
+    /// from the emitted lang-support JSON and defaults to empty there.
     #[serde(default, alias = "dev-apt")]
     pub dev_apt: Vec<String>,
+    /// Conda packages a dev environment adds to the pixi solve so the compiler's
+    /// Haskell dependencies can be built at RUN time. GHC links those deps through
+    /// the (active) conda toolchain, so the C libs they need (gmp, zlib, ...) must
+    /// live in the conda env, not just apt. Dev-only, same lifecycle as `dev_apt`:
+    /// parsed from the source YAML's `dev-conda` key, absent from released JSON.
+    #[serde(default, alias = "dev-conda")]
+    pub dev_conda: Vec<String>,
     /// Per-language entries, keyed by canonical short name (py/r/cpp/rust).
     #[serde(default)]
     pub languages: BTreeMap<String, LangEntry>,
@@ -169,6 +177,7 @@ impl LangSupport {
             morloc_version: morloc_version.to_string(),
             toolchain: core.toolchain,
             dev_apt: core.dev_apt,
+            dev_conda: core.dev_conda,
             languages,
         })
     }
@@ -239,12 +248,18 @@ mod tests {
         let ls = LangSupport::from_source_dir(&root, "0.98.1").unwrap();
         // The stdlib base is injected, not read from the source's own version.
         assert_eq!(ls.morloc_version, "0.98.1");
-        // Core toolchain carries rust; dev-apt lists the apt packages the Haskell
-        // build needs (GHC + stack come from ghcup, the libs from apt).
+        // Core toolchain carries rust. dev-apt lists the Phase-1 bootstrap libs the
+        // ghcup/stack binaries need at image build (GHC itself comes from ghcup);
+        // dev-conda lists the Phase-2 C libs GHC links the compiler's Haskell deps
+        // against, through the active conda toolchain.
         assert!(ls.toolchain.iter().any(|p| p.package == "rust"));
+        // build-essential provides the binutils (strip/ar) the Haskell build shells
+        // out to; the libs are linked by the ghcup/stack bootstrap.
         assert!(ls.dev_apt.iter().any(|p| p == "build-essential"));
         assert!(ls.dev_apt.iter().any(|p| p == "libncurses-dev"));
         assert!(ls.dev_apt.iter().any(|p| p == "libgmp-dev"));
+        assert!(ls.dev_conda.iter().any(|p| p == "gmp"));
+        assert!(ls.dev_conda.iter().any(|p| p == "zlib"));
         // Languages parsed; py has a python runtime with a default; pyarrow is
         // optional, numpy is not.
         let py = ls.languages.get("py").unwrap();

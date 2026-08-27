@@ -155,10 +155,17 @@ or `latest`). With no flags on a TTY, all settings are prompted interactively.")
         /// scope only.
         #[arg(long)]
         dev: Option<String>,
-        /// Extra OS package(s) to bake into the image, e.g. --system-packages
-        /// jq,vim. Repeatable or comma-separated. Container backend only.
-        #[arg(long = "system-packages", alias = "system-package")]
-        system_package: Vec<String>,
+        /// A file of apt packages to bake into the image, one per line (`#`
+        /// comments and blank lines ignored), e.g. locales or linux-tools-generic.
+        /// Container backend only; prefer --conda-packages-file for anything on
+        /// conda-forge.
+        #[arg(long = "system-packages-file")]
+        system_packages_file: Option<String>,
+        /// A file of conda match-specs added to the pixi solve, one per line (`#`
+        /// comments and blank lines ignored), e.g. `jq` or `hyperfine>=1.18`.
+        /// Works on every backend.
+        #[arg(long = "conda-packages-file")]
+        conda_packages_file: Option<String>,
         /// Directory of dotfiles to copy into the environment's home
         /// (.bashrc, .vimrc, .config/...). Docker/podman only.
         #[arg(long)]
@@ -381,8 +388,8 @@ Examples:
   morloc-manager modify --env myenv --set-default   # make myenv your default
   sudo morloc-manager modify --env shared --set-default --system
   morloc-manager modify --env myenv --dotfiles ~/mydots
-  morloc-manager modify --env myenv --system-packages jq,vim
-  morloc-manager modify --env myenv --rm-system-packages jq
+  morloc-manager modify --env myenv --conda-packages-file tools.conda
+  morloc-manager modify --env myenv --system-packages-file tools.apt
   morloc-manager modify --env myenv --lang py@3.13")]
     Modify {
         /// Environment to modify (default: the default environment)
@@ -392,15 +399,17 @@ Examples:
         /// comma-separated). Triggers a rebuild at the current morloc version.
         #[arg(long)]
         lang: Vec<String>,
-        /// Add OS package(s) to the image, e.g. --system-packages jq,vim.
-        /// Repeatable or comma-separated. Additive; container backend only.
-        /// Triggers a rebuild.
-        #[arg(long = "system-packages", alias = "system-package")]
-        system_package: Vec<String>,
-        /// Remove OS package(s) previously added, e.g. --rm-system-packages jq.
-        /// Repeatable or comma-separated. Triggers a rebuild.
-        #[arg(long = "rm-system-packages", alias = "rm-system-package")]
-        rm_system_package: Vec<String>,
+        /// Replace the env's apt package list with the contents of this file, one
+        /// package per line (`#` comments and blank lines ignored). Container
+        /// backend only. Triggers a rebuild. To change packages, edit the file
+        /// and re-apply.
+        #[arg(long = "system-packages-file")]
+        system_packages_file: Option<String>,
+        /// Replace the env's conda package list with the contents of this file,
+        /// one match-spec per line (`#` comments and blank lines ignored), e.g.
+        /// `jq` or `hyperfine>=1.18`. Any backend. Triggers a rebuild.
+        #[arg(long = "conda-packages-file")]
+        conda_packages_file: Option<String>,
         /// Directory of dotfiles to copy into the environment's home
         /// (.bashrc, .vimrc, .config/...). Overwrites like `cp -rf`;
         /// docker/podman only. No rebuild.
@@ -958,12 +967,13 @@ fn engine_installed(engine: ContainerEngine) -> bool {
     }
 }
 
-/// The error for `--system-packages` on a backend that has no image to bake OS
-/// packages into (i.e. native). Mirrors `dotfiles_not_supported`.
+/// The error for `--system-packages-file` on a backend that has no image to bake
+/// OS packages into (i.e. native). Mirrors `dotfiles_not_supported`.
 fn system_package_not_supported() -> ManagerError {
     ManagerError::EnvError(
-        "--system-packages applies only to container backends; the native backend \
-         has no image to bake packages into"
+        "--system-packages-file applies only to container backends; the native \
+         backend has no image to bake packages into. Use --conda-packages-file \
+         for utilities on conda-forge."
             .to_string(),
     )
 }
@@ -1195,7 +1205,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             morloc_version,
             engine,
             dev,
-            system_package,
+            system_packages_file,
+            conda_packages_file,
             dotfiles,
             cert_bundle,
             base,
@@ -1205,9 +1216,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             non_interactive,
         } => {
             if system { check_system_write_access()?; }
-            // Flatten `--system-packages a,b --system-packages c` into `[a,b,c]`
-            // once, so every downstream path sees a clean list.
-            let system_package = flatten_csv(&system_package);
+            // Read the package files up front so a bad path aborts before any
+            // prompting or provisioning; every downstream path sees the list.
+            let system_package =
+                system_packages_file.as_deref().map(read_package_file).transpose()?.unwrap_or_default();
+            let conda_package =
+                conda_packages_file.as_deref().map(read_package_file).transpose()?.unwrap_or_default();
             let interactive = !non_interactive && io::stdin().is_terminal();
             if !non_interactive && !interactive {
                 eprintln!("Note: No TTY detected, running in non-interactive mode.");
@@ -1223,6 +1237,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     cli_engine: engine,
                     cli_lang: lang,
                     cli_system_package: system_package,
+                    cli_conda_package: conda_package,
                     cli_system: system,
                     cli_dotfiles: dotfiles,
                     cli_set_default: set_default,
@@ -1239,7 +1254,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     let Backend::Container(eng) = plan.backend else { unreachable!() };
                     return container_new_dev(
                         plan.scope, eng, Some(plan.name), src, plan.lang, plan.system_packages,
-                        plan.dotfiles, cert_bundle, base.unwrap_or_default().image().to_string(),
+                        plan.conda_packages, plan.dotfiles, cert_bundle,
+                        base.unwrap_or_default().image().to_string(),
                         plan.requested_version, no_init, plan.make_default,
                     );
                 }
@@ -1249,13 +1265,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                             return Err(base_not_supported());
                         }
                         native_new(
-                            plan.scope, Some(plan.name), plan.lang, plan.requested_version,
-                            cert_bundle, no_init, plan.make_default, verbose,
+                            plan.scope, Some(plan.name), plan.lang, plan.conda_packages,
+                            plan.requested_version, cert_bundle, no_init, plan.make_default, verbose,
                         )
                     }
                     Backend::Container(eng) => container_new_derived(
                         plan.scope, eng, Some(plan.name), plan.lang, plan.system_packages,
-                        plan.dotfiles, cert_bundle, base.unwrap_or_default().image().to_string(),
+                        plan.conda_packages, plan.dotfiles, cert_bundle,
+                        base.unwrap_or_default().image().to_string(),
                         plan.requested_version, no_init, plan.make_default,
                     ),
                 };
@@ -1309,7 +1326,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if base.is_some() {
                     return Err(base_not_supported());
                 }
-                return native_new(scope, name, lang, morloc_version, cert_bundle, no_init, set_default, verbose);
+                return native_new(scope, name, lang, conda_package, morloc_version, cert_bundle, no_init, set_default, verbose);
             }
 
             // Resolve engine: explicit flag > config default > auto-detect single > error
@@ -1373,8 +1390,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let base_image = base.unwrap_or_default().image().to_string();
             if let Some(src) = dev {
                 return container_new_dev(
-                    scope, resolved_engine, name, src, lang, system_package, dotfiles,
-                    cert_bundle, base_image, morloc_version, no_init, set_default,
+                    scope, resolved_engine, name, src, lang, system_package, conda_package,
+                    dotfiles, cert_bundle, base_image, morloc_version, no_init, set_default,
                 );
             }
 
@@ -1382,8 +1399,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // built from a generated Dockerfile that runs pixi inside, sharing the
             // native backend's lowering. There is no pull/recipe/base-image path.
             container_new_derived(
-                scope, resolved_engine, name, lang, system_package, dotfiles, cert_bundle,
-                base_image, morloc_version, no_init, set_default,
+                scope, resolved_engine, name, lang, system_package, conda_package, dotfiles,
+                cert_bundle, base_image, morloc_version, no_init, set_default,
             )
         }
 
@@ -1747,6 +1764,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         installed: Vec<String>,
                         #[serde(skip_serializing_if = "Vec::is_empty")]
                         system_packages: Vec<String>,
+                        #[serde(skip_serializing_if = "Vec::is_empty")]
+                        conda_packages: Vec<String>,
                         packages: Vec<pixi::LockedPackage>,
                     }
                     // Container-only image/recipe detail (includes the engine flags,
@@ -1837,6 +1856,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                             languages,
                             installed,
                             system_packages: ec.system_packages.clone(),
+                            conda_packages: ec.conda_packages.clone(),
                             packages: locked,
                         },
                         container,
@@ -1909,6 +1929,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     }
                     if !ec.system_packages.is_empty() {
                         println!("  System:     {}", ec.system_packages.join(" "));
+                    }
+                    if !ec.conda_packages.is_empty() {
+                        println!("  Conda:      {}", ec.conda_packages.join(" "));
                     }
 
                     // Container image + recipe detail (docker/podman/apptainer only).
@@ -2110,8 +2133,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         Cmd::Modify {
             env,
             lang,
-            system_package,
-            rm_system_package,
+            system_packages_file,
+            conda_packages_file,
             dotfiles,
             cert_bundle,
             base,
@@ -2125,16 +2148,24 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                      an environment's scope is fixed when it is created".to_string(),
                 ));
             }
-            // Flatten repeatable + comma-separated package lists into clean tokens.
-            let system_package = flatten_csv(&system_package);
-            let rm_system_package = flatten_csv(&rm_system_package);
-            let touches_packages = !system_package.is_empty() || !rm_system_package.is_empty();
+            // Read the package files up front so a bad path aborts before any side
+            // effect. `None` = flag not passed = leave that list unchanged; `Some`
+            // replaces the stored list for that source.
+            let system_from_file =
+                system_packages_file.as_deref().map(read_package_file).transpose()?;
+            let conda_from_file =
+                conda_packages_file.as_deref().map(read_package_file).transpose()?;
+            // apt is container-only; conda works on every backend, so the native
+            // rejection below keys on apt alone.
+            let touches_apt = system_from_file.is_some();
+            let touches_packages = touches_apt || conda_from_file.is_some();
             let will_rebuild =
                 !lang.is_empty() || touches_packages || cert_bundle.is_some() || base.is_some();
             if !set_default && !will_rebuild && dotfiles.is_none() {
                 return Err(ManagerError::EnvError(
                     "nothing to modify: pass --set-default, --dotfiles, --lang, \
-                     --cert-bundle, --base, --system-packages, or --rm-system-packages".to_string(),
+                     --cert-bundle, --base, --system-packages-file, or \
+                     --conda-packages-file".to_string(),
                 ));
             }
 
@@ -2142,10 +2173,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
 
             // ---- Validation that needs the resolved env, done BEFORE any side
             //      effect so an invalid request never leaves partial changes. ----
-            if touches_packages && ec.backend.is_native() {
+            // Only apt packages are container-only; conda packages land in the
+            // pixi solve, which the native backend has too.
+            if touches_apt && ec.backend.is_native() {
                 return Err(ManagerError::EnvError(
-                    "--system-packages/--rm-system-packages apply only to container \
-                     backends; the native backend has no image to bake packages into"
+                    "--system-packages-file applies only to container backends; the \
+                     native backend has no image to bake packages into. Use \
+                     --conda-packages-file for utilities on conda-forge."
                         .to_string(),
                 ));
             }
@@ -2214,13 +2248,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let prev_ec = ec.clone();
                 let prev_inputs = cfg::read_env_inputs(env_scope, &env_name);
 
-                if touches_packages {
-                    for p in system_package {
-                        if !ec.system_packages.contains(&p) {
-                            ec.system_packages.push(p);
-                        }
-                    }
-                    ec.system_packages.retain(|p| !rm_system_package.contains(p));
+                // Each file is the env's whole list for its source; edit and
+                // re-apply to change it.
+                if let Some(list) = system_from_file {
+                    ec.system_packages = list;
+                }
+                if let Some(list) = conda_from_file {
+                    ec.conda_packages = list;
                 }
                 // Apply the CA bundle materialized during validation. Its new
                 // certs change the solve/image cache key, so the rebuild re-runs.
@@ -3389,6 +3423,7 @@ fn resolve_env_requirements(
     name: &str,
     program_specs: &[envspec::EnvSpec],
     lang_pins: &[(String, Option<String>)],
+    conda_packages: &[String],
     engine: Option<ContainerEngine>,
     requested_version: Option<&str>,
     base_image: &str,
@@ -3432,7 +3467,7 @@ fn resolve_env_requirements(
         None => hostprobe::probe_host().platform,
     };
     let (specs, lang_spec, requirements) =
-        build_env_requirements(name, &version, &platform, program_specs, lang_pins, &support)?;
+        build_env_requirements(name, &version, &platform, program_specs, lang_pins, conda_packages, &support)?;
 
     Ok(ResolvedRequirements {
         runtime_dir,
@@ -3456,6 +3491,7 @@ fn build_env_requirements(
     platform: &str,
     program_specs: &[envspec::EnvSpec],
     lang_pins: &[(String, Option<String>)],
+    conda_packages: &[String],
     support: &langsupport::LangSupport,
 ) -> Result<(Vec<envspec::EnvSpec>, Option<envspec::EnvSpec>, pixi::RequirementSet)> {
     let mut specs: Vec<envspec::EnvSpec> = program_specs.to_vec();
@@ -3470,13 +3506,19 @@ fn build_env_requirements(
         lang_spec = Some(ls);
     }
     let channels = pixi::default_channels();
-    let requirements = pixi::resolve_requirements(&pixi::PixiManifestInput {
+    let mut requirements = pixi::resolve_requirements(&pixi::PixiManifestInput {
         env_name: name,
         platform,
         channels: &channels,
         specs: &specs,
         lang_support: support,
     })?;
+    // Fold the user's conda package pins into the solve (LangSupport's own
+    // dev_conda is injected by `aggregate`). `add_conda_spec` splits name from
+    // version constraint and merges against any existing entry.
+    for pkg in conda_packages {
+        requirements.add_conda_spec(pkg)?;
+    }
     Ok((specs, lang_spec, requirements))
 }
 
@@ -3491,6 +3533,7 @@ fn materialize_native_env(
     name: &str,
     program_specs: &[envspec::EnvSpec],
     lang_pins: &[(String, Option<String>)],
+    conda_packages: &[String],
     requested_version: Option<&str>,
     verbose: bool,
 ) -> Result<String> {
@@ -3498,7 +3541,7 @@ fn materialize_native_env(
     // Native: the compiler runs on the host, so the base image is unused (it only
     // matters for the container lang-support fallback, which native never hits).
     let req = resolve_env_requirements(
-        scope, name, program_specs, lang_pins, None, requested_version, CONTAINER_BASE_IMAGE,
+        scope, name, program_specs, lang_pins, conda_packages, None, requested_version, CONTAINER_BASE_IMAGE,
     )?;
 
     // Phase 1 of the impurity gate: a fast reject on host/vcpkg system deps that
@@ -3877,16 +3920,64 @@ fn parse_token_list(answer: &str) -> Vec<String> {
         .collect()
 }
 
-/// Flatten repeatable + comma-separated CLI list values into trimmed, non-empty
-/// tokens, so `--system-packages a,b --system-packages c` yields `[a, b, c]`.
-fn flatten_csv(items: &[String]) -> Vec<String> {
-    items
-        .iter()
-        .flat_map(|s| s.split(','))
+/// Strip a `#` comment from a package-file line. The `#` counts as a comment only
+/// at line start or after whitespace, so a spec that itself contains `#` (rare in
+/// conda/apt names) is not silently truncated mid-token: `a # b` -> `a`, `a#b`
+/// stays whole.
+fn strip_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            return &line[..i];
+        }
+    }
+    line
+}
+
+/// Parse a package-list file: one spec per line, blank lines ignored, `#`
+/// comments stripped (see `strip_line_comment`), duplicates dropped preserving
+/// first-seen order. Serves both `--system-packages-file` (apt names) and
+/// `--conda-packages-file` (conda match-specs).
+fn parse_package_lines(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    text.lines()
+        .map(strip_line_comment)
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|l| !l.is_empty())
+        .filter(|l| seen.insert(*l))
         .map(str::to_string)
         .collect()
+}
+
+/// Read a package-list file into its deduped package list. A named file that
+/// cannot be read is a hard error, not a silent empty list.
+fn read_package_file(path: &str) -> Result<Vec<String>> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        ManagerError::EnvError(format!("cannot read package file '{path}': {e}"))
+    })?;
+    Ok(parse_package_lines(&text))
+}
+
+/// Prompt for an optional package-file path (interactive `new`); blank/"none"
+/// yields an empty list, otherwise the file is read and parsed.
+fn prompt_package_file(label: &str) -> Result<Vec<String>> {
+    let ans = prompt_line(label, "none");
+    let ans = ans.trim();
+    if ans.is_empty() || ans.eq_ignore_ascii_case("none") {
+        Ok(Vec::new())
+    } else {
+        read_package_file(ans)
+    }
+}
+
+/// Re-prompt for a package file (confirm-screen editor) and replace `list` with
+/// its contents. A read error is printed and the current list kept -- the editor
+/// must not fail the whole session over a bad path.
+fn update_packages_from_file_prompt(label: &str, list: &mut Vec<String>) {
+    match prompt_package_file(label) {
+        Ok(l) => *list = l,
+        Err(e) => eprintln!("  {e}"),
+    }
 }
 
 /// Prompt for the morloc version to provision. Returns the requested spec:
@@ -4154,6 +4245,7 @@ struct NewPlan {
     requested_version: Option<String>,
     lang: Vec<String>,
     system_packages: Vec<String>,
+    conda_packages: Vec<String>,
     dotfiles: Option<String>,
     make_default: bool,
     /// `Some(path)` builds a DEV env from that morloc source tree (container-only,
@@ -4169,6 +4261,7 @@ struct NewSessionInput {
     cli_engine: Option<EngineArg>,
     cli_lang: Vec<String>,
     cli_system_package: Vec<String>,
+    cli_conda_package: Vec<String>,
     cli_system: bool,
     cli_dotfiles: Option<String>,
     cli_set_default: bool,
@@ -4185,6 +4278,7 @@ enum EditField {
     Scope,
     Langs,
     Packages,
+    CondaPackages,
     Dotfiles,
     Default,
 }
@@ -4199,6 +4293,7 @@ impl EditField {
             EditField::Scope => "scope",
             EditField::Langs => "language pins",
             EditField::Packages => "system packages",
+            EditField::CondaPackages => "conda packages",
             EditField::Dotfiles => "dotfiles",
             EditField::Default => "default",
         }
@@ -4214,6 +4309,7 @@ impl EditField {
             EditField::Scope => if plan.scope == Scope::System { "system" } else { "local" }.to_string(),
             EditField::Langs => list_or_none(&plan.lang),
             EditField::Packages => list_or_none(&plan.system_packages),
+            EditField::CondaPackages => list_or_none(&plan.conda_packages),
             EditField::Dotfiles => plan.dotfiles.clone().unwrap_or_else(|| "none".to_string()),
             EditField::Default => if plan.make_default { "yes" } else { "no" }.to_string(),
         }
@@ -4245,11 +4341,14 @@ impl EditField {
                 let cur = EditField::Langs.value(plan);
                 plan.lang = parse_token_list(&prompt_line("language pins (e.g. py@3.12 r)", &cur));
             }
-            EditField::Packages => {
-                let cur = EditField::Packages.value(plan);
-                plan.system_packages =
-                    parse_token_list(&prompt_line("system packages (e.g. jq vim)", &cur));
-            }
+            EditField::Packages => update_packages_from_file_prompt(
+                "system (apt) packages file (path, blank for none)",
+                &mut plan.system_packages,
+            ),
+            EditField::CondaPackages => update_packages_from_file_prompt(
+                "conda packages file (path, blank for none)",
+                &mut plan.conda_packages,
+            ),
             EditField::Dotfiles => plan.dotfiles = interactive_choose_dotfiles(),
             EditField::Default => {
                 let current = environment::resolve_default_environment().ok().map(|(n, _, _)| n);
@@ -4280,6 +4379,9 @@ fn confirm_fields(plan: &NewPlan) -> Vec<EditField> {
     if is_container {
         fields.push(EditField::Packages);
     }
+    // Conda packages work on every backend (they land in the pixi solve, not the
+    // image), so they are always offered.
+    fields.push(EditField::CondaPackages);
     if is_oci {
         fields.push(EditField::Dotfiles);
     }
@@ -4327,6 +4429,7 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
         cli_engine,
         cli_lang,
         cli_system_package,
+        cli_conda_package,
         cli_system,
         cli_dotfiles,
         cli_set_default,
@@ -4397,9 +4500,18 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
         }
         cli_system_package
     } else if is_container {
-        parse_token_list(&prompt_line("System packages (e.g. jq vim)", "none"))
+        prompt_package_file("System (apt) packages file (path, blank for none)")?
     } else {
         Vec::new()
+    };
+
+    // 4b. Conda packages: utilities folded into the pixi solve. Unlike system
+    //     packages these work on every backend (native included), so a file is
+    //     always prompted when not given on the CLI.
+    let conda_packages = if !cli_conda_package.is_empty() {
+        cli_conda_package
+    } else {
+        prompt_package_file("Conda packages file (path, blank for none)")?
     };
 
     // 5. Scope. Offered interactively only for container backends; a native env
@@ -4453,6 +4565,7 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
         requested_version,
         lang,
         system_packages,
+        conda_packages,
         dotfiles,
         make_default,
         dev_source,
@@ -4510,6 +4623,7 @@ fn native_new(
     scope: Scope,
     name: Option<String>,
     lang: Vec<String>,
+    conda_packages: Vec<String>,
     requested_version: Option<String>,
     cert_bundle: Option<String>,
     no_init: bool,
@@ -4530,7 +4644,7 @@ fn native_new(
     let morloc_version = if no_init {
         None
     } else {
-        materialize_native_env(scope, &env_name, &[], &lang_pins, requested_version.as_deref(), verbose)?
+        materialize_native_env(scope, &env_name, &[], &lang_pins, &conda_packages, requested_version.as_deref(), verbose)?
             .parse::<Version>()
             .ok()
     };
@@ -4542,6 +4656,7 @@ fn native_new(
         None,
         morloc_version,
         Vec::new(),
+        conda_packages,
     );
     if let Some(p) = prepared {
         p.apply_to(&mut ec);
@@ -4966,8 +5081,8 @@ fn rematerialize_env(
         let stdlib = resolve_stdlib_version(effective_version)?;
         let source = std::path::PathBuf::from(&dev.source);
         let image_tag = build_dev_container_image(
-            scope, name, ce, &specs, &source, &lang_pins, &ec.system_packages, &stdlib,
-            &ec.base_image,
+            scope, name, ce, &specs, &source, &lang_pins, &ec.system_packages,
+            &ec.conda_packages, &stdlib, &ec.base_image,
         )?;
         let mut ec = ec;
         // Preserve the prior recorded version if the new stdlib base fails to parse
@@ -4989,7 +5104,7 @@ fn rematerialize_env(
         // actually installed (symmetric with the container path below); without
         // this a native `update` leaves a stale version that misleads `doctor`
         // and the manifest-version check.
-        let mver = materialize_native_env(scope, name, &specs, &lang_pins, effective_version, verbose)?;
+        let mver = materialize_native_env(scope, name, &specs, &lang_pins, &ec.conda_packages, effective_version, verbose)?;
         let mut ec = ec;
         ec.morloc_version = mver.parse::<Version>().ok();
         cfg::write_env_config(scope, name, &ec)?;
@@ -4998,8 +5113,8 @@ fn rematerialize_env(
 
     let ce = ec.engine()?;
     let (image_tag, mver) = build_requirement_derived_image(
-        scope, name, ce, &specs, &lang_pins, &ec.system_packages, effective_version,
-        &ec.base_image,
+        scope, name, ce, &specs, &lang_pins, &ec.system_packages, &ec.conda_packages,
+        effective_version, &ec.base_image,
     )?;
     let mut ec = ec;
     ec.built_image = Some(image_tag);
@@ -5019,6 +5134,7 @@ fn build_requirement_derived_image(
     program_specs: &[envspec::EnvSpec],
     lang_pins: &[(String, Option<String>)],
     system_packages: &[String],
+    conda_packages: &[String],
     requested_version: Option<&str>,
     base_image: &str,
 ) -> Result<(String, String)> {
@@ -5028,7 +5144,7 @@ fn build_requirement_derived_image(
     // Pass the engine so the language-support table can be generated in a
     // container when the host cannot run the compiler (NixOS/musl).
     let req = resolve_env_requirements(
-        scope, name, program_specs, lang_pins, Some(engine), requested_version, base_image,
+        scope, name, program_specs, lang_pins, conda_packages, Some(engine), requested_version, base_image,
     )?;
 
     let context = cfg::env_data_dir(scope, name).join(CONTAINER_BUILD_SUBDIR);
@@ -5241,6 +5357,7 @@ fn build_dev_container_image(
     source: &std::path::Path,
     lang_pins: &[(String, Option<String>)],
     system_packages: &[String],
+    conda_packages: &[String],
     stdlib_version: &str,
     base_image: &str,
 ) -> Result<String> {
@@ -5263,7 +5380,7 @@ fn build_dev_container_image(
 
     let platform = container_conda_platform();
     let (_specs, lang_spec, requirements) =
-        build_env_requirements(name, stdlib_version, &platform, program_specs, lang_pins, &support)?;
+        build_env_requirements(name, stdlib_version, &platform, program_specs, lang_pins, conda_packages, &support)?;
     let manifest = pixi::render_manifest(&requirements);
     let image_tag = format!("localhost/morloc-env:{name}");
 
@@ -5532,6 +5649,7 @@ fn container_new_derived(
     name: Option<String>,
     lang: Vec<String>,
     system_packages: Vec<String>,
+    conda_packages: Vec<String>,
     dotfiles: Option<String>,
     cert_bundle: Option<String>,
     base_image: String,
@@ -5563,8 +5681,8 @@ fn container_new_derived(
         (None, None)
     } else {
         let (image, version) = build_requirement_derived_image(
-            scope, &env_name, engine, &[], &lang_pins, &system_packages, requested_version.as_deref(),
-            &base_image,
+            scope, &env_name, engine, &[], &lang_pins, &system_packages, &conda_packages,
+            requested_version.as_deref(), &base_image,
         )?;
         (Some(image), version.parse::<Version>().ok())
     };
@@ -5576,6 +5694,7 @@ fn container_new_derived(
         built_image,
         morloc_version,
         system_packages,
+        conda_packages,
     );
     if let Some(p) = prepared {
         p.apply_to(&mut ec);
@@ -5607,6 +5726,7 @@ fn container_new_dev(
     source: String,
     lang: Vec<String>,
     system_packages: Vec<String>,
+    conda_packages: Vec<String>,
     dotfiles: Option<String>,
     cert_bundle: Option<String>,
     base_image: String,
@@ -5643,8 +5763,8 @@ fn container_new_dev(
         let stdlib = resolve_stdlib_version(requested_version.as_deref())?;
         // A brand-new env has no installed programs yet, so no program specs.
         let image_tag = build_dev_container_image(
-            scope, &env_name, engine, &[], &source_path, &lang_pins, &system_packages, &stdlib,
-            &base_image,
+            scope, &env_name, engine, &[], &source_path, &lang_pins, &system_packages,
+            &conda_packages, &stdlib, &base_image,
         )?;
         (Some(image_tag), stdlib.parse::<Version>().ok())
     };
@@ -5657,6 +5777,7 @@ fn container_new_dev(
         built_image,
         morloc_version,
         system_packages,
+        conda_packages,
     )
     .with_dev(dev);
     if let Some(p) = prepared {
@@ -6941,39 +7062,22 @@ mod tests {
     }
 
     #[test]
-    fn modify_takes_package_add_remove_and_dotfiles() {
-        // Plural flags + comma-separated values (comma-splitting is flatten_csv's
-        // job at dispatch, so the parsed token is still the raw "jq,git" here).
+    fn modify_parses_package_file_flags_and_dotfiles() {
         let cli = Cli::try_parse_from([
             "morloc-manager", "modify", "--env", "e",
-            "--system-packages", "jq,git", "--rm-system-packages", "vim", "--dotfiles", "/tmp/d",
+            "--system-packages-file", "tools.apt",
+            "--conda-packages-file", "tools.conda",
+            "--dotfiles", "/tmp/d",
         ])
-        .expect("modify should parse plural package add/remove and dotfiles");
+        .expect("modify should parse package-file flags and dotfiles");
         match cli.command {
-            Some(Cmd::Modify { system_package, rm_system_package, dotfiles, .. }) => {
-                assert_eq!(system_package, vec!["jq,git".to_string()]);
-                assert_eq!(rm_system_package, vec!["vim".to_string()]);
+            Some(Cmd::Modify { system_packages_file, conda_packages_file, dotfiles, .. }) => {
+                assert_eq!(system_packages_file.as_deref(), Some("tools.apt"));
+                assert_eq!(conda_packages_file.as_deref(), Some("tools.conda"));
                 assert_eq!(dotfiles.as_deref(), Some("/tmp/d"));
             }
             _ => panic!("expected Cmd::Modify"),
         }
-        // The singular forms remain accepted as hidden aliases.
-        let cli = Cli::try_parse_from([
-            "morloc-manager", "modify", "--env", "e",
-            "--system-package", "jq", "--rm-system-package", "vim",
-        ])
-        .expect("singular aliases should still parse");
-        assert!(matches!(cli.command, Some(Cmd::Modify { .. })));
-    }
-
-    #[test]
-    fn flatten_csv_splits_commas_and_trims() {
-        // Repeatable + comma-separated, with surrounding whitespace and blanks.
-        assert_eq!(
-            flatten_csv(&["jq, git".to_string(), "vim".to_string(), " , ".to_string()]),
-            vec!["jq".to_string(), "git".to_string(), "vim".to_string()]
-        );
-        assert!(flatten_csv(&[]).is_empty());
     }
 
     #[test]
@@ -6987,8 +7091,8 @@ mod tests {
         Cmd::Modify {
             env: Some("e".to_string()),
             lang: Vec::new(),
-            system_package: Vec::new(),
-            rm_system_package: Vec::new(),
+            system_packages_file: None,
+            conda_packages_file: None,
             dotfiles,
             cert_bundle: None,
             base: None,
@@ -7007,6 +7111,46 @@ mod tests {
     fn modify_requires_at_least_one_change() {
         let err = dispatch(false, false, modify_cmd(false, false, None)).unwrap_err();
         assert!(err.to_string().contains("nothing to modify"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_package_lines_strips_comments_dedups_keeps_inner_hash() {
+        // Whole-line and whitespace-preceded `#` are comments; an inner `#` with
+        // no leading whitespace stays in the token; duplicates drop (first wins).
+        let text = "# header\njq\n\nhyperfine>=1.18   # trailing\n  ripgrep  \njq\na#b\n#only\n";
+        assert_eq!(
+            parse_package_lines(text),
+            vec![
+                "jq".to_string(),
+                "hyperfine>=1.18".to_string(),
+                "ripgrep".to_string(),
+                "a#b".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn read_package_file_errors_on_missing() {
+        // A named-but-unreadable file is a hard error, not a silent empty list.
+        let err = read_package_file("/no/such/pkgs.txt").unwrap_err();
+        assert!(err.to_string().contains("cannot read package file"), "got: {err}");
+    }
+
+    #[test]
+    fn new_parses_package_file_flags() {
+        let cli = Cli::try_parse_from([
+            "morloc-manager", "new", "e",
+            "--conda-packages-file", "tools.conda",
+            "--system-packages-file", "tools.apt",
+        ])
+        .expect("new should accept package-file flags");
+        match cli.command {
+            Some(Cmd::New { conda_packages_file, system_packages_file, .. }) => {
+                assert_eq!(conda_packages_file.as_deref(), Some("tools.conda"));
+                assert_eq!(system_packages_file.as_deref(), Some("tools.apt"));
+            }
+            _ => panic!("expected Cmd::New"),
+        }
     }
 
     #[test]
@@ -7367,6 +7511,7 @@ mod tests {
             shm_size: "1g".to_string(),
             morloc_version: Some(Version::new(0, 67, 0)),
             system_packages: Vec::new(),
+            conda_packages: Vec::new(),
             dev: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
@@ -7804,6 +7949,7 @@ run:
             shm_size: "512m".to_string(),
             morloc_version: Some(Version::new(0, 85, 0)),
             system_packages: Vec::new(),
+            conda_packages: Vec::new(),
             dev: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
@@ -7857,6 +8003,7 @@ run:
             shm_size: "512m".to_string(),
             morloc_version: None,
             system_packages: Vec::new(),
+            conda_packages: Vec::new(),
             dev: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
@@ -7882,6 +8029,7 @@ run:
             shm_size: "512m".to_string(),
             morloc_version: None,
             system_packages: Vec::new(),
+            conda_packages: Vec::new(),
             dev: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
@@ -7932,6 +8080,7 @@ run:
                 shm_size: "512m".to_string(),
                 morloc_version: None,
                 system_packages: Vec::new(),
+                conda_packages: Vec::new(),
                 dev: None,
                 cert_bundle: None,
                 cert_fingerprints: Vec::new(),
@@ -8055,6 +8204,7 @@ run:
             Some("localhost/morloc-env:mydev".to_string()),
             Some(Version::new(0, 98, 1)),
             Vec::new(),
+            Vec::new(),
         )
         .with_dev(DevConfig {
             source: "/home/z/src/morloc".to_string(),
@@ -8072,6 +8222,7 @@ run:
             String::new(),
             None,
             None,
+            Vec::new(),
             Vec::new(),
         );
         assert!(!plain.is_dev());

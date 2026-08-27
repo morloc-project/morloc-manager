@@ -372,6 +372,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         )
     }
 

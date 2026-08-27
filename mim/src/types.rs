@@ -364,10 +364,17 @@ pub struct EnvironmentConfig {
     #[serde(default)]
     pub morloc_version: Option<Version>,
     /// Extra OS packages baked into the image via the base package manager
-    /// (apt), for tools conda cannot provide (e.g. jq). Container-only; the
-    /// native backend rejects them at creation.
+    /// (apt), for tools conda cannot provide (e.g. locales, linux-tools).
+    /// Container-only; the native backend rejects them at creation.
     #[serde(default)]
     pub system_packages: Vec<String>,
+    /// Extra conda packages folded into the pixi solve, for utilities the user
+    /// wants in the env (e.g. jq, hyperfine). Unlike `system_packages` (apt,
+    /// image-baked, container-only) these live in the writable host-mounted
+    /// `/env`, so they work on every backend and can be added without an image
+    /// rebuild.
+    #[serde(default)]
+    pub conda_packages: Vec<String>,
     /// Dev-environment config. Present iff this env builds morloc from a mounted
     /// source tree (`is_dev`); `None` for a normal release env.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -400,6 +407,7 @@ impl EnvironmentConfig {
         built_image: Option<String>,
         morloc_version: Option<Version>,
         system_packages: Vec<String>,
+        conda_packages: Vec<String>,
     ) -> Self {
         EnvironmentConfig {
             schema_version: CURRENT_ENV_SCHEMA,
@@ -417,6 +425,7 @@ impl EnvironmentConfig {
             shm_size: default_shm_size(),
             morloc_version,
             system_packages,
+            conda_packages,
             dev: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),

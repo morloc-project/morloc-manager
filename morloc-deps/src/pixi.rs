@@ -185,6 +185,39 @@ fn insert_merged_conda(
     Ok(())
 }
 
+/// Split a conda match-spec into its package name and version constraint: the
+/// name is the leading run up to the first version operator (`= < > ! ~`) or
+/// whitespace, the remainder the constraint (`"*"` when absent), e.g.
+/// `numpy>=1.22,<3` -> ("numpy", ">=1.22,<3"). Commas stay in the constraint --
+/// conda's AND operator belongs in the version value, not split into a second key.
+pub fn split_conda_matchspec(spec: &str) -> (&str, &str) {
+    let spec = spec.trim();
+    let end = spec
+        .find(|c: char| matches!(c, '=' | '<' | '>' | '!' | '~' | ' ' | '\t'))
+        .unwrap_or(spec.len());
+    let name = spec[..end].trim();
+    let constraint = spec[end..].trim();
+    if constraint.is_empty() {
+        (name, "*")
+    } else {
+        (name, constraint)
+    }
+}
+
+impl RequirementSet {
+    /// Add a user conda match-spec to the solve, merging name+constraint through
+    /// `insert_merged_conda` like every other conda dependency. Conda-forge only.
+    pub fn add_conda_spec(&mut self, spec: &str) -> Result<()> {
+        let (name, constraint) = split_conda_matchspec(spec);
+        if name.is_empty() {
+            return Err(DepsError::Env(format!(
+                "invalid conda package spec '{spec}': no package name"
+            )));
+        }
+        insert_merged_conda(&mut self.conda, name, constraint, None)
+    }
+}
+
 /// Aggregate all specs into (conda dependencies, pypi dependencies) maps,
 /// clamped and injected against morloc's language-support table. Every injected
 /// dependency (toolchain, runtime, binder, system lib) rides on conda-forge
@@ -202,6 +235,13 @@ fn aggregate(
         if !p.optional {
             insert_merged_conda(&mut conda, &p.package, &p.constraint, None)?;
         }
+    }
+
+    // Dev-only C libraries the compiler's Haskell dependencies link through the
+    // active conda toolchain; empty on released envs.
+    for spec in &support.dev_conda {
+        let (name, constraint) = split_conda_matchspec(spec);
+        insert_merged_conda(&mut conda, name, constraint, None)?;
     }
 
     // Merge each language's author version constraint across all programs.
@@ -806,6 +846,40 @@ pub fn parse_env0(dump: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_conda_matchspec_separates_name_and_constraint() {
+        assert_eq!(split_conda_matchspec("jq"), ("jq", "*"));
+        assert_eq!(split_conda_matchspec("  ripgrep  "), ("ripgrep", "*"));
+        assert_eq!(split_conda_matchspec("hyperfine>=1.18"), ("hyperfine", ">=1.18"));
+        // conda's AND-comma stays in the constraint VALUE, never split off.
+        assert_eq!(split_conda_matchspec("numpy>=1.22,<3"), ("numpy", ">=1.22,<3"));
+        // space-separated form.
+        assert_eq!(split_conda_matchspec("numpy 1.22"), ("numpy", "1.22"));
+    }
+
+    #[test]
+    fn add_conda_spec_renders_as_name_keyed_dependency() {
+        let mut req = RequirementSet {
+            env_name: "e".into(),
+            platform: "linux-64".into(),
+            channels: default_channels(),
+            conda: BTreeMap::new(),
+            pypi: BTreeMap::new(),
+        };
+        req.add_conda_spec("hyperfine>=1.18").unwrap();
+        // Rendered as `hyperfine = ">=1.18"`, NOT a malformed `"hyperfine>=1.18"` key.
+        assert_eq!(req.conda.get("hyperfine"), Some(&(">=1.18".to_string(), None)));
+        assert!(!req.conda.contains_key("hyperfine>=1.18"));
+        let toml = render_manifest(&req);
+        assert!(toml.contains("\"hyperfine\" = \">=1.18\""), "got:\n{toml}");
+        // A user pin of an already-present package intersects, not duplicates.
+        req.add_conda_spec("hyperfine<2").unwrap();
+        assert_eq!(req.conda.len(), 1);
+        assert!(!req.conda.contains_key("hyperfine<2"));
+        // A name-less spec is rejected, not silently turned into a garbage key.
+        assert!(req.add_conda_spec(">=3").is_err());
+    }
 
     fn sample_spec() -> EnvSpec {
         const SAMPLE: &str = r#"{"envspec_version":2,"morloc_version":"0.98.2","languages":[{"lang":"py","constraint":">=3.10"},{"lang":"cpp","std":"c++20"},{"lang":"rust"}],"packages":{"cpp":[{"name":"opencv","constraint":">=4.8","source":"conda"}],"py":[{"name":"numpy","constraint":">=2,<3","source":"conda"},{"name":"requests","constraint":"*","source":"pypi"}],"rust":[{"name":"ndarray","constraint":"0.16","source":"crates"}]},"system":[{"name":"blas","provider":"unspecified"}],"modules":[]}"#;
