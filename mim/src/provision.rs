@@ -404,6 +404,15 @@ pub fn sibling_mim_env() -> Option<PathBuf> {
         .and_then(|p| p.parent().map(|d| d.join("mim-env")))
 }
 
+/// Copy a `mim-env` agent binary into a runtime-bin dir and set its exec bit, so
+/// an in-container `morloc make` runs it via MORLOC_BUILD_HOOK. Shared by the
+/// release path (`stage_runtime`) and the dev path (a caller-chosen binary).
+pub fn stage_mim_env_agent(src: &Path, runtime_bin_dir: &Path) -> Result<()> {
+    let dest = runtime_mim_env_bin(runtime_bin_dir);
+    copy_file(src, &dest)?;
+    make_executable(&dest)
+}
+
 /// The Rust workspace source within a provisioned runtime store; this is
 /// `morloc init`'s MORLOC_RUST_DIR.
 pub fn runtime_rust_src(dir: &Path) -> PathBuf {
@@ -693,9 +702,7 @@ pub fn stage_runtime(src: &Path, dest: &Path) -> Result<()> {
     // follows a symlink, so a dev-staged symlink copies the real binary in.)
     let agent = runtime_mim_env_bin(src);
     if agent.is_file() {
-        let agent_dest = runtime_mim_env_bin(dest);
-        copy_file(&agent, &agent_dest)?;
-        make_executable(&agent_dest)?;
+        stage_mim_env_agent(&agent, dest)?;
     }
     let rust = runtime_rust_src(src);
     if !rust.is_dir() {

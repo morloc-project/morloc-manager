@@ -313,6 +313,12 @@ fn default_env_schema() -> u32 {
 pub struct DevConfig {
     /// Absolute host path to the morloc source repo, bind-mounted into the env.
     pub source: String,
+    /// Host path to the `mim-env` dependency-agent binary to stage into the env's
+    /// runtime bin (so `morloc make` can provision declared deps). `None` falls
+    /// back to the `mim-env` sitting beside the running `mim`. A dev env needs the
+    /// current dev agent, never a downloaded release, so this is chosen explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mim_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
