@@ -65,8 +65,7 @@ pub fn detect_morloc_version(engine: ContainerEngine, image: &str) -> Result<Ver
     }
 
     let ver_out = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let ver_str = ver_out.split_whitespace().last().unwrap_or(&ver_out);
-    ver_str.parse().map_err(|_| {
+    Version::from_command_output(&ver_out).ok_or_else(|| {
         ManagerError::EnvError(format!(
             "Could not parse morloc version from image '{image}' output: {ver_out}"
         ))

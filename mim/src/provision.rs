@@ -700,9 +700,15 @@ pub fn stage_runtime(src: &Path, dest: &Path) -> Result<()> {
     // Stage the mim-env dependency agent into the image alongside the compiler, so
     // an in-container `morloc make` can run it via MORLOC_BUILD_HOOK. (`copy_file`
     // follows a symlink, so a dev-staged symlink copies the real binary in.)
-    let agent = runtime_mim_env_bin(src);
-    if agent.is_file() {
-        stage_mim_env_agent(&agent, dest)?;
+    // Prefer an agent staged in the runtime store; otherwise fall back to the
+    // `mim-env` beside the running `mim` (versioned with it -- always the matching
+    // one). This covers a `--local-runtime` dir, which carries no agent, and also
+    // closes the gap where a downloaded release store has no mim-env either.
+    let staged = runtime_mim_env_bin(src);
+    if staged.is_file() {
+        stage_mim_env_agent(&staged, dest)?;
+    } else if let Some(sibling) = sibling_mim_env().filter(|p| p.is_file()) {
+        stage_mim_env_agent(&sibling, dest)?;
     }
     let rust = runtime_rust_src(src);
     if !rust.is_dir() {

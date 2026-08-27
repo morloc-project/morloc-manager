@@ -153,24 +153,22 @@ or `latest`). With no flags on a TTY, all settings are prompted interactively.")
         /// the compiler + runtime from in the dev shell (no release download).
         /// `--morloc-version` then sets the stdlib base only. Docker/podman + local
         /// scope only.
-        #[arg(long)]
+        #[arg(long, help_heading = "Advanced")]
         dev: Option<String>,
-        /// Path to the `mim-env` dependency-agent binary to stage into a dev
-        /// environment (e.g. the static build from morloc-manager's
-        /// scripts/build-static.sh), so `morloc make` can provision a program's
-        /// declared dependencies. Dev environments only; defaults to the `mim-env`
-        /// beside the running `mim`. Never a downloaded release.
+        /// Adopt a locally-built morloc runtime instead of a release. DIR must
+        /// contain a `morloc` binary and a `rust/` workspace source.
+        #[arg(long = "local-runtime", value_name = "DIR", help_heading = "Advanced",
+              conflicts_with_all = ["morloc_version", "dev"])]
+        local_runtime: Option<String>,
+        /// Path to a local `mim-env` binary to stage into a dev environment.
+        /// Defaults to the `mim-env` beside the running `mim`.
         #[arg(long = "dev-mim-env")]
         dev_mim_env: Option<String>,
-        /// A file of apt packages to bake into the image, one per line (`#`
-        /// comments and blank lines ignored), e.g. locales or linux-tools-generic.
-        /// Container backend only; prefer --conda-packages-file for anything on
-        /// conda-forge.
-        #[arg(long = "system-packages-file")]
+        /// A file of apt packages to bake into the image, one per line.
+        /// Container backend only.
+        #[arg(long = "system-packages-file", help_heading = "Advanced")]
         system_packages_file: Option<String>,
-        /// A file of conda match-specs added to the pixi solve, one per line (`#`
-        /// comments and blank lines ignored), e.g. `jq` or `hyperfine>=1.18`.
-        /// Works on every backend.
+        /// A file of conda match-specs added to the pixi solve, one per line.
         #[arg(long = "conda-packages-file")]
         conda_packages_file: Option<String>,
         /// Directory of dotfiles to copy into the environment's home
@@ -1218,6 +1216,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             engine,
             dev,
             dev_mim_env,
+            local_runtime,
             system_packages_file,
             conda_packages_file,
             dotfiles,
@@ -1234,6 +1233,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     "--dev-mim-env requires --dev (it stages the agent into a dev environment)".to_string(),
                 ));
             }
+            // Resolve/validate the local runtime dir up front (clap already makes it
+            // mutually exclusive with --morloc-version and --dev). An advanced,
+            // flag-only mode: it is never offered interactively.
+            let local_runtime = match local_runtime {
+                Some(raw) => Some(resolve_local_runtime(&raw).map_err(ManagerError::EnvError)?),
+                None => None,
+            };
             // Read the package files up front so a bad path aborts before any
             // prompting or provisioning; every downstream path sees the list.
             let system_package =
@@ -1248,7 +1254,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // Interactive: prompt (in order) for dev source, version, backend,
             // language pins, system packages, scope, dotfiles, name, and default --
             // skipping any dimension already fixed by a flag -- then dispatch.
-            if interactive {
+            // A local-runtime build is flag-only (advanced): skip prompting and fall
+            // through to the direct dispatch below.
+            if interactive && local_runtime.is_none() {
                 let plan = match interactive_new_session(NewSessionInput {
                     name,
                     cli_version: morloc_version,
@@ -1285,19 +1293,40 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         }
                         native_new(
                             plan.scope, Some(plan.name), plan.lang, plan.conda_packages,
-                            plan.requested_version, cert_bundle, no_init, plan.make_default, verbose,
+                            plan.requested_version, None, cert_bundle, no_init, plan.make_default, verbose,
                         )
                     }
                     Backend::Container(eng) => container_new_derived(
                         plan.scope, eng, Some(plan.name), plan.lang, plan.system_packages,
                         plan.conda_packages, plan.dotfiles, cert_bundle,
                         base.unwrap_or_default().image().to_string(),
-                        plan.requested_version, no_init, plan.make_default,
+                        plan.requested_version, None, no_init, plan.make_default,
                     ),
                 };
             }
 
+            // A local-runtime env has no release version to name itself after;
+            // default its name to "local" rather than the misleading "latest".
+            let name = name.or_else(|| local_runtime.as_ref().map(|_| "local".to_string()));
+
             let scope = resolve_scope(system);
+
+            // A local-runtime env is supported at any scope, but a SYSTEM (shared)
+            // env pinned to a developer-private runtime path is fragile: the path
+            // must stay present and readable by whoever runs the env. Native system
+            // envs additionally resolve the binary live on every `morloc make`;
+            // container ones bake it at build time. Warn, do not block.
+            if let Some(dir) = &local_runtime {
+                if scope == Scope::System {
+                    eprintln!(
+                        "Warning: creating a SYSTEM-scope environment from a local runtime \
+                         ({}). This shared environment depends on that path remaining present \
+                         and readable; on the native backend it is resolved live on every \
+                         build. Prefer a local-scope env for local-runtime testing.",
+                        dir.display()
+                    );
+                }
+            }
 
             // Backend fork: the native (no-container) backend has its own flow.
             // Choose it when explicitly requested (--engine none), when it is the
@@ -1345,7 +1374,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if base.is_some() {
                     return Err(base_not_supported());
                 }
-                return native_new(scope, name, lang, conda_package, morloc_version, cert_bundle, no_init, set_default, verbose);
+                return native_new(scope, name, lang, conda_package, morloc_version, local_runtime, cert_bundle, no_init, set_default, verbose);
             }
 
             // Resolve engine: explicit flag > config default > auto-detect single > error
@@ -1420,7 +1449,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // native backend's lowering. There is no pull/recipe/base-image path.
             container_new_derived(
                 scope, resolved_engine, name, lang, system_package, conda_package, dotfiles,
-                cert_bundle, base_image, morloc_version, no_init, set_default,
+                cert_bundle, base_image, morloc_version, local_runtime, no_init, set_default,
             )
         }
 
@@ -1812,6 +1841,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     struct DevInfo {
                         source: String,
                     }
+                    // For a local-runtime env, `morloc_version` is the adopted
+                    // binary's `x.y.z-local`; the runtime dir is here.
+                    #[derive(serde::Serialize)]
+                    struct LocalRuntimeInfo {
+                        source: String,
+                    }
                     #[derive(serde::Serialize)]
                     struct InfoDetail {
                         name: String,
@@ -1822,6 +1857,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         morloc_version: Option<Version>,
                         #[serde(skip_serializing_if = "Option::is_none")]
                         dev: Option<DevInfo>,
+                        #[serde(skip_serializing_if = "Option::is_none")]
+                        local_runtime: Option<LocalRuntimeInfo>,
                         materialized: bool,
                         folders: Folders,
                         environment: std::collections::BTreeMap<String, String>,
@@ -1861,6 +1898,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         dev: ec.dev.as_ref().map(|d| DevInfo {
                             source: d.source.clone(),
                         }),
+                        local_runtime: ec.local_runtime.as_ref().map(|l| LocalRuntimeInfo {
+                            source: l.source.clone(),
+                        }),
                         materialized,
                         folders: Folders {
                             data_dir: data_dir.display().to_string(),
@@ -1895,6 +1935,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         if let Some(agent) = &dev.mim_env {
                             println!("  Dep agent:   {agent}");
                         }
+                    }
+                    if let Some(ref lr) = ec.local_runtime {
+                        // A local-runtime env: the version below is the adopted binary's
+                        // `x.y.z-local`; the runtime dir is a developer-owned path.
+                        println!("Mode:      local runtime (adopted from a local build)");
+                        println!("  Runtime:     {}", lr.source);
                     }
                     if let Some(ref ver) = ec.morloc_version {
                         let what = if ec.is_dev() { "Stdlib" } else { "Morloc" };
@@ -2120,6 +2166,19 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
             if env_scope == Scope::System {
                 check_system_write_access()?;
+            }
+
+            // A local-runtime env's compiler version tracks its adopted binary; there
+            // is no release to move to. A bare `update` (re-adopt the rebuilt binary)
+            // is fine and flows through rematerialize_env below, but an explicit
+            // version move is rejected.
+            if ec.is_local_runtime() && (latest || morloc_version.is_some()) {
+                return Err(ManagerError::EnvError(format!(
+                    "environment '{env_name}' uses a local runtime (--local-runtime); its \
+                     morloc version tracks the adopted binary and cannot be moved to a \
+                     release. Rebuild morloc, then run `morloc-manager update --env \
+                     {env_name}` (no version) to re-adopt it."
+                )));
             }
 
             // Version policy: --latest -> newest release; --morloc-version V -> V;
@@ -2354,6 +2413,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     "environment '{env_name}' is a dev environment: its behavior depends on a \
                      mutable host source mount, so it cannot be frozen into a reproducible \
                      artifact. Freeze a release env instead."
+                )));
+            }
+            if ec.is_local_runtime() {
+                return Err(ManagerError::EnvError(format!(
+                    "environment '{env_name}' uses a local runtime (--local-runtime): its \
+                     compiler is an unreleased local build, so it cannot be frozen into a \
+                     reproducible artifact. Freeze a release env instead."
                 )));
             }
             let engine = ec.engine()?;
@@ -3467,33 +3533,52 @@ fn resolve_env_requirements(
     conda_packages: &[String],
     engine: Option<ContainerEngine>,
     requested_version: Option<&str>,
+    local_runtime: Option<&std::path::Path>,
     base_image: &str,
 ) -> Result<ResolvedRequirements> {
-    // An explicit per-env version (from --morloc-version, or an env's recorded
-    // version on update) wins; otherwise fall back to $MORLOC_RELEASE_TAG/latest.
-    let tag = requested_version
-        .map(|v| v.to_string())
-        .unwrap_or_else(resolve_release_tag);
-    // The runtime triple follows the BUILD target, not the host: a container
-    // backend builds and runs the compiler inside a Linux image (matching the
-    // host arch), so on a macOS host it needs the Linux runtime, not the
-    // (possibly unpublished) macOS one. Native builds on the host itself.
-    let triple = match engine {
-        Some(_) => provision::release_triple("linux", std::env::consts::ARCH),
-        None => provision::host_release_triple(),
-    }
-    .ok_or_else(|| {
-        ManagerError::BackendUnsupported(format!(
-            "no prebuilt morloc runtime is published for this platform ({}/{})",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ))
-    })?;
-    let (runtime_dir, version) = provision::provision_runtime(scope, &tag, triple)?;
-    let morloc_bin = provision::runtime_morloc_bin(&runtime_dir);
-    // `engine` lets the table be generated in a container when the host cannot
-    // run the compiler (native passes None; it runs on the host by definition).
-    let support = load_lang_support(&runtime_dir, engine, base_image)?;
+    let (runtime_dir, version, morloc_bin, support) = if let Some(local) = local_runtime {
+        // Local-runtime env: adopt the developer-assembled `{ morloc, rust/ }` dir
+        // in place of a downloaded release -- no manifest fetch, no download, no
+        // contract-version gate (the local binary supplies the lang-support schema
+        // directly, and libmorloc is built from the local source, so it is coherent
+        // by construction).
+        let morloc_bin = provision::runtime_morloc_bin(local);
+        let version = local_runtime_version(&morloc_bin)?;
+        // Emit the lang-support table FRESH from the (possibly just-rebuilt) local
+        // binary. Deliberately NOT via load_lang_support: that reads/writes a cached
+        // table in the runtime dir, which for a borrowed local dir would both go
+        // stale across rebuilds and write into a directory we do not own.
+        let json = emit_lang_support(&morloc_bin, engine, base_image)?;
+        let support = langsupport::LangSupport::from_json(&json)?;
+        (local.to_path_buf(), version, morloc_bin, support)
+    } else {
+        // An explicit per-env version (from --morloc-version, or an env's recorded
+        // version on update) wins; otherwise fall back to $MORLOC_RELEASE_TAG/latest.
+        let tag = requested_version
+            .map(|v| v.to_string())
+            .unwrap_or_else(resolve_release_tag);
+        // The runtime triple follows the BUILD target, not the host: a container
+        // backend builds and runs the compiler inside a Linux image (matching the
+        // host arch), so on a macOS host it needs the Linux runtime, not the
+        // (possibly unpublished) macOS one. Native builds on the host itself.
+        let triple = match engine {
+            Some(_) => provision::release_triple("linux", std::env::consts::ARCH),
+            None => provision::host_release_triple(),
+        }
+        .ok_or_else(|| {
+            ManagerError::BackendUnsupported(format!(
+                "no prebuilt morloc runtime is published for this platform ({}/{})",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ))
+        })?;
+        let (runtime_dir, version) = provision::provision_runtime(scope, &tag, triple)?;
+        let morloc_bin = provision::runtime_morloc_bin(&runtime_dir);
+        // `engine` lets the table be generated in a container when the host cannot
+        // run the compiler (native passes None; it runs on the host by definition).
+        let support = load_lang_support(&runtime_dir, engine, base_image)?;
+        (runtime_dir, version, morloc_bin, support)
+    };
 
     // Script-provisioned languages (futhark) install via a container script, not
     // conda; reject them on non-OCI backends before the (doomed) solve/build.
@@ -3576,13 +3661,14 @@ fn materialize_native_env(
     lang_pins: &[(String, Option<String>)],
     conda_packages: &[String],
     requested_version: Option<&str>,
+    local_runtime: Option<&std::path::Path>,
     verbose: bool,
 ) -> Result<String> {
     // Native runs on the host, so the compiler executes there -- no engine needed.
     // Native: the compiler runs on the host, so the base image is unused (it only
     // matters for the container lang-support fallback, which native never hits).
     let req = resolve_env_requirements(
-        scope, name, program_specs, lang_pins, conda_packages, None, requested_version, CONTAINER_BASE_IMAGE,
+        scope, name, program_specs, lang_pins, conda_packages, None, requested_version, local_runtime, CONTAINER_BASE_IMAGE,
     )?;
 
     // Phase 1 of the impurity gate: a fast reject on host/vcpkg system deps that
@@ -4196,6 +4282,81 @@ fn resolve_dev_source(raw: &str) -> std::result::Result<std::path::PathBuf, Stri
     Ok(abs)
 }
 
+/// Resolve, validate, and canonicalize a `--local-runtime` directory: a
+/// developer-assembled runtime store of a `morloc` binary and a `rust/`
+/// workspace source (typically both symlinks into a working tree), adopted in
+/// place of a downloaded release. Mirrors `resolve_dev_source`: the path is
+/// persisted as a String and re-read live on later operations, so a non-UTF-8
+/// path is rejected here.
+fn resolve_local_runtime(raw: &str) -> std::result::Result<std::path::PathBuf, String> {
+    let abs = std::fs::canonicalize(expand_tilde(raw))
+        .map_err(|e| format!("--local-runtime path {raw} is not accessible: {e}"))?;
+    if abs.to_str().is_none() {
+        return Err(format!(
+            "--local-runtime path {} contains non-UTF-8 characters, which morloc cannot record",
+            abs.display()
+        ));
+    }
+    let morloc_bin = provision::runtime_morloc_bin(&abs);
+    if !morloc_bin.is_file() {
+        return Err(format!(
+            "--local-runtime dir {} has no `morloc` binary (expected {}). Assemble the \
+             dir with a `morloc` symlink to your built compiler and a `rust` symlink to \
+             the compiler's data/rust workspace.",
+            abs.display(),
+            morloc_bin.display()
+        ));
+    }
+    let cargo = provision::runtime_rust_src(&abs).join("Cargo.toml");
+    if !cargo.is_file() {
+        return Err(format!(
+            "--local-runtime dir {} has no rust workspace (expected {}). Symlink `rust` \
+             to the compiler's data/rust directory.",
+            abs.display(),
+            cargo.display()
+        ));
+    }
+    Ok(abs)
+}
+
+/// Reduce `morloc --version` output to the local-runtime version tag: the
+/// reported major.minor.patch with a `-local` prerelease suffix (any existing
+/// prerelease on the binary is dropped, so the result is always `x.y.z-local`).
+/// `ctx` names the binary for error messages. Pure; the I/O wrapper is
+/// `local_runtime_version`.
+fn local_version_tag(version_output: &str, ctx: &std::path::Path) -> Result<String> {
+    let v = Version::from_command_output(version_output).ok_or_else(|| {
+        ManagerError::EnvError(format!(
+            "could not parse a morloc version from `{} --version` output: {}",
+            ctx.display(),
+            version_output.trim()
+        ))
+    })?;
+    Ok(format!("{}.{}.{}-local", v.major, v.minor, v.patch))
+}
+
+/// The recorded morloc version for a local-runtime env: the built binary's
+/// reported major.minor.patch with a `-local` prerelease tag. This records as a
+/// valid `Version` (`Some`, never `None`), is never mistaken for a release, and
+/// is never used as a download target. Running the binary here also smoke-tests
+/// that it executes on the host at all.
+fn local_runtime_version(morloc_bin: &std::path::Path) -> Result<String> {
+    let out = Command::new(morloc_bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| {
+            ManagerError::EnvError(format!("could not run {} --version: {e}", morloc_bin.display()))
+        })?;
+    if !out.status.success() {
+        return Err(ManagerError::EnvError(format!(
+            "{} --version failed: {}",
+            morloc_bin.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    local_version_tag(&String::from_utf8_lossy(&out.stdout), morloc_bin)
+}
+
 /// Resolve, and record, the `mim-env` agent source for a dev env: an explicit
 /// `--dev-mim-env` path (canonicalized, must exist and be UTF-8, since it is
 /// persisted) wins; `None` records nothing and falls back at stage time to the
@@ -4725,6 +4886,7 @@ fn native_new(
     lang: Vec<String>,
     conda_packages: Vec<String>,
     requested_version: Option<String>,
+    local_runtime: Option<std::path::PathBuf>,
     cert_bundle: Option<String>,
     no_init: bool,
     make_default: bool,
@@ -4739,12 +4901,13 @@ fn native_new(
     // A new env has no installed programs yet; its toolchain is morloc's core
     // language-support table plus any `--lang` pins. Provisioning (inside
     // materialize) yields the concrete morloc version. `--morloc-version` pins
-    // the release; omitted, it defaults to $MORLOC_RELEASE_TAG/latest.
+    // the release; omitted, it defaults to $MORLOC_RELEASE_TAG/latest. A
+    // `--local-runtime` dir is adopted instead of any release.
     let lang_pins = parse_lang_pins(&lang);
     let morloc_version = if no_init {
         None
     } else {
-        materialize_native_env(scope, &env_name, &[], &lang_pins, &conda_packages, requested_version.as_deref(), verbose)?
+        materialize_native_env(scope, &env_name, &[], &lang_pins, &conda_packages, requested_version.as_deref(), local_runtime.as_deref(), verbose)?
             .parse::<Version>()
             .ok()
     };
@@ -4758,6 +4921,9 @@ fn native_new(
         Vec::new(),
         conda_packages,
     );
+    if let Some(lr) = &local_runtime {
+        ec = ec.with_local_runtime(LocalRuntimeConfig { source: lr.to_string_lossy().into_owned() });
+    }
     if let Some(p) = prepared {
         p.apply_to(&mut ec);
     }
@@ -5202,12 +5368,23 @@ fn rematerialize_env(
         return Ok(());
     }
 
+    // A local-runtime env re-adopts its developer-assembled dir LIVE on every
+    // rematerialize (so a rebuilt binary is picked up), rather than provisioning
+    // a release. `resolve_env_requirements` ignores `effective_version` when this
+    // is set. Re-read from the persisted marker, never a version-keyed store, and
+    // re-validate its shape (the borrowed dir may have been moved or cleaned since
+    // creation) so a broken dir fails with the same precise error `new` gives.
+    let local_runtime = match ec.local_runtime.as_ref() {
+        Some(l) => Some(resolve_local_runtime(&l.source).map_err(ManagerError::EnvError)?),
+        None => None,
+    };
+
     if ec.backend.is_native() {
         // Persist the provisioned version so `ec.morloc_version` tracks what is
         // actually installed (symmetric with the container path below); without
         // this a native `update` leaves a stale version that misleads `doctor`
         // and the manifest-version check.
-        let mver = materialize_native_env(scope, name, &specs, &lang_pins, &ec.conda_packages, effective_version, verbose)?;
+        let mver = materialize_native_env(scope, name, &specs, &lang_pins, &ec.conda_packages, effective_version, local_runtime.as_deref(), verbose)?;
         let mut ec = ec;
         ec.morloc_version = mver.parse::<Version>().ok();
         cfg::write_env_config(scope, name, &ec)?;
@@ -5217,7 +5394,7 @@ fn rematerialize_env(
     let ce = ec.engine()?;
     let (image_tag, mver) = build_requirement_derived_image(
         scope, name, ce, &specs, &lang_pins, &ec.system_packages, &ec.conda_packages,
-        effective_version, &ec.base_image,
+        effective_version, local_runtime.as_deref(), &ec.base_image,
     )?;
     let mut ec = ec;
     ec.built_image = Some(image_tag);
@@ -5239,6 +5416,7 @@ fn build_requirement_derived_image(
     system_packages: &[String],
     conda_packages: &[String],
     requested_version: Option<&str>,
+    local_runtime: Option<&std::path::Path>,
     base_image: &str,
 ) -> Result<(String, String)> {
     // Unlike native, a container HAS a build layer, so host/vcpkg system deps are
@@ -5247,7 +5425,7 @@ fn build_requirement_derived_image(
     // Pass the engine so the language-support table can be generated in a
     // container when the host cannot run the compiler (NixOS/musl).
     let req = resolve_env_requirements(
-        scope, name, program_specs, lang_pins, conda_packages, Some(engine), requested_version, base_image,
+        scope, name, program_specs, lang_pins, conda_packages, Some(engine), requested_version, local_runtime, base_image,
     )?;
 
     let context = cfg::env_data_dir(scope, name).join(CONTAINER_BUILD_SUBDIR);
@@ -5757,6 +5935,7 @@ fn container_new_derived(
     cert_bundle: Option<String>,
     base_image: String,
     requested_version: Option<String>,
+    local_runtime: Option<std::path::PathBuf>,
     no_init: bool,
     make_default: bool,
 ) -> Result<()> {
@@ -5785,7 +5964,7 @@ fn container_new_derived(
     } else {
         let (image, version) = build_requirement_derived_image(
             scope, &env_name, engine, &[], &lang_pins, &system_packages, &conda_packages,
-            requested_version.as_deref(), &base_image,
+            requested_version.as_deref(), local_runtime.as_deref(), &base_image,
         )?;
         (Some(image), version.parse::<Version>().ok())
     };
@@ -5799,6 +5978,9 @@ fn container_new_derived(
         system_packages,
         conda_packages,
     );
+    if let Some(lr) = &local_runtime {
+        ec = ec.with_local_runtime(LocalRuntimeConfig { source: lr.to_string_lossy().into_owned() });
+    }
     if let Some(p) = prepared {
         p.apply_to(&mut ec);
     }
@@ -7654,6 +7836,7 @@ mod tests {
             system_packages: Vec::new(),
             conda_packages: Vec::new(),
             dev: None,
+            local_runtime: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
         };
@@ -8092,6 +8275,7 @@ run:
             system_packages: Vec::new(),
             conda_packages: Vec::new(),
             dev: None,
+            local_runtime: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
         };
@@ -8146,6 +8330,7 @@ run:
             system_packages: Vec::new(),
             conda_packages: Vec::new(),
             dev: None,
+            local_runtime: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
         };
@@ -8172,6 +8357,7 @@ run:
             system_packages: Vec::new(),
             conda_packages: Vec::new(),
             dev: None,
+            local_runtime: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
         };
@@ -8223,6 +8409,7 @@ run:
                 system_packages: Vec::new(),
                 conda_packages: Vec::new(),
                 dev: None,
+                local_runtime: None,
                 cert_bundle: None,
                 cert_fingerprints: Vec::new(),
             },
@@ -8369,6 +8556,93 @@ run:
         );
         assert!(!plain.is_dev());
         assert!(!serde_yaml::to_string(&plain).unwrap().contains("dev:"));
+    }
+
+    #[test]
+    fn new_parses_local_runtime_flag() {
+        let cli = Cli::try_parse_from(["morloc-manager", "new", "lr", "--local-runtime", "/rt"])
+            .expect("new --local-runtime should parse");
+        assert!(matches!(cli.command, Some(Cmd::New { local_runtime: Some(ref p), .. }) if p == "/rt"));
+        let cli = Cli::try_parse_from(["morloc-manager", "new", "foo"]).unwrap();
+        assert!(matches!(cli.command, Some(Cmd::New { local_runtime: None, .. })));
+    }
+
+    #[test]
+    fn local_runtime_conflicts_with_version_and_dev() {
+        // --local-runtime is mutually exclusive with both --morloc-version and --dev.
+        assert!(Cli::try_parse_from([
+            "morloc-manager", "new", "e", "--local-runtime", "/rt", "--morloc-version", "0.98.0",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "morloc-manager", "new", "e", "--local-runtime", "/rt", "--dev", "/src",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn local_version_tag_formats_with_local_suffix() {
+        let ctx = std::path::Path::new("morloc");
+        // Bare version, and a "morloc <version>" style line, both reduce to x.y.z-local.
+        assert_eq!(local_version_tag("0.98.3", ctx).unwrap(), "0.98.3-local");
+        assert_eq!(local_version_tag("morloc 0.98.3\n", ctx).unwrap(), "0.98.3-local");
+        // Any prerelease on the binary is dropped -- the tag is always `-local`.
+        assert_eq!(local_version_tag("0.98.3-rc.1", ctx).unwrap(), "0.98.3-local");
+        // The tag parses back as a valid Version (records as Some, never None).
+        let v: Version = local_version_tag("0.98.3", ctx).unwrap().parse().unwrap();
+        assert_eq!(v.prerelease.as_deref(), Some("local"));
+        // Unparseable output is a loud error, not a silent None.
+        assert!(local_version_tag("not-a-version", ctx).is_err());
+    }
+
+    #[test]
+    fn env_config_local_runtime_block_round_trips() {
+        let ec = EnvironmentConfig::new_backend(
+            "lr".to_string(),
+            Backend::Native,
+            String::new(),
+            None,
+            Some(Version::new(0, 98, 3)),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_local_runtime(LocalRuntimeConfig {
+            source: "/home/z/morloc-local-runtime".to_string(),
+        });
+        assert!(ec.is_local_runtime());
+        assert!(!ec.is_dev());
+        let yaml = serde_yaml::to_string(&ec).unwrap();
+        let back: EnvironmentConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert!(back.is_local_runtime());
+        assert_eq!(back.local_runtime.unwrap().source, "/home/z/morloc-local-runtime");
+        // A non-local env omits the block entirely (skip_serializing_if).
+        let plain = EnvironmentConfig::new_backend(
+            "rel".to_string(),
+            Backend::Native,
+            String::new(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(!plain.is_local_runtime());
+        assert!(!serde_yaml::to_string(&plain).unwrap().contains("local_runtime:"));
+    }
+
+    #[test]
+    fn resolve_local_runtime_validates_dir_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Missing morloc binary: rejected.
+        assert!(resolve_local_runtime(root.to_str().unwrap()).is_err());
+        // Add morloc but no rust workspace: still rejected.
+        std::fs::write(root.join("morloc"), b"#!/bin/true\n").unwrap();
+        assert!(resolve_local_runtime(root.to_str().unwrap()).is_err());
+        // Add the rust workspace: accepted, and the path is canonicalized.
+        std::fs::create_dir_all(root.join("rust")).unwrap();
+        std::fs::write(root.join("rust").join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let resolved = resolve_local_runtime(root.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(root).unwrap());
     }
 
     #[test]
