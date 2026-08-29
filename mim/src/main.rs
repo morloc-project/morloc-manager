@@ -5370,9 +5370,9 @@ fn container_capture_env(
         (cwd, serve::CONTAINER_WORK.to_string()),
     ];
     // A dev env's compiler is not baked into the image; it lives in the mounted
-    // dev-bin dir (with the Rust source), so capture must mount it like run/serve.
-    if let Some(dev) = &ec.dev {
-        mounts.extend(dev_mounts(&v_data_dir, &dev.source));
+    // dev-bin dir, so capture must mount it like run/serve.
+    if ec.dev.is_some() {
+        mounts.extend(dev_mounts(&v_data_dir));
     }
     cfg.bind_mounts = mounts;
     cfg.env = serve::oci_base_env(serve::CONTAINER_MORLOC_HOME);
@@ -6869,15 +6869,15 @@ pub(crate) fn container_run_env(
 
     let is_init = matches!(args, [a, b, ..] if a == "morloc" && b == "init");
     let is_home_dir = normalize_trailing(&cwd) == normalize_trailing(&home);
-    // A dev env's compiler + source are host-mounted, not baked into the image.
-    let dev_source = ec.dev.as_ref().map(|d| d.source.clone());
+    // A dev env's compiler is host-mounted (dev-bin), not baked into the image.
+    let is_dev = ec.dev.is_some();
 
     if !is_init && !suffix.is_empty() && !is_home_dir {
         selinux::validate_mount_path(&cwd)?;
         run_with_config(
             engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd, suffix,
             shell, args, false, &ec.shm_size, &extra_flags, user_env,
-            bridge_mount.as_deref(), dev_source.as_deref(),
+            bridge_mount.as_deref(), is_dev,
         )
     } else {
         let (cwd_final, skip_work_mount) = if is_home_dir && !suffix.is_empty() && !is_init {
@@ -6891,31 +6891,23 @@ pub(crate) fn container_run_env(
         run_with_config(
             engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd_final, suffix,
             shell, args, is_init || skip_work_mount, &ec.shm_size, &extra_flags, user_env,
-            bridge_mount.as_deref(), dev_source.as_deref(),
+            bridge_mount.as_deref(), is_dev,
         )
     }
 }
 
-/// The in-container `MORLOC_RUST_DIR`: the Rust workspace under the mounted dev
-/// source tree. `morloc init`/`make` build the runtime from it. One source of
-/// truth for the materialize and run/serve paths.
-fn container_dev_rust_dir() -> String {
-    format!("{}/{}", serve::CONTAINER_DEV_SRC, morloc_deps::layout::RUST_DIR)
-}
-
-/// Extra bind mounts for a dev environment, shared by the run/shell and serve
+/// Extra bind mounts for a dev environment, shared by the run/shell and capture
 /// paths so the mount targets live in one place. The source-built compiler
 /// (`<env>/dev-bin`) maps to the PATH slot the image expects
-/// (`CONTAINER_RUNTIME_BIN`); the source tree maps to `CONTAINER_DEV_SRC` so an
-/// in-container `morloc make`/`init` finds its Rust source.
-fn dev_mounts(v_data_dir: &str, source: &str) -> Vec<(String, String)> {
-    vec![
-        (
-            format!("{v_data_dir}/{DEV_BIN_SUBDIR}"),
-            serve::CONTAINER_RUNTIME_BIN.to_string(),
-        ),
-        (source.to_string(), serve::CONTAINER_DEV_SRC.to_string()),
-    ]
+/// (`CONTAINER_RUNTIME_BIN`). The morloc source tree itself is NOT mounted: the
+/// developer works from the host cwd (mounted at `CONTAINER_WORK`) and points
+/// `morloc init`/`make` at it via `MORLOC_RUST_DIR` themselves, so the shell is
+/// not tied to a fixed source location or a mandatory `cd`.
+fn dev_mounts(v_data_dir: &str) -> Vec<(String, String)> {
+    vec![(
+        format!("{v_data_dir}/{DEV_BIN_SUBDIR}"),
+        serve::CONTAINER_RUNTIME_BIN.to_string(),
+    )]
 }
 
 fn run_with_config(
@@ -6934,7 +6926,7 @@ fn run_with_config(
     extra_flags: &[String],
     user_env: &[(String, String)],
     bridge_socket: Option<&std::path::Path>,
-    dev_source: Option<&str>,
+    is_dev: bool,
 ) -> Result<()> {
     if shell {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -6967,7 +6959,7 @@ fn run_with_config(
     // developer (`morloc init`), so it starts empty by design -- only the conda
     // toolchain is manager-materialized. Non-dev envs bake the runtime at setup,
     // so a missing one there is a real half-provisioned state.
-    if !is_init && dev_source.is_none() {
+    if !is_init && !is_dev {
         required.push((runtime_src.as_path(), "morloc runtime (MORLOC_HOME)"));
     }
     for (src, what) in required {
@@ -7002,10 +6994,12 @@ fn run_with_config(
         )],
         None => Vec::new(),
     };
-    // Dev envs additionally mount the source-built compiler + the source tree.
-    let dev_mount: Vec<(String, String)> = match dev_source {
-        Some(src) => dev_mounts(v_data_dir, src),
-        None => Vec::new(),
+    // Dev envs additionally mount the source-built compiler (dev-bin). The
+    // source tree itself is not mounted; the developer works from the cwd mount.
+    let dev_mount: Vec<(String, String)> = if is_dev {
+        dev_mounts(v_data_dir)
+    } else {
+        Vec::new()
     };
     let all_mounts: Vec<(String, String)> = base_mounts
         .into_iter()
@@ -7090,11 +7084,9 @@ fn run_with_config(
             BRIDGE_SOCK_IN_CONTAINER.to_string(),
         ));
     }
-    // A dev env's Rust source is the mounted source tree, so an in-container
-    // `morloc init` (rebuild) finds it there rather than at a baked path.
-    if dev_source.is_some() {
-        env_vars.push(("MORLOC_RUST_DIR".to_string(), container_dev_rust_dir()));
-    }
+    // MORLOC_RUST_DIR is intentionally NOT set for a dev env: the source tree is
+    // not mounted at a fixed path, so the developer points `morloc init`/`make`
+    // at their working copy (e.g. `MORLOC_RUST_DIR=$PWD/data/rust`) themselves.
     env_vars.extend(user_env.iter().cloned());
     let cmd = if shell {
         // The image ships bash; tag its prompt with the env name. The rcfile is

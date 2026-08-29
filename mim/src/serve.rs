@@ -679,11 +679,6 @@ pub const CONTAINER_PIXI_DIR: &str = "/env";
 /// The pixi binary inside the image (PIXI_HOME=/opt/pixi; not on the run PATH).
 pub const CONTAINER_PIXI_BIN: &str = "/opt/pixi/bin/pixi";
 
-/// Dev environments only: where the mounted morloc SOURCE tree appears
-/// in-container (the compiler + runtime are built from it). `MORLOC_RUST_DIR`
-/// points at `<this>/data/rust`.
-pub const CONTAINER_DEV_SRC: &str = "/opt/morloc-src";
-
 /// Dev environments only: the ghcup bin dir baked into the dev image
 /// (`GHCUP_INSTALL_BASE_PREFIX=/opt`), holding `ghcup`/`stack`. Placed on the run
 /// PATH so an interactive dev shell can build the compiler, not just run it. On a

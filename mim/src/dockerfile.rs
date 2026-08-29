@@ -154,10 +154,11 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     // pools. The COPY destination is shared with the run-side PATH
     // (serve::container_path), so it comes from one constant, not a literal.
     //
-    // Dev envs skip the COPY + baked MORLOC_RUST_DIR: the compiler is BUILT from a
-    // mounted source tree at materialize time and installed into CONTAINER_RUNTIME_BIN
-    // (a mount, not a baked layer), and MORLOC_RUST_DIR points at the mounted
-    // source. Only the PATH entry is kept, so the built compiler is found.
+    // Dev envs skip the COPY + baked MORLOC_RUST_DIR: the developer builds the
+    // compiler from their own source checkout and installs it into
+    // CONTAINER_RUNTIME_BIN (a mount, not a baked layer), setting MORLOC_RUST_DIR
+    // to point at that checkout themselves. Only the PATH entry is kept here, so
+    // the built compiler is found.
     let runtime_bin = crate::serve::CONTAINER_RUNTIME_BIN;
     if input.dev {
         out.push_str("# morloc compiler + rust source are built from a mounted source tree\n");
