@@ -29,8 +29,9 @@ pub const DEFAULT_SIZE_CAP: u64 = 1 << 20;
 /// bundle. Different layers read different variables, so all are set: rustls /
 /// rattler + curl (`SSL_CERT_FILE`, `CURL_CA_BUNDLE`), pip / requests
 /// (`REQUESTS_CA_BUNDLE`), conda (`CONDA_SSL_VERIFY`), Node
-/// (`NODE_EXTRA_CA_CERTS`), and git (`GIT_SSL_CAINFO`, process-scoped -- never
-/// `git config --global`).
+/// (`NODE_EXTRA_CA_CERTS`), git (`GIT_SSL_CAINFO`, process-scoped -- never
+/// `git config --global`), and cargo (`CARGO_HTTP_CAINFO`, for crates.io
+/// fetches during the Rust runtime build; cargo reads none of the others).
 pub const CERT_ENV_VARS: &[&str] = &[
     "SSL_CERT_FILE",
     "REQUESTS_CA_BUNDLE",
@@ -38,6 +39,7 @@ pub const CERT_ENV_VARS: &[&str] = &[
     "CONDA_SSL_VERIFY",
     "NODE_EXTRA_CA_CERTS",
     "GIT_SSL_CAINFO",
+    "CARGO_HTTP_CAINFO",
 ];
 
 /// `(name, value)` pairs setting every [`CERT_ENV_VARS`] entry to `bundle`.

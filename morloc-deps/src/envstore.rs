@@ -31,6 +31,13 @@ pub struct SolveInputs<'a> {
     pub channels: &'a [String],
 }
 
+/// The result of a solve: the captured toolchain activation env-map, and whether
+/// a pixi solve actually ran (`false` = served from the solve-cache unchanged).
+pub struct SolveOutcome {
+    pub activation: Vec<(String, String)>,
+    pub solved: bool,
+}
+
 /// Locates an environment's on-disk layout. Constructed from the env's home
 /// directory: the manager derives that from its config, the in-env agent from
 /// its environment variables. Deliberately agnostic to how the env was located.
@@ -155,6 +162,20 @@ impl EnvContext {
         read_optional_spec(&self.toolchain_path())
     }
 
+    /// The languages PINNED as this environment's persistent baseline (the
+    /// `--lang` toolchain spec), sorted and deduplicated. These are kept
+    /// installed even when no program uses them; a language present in the solved
+    /// world but NOT here was provisioned on demand.
+    pub fn pinned_languages(&self) -> Result<Vec<String>> {
+        let mut langs: Vec<String> = match self.read_toolchain()? {
+            Some(spec) => spec.languages.into_iter().map(|l| l.lang).collect(),
+            None => Vec::new(),
+        };
+        langs.sort();
+        langs.dedup();
+        Ok(langs)
+    }
+
     /// Create the requirements dir and write `json` to a file directly under it
     /// (the toolchain pin, the abi lock). Callers own any pre-write validation.
     fn write_requirements_file(&self, path: &Path, json: &str) -> Result<()> {
@@ -188,6 +209,14 @@ impl EnvContext {
     /// The env's shim-ABI pin spec, if one has been recorded.
     fn read_abi_lock(&self) -> Result<Option<EnvSpec>> {
         read_optional_spec(&self.abi_lock_path())
+    }
+
+    /// Whether this env pins an interpreter minor to protect a built shim's ABI.
+    /// A solve failure in such an env may be the pin conflicting with a dependency
+    /// that needs a different interpreter version, which callers surface as an
+    /// actionable hint.
+    pub fn has_abi_lock(&self) -> bool {
+        self.abi_lock_path().exists()
     }
 
     /// Record the shim-ABI pin from this env's freshly solved conda prefix: pin
@@ -290,18 +319,65 @@ impl EnvContext {
     /// Render the given specs to a pixi manifest and solve it into this env's
     /// pixi prefix, returning the captured activation env-map. Does NOT persist
     /// specs or rebuild the morloc runtime -- callers own those steps.
+    ///
+    /// A solve-cache short-circuits the (multi-process) pixi solve + activation
+    /// capture when the rendered manifest matches the on-disk `pixi.toml`, the
+    /// solved prefix already exists, and a cached activation is present. A
+    /// managed `morloc make` runs a sync on nearly every build (see
+    /// `Build.syncEnvDeps`), so the common "nothing changed" case must be cheap.
     pub fn solve_world(
         &self,
         specs: &[EnvSpec],
         inputs: &SolveInputs,
-    ) -> Result<Vec<(String, String)>> {
+    ) -> Result<SolveOutcome> {
         let manifest = self.rendered_manifest(specs, inputs)?;
         let pixi_dir = self.pixi_dir();
+        let cache_path = self.activation_cache_path();
+        let prefix = crate::abi::conda_prefix(&pixi_dir);
+        let unchanged = matches!(
+            std::fs::read_to_string(pixi_dir.join("pixi.toml")),
+            Ok(on_disk) if on_disk == manifest
+        );
+        if unchanged && prefix.is_dir() {
+            if let Some(activation) = read_activation_cache(&cache_path) {
+                return Ok(SolveOutcome { activation, solved: false });
+            }
+        }
+        // Invalidate the cached activation BEFORE a real solve. Otherwise an
+        // interrupted solve (SIGKILL mid `pixi install`) that has already written
+        // the new pixi.toml would leave the manifest matching on-disk, a
+        // half-installed prefix that still passes `is_dir()`, and a STALE cache --
+        // so the next build would cache-hit with the wrong activation and skip the
+        // corrective re-solve. With no cache present, the next build re-solves.
+        let _ = std::fs::remove_file(&cache_path);
         crate::pixi::write_manifest(&pixi_dir, &manifest)?;
         // In-container path (mim-env): the built image already sets the CA env
         // vars, which the pixi subprocess inherits, so no override is needed.
-        crate::pixi::solve(&pixi_dir, inputs.pixi_bin, None)?;
-        crate::pixi::capture_activation(&pixi_dir, inputs.pixi_bin, None)
+        // No FHS wrapping: the in-env agent already runs inside its execution
+        // environment (the container, or -- on native NixOS -- the FHS sandbox it
+        // was spawned within by the wrapped `morloc make`).
+        crate::pixi::solve(&pixi_dir, inputs.pixi_bin, None, None)?;
+        let activation =
+            crate::pixi::capture_activation(&pixi_dir, inputs.pixi_bin, None, None)?;
+        write_activation_cache(&cache_path, &activation);
+        Ok(SolveOutcome { activation, solved: true })
+    }
+
+    /// The cached toolchain activation env-map file for the current solve.
+    fn activation_cache_path(&self) -> PathBuf {
+        self.pixi_dir().join(".morloc-activation.json")
+    }
+
+    /// The morloc languages whose RUNTIME is present in the solved world (read
+    /// from `pixi.lock`). Empty before the first solve. Used by `clean` to detect
+    /// which languages a re-solve DROPPED (so the agent can invalidate their stale
+    /// shim markers).
+    fn runtime_language_set(&self, platform: &str) -> Result<Vec<String>> {
+        let locked = crate::pixi::locked_packages(&self.pixi_dir(), platform)?;
+        Ok(crate::pixi::runtime_languages(&locked)
+            .into_iter()
+            .map(|(lang, _version)| lang.to_string())
+            .collect())
     }
 
     /// Merge a program's spec into the declared world under `provenance`,
@@ -325,13 +401,30 @@ impl EnvContext {
         inputs: &SolveInputs,
     ) -> Result<Vec<(String, String)>> {
         // Serialize concurrent solves against this env's shared prefix; held
-        // through the write/gather/solve/rollback, released when `_lock` drops.
+        // through the write/gather/solve/record, released when `_lock` drops.
         let _lock = self.lock_solve()?;
         self.write_spec(program, provenance, spec_json)?;
         let mut specs = self.gather()?;
         self.append_abi_lock(&mut specs)?;
         match self.solve_world(&specs, inputs) {
-            Ok(activation) => Ok(activation),
+            Ok(outcome) => {
+                if outcome.solved {
+                    // Pin the interpreter minor the (about-to-be-built) shims
+                    // will link against, so a later solve cannot silently move it
+                    // and break the ABI. Recorded here, under the solve lock, as
+                    // part of the same sync: whichever caller adds a language on
+                    // demand -- the in-env agent or the manager's provision --
+                    // pins the interpreter the moment it is provisioned.
+                    self.record_abi_lock(inputs.lang_support.morloc_version.as_str())?;
+                }
+                // The agent decides whether to build shims from actual SHIM state
+                // (a per-language `morloc init` marker), NOT from a before/after
+                // lock diff: the lock reflects PROVISIONING, so a language present
+                // in the lock whose shim failed to build (or an immutable env that
+                // never built it) must stay flagged on every retry, which a lock
+                // diff -- empty once the language is in the lock -- cannot do.
+                Ok(outcome.activation)
+            }
             Err(e) => {
                 let _ = self.remove_spec(program, provenance);
                 Err(e)
@@ -359,13 +452,56 @@ impl EnvContext {
     }
 
     /// Reset the declared world to the installed baseline: drop all scratch
-    /// specs, then re-solve so the prefix reflects only installed programs.
-    pub fn clean(&self, inputs: &SolveInputs) -> Result<Vec<(String, String)>> {
+    /// specs, then re-solve so the prefix reflects only installed programs (plus
+    /// the pinned toolchain). Unlike `sync`, this does NOT append the abi-lock:
+    /// clean is the one path allowed to DROP an unreferenced on-demand language,
+    /// so it re-solves free of the old interpreter pins, then re-records the pin
+    /// for whatever interpreters survive (pruning pins for dropped ones).
+    /// Pinned (`--lang`) languages live in the toolchain spec and so survive;
+    /// on-demand languages no program references are dropped. Returns the
+    /// languages whose runtime was dropped, so the agent can invalidate their
+    /// stale shim markers.
+    pub fn clean(&self, inputs: &SolveInputs) -> Result<Vec<String>> {
         let _lock = self.lock_solve()?;
         self.clear_scratch()?;
         let mut specs = self.gather_installed()?;
-        self.append_abi_lock(&mut specs)?;
-        self.solve_world(&specs, inputs)
+        let before = self.runtime_language_set(inputs.platform)?;
+        // Keep the abi-lock pin ONLY for languages still referenced by an
+        // installed program or a `--lang` pin, so their shims stay valid; drop it
+        // for languages no program references so those can leave the solved world.
+        // (Appending the full pin unconditionally would force every once-added
+        // interpreter to stay -- no cleanup; dropping it unconditionally could
+        // move a still-referenced interpreter and break its shim.)
+        let referenced: std::collections::BTreeSet<String> = specs
+            .iter()
+            .flat_map(|s| s.languages.iter().map(|l| l.lang.clone()))
+            .collect();
+        if let Some(mut abi) = self.read_abi_lock()? {
+            abi.languages.retain(|l| referenced.contains(&l.lang));
+            if !abi.languages.is_empty() {
+                specs.push(abi);
+            }
+        }
+        let outcome = self.solve_world(&specs, inputs)?;
+        let dropped = if outcome.solved {
+            self.record_abi_lock(inputs.lang_support.morloc_version.as_str())?;
+            let after = self.runtime_language_set(inputs.platform)?;
+            before.into_iter().filter(|l| !after.contains(l)).collect()
+        } else {
+            Vec::new()
+        };
+        Ok(dropped)
+    }
+
+    /// Acquire the environment's exclusive solve/build lock, returning a guard
+    /// that releases on drop. The in-env agent holds this around the on-demand
+    /// `morloc init` shim build so two concurrent `morloc make`s on one env cannot
+    /// run two inits that write the same shim artifacts/markers at once. It is a
+    /// SEPARATE acquisition from `sync`'s internal lock (which is released before
+    /// the agent builds), so callers must not hold it across a `sync`/`clean`
+    /// call -- that would deadlock on the same advisory lock.
+    pub fn lock_env(&self) -> Result<Flock<File>> {
+        self.lock_solve()
     }
 }
 
@@ -376,6 +512,23 @@ fn read_optional_spec(path: &Path) -> Result<Option<EnvSpec>> {
         Ok(text) => Ok(Some(EnvSpec::from_json(&text)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(DepsError::Env(format!("cannot read {}: {e}", path.display()))),
+    }
+}
+
+/// The cached toolchain activation env-map, if present and parseable. A missing,
+/// unreadable, or corrupt cache yields `None` (forcing a fresh solve), never an
+/// error -- the cache is an optimization, not a source of truth.
+fn read_activation_cache(path: &Path) -> Option<Vec<(String, String)>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Vec<(String, String)>>(&text).ok()
+}
+
+/// Persist the activation env-map beside the solved prefix. Best-effort: a write
+/// failure must not fail the solve (the cache is an optimization); the next
+/// solve simply re-captures.
+fn write_activation_cache(path: &Path, activation: &[(String, String)]) {
+    if let Ok(json) = serde_json::to_string(activation) {
+        let _ = std::fs::write(path, json);
     }
 }
 
@@ -623,5 +776,41 @@ mod tests {
         assert_eq!(ctx.gather_installed().unwrap().len(), 1);
         // removing a missing spec is a no-op
         ctx.remove_spec("p", Provenance::Scratch).unwrap();
+    }
+
+    #[test]
+    fn pinned_languages_reads_only_the_toolchain_spec() {
+        let (_d, ctx) = ctx();
+        // An installed program's languages are NOT pins (they are on-demand).
+        ctx.write_spec("prog", Provenance::Installed, &spec(r#"{"lang":"r"}"#)).unwrap();
+        assert!(ctx.pinned_languages().unwrap().is_empty());
+        // The --lang toolchain spec IS the pinned baseline.
+        ctx.write_toolchain(&spec(r#"{"lang":"py"},{"lang":"cpp"}"#)).unwrap();
+        assert_eq!(
+            ctx.pinned_languages().unwrap(),
+            vec!["cpp".to_string(), "py".to_string()] // sorted
+        );
+    }
+
+    #[test]
+    fn has_abi_lock_reflects_the_lock_file() {
+        let (_d, ctx) = ctx();
+        assert!(!ctx.has_abi_lock());
+        std::fs::create_dir_all(ctx.requirements_dir()).unwrap();
+        std::fs::write(ctx.abi_lock_path(), spec(r#"{"lang":"py","constraint":"3.12.*"}"#)).unwrap();
+        assert!(ctx.has_abi_lock());
+    }
+
+    #[test]
+    fn activation_cache_round_trips_and_tolerates_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("act.json");
+        assert!(read_activation_cache(&path).is_none()); // missing -> None
+        let env = vec![("PATH".to_string(), "/x".to_string()), ("CC".to_string(), "gcc".to_string())];
+        write_activation_cache(&path, &env);
+        assert_eq!(read_activation_cache(&path), Some(env));
+        // corrupt content -> None (cache is an optimization, never an error)
+        std::fs::write(&path, "not json").unwrap();
+        assert!(read_activation_cache(&path).is_none());
     }
 }

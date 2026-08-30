@@ -1,13 +1,14 @@
-# Release workflow for mim (the morloc installation manager) and its in-env
-# dependency agent mim-env.
+# Release workflow for mim (the morloc installation manager). mim also embeds the
+# in-environment dependency agent it once shipped as a separate `mim-env` binary
+# (now `mim sync ...`), so it is version-coherent with itself by construction.
 #
 # Triggered by pushing a version tag:
 #   git tag v0.26.0 && git push origin v0.26.0
 #
 # Produces fully static musl binaries on Linux (run on any Linux, including NixOS
 # and minimal containers) and native binaries on macOS-arm64, plus a SHA-256 for
-# every asset. mim/mim-env are pure-Rust with no native dependencies, so the musl
-# target links fully static.
+# every asset. mim is pure-Rust with no native dependencies, so the musl target
+# links fully static.
 
 name: Release
 
@@ -16,7 +17,25 @@ on:
     tags: ['v*']
 
 jobs:
+  # The runtime reconstructs a release URL from the crate version for cross-arch
+  # agent fetches, so the tag MUST equal `v<workspace.version>`. Fail the release
+  # loudly on skew rather than publish binaries that point at a nonexistent tag.
+  verify-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert tag matches workspace version
+        run: |
+          ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          expected="v${ver}"
+          if [ "${GITHUB_REF_NAME}" != "${expected}" ]; then
+            echo "ERROR: tag ${GITHUB_REF_NAME} != workspace version ${expected}" >&2
+            echo "Bump Cargo.toml [workspace.package] version to match the tag (or vice versa)." >&2
+            exit 1
+          fi
+
   build:
+    needs: verify-tag
     strategy:
       fail-fast: false
       matrix:
@@ -53,13 +72,13 @@ jobs:
           key: cargo-${{ matrix.platform }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ matrix.platform }}-
 
-      - name: Build mim + mim-env
-        run: cargo build --release --target ${{ matrix.target }} -p mim -p mim-env
+      - name: Build mim
+        run: cargo build --release --target ${{ matrix.target }} -p mim
 
       - name: Stage, strip, verify, checksum
         run: |
           mkdir -p out
-          for bin in mim mim-env; do
+          for bin in mim; do
             src="target/${{ matrix.target }}/release/$bin"
             dst="out/${bin}-${{ matrix.platform }}"
             cp "$src" "$dst"

@@ -1,9 +1,9 @@
 [workspace]
-members = ["morloc-deps", "mim-env", "mim"]
+members = ["morloc-deps", "mim"]
 resolver = "2"
 
 [workspace.package]
-version = "0.27.1"
+version = "0.28.0"
 edition = "2021"
 
 [workspace.dependencies]

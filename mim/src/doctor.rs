@@ -249,6 +249,7 @@ pub fn native_doctor(
     check_file_readability(&mut c, &data_dir);
     check_cert_bundle(&mut c, ec);
     check_native_runtime(&mut c, env_name, rt.as_ref());
+    check_fhs_sandbox(&mut c, rt.as_ref());
     check_state(&mut c, &data_dir);
     if let Some(ref rt) = rt {
         check_activation_toolchain(&mut c, rt);
@@ -324,6 +325,24 @@ pub fn native_doctor(
     Ok(())
 }
 
+/// On NixOS the native runtime runs every conda binary inside a `buildFHSEnv`
+/// sandbox; verify its launcher (recorded at materialize) still resolves. A record
+/// without a wrapper -- a glibc-FHS host, or one materialized before FHS support --
+/// is not flagged. When the launcher is gone (e.g. `nix-collect-garbage` reclaimed
+/// it), every conda probe below would fail cryptically, so this names the cause.
+fn check_fhs_sandbox(c: &mut Counts, rt: Option<&NativeRuntime>) {
+    let Some(rt) = rt else { return };
+    let Some(w) = rt.fhs_wrapper.as_deref() else { return };
+    if Path::new(w).exists() {
+        c.pass("FHS sandbox launcher present (NixOS native runtime)");
+    } else {
+        c.fail(&format!(
+            "FHS sandbox launcher missing at {w}; rebuild it with \
+             'morloc-manager update --env <name>' (nix may have garbage-collected it)"
+        ));
+    }
+}
+
 /// Native materialization health: the runtime record + captured toolchain
 /// activation, the conda prefix it points at, and the libmorloc + nexus
 /// `morloc init` builds into the env.
@@ -361,17 +380,24 @@ const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// child (a `--version`/`ldd`) is left to exit on its own; doctor returns
 /// promptly rather than blocking on it.
 fn run_with_activation(
-    activation: &[(String, String)],
+    rt: &NativeRuntime,
     program: impl AsRef<std::ffi::OsStr>,
     args: &[&str],
 ) -> Option<std::process::Output> {
-    let program = program.as_ref().to_os_string();
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let activation = activation.to_vec();
+    let program = std::path::PathBuf::from(program.as_ref());
+    let args: Vec<std::ffi::OsString> =
+        args.iter().map(std::ffi::OsString::from).collect();
+    let activation = rt.activation_env.clone();
+    // On NixOS the probe binary is a conda/glibc ELF that needs the FHS loader, so
+    // run it inside the same sandbox the runtime uses -- otherwise its (sandbox-only)
+    // activation PATH and the missing loader would make every probe falsely fail.
+    let fhs = rt.fhs_wrapper.clone();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut cmd = Command::new(program);
-        cmd.args(&args).stdin(std::process::Stdio::null());
+        let force_path = crate::activation_path(&activation);
+        let mut cmd = crate::native_command(fhs.as_deref(), &program, &args, &cwd, force_path);
+        cmd.stdin(std::process::Stdio::null());
         crate::apply_activation(&mut cmd, &activation);
         let _ = tx.send(cmd.output());
     });
@@ -594,7 +620,7 @@ fn check_linkage(c: &mut Counts, data_dir: &Path, rt: &NativeRuntime) {
         return; // core check already reports a missing libmorloc
     }
     let ts = lib.to_string_lossy();
-    let out = match run_with_activation(&rt.activation_env, "ldd", &[ts.as_ref()]) {
+    let out = match run_with_activation(rt, "ldd", &[ts.as_ref()]) {
         Some(out) => out,
         None => return, // ldd unavailable (e.g. macOS) or timed out; skip
     };
@@ -625,7 +651,7 @@ fn check_staleness(c: &mut Counts, ec: &EnvironmentConfig, rt: &NativeRuntime) {
 
     // The morloc resolved under activation vs the store stamp.
     if let Some(want) = &stamp_ver {
-        match run_with_activation(&rt.activation_env, "morloc", &["--version"]) {
+        match run_with_activation(rt, "morloc", &["--version"]) {
             Some(out) if out.status.success() => match parse_version_output(&out.stdout) {
                 Some(got) if &got == want => {
                     c.pass(&format!("morloc compiler matches the env runtime ({})", got.show()))
@@ -668,29 +694,35 @@ fn check_staleness(c: &mut Counts, ec: &EnvironmentConfig, rt: &NativeRuntime) {
         None => {}
     }
 
-    // The dependency agent (mim-env) mim runs for a managed `morloc make`. Natively
-    // the build hook points at mim's own sibling mim-env (versioned with mim), so
-    // the check confirms it is present next to mim and version-coherent.
-    match crate::provision::sibling_mim_env() {
-        Some(agent) if agent.is_file() => {
-            match run_with_activation(&rt.activation_env, &agent, &["--version"]) {
-                Some(out) if out.status.success() => {
-                    let s = String::from_utf8_lossy(&out.stdout);
-                    let tok = s.split_whitespace().last().unwrap_or("").trim();
-                    if tok == running {
-                        c.pass(&format!("mim-env agent matches the manager ({running})"));
-                    } else {
-                        c.warn(&format!(
-                            "mim-env agent is {tok} but the manager is {running} -- dependency provisioning may misbehave; reinstall mim"
-                        ));
+    // The dependency agent mim runs for a managed `morloc make` (`mim sync ...`).
+    // Natively the build hook is the running mim itself, so the agent is coherent
+    // with the manager by construction -- unless MORLOC_MIM_ENV overrides it, in
+    // which case check that override resolves and report its version.
+    match std::env::var("MORLOC_MIM_ENV") {
+        Ok(p) if !p.is_empty() => {
+            let agent = std::path::PathBuf::from(&p);
+            if !agent.is_file() {
+                c.fail(&format!(
+                    "MORLOC_MIM_ENV is set to {p}, but that is not a file -- `morloc make` cannot provision deps"
+                ));
+            } else {
+                match run_with_activation(rt, &agent, &["--version"]) {
+                    Some(out) if out.status.success() => {
+                        let s = String::from_utf8_lossy(&out.stdout);
+                        let tok = s.split_whitespace().last().unwrap_or("").trim();
+                        if tok == running {
+                            c.pass(&format!("dependency agent (MORLOC_MIM_ENV override) matches the manager ({running})"));
+                        } else {
+                            c.warn(&format!(
+                                "MORLOC_MIM_ENV override is {tok} but the manager is {running} -- dependency provisioning may misbehave"
+                            ));
+                        }
                     }
+                    _ => c.skip("MORLOC_MIM_ENV override version not reported"),
                 }
-                _ => c.skip("mim-env agent version not reported (predates --version)"),
             }
         }
-        _ => c.warn(
-            "mim-env agent not found next to mim -- `morloc make` cannot provision deps; reinstall mim so mim-env sits alongside it",
-        ),
+        _ => c.pass("dependency agent is built into mim (coherent by construction)"),
     }
 }
 
@@ -1380,6 +1412,7 @@ mod native_health_tests {
             activation_env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             manager_version: None,
             morloc_bin: None,
+            fhs_wrapper: None,
         }
     }
 

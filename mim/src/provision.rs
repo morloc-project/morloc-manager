@@ -158,6 +158,19 @@ pub fn host_release_triple() -> Option<&'static str> {
     release_triple(std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// The release triple for a container built on this host: a container runs Linux
+/// (matching the host arch), so on a macOS host it is the Linux triple, not the
+/// (possibly unpublished) macOS one. Errors if the host arch has no published
+/// Linux binaries.
+pub fn container_release_triple() -> Result<&'static str> {
+    release_triple("linux", std::env::consts::ARCH).ok_or_else(|| {
+        ManagerError::BackendUnsupported(format!(
+            "no prebuilt binaries are published for the container platform (linux/{})",
+            std::env::consts::ARCH
+        ))
+    })
+}
+
 /// GitHub download URL for `asset` of a release `tag` (e.g. "v0.98.3" or "dev").
 pub fn asset_url(tag: &str, asset: &str) -> String {
     format!("{RELEASE_BASE}/{tag}/{asset}")
@@ -209,8 +222,23 @@ fn curl_spawn_err(e: std::io::Error) -> ManagerError {
 
 /// Capture a URL's body to a string via curl (follows redirects; fails on HTTP
 /// error). Used to fetch the release manifest.
-fn curl_capture(url: &str) -> Result<String> {
+pub(crate) fn curl_capture(url: &str) -> Result<String> {
     let out = curl_base().arg(url).output().map_err(curl_spawn_err)?;
+    if !out.status.success() {
+        return Err(ManagerError::EnvError(format!("download failed: {url}")));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Like `curl_capture` but silences curl's own stderr. For probes where a 404
+/// is an expected, handled outcome (the caller reports it), so curl's raw error
+/// line does not precede the caller's message.
+pub(crate) fn curl_capture_quiet(url: &str) -> Result<String> {
+    let out = curl_base()
+        .arg(url)
+        .stderr(Stdio::null())
+        .output()
+        .map_err(curl_spawn_err)?;
     if !out.status.success() {
         return Err(ManagerError::EnvError(format!("download failed: {url}")));
     }
@@ -219,7 +247,7 @@ fn curl_capture(url: &str) -> Result<String> {
 
 /// The final URL after following redirects for `url` (an HTTP HEAD; the body is
 /// discarded). Used to resolve the `releases/latest` redirect to its tag page.
-fn curl_effective_url(url: &str) -> Result<String> {
+pub(crate) fn curl_effective_url(url: &str) -> Result<String> {
     let out = curl_base()
         .args(["-I", "-o", "/dev/null", "-w", "%{url_effective}"])
         .arg(url)
@@ -235,7 +263,7 @@ fn curl_effective_url(url: &str) -> Result<String> {
 
 /// Extract the release tag from a `.../releases/tag/<tag>` URL (the target of the
 /// `releases/latest` redirect).
-fn parse_tag_from_release_url(url: &str) -> Option<String> {
+pub(crate) fn parse_tag_from_release_url(url: &str) -> Option<String> {
     url.rsplit_once("/tag/")
         .map(|(_, tag)| tag.trim_end_matches('/').to_string())
         .filter(|t| !t.is_empty())
@@ -279,7 +307,7 @@ pub fn runtimes_dir(scope: Scope, version: &str) -> PathBuf {
 }
 
 /// Download a URL to a path via curl (follows redirects; fails on HTTP error).
-fn curl_download(url: &str, dest: &Path) -> Result<()> {
+pub(crate) fn curl_download(url: &str, dest: &Path) -> Result<()> {
     let status = curl_base()
         .arg("-o")
         .arg(dest)
@@ -320,13 +348,20 @@ fn file_sha256(path: &Path) -> Result<String> {
     Ok(hex_lower(&hasher.finalize()))
 }
 
-/// The sibling `<name>.part` staging path for a download destination.
+/// A unique sibling `<name>.<pid>.<n>.part` staging path for a download
+/// destination. The pid + monotonic counter keep two concurrent fetches to the
+/// SAME cache path (e.g. two envs materializing at once) from writing into one
+/// another's staging file; the post-verify atomic rename still elects a single
+/// winner into `dest`.
 fn part_path(dest: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = dest
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    dest.with_file_name(format!("{name}.part"))
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    dest.with_file_name(format!("{name}.{}.{n}.part", std::process::id()))
 }
 
 /// Download `asset` of release `tag` to `dest` atomically, verifying its SHA-256
@@ -387,28 +422,174 @@ pub fn runtime_morloc_bin(dir: &Path) -> PathBuf {
     dir.join("morloc")
 }
 
-/// The `mim-env` dependency agent staged within a provisioned runtime store. Used
-/// by the container backend, where the build hook (MORLOC_BUILD_HOOK) points at
-/// this in-image path. Natively the hook points at mim's own sibling agent
-/// (`sibling_mim_env`) instead, since the agent is versioned with mim.
-pub fn runtime_mim_env_bin(dir: &Path) -> PathBuf {
-    dir.join("mim-env")
+/// GitHub release download base for the morloc-manager (mim) repository. mim IS
+/// the in-environment dependency agent (`mim sync ...`), so a container image or a
+/// cross-arch native env fetches the matching-platform `mim` from here.
+const MIM_RELEASE_BASE: &str = "https://github.com/morloc-project/morloc-manager/releases/download";
+
+/// The release tag whose `mim` binaries are coherent with THIS mim. Baked from the
+/// actual CI ref (`GITHUB_REF_NAME`, via build.rs) so the URL targets the real
+/// release rather than a reconstruction; falls back to `v<crate version>` for
+/// local builds (where the fetch is only reached by a cross-arch build anyway).
+pub fn mim_release_tag() -> String {
+    option_env!("MIM_RELEASE_TAG")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")))
 }
 
-/// The `mim-env` dependency agent shipped alongside THIS `mim` executable. The
-/// native build hook points here: the agent is versioned with mim, so mim's own
-/// sibling is always the matching one and needs no staging into the runtime.
-pub fn sibling_mim_env() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("mim-env")))
+/// The `mim` binary within a runtime-bin dir (an in-container staging dir). The
+/// container build hook (MORLOC_BUILD_HOOK) points at this in-image path.
+pub fn runtime_mim_bin(dir: &Path) -> PathBuf {
+    dir.join("mim")
 }
 
-/// Copy a `mim-env` agent binary into a runtime-bin dir and set its exec bit, so
-/// an in-container `morloc make` runs it via MORLOC_BUILD_HOOK. Shared by the
-/// release path (`stage_runtime`) and the dev path (a caller-chosen binary).
-pub fn stage_mim_env_agent(src: &Path, runtime_bin_dir: &Path) -> Result<()> {
-    let dest = runtime_mim_env_bin(runtime_bin_dir);
+/// The version+triple-keyed cache for a downloaded foreign-platform `mim`. Keyed
+/// by this mim's version so a mim upgrade re-fetches; keyed by triple so a host
+/// can cache both its own and a container platform's binary.
+pub fn mim_cache_bin(scope: Scope, triple: &str) -> PathBuf {
+    config::data_dir(scope)
+        .join("mim")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join(triple)
+        .join("mim")
+}
+
+/// The running mim executable. Shared by the native hook and the same-triple
+/// container path: natively the agent runs on the host, so the running binary is
+/// always the right platform AND coherent with the manager by construction.
+fn running_mim() -> Result<PathBuf> {
+    std::env::current_exe().map_err(|e| {
+        ManagerError::EnvError(format!("cannot locate the running mim executable: {e}"))
+    })
+}
+
+/// The `MORLOC_MIM_ENV` path override for a binary we are about to STAGE (copy),
+/// if set. Dev environments point this at a locally-built mim (whose version need
+/// not match any release); it also serves as the air-gap / escape hatch and, being
+/// consulted first, always wins. Set-but-missing is a hard error, since staging
+/// copies the file immediately -- a typo must not silently fall through to a
+/// download. (The native-run hook uses [`mim_agent_for_host`], which does NOT
+/// validate: there the override is only a value handed to the compiler.)
+fn mim_env_override_for_staging() -> Result<Option<PathBuf>> {
+    match std::env::var("MORLOC_MIM_ENV") {
+        Ok(p) if !p.is_empty() => {
+            let path = PathBuf::from(&p);
+            if path.is_file() {
+                Ok(Some(path))
+            } else {
+                Err(ManagerError::EnvError(format!(
+                    "MORLOC_MIM_ENV is set to {p}, but that is not a file"
+                )))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The in-environment dependency agent for a NATIVE env: the executable the build
+/// hook names (`MORLOC_BUILD_HOOK`, run as `mim sync ...`). Returns the
+/// `MORLOC_MIM_ENV` override verbatim if set, else the running mim.
+///
+/// This does NOT validate the override's existence: the hook is only a value
+/// handed to the compiler, which validates it (and errors clearly) if and only if
+/// `morloc make` actually invokes it. Validating here would hard-fail unrelated
+/// native commands (`run -- ls`) that never provision dependencies. A bad override
+/// is still surfaced -- by `doctor` and by `morloc make` itself.
+pub fn mim_agent_for_host(_scope: Scope) -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("MORLOC_MIM_ENV").filter(|p| !p.is_empty()) {
+        return Ok(PathBuf::from(p));
+    }
+    running_mim()
+}
+
+/// Resolve an executable `mim` for the given release `triple`, to STAGE (copy) as
+/// the in-environment dependency agent into a container image (the build hook runs
+/// `mim sync ...`).
+///
+/// Precedence:
+///   1. `MORLOC_MIM_ENV` override (see [`mim_env_override_for_staging`]).
+///   2. host triple == `triple` -- the running mim IS the matching agent; return
+///      it. This is every same-arch container (the common case, e.g. a Linux host
+///      building a Linux image), and needs no network: coherence is definitional
+///      (same binary).
+///   3. foreign triple -- download the matching-platform `mim` from this mim's
+///      release, verify it, cache it, and return the cached path. Reached only
+///      when building an image for a different platform than the host (e.g. a
+///      macOS-arm64 host building a Linux image).
+pub fn mim_for_triple(scope: Scope, triple: &str) -> Result<PathBuf> {
+    if let Some(p) = mim_env_override_for_staging()? {
+        return Ok(p);
+    }
+    if host_release_triple() == Some(triple) {
+        return running_mim();
+    }
+    let cached = mim_cache_bin(scope, triple);
+    if cached.is_file() {
+        return Ok(cached);
+    }
+    download_mim(triple, &cached)?;
+    Ok(cached)
+}
+
+/// Download `mim-<triple>` from this mim's release into `dest` atomically,
+/// verifying its SHA-256 against the published `mim-<triple>.sha256` checksum file.
+/// An absent checksum file is a hard error -- an unverifiable binary is never
+/// installed. The body lands on a temporary `.part` path and is renamed into place
+/// only after the download and verification succeed.
+fn download_mim(triple: &str, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ManagerError::EnvError(format!("cannot create {}: {e}", parent.display()))
+        })?;
+    }
+    let tag = mim_release_tag();
+    let asset = format!("mim-{triple}");
+    let url = format!("{MIM_RELEASE_BASE}/{tag}/{asset}");
+    let sha_url = format!("{url}.sha256");
+    eprintln!("Fetching the dependency agent ({asset}, {tag})...");
+    let part = part_path(dest);
+    let result = (|| {
+        curl_download(&url, &part)?;
+        // The checksum file is REQUIRED: never install an unverified binary. The
+        // fetch can fail because the file is genuinely absent (a partial release)
+        // OR for a transport reason (proxy/TLS/DNS); surface the underlying error
+        // rather than asserting one cause.
+        let sha_body = curl_capture(&sha_url).map_err(|e| {
+            ManagerError::EnvError(format!(
+                "could not fetch the checksum file {asset}.sha256 from {sha_url} ({e}); \
+                 refusing to install an unverified {asset}"
+            ))
+        })?;
+        let expected = sha_body.split_whitespace().next().unwrap_or("").trim();
+        if expected.is_empty() {
+            return Err(ManagerError::EnvError(format!(
+                "checksum file {asset}.sha256 is empty"
+            )));
+        }
+        let actual = file_sha256(&part)?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(ManagerError::EnvError(format!(
+                "checksum mismatch for {asset}: expected {expected}, got {actual} \
+                 (corrupt or tampered download)"
+            )));
+        }
+        std::fs::rename(&part, dest).map_err(|e| {
+            ManagerError::EnvError(format!("cannot finalize {}: {e}", dest.display()))
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    result?;
+    make_executable(dest)
+}
+
+/// Copy a `mim` agent binary into a runtime-bin dir (an in-container staging dir)
+/// and set its exec bit, so an in-container `morloc make` runs it via
+/// MORLOC_BUILD_HOOK. (`copy_file` follows a symlink, so a dev-staged symlink
+/// copies the real binary in.)
+pub fn stage_mim_agent(src: &Path, runtime_bin_dir: &Path) -> Result<()> {
+    let dest = runtime_mim_bin(runtime_bin_dir);
     copy_file(src, &dest)?;
     make_executable(&dest)
 }
@@ -684,7 +865,7 @@ fn copy_dir_inner(
 /// plus the Rust workspace source. libmorloc.so + morloc-nexus are built from
 /// that source in-image by `morloc init`, so they are not staged. Everything
 /// comes from the downloaded runtime -- no host morloc install is required.
-pub fn stage_runtime(src: &Path, dest: &Path) -> Result<()> {
+pub fn stage_runtime(scope: Scope, triple: &str, src: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)
         .map_err(|e| ManagerError::EnvError(format!("cannot create {}: {e}", dest.display())))?;
     let from = runtime_morloc_bin(src);
@@ -697,19 +878,14 @@ pub fn stage_runtime(src: &Path, dest: &Path) -> Result<()> {
     let morloc_dest = runtime_morloc_bin(dest);
     copy_file(&from, &morloc_dest)?;
     make_executable(&morloc_dest)?;
-    // Stage the mim-env dependency agent into the image alongside the compiler, so
-    // an in-container `morloc make` can run it via MORLOC_BUILD_HOOK. (`copy_file`
-    // follows a symlink, so a dev-staged symlink copies the real binary in.)
-    // Prefer an agent staged in the runtime store; otherwise fall back to the
-    // `mim-env` beside the running `mim` (versioned with it -- always the matching
-    // one). This covers a `--local-runtime` dir, which carries no agent, and also
-    // closes the gap where a downloaded release store has no mim-env either.
-    let staged = runtime_mim_env_bin(src);
-    if staged.is_file() {
-        stage_mim_env_agent(&staged, dest)?;
-    } else if let Some(sibling) = sibling_mim_env().filter(|p| p.is_file()) {
-        stage_mim_env_agent(&sibling, dest)?;
-    }
+    // Stage the mim binary into the image alongside the compiler as the
+    // in-environment dependency agent: an in-container `morloc make` runs it via
+    // MORLOC_BUILD_HOOK (`mim sync ...`). The staged binary must match the
+    // CONTAINER's platform, not the host's, so a macOS host building a Linux image
+    // stages the Linux mim -- `mim_for_triple` returns the running mim when the
+    // triples match and downloads the matching release binary otherwise.
+    let agent = mim_for_triple(scope, triple)?;
+    stage_mim_agent(&agent, dest)?;
     let rust = runtime_rust_src(src);
     if !rust.is_dir() {
         return Err(ManagerError::EnvError(format!(
@@ -878,5 +1054,61 @@ mod tests {
         let no_digests =
             format!(r#"{{"schema":1,"version":"1.0.0","rust_src":"r",{vers},"triples":{{}}}}"#);
         assert!(ReleaseManifest::from_json(&no_digests).is_err());
+    }
+
+    #[test]
+    fn container_release_triple_matches_linux_host_arch() {
+        // Never the host's OS -- always Linux (a container runs Linux), matching
+        // the host arch.
+        assert_eq!(
+            container_release_triple().ok(),
+            release_triple("linux", std::env::consts::ARCH),
+        );
+    }
+
+    #[test]
+    fn mim_env_override_precedence() {
+        // All MORLOC_MIM_ENV assertions live in ONE test: it mutates the process
+        // env, and no other test reads that var, so keeping them serial here avoids
+        // the parallel-test env race. The original value is saved and restored.
+        let key = "MORLOC_MIM_ENV";
+        let saved = std::env::var_os(key);
+
+        // Unset: no staging override; the native hook falls back to the running
+        // exe; and the same-triple staging path returns the running exe with no
+        // download.
+        std::env::remove_var(key);
+        assert!(mim_env_override_for_staging().unwrap().is_none());
+        assert_eq!(mim_agent_for_host(Scope::Local).unwrap(), running_mim().unwrap());
+        if let Some(host) = host_release_triple() {
+            assert_eq!(mim_for_triple(Scope::Local, host).unwrap(), running_mim().unwrap());
+        }
+
+        // Empty string is treated as unset.
+        std::env::set_var(key, "");
+        assert!(mim_env_override_for_staging().unwrap().is_none());
+
+        // Set to an existing file: staging returns it; the hook returns it verbatim.
+        let present = std::env::temp_dir().join(format!("mim-override-present-{}", std::process::id()));
+        std::fs::write(&present, b"x").unwrap();
+        std::env::set_var(key, &present);
+        assert_eq!(mim_env_override_for_staging().unwrap().as_deref(), Some(present.as_path()));
+        assert_eq!(mim_agent_for_host(Scope::Local).unwrap(), present);
+        let _ = std::fs::remove_file(&present);
+
+        // Set to a MISSING path: staging is a hard error (it copies immediately),
+        // but the native hook is lenient -- it returns the path verbatim, leaving
+        // validation to the compiler when `morloc make` actually invokes the hook.
+        let missing =
+            std::env::temp_dir().join(format!("mim-override-missing-{}", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        std::env::set_var(key, &missing);
+        assert!(mim_env_override_for_staging().is_err());
+        assert_eq!(mim_agent_for_host(Scope::Local).unwrap(), missing);
+
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 }

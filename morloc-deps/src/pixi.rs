@@ -19,8 +19,11 @@
 //!     unresolvable name surfaces at solve time as an impurity/escalation.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+use crate::sandbox::sh_quote;
 
 use crate::envspec::{EnvSpec, PackageReq};
 use crate::error::{DepsError, Result};
@@ -494,10 +497,25 @@ pub fn write_manifest(env_dir: &Path, manifest: &str) -> Result<()> {
 /// of the impurity gate: an unresolvable package (one conda-forge cannot
 /// provide for this platform) fails here, which is the accurate verdict that a
 /// native build is impossible -- the caller escalates to a container.
-pub fn solve(env_dir: &Path, pixi_bin: &Path, ssl_cert_file: Option<&Path>) -> Result<()> {
+pub fn solve(
+    env_dir: &Path,
+    pixi_bin: &Path,
+    ssl_cert_file: Option<&Path>,
+    fhs: Option<&Path>,
+) -> Result<()> {
     let manifest = env_dir.join("pixi.toml");
-    let mut cmd = Command::new(pixi_bin);
-    cmd.arg("install").arg("--manifest-path").arg(&manifest).stdin(Stdio::null());
+    // On NixOS the solve runs inside the FHS sandbox: pixi itself is a static
+    // binary, but a package's conda post-link script can exec a glibc ELF that
+    // needs the loader the sandbox supplies. No cwd/PATH forcing -- the solve does
+    // not depend on either.
+    let mut cmd = crate::sandbox::command(
+        fhs,
+        pixi_bin,
+        &[OsString::from("install"), OsString::from("--manifest-path"), manifest.clone().into()],
+        None,
+        None,
+    );
+    cmd.stdin(Stdio::null());
     apply_cert_env(&mut cmd, ssl_cert_file);
     let status = cmd
         .status()
@@ -688,13 +706,6 @@ pub fn runtime_languages(locked: &[LockedPackage]) -> Vec<(&'static str, String)
         .collect()
 }
 
-/// Single-quote a string for safe interpolation into a shell command: wrap in
-/// single quotes and replace each embedded `'` with `'\''`. Prevents a path
-/// containing a quote/space/metachar from breaking or injecting into the script.
-fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// Capture the toolchain activation env-map from a solved pixi env. The map is
 /// what the native Runner injects before spawning a command, and it must carry
 /// EVERY variable the conda activation exports -- PATH + CONDA_PREFIX, and
@@ -716,6 +727,7 @@ pub fn capture_activation(
     env_dir: &Path,
     pixi_bin: &Path,
     ssl_cert_file: Option<&Path>,
+    fhs: Option<&Path>,
 ) -> Result<Vec<(String, String)>> {
     let manifest = env_dir.join("pixi.toml");
     const SPLIT: &str = "__MORLOC_ACTIVATION_SPLIT__";
@@ -743,7 +755,15 @@ pub fn capture_activation(
         pixi = sh_quote(&pixi_bin.display().to_string()),
         manifest = sh_quote(&manifest.display().to_string()),
     );
-    let mut cmd = Command::new("bash");
+    // On NixOS run the whole activation inside the FHS sandbox: sourcing conda's
+    // activate.d execs conda ELFs that need the loader the sandbox supplies. The
+    // launcher runs `bash -c "<script>"` inside the namespace, so it is a drop-in
+    // for `bash`. The base/activated env is therefore captured with the sandbox's
+    // FHS PATH -- consistent, because the native Runner also replays inside it.
+    let mut cmd = match fhs {
+        Some(w) => Command::new(w),
+        None => Command::new("bash"),
+    };
     cmd.arg("-c").arg(&script).stdin(Stdio::null());
     apply_cert_env(&mut cmd, ssl_cert_file);
     let out = cmd
@@ -1195,14 +1215,6 @@ environments:
     }
 
     #[test]
-    fn sh_quote_escapes_single_quotes() {
-        assert_eq!(sh_quote("plain"), "'plain'");
-        assert_eq!(sh_quote("a b"), "'a b'");
-        // The o'brien case: the embedded quote must be escaped, not close the quote.
-        assert_eq!(sh_quote("/home/o'brien/x"), "'/home/o'\\''brien/x'");
-    }
-
-    #[test]
     fn runtime_languages_maps_present_packages() {
         let pkgs = vec![
             LockedPackage { name: "python".into(), version: "3.12.4".into(), kind: "conda".into() },
@@ -1305,8 +1317,8 @@ environments:
              platforms = [\"linux-64\"]\n\n[dependencies]\n\"cxx-compiler\" = \"*\"\n",
         )
         .unwrap();
-        solve(dir.path(), &pixi, None).expect("pixi solve");
-        let act = capture_activation(dir.path(), &pixi, None).expect("capture activation");
+        solve(dir.path(), &pixi, None, None).expect("pixi solve");
+        let act = capture_activation(dir.path(), &pixi, None, None).expect("capture activation");
         let get = |k: &str| act.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
         assert!(get("CONDA_PREFIX").is_some(), "no CONDA_PREFIX captured");
         let path = get("PATH").expect("PATH captured");

@@ -281,6 +281,13 @@ pub fn serve_environment(
     // the host bind-mount side so those writes do not hit ENOENT.
     let _ = crate::config::ensure_env_home(data_dir);
     cfg.env = oci_base_env(mh);
+    // A served container is IMMUTABLE: its runtime prefix is read-only (see
+    // `cfg.read_only = true` above) and its language set is fixed at image-build
+    // time. Mark it so the in-env build hook refuses on-demand language
+    // provisioning (which would need to write the runtime) with an actionable
+    // "rebuild the image with --lang X" message. The pliable `run` path (writable,
+    // persistent runtime mount) is NOT marked, so on-demand works there.
+    cfg.env.push(("MORLOC_IMMUTABLE".to_string(), "1".to_string()));
     cfg.env.extend(user_env.iter().cloned());
     cfg.command = Some(command.to_vec());
     cfg.shm_size = shm_size.clone();
@@ -745,14 +752,15 @@ pub fn oci_base_env(mh: &str) -> Vec<(String, String)> {
 
 /// The OCI managed-environment markers appended for an in-container `morloc make`:
 /// the `MORLOC_ENV` gate the compiler's dependency callback checks; the build hook
-/// (`MORLOC_BUILD_HOOK` = the staged mim-env agent) and `MORLOC_BIN` (the staged
-/// compiler) it needs to provision, both under `CONTAINER_RUNTIME_BIN`; plus the
-/// baked pixi location (`/env`, distinct from the state root). Shared so
-/// `morloc-manager info` reports exactly the markers a run exports.
+/// (`MORLOC_BUILD_HOOK` = the staged mim agent, run as `mim sync ...`) and
+/// `MORLOC_BIN` (the staged compiler) it needs to provision, both under
+/// `CONTAINER_RUNTIME_BIN`; plus the baked pixi location (`/env`, distinct from the
+/// state root). Shared so `morloc-manager info` reports exactly the markers a run
+/// exports.
 pub fn oci_managed_markers() -> Vec<(String, String)> {
     vec![
         ("MORLOC_ENV".to_string(), "container".to_string()),
-        ("MORLOC_BUILD_HOOK".to_string(), format!("{CONTAINER_RUNTIME_BIN}/mim-env")),
+        ("MORLOC_BUILD_HOOK".to_string(), format!("{CONTAINER_RUNTIME_BIN}/mim")),
         ("MORLOC_BIN".to_string(), format!("{CONTAINER_RUNTIME_BIN}/morloc")),
         ("MORLOC_PIXI".to_string(), CONTAINER_PIXI_BIN.to_string()),
         ("MORLOC_PIXI_DIR".to_string(), CONTAINER_PIXI_DIR.to_string()),

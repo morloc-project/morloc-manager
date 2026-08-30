@@ -323,12 +323,6 @@ fn default_env_schema() -> u32 {
 pub struct DevConfig {
     /// Absolute host path to the morloc source repo, bind-mounted into the env.
     pub source: String,
-    /// Host path to the `mim-env` dependency-agent binary to stage into the env's
-    /// runtime bin (so `morloc make` can provision declared deps). `None` falls
-    /// back to the `mim-env` sitting beside the running `mim`. A dev env needs the
-    /// current dev agent, never a downloaded release, so this is chosen explicitly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mim_env: Option<String>,
 }
 
 /// Local-runtime configuration. Its PRESENCE marks an environment that adopts a
@@ -796,6 +790,13 @@ pub struct NativeRuntime {
     /// compiler without relying on PATH. `None` for records predating this field.
     #[serde(default)]
     pub morloc_bin: Option<std::path::PathBuf>,
+    /// Absolute path of this env's FHS-sandbox launcher (`bin/morloc-fhs`) on
+    /// hosts that lack a standard FHS (NixOS). When set, every conda/glibc binary
+    /// -- the compiler, the toolchain, the nexus, and the pools it spawns -- is
+    /// launched through this launcher so the missing dynamic loader is supplied.
+    /// `None` on glibc-FHS Linux and macOS, where behavior is unchanged.
+    #[serde(default)]
+    pub fhs_wrapper: Option<String>,
 }
 
 /// Persisted requirement inputs for an environment (native or container), kept

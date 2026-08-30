@@ -564,7 +564,7 @@ mod tests {
         // The type permits both Options; a record (e.g. hand-edited) that sets
         // both must be refused at read rather than silently resolved downstream.
         let mut ec = parse(V1_YAML);
-        ec.dev = Some(crate::types::DevConfig { source: "/src".to_string(), mim_env: None });
+        ec.dev = Some(crate::types::DevConfig { source: "/src".to_string() });
         ec.local_runtime =
             Some(crate::types::LocalRuntimeConfig { source: "/rt".to_string() });
         let err = migrate_env_config(ec).expect_err("dev + local_runtime must fail");

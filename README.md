@@ -6,15 +6,16 @@ cross-language package dependencies into a coherent world (via conda/pixi), and
 runs, serves, freezes, and inspects morloc programs. It works natively or in
 containers.
 
-This repository holds three Rust crates:
+This repository holds two Rust crates:
 
- - **`mim`**: defines the user-facing manager
+ - **`mim`**: the user-facing manager. It also embeds the in-environment
+   dependency agent as hidden `mim sync`/`clean`/`spec` subcommands: the morloc
+   compiler invokes `mim sync ...` during `morloc make` (via `MORLOC_BUILD_HOOK`)
+   to provision a program's declared dependencies. Building the agent into `mim`
+   keeps it version-coherent with the manager by construction and keeps `mim` a
+   single, freely relocatable binary.
 
- - **`mim-env`**: the in-environment dependency agent. The morloc compiler
-   invokes it during `morloc make` to provision a program's declared
-   dependencies.
-
- - **`morloc-deps`**: shared dependencies between `mim` and `mim-env`.
+ - **`morloc-deps`**: the shared dependency-resolution kernel `mim` builds on.
 
 ## Contracts with the morloc compiler
 
@@ -128,8 +129,11 @@ provisioner:
 "$MORLOC_BUILD_HOOK" sync --name <program-key> --spec envspec.json
 ```
 
- - **`MORLOC_BUILD_HOOK`** names the provisioner (our `mim-env`). If `MORLOC_ENV`
-   is set but this is unset, `morloc make` **errors** — a managed env with no provisioner.
+ - **`MORLOC_BUILD_HOOK`** names the provisioner: the `mim` binary, invoked as
+   `mim sync ...`. Natively this is the running mim itself; in a container it is the
+   mim staged into the image; a dev env can override it with `MORLOC_MIM_ENV`. If
+   `MORLOC_ENV` is set but this is unset, `morloc make` **errors** — a managed env
+   with no provisioner.
 
  - **`MORLOC_BIN`** is the compiler's own path, so the hook's reverse `morloc
    lang-support` call resolves the exact driving compiler without relying on PATH.
