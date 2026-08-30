@@ -97,24 +97,30 @@ pub fn validate_env_name(name: &str) -> Result<()> {
 
 
 
-/// Remove an environment and all its data.
-pub fn remove_environment(engine: ContainerEngine, scope: Scope, name: &str) -> Result<()> {
+/// Remove an environment and all its data. `engine` is the container engine for
+/// container-backed environments, or `None` for native environments (which have
+/// no serve container or image to clean up, only on-disk files).
+pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &str) -> Result<()> {
     let ec = config::read_env_config(scope, name)
         .map_err(|_| ManagerError::EnvironmentNotFound(name.to_string()))?;
 
-    // Stop and remove any running serve container for this environment before
-    // removing its image. If we skipped this, the serve container would keep
-    // running and be unreachable through morloc-manager.
-    let serve_name = serve::serve_container_name(name);
-    if container::container_exists(engine, &serve_name) {
-        let _ = container::container_stop(engine, &serve_name);
-        let _ = container::container_remove_quiet(engine, &serve_name);
-    }
+    // Stop and remove any running serve container and built image. Native
+    // environments have neither, so this whole block is skipped for them.
+    if let Some(engine) = engine {
+        // Stop and remove any running serve container for this environment
+        // before removing its image. If we skipped this, the serve container
+        // would keep running and be unreachable through morloc-manager.
+        let serve_name = serve::serve_container_name(name);
+        if container::container_exists(engine, &serve_name) {
+            let _ = container::container_stop(engine, &serve_name);
+            let _ = container::container_remove_quiet(engine, &serve_name);
+        }
 
-    // Remove built Dockerfile layer image
-    if let Some(ref img) = ec.built_image {
-        if image_exists_locally(engine, img) {
-            container::remove_image(engine, img);
+        // Remove built Dockerfile layer image
+        if let Some(ref img) = ec.built_image {
+            if image_exists_locally(engine, img) {
+                container::remove_image(engine, img);
+            }
         }
     }
 

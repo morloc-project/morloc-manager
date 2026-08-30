@@ -1515,7 +1515,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     let ec = cfg::read_env_config(scope, name)
                         .map_err(|_| ManagerError::EnvironmentNotFound(name.to_string()))?;
                     // remove_environment clears the default tag if it matched.
-                    environment::remove_environment(ec.engine()?, scope, name)?;
+                    // container_engine() is None for native envs, whose removal
+                    // is purely file cleanup (no container/image to tear down).
+                    environment::remove_environment(ec.backend.container_engine(), scope, name)?;
                     Ok(())
                 })();
                 match result {
@@ -1584,8 +1586,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
 
             eprintln!("Removing all {scope_label} morloc environments...");
 
-            // Collect env info before removal (configs are deleted during removal)
-            let mut env_list: Vec<(String, ContainerEngine)> = Vec::new();
+            // Collect env info before removal (configs are deleted during
+            // removal). The engine is None for native envs (file-only cleanup).
+            let mut env_list: Vec<(String, Option<ContainerEngine>)> = Vec::new();
             let mut base_images: HashSet<String> = HashSet::new();
 
             for name in cfg::list_env_names(scope) {
@@ -1596,7 +1599,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                             base_images.insert(orig.clone());
                         }
                     }
-                    env_list.push((name, ec.engine()?));
+                    env_list.push((name, ec.backend.container_engine()));
                 }
             }
 
@@ -2442,6 +2445,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                      reproducible artifact. Freeze a release env instead."
                 )));
             }
+            if ec.backend.is_native() {
+                return Err(ManagerError::FreezeError(format!(
+                    "environment '{env_name}' uses the native backend; freezing a native \
+                     environment is not yet supported (a native freeze is a multi-platform \
+                     pixi lock, not a container image). Freeze a container environment instead."
+                )));
+            }
             let engine = ec.engine()?;
             // Detect the version from the container binary for sanity check.
             // The morloc binary can't report prerelease tags (stack limitation),
@@ -2648,18 +2658,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     return Ok(());
                 }
             }
-            // Legacy record (no handle): fall back to the container-name probe.
-            let container_name = serve::serve_container_name(&env_name);
-            if crate::container::container_exists(ec.engine()?, &container_name) {
-                serve::stop_serve_container(ec.engine()?, verbose, &container_name)?;
-                cfg::remove_serve_runtime(env_scope, &env_name);
-                eprintln!("Stopped serving environment: {env_name}");
-            } else {
-                return Err(ManagerError::EnvError(
-                    format!("No serve running for environment '{env_name}'")
-                ));
+            // No stored handle: fall back to the container-name probe, but only
+            // for container backends. A native env always records a handle when
+            // it serves, so one reaching here simply is not serving.
+            if let Some(engine) = ec.backend.container_engine() {
+                let container_name = serve::serve_container_name(&env_name);
+                if container::container_exists(engine, &container_name) {
+                    serve::stop_serve_container(engine, verbose, &container_name)?;
+                    cfg::remove_serve_runtime(env_scope, &env_name);
+                    eprintln!("Stopped serving environment: {env_name}");
+                    return Ok(());
+                }
             }
-            Ok(())
+            Err(ManagerError::EnvError(
+                format!("No serve running for environment '{env_name}'")
+            ))
         }
 
         // ---- logs ----
@@ -2676,13 +2689,19 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             }
             let (container_name, engine, logs_dir) = if let Some(ref n) = env {
                 let (env_name, scope, ec) = resolve_env_or_default(Some(n.clone()))?;
+                // A live native serve was already handled above via its handle;
+                // a native env reaching here is not serving, so there are no
+                // container logs to show (report that rather than an engine error).
+                let engine = ec.backend.container_engine().ok_or_else(|| {
+                    ManagerError::EnvError(format!("No serve running for environment '{n}'"))
+                })?;
                 let cname = serve::serve_container_name(n);
-                if !container::container_exists(ec.engine()?, &cname) {
+                if !container::container_exists(engine, &cname) {
                     return Err(ManagerError::EnvError(
                         format!("No serve container running for environment '{n}'")
                     ));
                 }
-                (cname, ec.engine()?, cfg::env_data_dir(scope, &env_name).join("logs"))
+                (cname, engine, cfg::env_data_dir(scope, &env_name).join("logs"))
             } else {
                 let (cname, engine) = find_running_serve_container()?;
                 // Resolve the env's data dir for its captured daemon logs; fall
@@ -2740,13 +2759,15 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
 
         // ---- eval ----
         Cmd::Eval { expr, env, port } => {
-            // When --env is given, validate that env's serve container is running.
+            // When --env is given, validate that env's server is running. Eval
+            // itself is a backend-neutral HTTP client (it connects over --port);
+            // this pre-flight check must be backend-neutral too, or it would
+            // wrongly reject a live native serve.
             if let Some(env_arg) = env {
-                let (env_name, _, ec) = resolve_env_or_default(Some(env_arg))?;
-                let container_name = serve::serve_container_name(&env_name);
-                if !container::container_exists(ec.engine()?, &container_name) {
+                let (env_name, scope, ec) = resolve_env_or_default(Some(env_arg))?;
+                if !env_serve_alive(scope, &env_name, &ec) {
                     return Err(ManagerError::EnvError(format!(
-                        "No serve container running for '{env_name}'. Start with: morloc-manager start --env {env_name}"
+                        "No server running for '{env_name}'. Start with: morloc-manager start --env {env_name}"
                     )));
                 }
             }
@@ -6440,6 +6461,22 @@ fn serve_handle_alive(handle: &ServeHandle) -> bool {
     match handle {
         ServeHandle::Native { pid, .. } => native_serve_alive(*pid),
         ServeHandle::Container { engine, name } => container::container_exists(*engine, name),
+    }
+}
+
+/// Whether environment `name` currently has a live server, regardless of
+/// backend. Prefers the stored launch handle (native pid or container name); a
+/// handle-less legacy record falls back to the container-name probe only for
+/// container backends -- native serves always record a handle, so a native env
+/// reaching that fallback simply is not serving.
+fn env_serve_alive(scope: Scope, name: &str, ec: &EnvironmentConfig) -> bool {
+    let Some(rt) = cfg::read_serve_runtime(scope, name) else { return false };
+    if let Some(handle) = &rt.handle {
+        return serve_handle_alive(handle);
+    }
+    match ec.backend.container_engine() {
+        Some(engine) => container::container_exists(engine, &serve::serve_container_name(name)),
+        None => false,
     }
 }
 
