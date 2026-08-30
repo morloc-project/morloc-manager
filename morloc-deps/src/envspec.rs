@@ -173,9 +173,27 @@ impl EnvSpec {
                 peek.envspec_version, ENVSPEC_VERSION
             )));
         }
-        serde_json::from_str(text).map_err(|e| {
+        let mut spec: EnvSpec = serde_json::from_str(text).map_err(|e| {
             DepsError::Env(format!("Failed to parse envspec.json: {e}"))
-        })
+        })?;
+        spec.normalize_language_codes();
+        Ok(spec)
+    }
+
+    /// Canonicalize language codes to the names the rest of the manager keys on.
+    /// The compiler's canonical code for Julia is `jl` (its lang.yaml `name`), but
+    /// the manager's toolchain / runtime / shim-marker tables all key on `julia`
+    /// (the conda package name) -- the same morloc-vs-conda split as `py` vs
+    /// `python`. Map `jl` -> `julia` once at ingestion so every downstream
+    /// consumer (aggregate, abi-lock, shim detection) agrees; the compiler already
+    /// keys its per-language `packages` under `julia`, so only the language list
+    /// carries the short code.
+    fn normalize_language_codes(&mut self) {
+        for l in &mut self.languages {
+            if l.lang == "jl" {
+                l.lang = "julia".to_string();
+            }
+        }
     }
 
     /// Read and parse the `envspec.json` sitting in a program's build directory.
@@ -313,6 +331,18 @@ mod tests {
     // map keys; a bare language entry with neither constraint nor std). Each
     // package carries an explicit source.
     const SAMPLE: &str = r#"{"envspec_version":2,"morloc_version":"0.98.2","languages":[{"lang":"py","constraint":">=3.10"},{"lang":"cpp","std":"c++20"},{"lang":"rust"}],"packages":{"cpp":[{"name":"opencv","constraint":">=4.8","source":"conda"}],"py":[{"name":"numpy","constraint":">=2,<3","source":"conda"},{"name":"requests","constraint":"*","source":"pypi"}],"rust":[{"name":"ndarray","constraint":"0.16","source":"crates"}]},"system":[{"name":"blas","provider":"unspecified"}],"modules":[{"name":"tensor-cpp","git_hash":"abc123"}]}"#;
+
+    #[test]
+    fn from_json_normalizes_julia_code_jl_to_julia() {
+        // The compiler's canonical Julia language code is `jl` (lang.yaml name),
+        // but every manager table keys on `julia`; ingestion must bridge them.
+        let s = EnvSpec::from_json(
+            r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"jl"},{"lang":"py"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.languages[0].lang, "julia");
+        assert_eq!(s.languages[1].lang, "py"); // others untouched
+    }
 
     #[test]
     fn parses_compiler_output() {

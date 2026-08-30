@@ -281,6 +281,13 @@ pub fn serve_environment(
     // the host bind-mount side so those writes do not hit ENOENT.
     let _ = crate::config::ensure_env_home(data_dir);
     cfg.env = oci_base_env(mh);
+    // A served container is IMMUTABLE: its runtime prefix is read-only (see
+    // `cfg.read_only = true` above) and its language set is fixed at image-build
+    // time. Mark it so the in-env build hook refuses on-demand language
+    // provisioning (which would need to write the runtime) with an actionable
+    // "rebuild the image with --lang X" message. The pliable `run` path (writable,
+    // persistent runtime mount) is NOT marked, so on-demand works there.
+    cfg.env.push(("MORLOC_IMMUTABLE".to_string(), "1".to_string()));
     cfg.env.extend(user_env.iter().cloned());
     cfg.command = Some(command.to_vec());
     cfg.shm_size = shm_size.clone();

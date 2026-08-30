@@ -140,8 +140,11 @@ or `latest`). With no flags on a TTY, all settings are prompted interactively.")
         /// Environment name. Defaults to the requested morloc version
         /// (`v0.90.0`), or `latest` when tracking the latest release.
         name: Option<String>,
-        /// Language toolchain(s) to provision: `lang` or `lang@version`
-        /// (e.g. --lang py@3.12 --lang r). Repeatable or comma-separated.
+        /// Language toolchain(s) to KEEP installed regardless of use: `lang` or
+        /// `lang@version` (e.g. --lang py@3.12 --lang r). Repeatable or
+        /// comma-separated. Optional -- any language a built module uses is
+        /// provisioned automatically on demand; pin one here only to keep it
+        /// installed even when no module needs it (a general toolchain).
         #[arg(long)]
         lang: Vec<String>,
         /// morloc version to provision (e.g. 0.98.0). Omit for the latest release.
@@ -1147,12 +1150,21 @@ fn info_languages(ctx: &envstore::EnvContext) -> Vec<String> {
 }
 
 /// Language-runtime versions found in the solved world, for the `info` summary --
-/// e.g. `["python 3.12.4", "rust 1.83.0"]`. The runtime-package -> language map is
-/// shared with `doctor` via `pixi::runtime_languages` so the two cannot drift.
-fn info_runtimes(locked: &[pixi::LockedPackage]) -> Vec<String> {
+/// e.g. `["python 3.12.4 (pinned)", "rust 1.83.0 (on demand)"]`. Each is tagged
+/// PINNED (a persistent `--lang` baseline language, kept even when unused) or ON
+/// DEMAND (provisioned automatically because a built module used it). The
+/// runtime-package -> language map is shared with `doctor` via
+/// `pixi::runtime_languages` so the two cannot drift.
+fn info_runtimes(locked: &[pixi::LockedPackage], pinned: &[String]) -> Vec<String> {
+    // `--lang` pins store the short code `py`; the solved runtime reports `python`.
+    let is_pinned =
+        |lang: &str| pinned.iter().any(|p| p == lang || (p == "py" && lang == "python"));
     pixi::runtime_languages(locked)
         .into_iter()
-        .map(|(lang, ver)| format!("{lang} {ver}"))
+        .map(|(lang, ver)| {
+            let tag = if is_pinned(lang) { "pinned" } else { "on demand" };
+            format!("{lang} {ver} ({tag})")
+        })
         .collect()
 }
 
@@ -1809,6 +1821,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 };
                 let exports = info_env_exports(scope, &data_dir, &env_name, engine);
                 let languages = info_languages(&dep_ctx);
+                let pinned_langs = dep_ctx.pinned_languages().unwrap_or_default();
                 let installed = dep_ctx.installed_program_names().unwrap_or_default();
                 // The actual solved world from pixi.lock (host-side for every
                 // backend). Empty if the env has not been solved yet.
@@ -1845,6 +1858,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     #[derive(serde::Serialize)]
                     struct Deps {
                         languages: Vec<String>,
+                        /// The persistent baseline: languages kept installed even
+                        /// when unused (`--lang`). A solved language not listed
+                        /// here was provisioned on demand.
+                        pinned: Vec<String>,
                         installed: Vec<String>,
                         #[serde(skip_serializing_if = "Vec::is_empty")]
                         system_packages: Vec<String>,
@@ -1952,6 +1969,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         environment: exports.into_iter().collect(),
                         dependencies: Deps {
                             languages,
+                            pinned: pinned_langs.clone(),
                             installed,
                             system_packages: ec.system_packages.clone(),
                             conda_packages: ec.conda_packages.clone(),
@@ -2013,7 +2031,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     if locked.is_empty() {
                         println!("  not solved yet (run `update`)");
                     } else {
-                        let runtimes = info_runtimes(&locked);
+                        let runtimes = info_runtimes(&locked, &pinned_langs);
                         if !runtimes.is_empty() {
                             println!("  Languages:  {}", runtimes.join(", "));
                         }
@@ -2028,8 +2046,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     if !installed.is_empty() {
                         println!("  Programs:   {}", installed.join(", "));
                     }
-                    if !languages.is_empty() {
-                        println!("  Pinned:     {}", languages.join(", "));
+                    // The persistent baseline: languages kept installed even when
+                    // no module uses them (the solved `Languages:` above tags each
+                    // as pinned or on-demand).
+                    if !pinned_langs.is_empty() {
+                        println!("  Pinned:     {}", pinned_langs.join(", "));
                     }
                     if !ec.system_packages.is_empty() {
                         println!("  System:     {}", ec.system_packages.join(" "));
@@ -3464,6 +3485,11 @@ fn run_native_morloc_init(
     let mut cmd = native_command(fhs_wrapper, morloc_bin, &args, env_dir, activation_path(activation));
     apply_activation(&mut cmd, activation);
     cmd.env("MORLOC_HOME", env_dir);
+    // Build shims in STRICT conda mode: select ONLY tools from the env's conda
+    // prefix (never a stray host python/R on PATH), so a shim is ABI-coherent with
+    // the env's interpreter, and a build failure aborts init loudly. The activation
+    // sets CONDA_PREFIX, which strict mode requires.
+    cmd.env(envagent::ENV_STRICT_CONDA, "1");
     // init builds libmorloc.so + morloc-nexus from source with the env toolchain;
     // point it at the Rust workspace bundled in the provisioned runtime.
     cmd.env("MORLOC_RUST_DIR", provision::runtime_rust_src(runtime_dir));
@@ -4236,16 +4262,20 @@ fn language_shortnames(is_oci: bool) -> Vec<&'static str> {
 }
 
 /// Language multi-select. Returns the chosen short names (e.g. `["py","cpp"]`).
-/// The four core conda languages are pre-checked on first entry; when re-editing,
-/// `current` (short names, possibly `lang@ver` from `--lang`) pre-checks exactly
-/// that set. Script languages start unchecked.
+/// Selecting a language here PINS it: it is installed by default and kept in the
+/// environment even when no morloc module uses it (a general toolchain to keep
+/// around). Leaving the set empty is the norm -- any language a built module uses
+/// is provisioned automatically on demand. On first entry nothing is pre-checked;
+/// when re-editing, `current` (short names, possibly `lang@ver` from `--lang`)
+/// pre-checks exactly that set.
 fn interactive_choose_langs(is_oci: bool, current: &[String]) -> prompt::Result<Vec<String>> {
     let shorts = language_shortnames(is_oci);
     let labels: Vec<String> = shorts.iter().map(|s| s.to_string()).collect();
     // Defaults: the `current` selection when re-editing (matched by the short name
-    // before any `@version`), else the core conda languages.
+    // before any `@version`), else nothing -- the baseline is opt-in; unpinned
+    // languages are added on demand at build time.
     let default: Vec<usize> = if current.is_empty() {
-        (0..layout::LANGUAGES.len()).collect()
+        Vec::new()
     } else {
         shorts
             .iter()
@@ -4258,7 +4288,11 @@ fn interactive_choose_langs(is_oci: bool, current: &[String]) -> prompt::Result<
             .map(|(i, _)| i)
             .collect()
     };
-    let chosen = prompt::multiselect("Languages to provision", labels, &default)?;
+    let chosen = prompt::multiselect(
+        "Languages to keep installed (optional; others are added on demand)",
+        labels,
+        &default,
+    )?;
     let chosen_shorts: Vec<&str> = chosen.into_iter().map(|i| shorts[i]).collect();
     Ok(merge_lang_pins(&chosen_shorts, current))
 }
@@ -5039,7 +5073,8 @@ fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
     let is_container = matches!(backend, Backend::Container(_));
     let is_oci = matches!(backend, Backend::Container(e) if e.is_oci());
 
-    // 3. Languages (checkbox multi-select; the core conda languages are pre-checked).
+    // 3. Languages to PIN (checkbox multi-select; none pre-checked -- the baseline
+    //    is opt-in, and unpinned languages are provisioned on demand at build time).
     let lang = if cli_lang.is_empty() {
         interactive_choose_langs(is_oci, &[])?
     } else {
@@ -5888,7 +5923,13 @@ fn materialize_container_env(
     let mut script = format!("set -e\n{pixi} install --locked\n", pixi = serve::CONTAINER_PIXI_BIN);
     if build_runtime {
         script.push_str(&serve::conda_activate_lines().join("\n"));
-        script.push_str("\nmorloc init -f\n");
+        // Strict conda: build shims against ONLY the activated conda prefix's tools
+        // (never a stray host python/R) so they are ABI-coherent with the env's
+        // interpreter and a build failure aborts loudly.
+        script.push_str(&format!(
+            "\nexport {}=1\nmorloc init -f\n",
+            envagent::ENV_STRICT_CONDA
+        ));
     }
     let cfg = crate::container::RunConfig {
         image: image.to_string(),
@@ -7530,6 +7571,21 @@ mod tests {
         assert_eq!(merge_lang_pins(&["r"], &current), vec!["r".to_string()]);
         // With no prior pins, everything is bare (first-pass selection).
         assert_eq!(merge_lang_pins(&["py", "r"], &[]), vec!["py", "r"]);
+    }
+
+    #[test]
+    fn info_runtimes_tags_pinned_vs_on_demand() {
+        let locked = vec![
+            pixi::LockedPackage { name: "python".to_string(), version: "3.12.4".to_string(), kind: "conda".to_string() },
+            pixi::LockedPackage { name: "rust".to_string(), version: "1.83.0".to_string(), kind: "conda".to_string() },
+        ];
+        // `py` is pinned (note the short-code -> `python` runtime normalization);
+        // rust is present but unpinned, so it reads as on-demand.
+        let out = info_runtimes(&locked, &["py".to_string()]);
+        assert_eq!(out, vec![
+            "python 3.12.4 (pinned)".to_string(),
+            "rust 1.83.0 (on demand)".to_string(),
+        ]);
     }
 
     #[test]
