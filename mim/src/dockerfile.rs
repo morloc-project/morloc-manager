@@ -80,6 +80,26 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     for pkg in &input.extras.system_packages {
         out.push_str(&format!(" {pkg}"));
     }
+    if input.dev {
+        // A dev env builds the Haskell compiler from source with stack/GHC, which
+        // needs a NATIVE GNU toolchain (gcc/ld/libc-dev) plus GHC's build deps
+        // (libgmp, libtinfo/ncurses, libffi, libz, xz to unpack the bindist). This
+        // must come from apt, NOT the conda env: conda ships a sysroot-wrapped
+        // toolchain (x86_64-conda-linux-gnu-cc/-ld) whose CentOS-style /lib64
+        // sysroot does not exist on the Ubuntu root, so GHC's Template Haskell
+        // object load fails resolving /lib64/libc.so.6. The conda toolchain is
+        // still the right one for building language pools (`morloc make`); only the
+        // Haskell build is carved onto the native toolchain (see the stack shim
+        // below). The morloc compiler is a standalone glibc binary, so building it
+        // against the base OS toolchain is correct and needs no conda coherence.
+        out.push_str(
+            " build-essential libgmp-dev libncurses-dev libffi-dev zlib1g-dev xz-utils pkg-config",
+        );
+        // Passwordless sudo for the (non-root, host-UID) dev shell: `sudo` for the
+        // capability, `libnss-extrausers` so setuid sudo can resolve the host UID
+        // (nss_wrapper is LD_PRELOAD and thus invisible to setuid binaries).
+        out.push_str(" sudo libnss-extrausers");
+    }
     out.push_str(" \\\n");
     if input.cert_file.is_some() {
         // Fold the corporate CA into the system trust store now that
@@ -189,8 +209,62 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
         out.push_str("# Haskell toolchain (ghcup + stack) to build the compiler from source\n");
         out.push_str("ENV GHCUP_INSTALL_BASE_PREFIX=/opt BOOTSTRAP_HASKELL_NONINTERACTIVE=1 BOOTSTRAP_HASKELL_MINIMAL=1\n");
         out.push_str("RUN curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org | sh \\\n");
-        out.push_str(&format!("  && {ghcup_bin}/ghcup install stack --set\n"));
+        out.push_str(&format!("  && {ghcup_bin}/ghcup install stack --set \\\n"));
+        // Carve the Haskell build onto the native toolchain. Every container
+        // process runs conda-active (the ENTRYPOINT sources conda's activate.d so
+        // pool builds get $CC/$AR), which exports CC=x86_64-conda-linux-gnu-cc plus
+        // conda CFLAGS/LDFLAGS/CONDA_BUILD_SYSROOT. If `stack setup` runs in that
+        // env, GHC bakes conda's sysroot-wrapped cc/ld into its settings and later
+        // fails to load Template Haskell objects (libc resolves to a nonexistent
+        // /lib64/libc.so.6). Two independent channels leak the conda toolchain into
+        // a build -- GHC's baked settings AND the ambient $CC that Configure and
+        // custom-Setup.hs packages read directly -- so overriding only GHC's -pgm*
+        // is insufficient. Instead wrap `stack` so the WHOLE stack process tree
+        // (stack -> ghc -> gcc/ld, and any configure child) sees the native
+        // toolchain and no conda compiler env. The `-u` list clears every conda
+        // channel that could still route a native-gcc compile through conda's tree
+        // -- the compiler flags/sysroot AND the header/lib discovery paths
+        // (CPATH/C_INCLUDE_PATH/CPLUS_INCLUDE_PATH/LIBRARY_PATH/LD_LIBRARY_PATH/
+        // PKG_CONFIG_PATH/CMAKE_PREFIX_PATH); `env -u` on an unset var is a no-op,
+        // so listing ones conda may not export is harmless. `-u` flags MUST precede
+        // the NAME=VALUE assignments (GNU env stops option parsing at the first
+        // assignment). Replacing ghcup's `stack` in place (rather than shadowing via
+        // PATH) is robust: the run-time PATH is set by serve::container_path, which
+        // orders /usr/local/bin AFTER the ghcup dir.
+        out.push_str(&format!("  && mv {ghcup_bin}/stack {ghcup_bin}/stack.real \\\n"));
+        out.push_str(&format!(
+            "  && printf '#!/bin/sh\\nexec env -u LD_LIBRARY_PATH -u LIBRARY_PATH -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u PKG_CONFIG_PATH -u CMAKE_PREFIX_PATH -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS -u CONDA_BUILD_SYSROOT CC=/usr/bin/gcc CXX=/usr/bin/g++ AR=/usr/bin/ar LD=/usr/bin/ld {ghcup_bin}/stack.real \"$@\"\\n' > {ghcup_bin}/stack \\\n"
+        ));
+        out.push_str(&format!("  && chmod +x {ghcup_bin}/stack\n"));
         out.push_str(&format!("ENV PATH=\"{ghcup_bin}:${{PATH}}\"\n"));
+        out.push('\n');
+
+        // Passwordless sudo for the dev shell. The container runs as the host UID,
+        // and setuid `sudo` must resolve it via getpwuid() -- but the loader strips
+        // the entrypoint's LD_PRELOAD=nss_wrapper from setuid binaries, so sudo
+        // cannot see the synthesized user. podman injects a real passwd entry for
+        // the keep-id UID (named after the host user), but docker's `--user` leaves
+        // it nameless; `libnss-extrausers` (a real NSS module, honored by setuid
+        // tools) guarantees an entry on both: point nsswitch at it and have the
+        // entrypoint write the UID into its world-writable file. The NOPASSWD rule
+        // then targets ALL users, since that name varies by engine.
+        let ex = crate::serve::CONTAINER_EXTRAUSERS_DIR;
+        out.push_str("# Passwordless sudo for the dev shell (identity via libnss-extrausers)\n");
+        out.push_str(
+            "RUN sed -i -E '/^(passwd|group):/ s/$/ extrausers/' /etc/nsswitch.conf \\\n",
+        );
+        out.push_str(&format!(
+            "  && install -d {ex} && : > {ex}/passwd && : > {ex}/group && chmod 0666 {ex}/passwd {ex}/group \\\n"
+        ));
+        // The NOPASSWD rule targets ALL users, not a fixed name: the runtime user
+        // is named by whatever provides the passwd entry -- podman injects the host
+        // username (e.g. `z`) under keep-id, docker's --user leaves it nameless
+        // (resolved via extrausers as `morloc`) -- so a name-specific rule would
+        // miss. A single-user throwaway dev container makes ALL the right scope.
+        out.push_str(
+            "  && printf 'Defaults env_keep += \"http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY\"\\nALL ALL=(ALL) NOPASSWD: ALL\\n' > /etc/sudoers.d/nopasswd \\\n",
+        );
+        out.push_str("  && chmod 0440 /etc/sudoers.d/nopasswd\n");
         out.push('\n');
     }
 
@@ -217,43 +291,64 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     out.push_str(&format!("WORKDIR {}\n", crate::serve::CONTAINER_WORK));
     out.push('\n');
 
-    // Synthesize a passwd/group entry for the host UID via nss_wrapper, then
-    // self-activate the conda toolchain -- for EVERY container process (the
-    // interactive shell, `morloc make`, and the cargo/cc-rs it spawns; see
-    // serve::conda_activate_lines for why activate.d must be sourced). The pixi
-    // path is absolute because the run-time PATH does not include /opt/pixi/bin.
+    // Establish container identity for the host UID, then self-activate the conda
+    // toolchain -- for EVERY container process (the interactive shell, `morloc
+    // make`, and the cargo/cc-rs it spawns; see serve::conda_activate_lines for why
+    // activate.d must be sourced). The pixi path is absolute because the run-time
+    // PATH does not include /opt/pixi/bin. Both identity paths deliberately do NOT
+    // set HOME -- HOME is supplied by the container run env (serve::oci_base_env) so
+    // the interactive and served paths agree. Lines avoid single quotes so the
+    // single-quote-wrapped printf emitter below reproduces them verbatim.
     //
-    // The nss block runs only when the current UID has no passwd entry (the
-    // keep-id case); it LD_PRELOADs nss_wrapper against temp passwd/group files
-    // naming the env-owned `morloc` user. It deliberately does NOT set HOME -- HOME
-    // is supplied by the container run env (serve::oci_base_env) so the interactive
-    // and served paths agree. Lines avoid single quotes so the single-quote-wrapped
-    // printf below emits them verbatim.
-    let nss_block = [
-        format!(
-            "if [ -f {lib} ] && ! getent passwd \"$(id -u)\" >/dev/null 2>&1; then",
-            lib = crate::serve::CONTAINER_NSS_WRAPPER_LIB
-        ),
-        "  _p=\"$(mktemp)\"; _g=\"$(mktemp)\"".to_string(),
-        "  if [ -n \"$_p\" ] && [ -n \"$_g\" ]; then".to_string(),
-        format!(
-            "    printf \"morloc:x:%s:%s:morloc:{home}:/bin/bash\\n\" \"$(id -u)\" \"$(id -g)\" > \"$_p\"",
-            home = crate::serve::CONTAINER_HOME
-        ),
-        "    printf \"morloc:x:%s:\\n\" \"$(id -g)\" > \"$_g\"".to_string(),
-        format!(
-            "    export LD_PRELOAD={lib} NSS_WRAPPER_PASSWD=\"$_p\" NSS_WRAPPER_GROUP=\"$_g\" USER=morloc LOGNAME=morloc",
-            lib = crate::serve::CONTAINER_NSS_WRAPPER_LIB
-        ),
-        "  fi".to_string(),
-        "fi".to_string(),
-    ];
-    let script_lines: String = nss_block
+    // Dev images run interactively as the host UID and need passwordless sudo:
+    // setuid `sudo` resolves the UID through getpwuid, which honors real NSS
+    // modules but never the LD_PRELOAD nss_wrapper, so dev writes the entry to
+    // libnss-extrausers (its nsswitch source). Release images keep nss_wrapper.
+    let identity_block: Vec<String> = if input.dev {
+        let ex = crate::serve::CONTAINER_EXTRAUSERS_DIR;
+        let home = crate::serve::CONTAINER_HOME;
+        vec![
+            // Fill any missing passwd/group entry (podman's keep-id injection may
+            // already provide one; docker --user leaves the UID nameless). The two
+            // are independent, so a host that has a passwd entry but no matching
+            // group still gets its group synthesized.
+            format!(
+                "getent passwd \"$(id -u)\" >/dev/null 2>&1 || printf \"morloc:x:%s:%s:morloc:{home}:/bin/bash\\n\" \"$(id -u)\" \"$(id -g)\" >> {ex}/passwd 2>/dev/null || true"
+            ),
+            format!(
+                "getent group \"$(id -g)\" >/dev/null 2>&1 || printf \"morloc:x:%s:\\n\" \"$(id -g)\" >> {ex}/group 2>/dev/null || true"
+            ),
+            // Match $USER to the resolved identity (podman's injected host username,
+            // or extrausers' `morloc`); skip when the UID does not resolve, so USER
+            // is never exported as an empty string.
+            "_u=\"$(id -un 2>/dev/null)\"; [ -n \"$_u\" ] && export USER=\"$_u\" LOGNAME=\"$_u\"".to_string(),
+        ]
+    } else {
+        // nss_wrapper: synthesize the entry only when the UID has none (keep-id),
+        // via an LD_PRELOAD interposer over temp files naming the `morloc` user.
+        let lib = crate::serve::CONTAINER_NSS_WRAPPER_LIB;
+        let home = crate::serve::CONTAINER_HOME;
+        vec![
+            format!("if [ -f {lib} ] && ! getent passwd \"$(id -u)\" >/dev/null 2>&1; then"),
+            "  _p=\"$(mktemp)\"; _g=\"$(mktemp)\"".to_string(),
+            "  if [ -n \"$_p\" ] && [ -n \"$_g\" ]; then".to_string(),
+            format!(
+                "    printf \"morloc:x:%s:%s:morloc:{home}:/bin/bash\\n\" \"$(id -u)\" \"$(id -g)\" > \"$_p\""
+            ),
+            "    printf \"morloc:x:%s:\\n\" \"$(id -g)\" > \"$_g\"".to_string(),
+            format!(
+                "    export LD_PRELOAD={lib} NSS_WRAPPER_PASSWD=\"$_p\" NSS_WRAPPER_GROUP=\"$_g\" USER=morloc LOGNAME=morloc"
+            ),
+            "  fi".to_string(),
+            "fi".to_string(),
+        ]
+    };
+    let script_lines: String = identity_block
         .iter()
         .chain(crate::serve::conda_activate_lines().iter())
         .map(|l| format!(" '{l}'"))
         .collect();
-    out.push_str("# Env identity (nss_wrapper) + conda activation for every container process\n");
+    out.push_str("# Env identity + conda activation for every container process\n");
     out.push_str(&format!(
         "RUN printf '%s\\n' '#!/bin/bash'{script_lines} 'exec \"$@\"' > /usr/local/bin/morloc-activate && chmod +x /usr/local/bin/morloc-activate\n"
     ));
@@ -313,7 +408,7 @@ ENV MORLOC_HOME=/opt/morloc
 
 WORKDIR /work
 
-# Env identity (nss_wrapper) + conda activation for every container process
+# Env identity + conda activation for every container process
 RUN printf '%s\\n' '#!/bin/bash' 'if [ -f /usr/local/lib/morloc-nss-wrapper.so ] && ! getent passwd \"$(id -u)\" >/dev/null 2>&1; then' '  _p=\"$(mktemp)\"; _g=\"$(mktemp)\"' '  if [ -n \"$_p\" ] && [ -n \"$_g\" ]; then' '    printf \"morloc:x:%s:%s:morloc:/home/morloc:/bin/bash\\n\" \"$(id -u)\" \"$(id -g)\" > \"$_p\"' '    printf \"morloc:x:%s:\\n\" \"$(id -g)\" > \"$_g\"' '    export LD_PRELOAD=/usr/local/lib/morloc-nss-wrapper.so NSS_WRAPPER_PASSWD=\"$_p\" NSS_WRAPPER_GROUP=\"$_g\" USER=morloc LOGNAME=morloc' '  fi' 'fi' 'export CONDA_PREFIX=/env/.pixi/envs/default' 'eval \"$(/opt/pixi/bin/pixi shell-hook --manifest-path /env/pixi.toml --shell bash 2>/dev/null)\" || true' 'for f in \"$CONDA_PREFIX/etc/conda/activate.d/\"*.sh; do [ -r \"$f\" ] && . \"$f\"; done' 'exec \"$@\"' > /usr/local/bin/morloc-activate && chmod +x /usr/local/bin/morloc-activate
 ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
 ";
@@ -377,6 +472,78 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         assert!(!got.contains("ENV MORLOC_RUST_DIR="));
         // But CONTAINER_RUNTIME_BIN (a mount target) is still on PATH.
         assert!(got.contains(&format!("ENV PATH=\"{}:", crate::serve::CONTAINER_RUNTIME_BIN)));
+    }
+
+    #[test]
+    fn dev_dockerfile_installs_native_toolchain_and_stack_shim() {
+        let extras = BuildExtras::default();
+        let ghcup_bin = crate::serve::CONTAINER_GHCUP_BIN;
+        let dev = DockerfileInput {
+            base_image: "ubuntu:24.04",
+            pixi_version: "0.76.2",
+            morloc_home: "/opt/morloc",
+            extras: &extras,
+            lang_installs: &[],
+            dev: true,
+            cert_file: None,
+        };
+        let got = generate_dockerfile(&dev);
+        // The native GNU toolchain + GHC build deps are apt-installed (a dev env
+        // builds the Haskell compiler; conda's sysroot-wrapped cc/ld would make GHC
+        // seek a nonexistent /lib64/libc.so.6 at Template Haskell load time).
+        assert!(got.contains("build-essential"));
+        assert!(got.contains("libgmp-dev"));
+        // `stack` is wrapped so the whole stack->ghc->gcc/ld tree runs on the native
+        // toolchain, with conda's compiler env carved out.
+        assert!(got.contains(&format!("mv {ghcup_bin}/stack {ghcup_bin}/stack.real")));
+        assert!(got.contains("CC=/usr/bin/gcc"));
+        assert!(got.contains("-u CONDA_BUILD_SYSROOT"));
+        assert!(got.contains(&format!("{ghcup_bin}/stack.real \"$@\"")));
+
+        // A release (non-dev) image ships a prebuilt compiler, so it gets neither
+        // the Haskell build toolchain nor the stack shim.
+        let release = DockerfileInput {
+            dev: false,
+            ..dev
+        };
+        let got = generate_dockerfile(&release);
+        assert!(!got.contains("build-essential"));
+        assert!(!got.contains("stack.real"));
+    }
+
+    #[test]
+    fn dev_dockerfile_enables_passwordless_sudo() {
+        let extras = BuildExtras::default();
+        let ex = crate::serve::CONTAINER_EXTRAUSERS_DIR;
+        let dev = DockerfileInput {
+            base_image: "ubuntu:24.04",
+            pixi_version: "0.76.2",
+            morloc_home: "/opt/morloc",
+            extras: &extras,
+            lang_installs: &[],
+            dev: true,
+            cert_file: None,
+        };
+        let got = generate_dockerfile(&dev);
+        // sudo + a real NSS module (setuid sudo cannot see the LD_PRELOAD nss_wrapper).
+        assert!(got.contains("sudo libnss-extrausers"));
+        assert!(got.contains("/etc/nsswitch.conf"));
+        // Rule targets ALL users, not a fixed name (the runtime user may be named
+        // by podman's passwd injection rather than extrausers).
+        assert!(got.contains("ALL ALL=(ALL) NOPASSWD: ALL"));
+        // The dev entrypoint resolves identity via extrausers, not nss_wrapper.
+        assert!(got.contains(&format!(">> {ex}/passwd")));
+        assert!(!got.contains("LD_PRELOAD="));
+
+        // Release images keep nss_wrapper and get no sudo/extrausers.
+        let release = DockerfileInput {
+            dev: false,
+            ..dev
+        };
+        let got = generate_dockerfile(&release);
+        assert!(!got.contains("libnss-extrausers"));
+        assert!(!got.contains("NOPASSWD"));
+        assert!(got.contains("LD_PRELOAD="));
     }
 
     #[test]

@@ -655,6 +655,16 @@ pub const CONTAINER_WORK: &str = "/work";
 /// which otherwise has no /etc/passwd entry.
 pub const CONTAINER_NSS_WRAPPER_LIB: &str = "/usr/local/lib/morloc-nss-wrapper.so";
 
+/// Fixed path of the `libnss-extrausers` identity file (the module reads this
+/// exact location; it is not configurable). Dev images point `nsswitch.conf` at
+/// the `extrausers` NSS source and the entrypoint writes the host UID's
+/// passwd/group entry here. Unlike nss_wrapper (an `LD_PRELOAD` interposer that
+/// the loader strips from setuid binaries), extrausers is a real NSS module, so
+/// setuid `sudo` resolves the entry -- which passwordless `sudo` in the dev
+/// container requires. The file is world-writable so the (non-root, host-UID)
+/// entrypoint can append to it.
+pub const CONTAINER_EXTRAUSERS_DIR: &str = "/var/lib/extrausers";
+
 /// System PATH tail appended after the morloc + toolchain dirs for every
 /// in-container invocation (run, serve, apptainer).
 pub const CONTAINER_PATH_TAIL: &str =

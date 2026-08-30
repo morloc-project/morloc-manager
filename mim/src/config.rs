@@ -65,8 +65,13 @@ pub fn env_config_path_legacy_json(scope: Scope, name: &str) -> PathBuf {
     env_config_dir(scope, name).join("env.json")
 }
 
-/// Path to an environment's custom Dockerfile (read by freeze/doctor; not
-/// produced by the requirement-derived build).
+/// Path to an environment's Dockerfile in its config dir. Holds either a custom
+/// recipe (legacy/freeze; recorded in `EnvironmentConfig::dockerfile` and read by
+/// freeze/doctor) OR a documentation copy of the requirement-derived Dockerfile
+/// the build renders -- the latter is written for reproducibility/debugging and
+/// surfaced by `mim info`, but is NOT recorded in `dockerfile`, so freeze/doctor
+/// (which gate on that field) ignore it. The two uses are mutually exclusive per
+/// environment.
 pub fn env_dockerfile_path(scope: Scope, name: &str) -> PathBuf {
     env_config_dir(scope, name).join("Dockerfile")
 }

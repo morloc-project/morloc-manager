@@ -1007,6 +1007,19 @@ fn annotate_missing(p: &std::path::Path) -> String {
     }
 }
 
+/// The env's Dockerfile path to surface in `info`, or None. Present when the env
+/// records a custom recipe (`ec.dockerfile`) OR the requirement-derived build
+/// persisted a documentation copy on disk. Single source of truth so the human
+/// and JSON `info` renderings cannot drift.
+fn info_dockerfile_path(scope: Scope, name: &str, has_custom_recipe: bool) -> Option<std::path::PathBuf> {
+    let p = cfg::env_dockerfile_path(scope, name);
+    if has_custom_recipe || p.exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
 /// Locate pixi WITHOUT provisioning it (never downloads): the `MORLOC_PIXI`
 /// override if it names a file, else the provisioned `<data_dir>/bin/pixi`.
 /// `None` if it isn't provisioned yet. Used by `info` and by doctor so neither
@@ -1826,6 +1839,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         #[serde(skip_serializing_if = "Option::is_none")]
                         image: Option<String>,
                         #[serde(skip_serializing_if = "Option::is_none")]
+                        base_image: Option<String>,
+                        #[serde(skip_serializing_if = "Option::is_none")]
                         shm_size: Option<String>,
                         #[serde(skip_serializing_if = "Option::is_none")]
                         dockerfile: Option<String>,
@@ -1869,9 +1884,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         container: Option<Container>,
                     }
                     let container = engine.map(|e| {
-                        let dockerfile = ec.dockerfile.as_ref().map(|_| {
-                            cfg::env_dockerfile_path(scope, &env_name).display().to_string()
-                        });
+                        let dockerfile = info_dockerfile_path(scope, &env_name, ec.dockerfile.is_some())
+                            .map(|p| p.display().to_string());
                         let deffile = ec.singularity_def.as_ref().map(|_| {
                             cfg::env_deffile_path(scope, &env_name).display().to_string()
                         });
@@ -1882,6 +1896,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         };
                         Container {
                             image: ec.built_image.clone(),
+                            // Base image (the OCI FROM) applies only under docker/podman.
+                            base_image: if e.is_oci() { Some(ec.base_image.clone()) } else { None },
                             // SHM size is honored only under docker/podman.
                             shm_size: if e.is_oci() { Some(ec.shm_size.clone()) } else { None },
                             dockerfile,
@@ -2015,9 +2031,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                             if let Some(ref img) = ec.built_image {
                                 println!("  Image:        {img}");
                             }
+                            println!("  Base image:   {}", ec.base_image);
                             println!("  SHM size:     {}", ec.shm_size);
-                            println!("  Dockerfile:   {}", match ec.dockerfile {
-                                Some(_) => annotate_missing(&cfg::env_dockerfile_path(scope, &env_name)),
+                            println!("  Dockerfile:   {}", match info_dockerfile_path(scope, &env_name, ec.dockerfile.is_some()) {
+                                Some(p) => annotate_missing(&p),
                                 None => "none".to_string(),
                             });
                         }
@@ -5777,8 +5794,9 @@ fn build_requirement_derived_image(
         dev: false,
         cert_file: cert_file.as_deref(),
     });
+    persist_env_dockerfile(scope, name, &df_text);
     let df_path = context.join("Dockerfile");
-    std::fs::write(&df_path, df_text)
+    std::fs::write(&df_path, &df_text)
         .map_err(|e| ManagerError::EnvError(format!("cannot write {}: {e}", df_path.display())))?;
 
     eprintln!("Building the environment base image ({image_tag}) with {}...", engine.name());
@@ -5812,6 +5830,20 @@ fn build_requirement_derived_image(
     // materialized, written only now that both have succeeded.
     let _ = std::fs::write(&marker, &key);
     Ok((image_tag, req.version))
+}
+
+/// Write a documentation copy of the rendered Dockerfile next to the env config
+/// (`mim info` surfaces its path) for reproducibility/debugging. Best-effort: a
+/// failure never fails the build. Deliberately does NOT set
+/// `EnvironmentConfig::dockerfile` -- that field marks a custom recipe consumed by
+/// freeze/doctor, whereas this generated file references build-context paths
+/// (`COPY runtime/` ...) that exist only during the build.
+fn persist_env_dockerfile(scope: Scope, name: &str, df_text: &str) {
+    let df_doc = cfg::env_dockerfile_path(scope, name);
+    if let Some(parent) = df_doc.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&df_doc, df_text);
 }
 
 /// The bind mounts every materialize/run of a container env shares: the env state
@@ -5970,6 +6002,10 @@ fn build_dev_container_image(
         dev: true,
         cert_file: cert_file.as_deref(),
     });
+    // Persist even when the image is cache-fresh below (the rebuild block that
+    // writes the context copy is skipped then), so `mim info` always reflects the
+    // current render.
+    persist_env_dockerfile(scope, name, &df_text);
 
     // Single cache key: the pixi manifest + the rendered Dockerfile + the CA
     // bundle contents. A change re-solves, rebuilds the image, and re-materializes
