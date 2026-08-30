@@ -39,7 +39,7 @@ else
     exit 1
 fi
 
-echo "=== Building static mim + mim-env for ${target} (via ${engine}) ==="
+echo "=== Building static mim for ${target} (via ${engine}) ==="
 DOCKER_BUILDKIT=1 "$engine" build \
     --build-arg "TARGET=${target}" \
     -t mim-static-build \
@@ -54,7 +54,6 @@ mkdir -p out
 cid=$("$engine" create mim-static-build)
 trap '"$engine" rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 "$engine" cp "$cid:/artifacts/mim" out/mim
-"$engine" cp "$cid:/artifacts/mim-env" out/mim-env
 
 echo "=== Output in out/ ==="
-ls -lh out/mim out/mim-env
+ls -lh out/mim

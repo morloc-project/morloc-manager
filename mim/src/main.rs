@@ -4,6 +4,7 @@ mod config;
 mod container;
 mod doctor;
 mod dockerfile;
+mod envagent;
 mod environment;
 mod error;
 mod fhs;
@@ -162,10 +163,6 @@ or `latest`). With no flags on a TTY, all settings are prompted interactively.")
         #[arg(long = "local-runtime", value_name = "DIR", help_heading = "Advanced",
               conflicts_with_all = ["morloc_version", "dev"])]
         local_runtime: Option<String>,
-        /// Path to a local `mim-env` binary to stage into a dev environment.
-        /// Defaults to the `mim-env` beside the running `mim`.
-        #[arg(long = "dev-mim-env", help_heading = "Advanced")]
-        dev_mim_env: Option<String>,
         /// A file of apt packages to bake into the image, one per line.
         /// Container backend only.
         #[arg(long = "system-packages-file")]
@@ -417,11 +414,6 @@ Examples:
         /// `jq` or `hyperfine>=1.18`. Any backend. Triggers a rebuild.
         #[arg(long = "conda-packages-file")]
         conda_packages_file: Option<String>,
-        /// Re-stage a dev environment's `mim-env` dependency agent from this
-        /// binary path (e.g. a freshly rebuilt static agent). Dev environments
-        /// only. No image rebuild.
-        #[arg(long = "dev-mim-env")]
-        dev_mim_env: Option<String>,
         /// Directory of dotfiles to copy into the environment's home
         /// (.bashrc, .vimrc, .config/...). Overwrites like `cp -rf`;
         /// docker/podman only. No rebuild.
@@ -648,6 +640,36 @@ Examples:
 Examples:
   morloc-manager status")]
     Status,
+
+    // -- In-environment dependency agent (hidden) --
+    //
+    // These run INSIDE a managed environment, not on the host. The morloc
+    // compiler invokes `mim sync ...` as its build hook (MORLOC_BUILD_HOOK points
+    // at this binary); `clean`/`spec` are for a user in an entered shell. Hidden
+    // because they are an internal contract with the compiler, not part of the
+    // manager's user-facing surface. See `envagent`.
+    #[command(hide = true)]
+    Sync {
+        /// The key under which the spec is stored
+        #[arg(long)]
+        name: String,
+        /// Path to the program's `envspec.json`
+        #[arg(long)]
+        spec: std::path::PathBuf,
+        /// Project root (the entry module's directory) against which local
+        /// (filesystem-path) dependency paths are resolved.
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+        /// Record as an installed program, not a transient local build
+        #[arg(long)]
+        installed: bool,
+    },
+    /// Resolve with only installed modules (reset the world to its baseline)
+    #[command(hide = true)]
+    Clean,
+    /// Print the merged pixi manifest for the current declared world
+    #[command(hide = true)]
+    Spec,
 }
 
 #[derive(Subcommand)]
@@ -1039,20 +1061,20 @@ pub(crate) fn locate_pixi(scope: Scope) -> Option<std::path::PathBuf> {
 
 /// The managed-environment marker trio the compiler's build hook depends on,
 /// ALWAYS produced together so they cannot drift apart: MORLOC_ENV (the gate
-/// `morloc make`'s dependency callback checks), MORLOC_BUILD_HOOK (the mim-env
-/// agent it runs to provision dependencies), and MORLOC_BIN (the env's compiler,
-/// so the agent's reverse `morloc lang-support` resolves without PATH). Every site
-/// that marks a process as running inside a managed environment uses this, so the
-/// invariant "MORLOC_ENV set => hook and bin set" holds by construction rather
-/// than by remembering three vars at each call site.
+/// `morloc make`'s dependency callback checks), MORLOC_BUILD_HOOK (the mim agent it
+/// runs as `mim sync ...` to provision dependencies), and MORLOC_BIN (the env's
+/// compiler, so the agent's reverse `morloc lang-support` resolves without PATH).
+/// Every site that marks a process as running inside a managed environment uses
+/// this, so the invariant "MORLOC_ENV set => hook and bin set" holds by
+/// construction rather than by remembering three vars at each call site.
 fn managed_env_vars(
     env_name: &str,
     morloc_bin: &std::path::Path,
-    mim_env: &std::path::Path,
+    build_hook: &std::path::Path,
 ) -> Vec<(String, String)> {
     vec![
         ("MORLOC_ENV".to_string(), env_name.to_string()),
-        ("MORLOC_BUILD_HOOK".to_string(), mim_env.display().to_string()),
+        ("MORLOC_BUILD_HOOK".to_string(), build_hook.display().to_string()),
         ("MORLOC_BIN".to_string(), morloc_bin.display().to_string()),
     ]
 }
@@ -1230,7 +1252,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             morloc_version,
             engine,
             dev,
-            dev_mim_env,
             local_runtime,
             system_packages_file,
             conda_packages_file,
@@ -1243,11 +1264,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             non_interactive,
         } => {
             if system { check_system_write_access()?; }
-            if dev_mim_env.is_some() && dev.is_none() {
-                return Err(ManagerError::EnvError(
-                    "--dev-mim-env requires --dev (it stages the agent into a dev environment)".to_string(),
-                ));
-            }
             // Resolve/validate the local runtime dir up front (clap already makes it
             // mutually exclusive with --morloc-version and --dev). An advanced,
             // flag-only mode: it is never offered interactively.
@@ -1283,7 +1299,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     cli_dotfiles: dotfiles,
                     cli_set_default: set_default,
                     cli_dev: dev,
-                    cli_dev_mim_env: dev_mim_env,
                     cli_cert_bundle: cert_bundle,
                 })? {
                     Some(p) => p,
@@ -1297,7 +1312,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     let Backend::Container(eng) = plan.backend else { unreachable!() };
                     return container_new_dev(
                         plan.scope, eng, Some(plan.name), src, plan.lang, plan.system_packages,
-                        plan.conda_packages, plan.dev_mim_env, plan.dotfiles, plan.cert_bundle,
+                        plan.conda_packages, plan.dotfiles, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
                         plan.requested_version, no_init, plan.make_default,
                     );
@@ -1456,7 +1471,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             if let Some(src) = dev {
                 return container_new_dev(
                     scope, resolved_engine, name, src, lang, system_package, conda_package,
-                    dev_mim_env, dotfiles, cert_bundle, base_image, morloc_version, no_init,
+                    dotfiles, cert_bundle, base_image, morloc_version, no_init,
                     set_default,
                 );
             }
@@ -1955,9 +1970,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         // is built by the developer from the mounted source.
                         println!("Mode:      dev (compiler built from source by developer)");
                         println!("  Source:      {}", dev.source);
-                        if let Some(agent) = &dev.mim_env {
-                            println!("  Dep agent:   {agent}");
-                        }
                     }
                     if let Some(ref lr) = ec.local_runtime {
                         // A local-runtime env: the version below is the adopted binary's
@@ -2241,7 +2253,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             lang,
             system_packages_file,
             conda_packages_file,
-            dev_mim_env,
             dotfiles,
             cert_bundle,
             base,
@@ -2262,19 +2273,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 system_packages_file.as_deref().map(read_package_file).transpose()?;
             let conda_from_file =
                 conda_packages_file.as_deref().map(read_package_file).transpose()?;
-            // Validate the agent path up front, alongside the package files.
-            let dev_mim_env_src = resolve_dev_mim_env(dev_mim_env.as_deref())?;
             // apt is container-only; conda works on every backend, so the native
             // rejection below keys on apt alone.
             let touches_apt = system_from_file.is_some();
             let touches_packages = touches_apt || conda_from_file.is_some();
             let will_rebuild =
                 !lang.is_empty() || touches_packages || cert_bundle.is_some() || base.is_some();
-            if !set_default && !will_rebuild && dotfiles.is_none() && dev_mim_env.is_none() {
+            if !set_default && !will_rebuild && dotfiles.is_none() {
                 return Err(ManagerError::EnvError(
                     "nothing to modify: pass --set-default, --dotfiles, --lang, \
-                     --cert-bundle, --base, --system-packages-file, \
-                     --conda-packages-file, or --dev-mim-env".to_string(),
+                     --cert-bundle, --base, --system-packages-file, or \
+                     --conda-packages-file".to_string(),
                 ));
             }
 
@@ -2299,11 +2308,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 // Same rule as `new`: dotfiles land in a docker/podman env home;
                 // native runs against your real home and apptainer mounts host $HOME.
                 return Err(dotfiles_not_supported());
-            }
-            if dev_mim_env.is_some() && ec.dev.is_none() {
-                return Err(ManagerError::EnvError(
-                    "--dev-mim-env applies only to dev environments".to_string(),
-                ));
             }
             if set_default && system && env_scope != Scope::System {
                 return Err(ManagerError::EnvError(format!(
@@ -2349,16 +2353,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let data_dir = cfg::env_data_dir(env_scope, &env_name);
                 apply_dotfiles(ec.backend.container_engine(), &data_dir, src)?;
                 eprintln!("Copied dotfiles into '{env_name}'.");
-            }
-
-            // 2b. dev agent: re-stage into the runtime-bin mount and persist the
-            //     new source path; no rebuild.
-            if dev_mim_env.is_some() {
-                stage_dev_mim_env(env_scope, &env_name, dev_mim_env_src.as_deref())?;
-                if let Some(dev) = ec.dev.as_mut() {
-                    dev.mim_env = dev_mim_env_src;
-                }
-                cfg::write_env_config(env_scope, &env_name, &ec)?;
             }
 
             // 3. Build-affecting changes (system packages, language pins) + rebuild.
@@ -3091,6 +3085,20 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             doctor::doctor(ec.engine()?, verbose, &env_name, env_scope, &ec, deep, strict, slurm, json)
         }
 
+        // ---- in-environment dependency agent (hidden; run inside an env) ----
+        Cmd::Sync { name, spec, root, installed } => {
+            envagent::sync(&name, &spec, root.as_deref(), installed)?;
+            Ok(())
+        }
+        Cmd::Clean => {
+            envagent::clean()?;
+            Ok(())
+        }
+        Cmd::Spec => {
+            envagent::spec()?;
+            Ok(())
+        }
+
     }
 }
 
@@ -3268,9 +3276,10 @@ pub(crate) fn native_run_env(
     // Managed-env markers, set as a UNIT (see `managed_env_vars`) so the compiler
     // never sees MORLOC_ENV without a resolvable build hook. MORLOC_ENV is the gate
     // the dependency callback checks -- set ONLY inside a managed environment, so a
-    // bare host `morloc make` never triggers a sync. The build hook is mim's own
-    // sibling mim-env (versioned with mim); MORLOC_BIN is this env's compiler.
-    let hook = provision::sibling_mim_env().unwrap_or_else(|| std::path::PathBuf::from("mim-env"));
+    // bare host `morloc make` never triggers a sync. The build hook is mim itself
+    // (`mim sync ...`); natively that is the running executable, so the agent is
+    // coherent with the manager by construction. MORLOC_BIN is this env's compiler.
+    let hook = provision::mim_agent_for_host(env.scope)?;
     let morloc_bin = runtime
         .morloc_bin
         .clone()
@@ -3278,8 +3287,8 @@ pub(crate) fn native_run_env(
     for (k, v) in managed_env_vars(&env.name, &morloc_bin, &hook) {
         cmd.env(k, v);
     }
-    // The pixi binary, so the in-env mim-env agent re-solves without rediscovering
-    // it. Best-effort: pixi was already provisioned at materialize.
+    // The pixi binary, so the in-env agent re-solves without rediscovering it.
+    // Best-effort: pixi was already provisioned at materialize.
     if let Ok(pixi) = provision::provision_pixi(env.scope) {
         cmd.env("MORLOC_PIXI", pixi);
     }
@@ -4465,57 +4474,20 @@ fn local_version_tag(reported_version: &str, ctx: &std::path::Path) -> Result<St
     Ok(format!("{}.{}.{}-local", v.major, v.minor, v.patch))
 }
 
-/// Resolve, and record, the `mim-env` agent source for a dev env: an explicit
-/// `--dev-mim-env` path (canonicalized, must exist and be UTF-8, since it is
-/// persisted) wins; `None` records nothing and falls back at stage time to the
-/// `mim-env` beside the running `mim`.
-fn resolve_dev_mim_env(explicit: Option<&str>) -> Result<Option<String>> {
-    match explicit {
-        None => Ok(None),
-        Some(raw) => {
-            let abs = std::fs::canonicalize(expand_tilde(raw)).map_err(|e| {
-                ManagerError::EnvError(format!("--dev-mim-env path {raw} is not accessible: {e}"))
-            })?;
-            match abs.to_str() {
-                Some(s) if abs.is_file() => Ok(Some(s.to_string())),
-                Some(_) => Err(ManagerError::EnvError(format!(
-                    "--dev-mim-env path {} is not a file",
-                    abs.display()
-                ))),
-                None => Err(ManagerError::EnvError(format!(
-                    "--dev-mim-env path {} contains non-UTF-8 characters",
-                    abs.display()
-                ))),
-            }
-        }
-    }
-}
-
-/// Stage a dev env's `mim-env` agent into its runtime-bin mount (`dev-bin` ->
-/// CONTAINER_RUNTIME_BIN). The recorded `--dev-mim-env` path wins; otherwise the
-/// `mim-env` beside the running `mim`. Warns (does not fail) when neither exists,
-/// so a dev env still builds -- `morloc make` reports the missing hook only if a
-/// program actually declares dependencies.
-fn stage_dev_mim_env(scope: Scope, name: &str, recorded: Option<&str>) -> Result<()> {
-    let source = match recorded {
-        Some(p) => Some(std::path::PathBuf::from(p)),
-        None => provision::sibling_mim_env().filter(|p| p.is_file()),
-    };
-    match source {
-        Some(src) => {
-            let dest_dir = cfg::env_data_dir(scope, name).join(DEV_BIN_SUBDIR);
-            std::fs::create_dir_all(&dest_dir).map_err(|e| {
-                ManagerError::EnvError(format!("cannot create {}: {e}", dest_dir.display()))
-            })?;
-            provision::stage_mim_env_agent(&src, &dest_dir)?;
-            eprintln!("Staged mim-env dependency agent from {}", src.display());
-        }
-        None => eprintln!(
-            "Note: no mim-env agent staged. Pass --dev-mim-env <path> (e.g. the static \
-             build from morloc-manager) so 'morloc make' can provision declared \
-             dependencies."
-        ),
-    }
+/// Stage a dev env's dependency agent (a `mim` binary) into its runtime-bin mount
+/// (`dev-bin` -> CONTAINER_RUNTIME_BIN), run in-container as `mim sync ...`. Stages
+/// the mim matching the container's Linux platform -- the running mim on a Linux
+/// host, or the release binary downloaded for a foreign host; set `MORLOC_MIM_ENV`
+/// to a locally-built mim to test one. A dev env is a container, so the staged
+/// binary must match the container platform, not necessarily the host.
+fn stage_dev_agent(scope: Scope, name: &str) -> Result<()> {
+    let src = provision::mim_for_triple(scope, provision::container_release_triple()?)?;
+    let dest_dir = cfg::env_data_dir(scope, name).join(DEV_BIN_SUBDIR);
+    std::fs::create_dir_all(&dest_dir).map_err(|e| {
+        ManagerError::EnvError(format!("cannot create {}: {e}", dest_dir.display()))
+    })?;
+    provision::stage_mim_agent(&src, &dest_dir)?;
+    eprintln!("Staged the dependency agent (mim) from {}", src.display());
     Ok(())
 }
 
@@ -4615,29 +4587,6 @@ fn interactive_choose_cert_bundle(current: Option<&str>) -> prompt::Result<Optio
     }
 }
 
-/// Prompt for an optional local `mim-env` binary to stage into a dev env. Blank
-/// uses the `mim-env` beside `mim`. `current` (when re-editing) is pre-filled so
-/// a bare Enter keeps it. The raw path is returned (validated for existence);
-/// `container_new_dev` resolves it canonically.
-fn interactive_choose_dev_mim_env(current: Option<&str>) -> prompt::Result<Option<String>> {
-    let msg = "Local mim-env binary (blank = the one beside mim)";
-    let help = "staged as the dev env's dependency agent";
-    loop {
-        let choice = match current {
-            Some(cur) => prompt::path_seeded(msg, help, cur)?,
-            None => prompt::path(msg, help)?,
-        };
-        let choice = choice.trim();
-        if choice.is_empty() {
-            return Ok(None);
-        }
-        match resolve_dev_mim_env(Some(choice)) {
-            Ok(_) => return Ok(Some(choice.to_string())),
-            Err(e) => eprintln!("  {e}"),
-        }
-    }
-}
-
 /// Prompt for an optional dev-mode source tree. A "no" answer means a normal
 /// release env; a path is validated as a morloc source tree and re-prompted on
 /// error. Returns the absolute source path when dev is chosen.
@@ -4723,8 +4672,6 @@ struct NewPlan {
     /// `Some(path)` builds a DEV env from that morloc source tree (container-only,
     /// local scope). `None` for a normal release env.
     dev_source: Option<String>,
-    /// `--dev-mim-env` path to the dependency agent to stage (dev envs only).
-    dev_mim_env: Option<String>,
     /// `--cert-bundle` / firewall-prompt path to a corporate CA bundle to trust.
     cert_bundle: Option<String>,
 }
@@ -4742,7 +4689,6 @@ struct NewSessionInput {
     cli_dotfiles: Option<String>,
     cli_set_default: bool,
     cli_dev: Option<String>,
-    cli_dev_mim_env: Option<String>,
     cli_cert_bundle: Option<String>,
 }
 
@@ -4759,7 +4705,6 @@ enum EditField {
     Packages,
     CondaPackages,
     Dotfiles,
-    DevMimEnv,
     Default,
 }
 
@@ -4776,7 +4721,6 @@ impl EditField {
             EditField::Packages => "system packages",
             EditField::CondaPackages => "conda packages",
             EditField::Dotfiles => "dotfiles",
-            EditField::DevMimEnv => "dev mim-env",
             EditField::Default => "default",
         }
     }
@@ -4794,7 +4738,6 @@ impl EditField {
             EditField::Packages => list_or_none(&plan.system_packages),
             EditField::CondaPackages => list_or_none(&plan.conda_packages),
             EditField::Dotfiles => plan.dotfiles.clone().unwrap_or_else(|| "none".to_string()),
-            EditField::DevMimEnv => plan.dev_mim_env.clone().unwrap_or_else(|| "beside mim".to_string()),
             EditField::Default => if plan.make_default { "yes" } else { "no" }.to_string(),
         }
     }
@@ -4851,9 +4794,6 @@ impl EditField {
             EditField::Dotfiles => {
                 plan.dotfiles = interactive_choose_dotfiles(plan.dotfiles.as_deref())?
             }
-            EditField::DevMimEnv => {
-                plan.dev_mim_env = interactive_choose_dev_mim_env(plan.dev_mim_env.as_deref())?
-            }
             EditField::Default => {
                 let current = environment::resolve_default_environment().ok().map(|(n, _, _)| n);
                 plan.make_default = interactive_choose_set_default(current.as_deref())?;
@@ -4891,9 +4831,6 @@ fn confirm_fields(plan: &NewPlan) -> Vec<EditField> {
     fields.push(EditField::CondaPackages);
     if is_oci {
         fields.push(EditField::Dotfiles);
-    }
-    if is_dev {
-        fields.push(EditField::DevMimEnv);
     }
     fields.push(EditField::Default);
     fields
@@ -4944,8 +4881,6 @@ struct SetupFile {
     cert_bundle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dev_source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dev_mim_env: Option<String>,
     set_default: bool,
 }
 
@@ -4964,7 +4899,6 @@ impl SetupFile {
             dotfiles,
             make_default,
             dev_source,
-            dev_mim_env,
             cert_bundle,
         } = p;
         let engine = match backend {
@@ -4984,7 +4918,6 @@ impl SetupFile {
             dotfiles: dotfiles.clone(),
             cert_bundle: cert_bundle.clone(),
             dev_source: dev_source.clone(),
-            dev_mim_env: dev_mim_env.clone(),
             set_default: *make_default,
         }
     }
@@ -5041,8 +4974,8 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
 
 /// The prompt-driven body of the session. Prompts in order for dev source,
 /// version, backend, languages, CA bundle (firewall), system/conda packages,
-/// scope, dotfiles, dev mim-env, name, and default; any dimension fixed by a flag
-/// skips its prompt. Returns the resolved plan, or `Cancelled` if the user aborts.
+/// scope, dotfiles, name, and default; any dimension fixed by a flag skips its
+/// prompt. Returns the resolved plan, or `Cancelled` if the user aborts.
 fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
     let NewSessionInput {
         name,
@@ -5055,7 +4988,6 @@ fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
         cli_dotfiles,
         cli_set_default,
         cli_dev,
-        cli_dev_mim_env,
         cli_cert_bundle,
     } = input;
 
@@ -5171,17 +5103,6 @@ fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
         return Err(dotfiles_not_supported().into());
     }
 
-    // 6b. Dev mim-env (dev envs only). The raw path is stored; container_new_dev
-    //     resolves it. Skipped when passed on the CLI.
-    let dev_mim_env = if is_dev {
-        match cli_dev_mim_env {
-            Some(p) => Some(p),
-            None => interactive_choose_dev_mim_env(None)?,
-        }
-    } else {
-        None
-    };
-
     // 7. Name (existence checked against the chosen scope).
     let name = match name {
         Some(n) => resolve_new_env_name(scope, Some(n), requested_version.as_deref())?,
@@ -5210,7 +5131,6 @@ fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
         dotfiles,
         make_default,
         dev_source,
-        dev_mim_env,
         cert_bundle,
     };
 
@@ -5736,9 +5656,9 @@ fn rematerialize_env(
             scope, name, ce, &specs, &source, &lang_pins, &ec.system_packages,
             &ec.conda_packages, &stdlib, &ec.base_image,
         )?;
-        // Re-stage the dependency agent so a rebuilt binary at the recorded path
-        // (or a newer sibling mim-env) propagates on update.
-        stage_dev_mim_env(scope, name, dev.mim_env.as_deref())?;
+        // Re-stage the dependency agent so a newer platform-matched mim (or the
+        // MORLOC_MIM_ENV override) propagates on update.
+        stage_dev_agent(scope, name)?;
         let mut ec = ec;
         // Preserve the prior recorded version if the new stdlib base fails to parse
         // (e.g. a malformed --morloc-version), so a bad input never silently wipes a
@@ -5866,7 +5786,11 @@ fn build_requirement_derived_image(
     // compiler/rust source). The env-specific pixi solve + `morloc init` run in a
     // container step below, writing into the host mounts.
     eprintln!("Staging the morloc runtime into the build context...");
-    provision::stage_runtime(&req.runtime_dir, &context.join("runtime"))?;
+    // A container runs Linux (matching the host arch); the staged mim agent must
+    // match that platform, not the host's (identical to the triple
+    // `provision_runtime` used above).
+    let container_triple = provision::container_release_triple()?;
+    provision::stage_runtime(scope, container_triple, &req.runtime_dir, &context.join("runtime"))?;
     let lang_install_names = stage_lang_installs(&context, &req.lang_installs)?;
     // Stage the corp CA into the build context (COPY-ed into the image and
     // trusted before any network build step).
@@ -6417,7 +6341,6 @@ fn container_new_dev(
     lang: Vec<String>,
     system_packages: Vec<String>,
     conda_packages: Vec<String>,
-    dev_mim_env: Option<String>,
     dotfiles: Option<String>,
     cert_bundle: Option<String>,
     base_image: String,
@@ -6433,8 +6356,6 @@ fn container_new_dev(
     }
     let source_path = resolve_dev_source(&source).map_err(ManagerError::EnvError)?;
     let source = source_path.to_string_lossy().into_owned();
-    // Validate the agent path up front (before the multi-minute image build).
-    let mim_env = resolve_dev_mim_env(dev_mim_env.as_deref())?;
 
     // A host typically has one dev env, so default its name to `dev` rather than
     // the version (matching the interactive default).
@@ -6461,7 +6382,7 @@ fn container_new_dev(
         )?;
         (Some(image_tag), stdlib.parse::<Version>().ok())
     };
-    let dev = DevConfig { source, mim_env };
+    let dev = DevConfig { source };
 
     let mut ec = EnvironmentConfig::new_backend(
         env_name,
@@ -6479,7 +6400,7 @@ fn container_new_dev(
     // Stage the dependency agent into the runtime-bin mount unless this was a
     // --no-init dry run (nothing to provision against yet).
     if !no_init {
-        stage_dev_mim_env(scope, &ec.name, ec.dev.as_ref().and_then(|d| d.mim_env.as_deref()))?;
+        stage_dev_agent(scope, &ec.name)?;
     }
     finalize_new_env(scope, &ec, lang_pins, make_default)
 }
@@ -7624,7 +7545,6 @@ mod tests {
             dotfiles: None,
             make_default: true,
             dev_source: None,
-            dev_mim_env: None,
             cert_bundle: None,
         };
         let v: serde_json::Value =
@@ -7655,7 +7575,6 @@ mod tests {
             dotfiles: None,
             make_default: false,
             dev_source: None,
-            dev_mim_env: None,
             cert_bundle: None,
         };
         let v: serde_json::Value =
@@ -7869,35 +7788,6 @@ mod tests {
     }
 
     #[test]
-    fn new_parses_dev_mim_env_flag() {
-        let cli = Cli::try_parse_from([
-            "morloc-manager", "new", "dev", "--dev", "/src/morloc",
-            "--dev-mim-env", "/out/mim-env",
-        ])
-        .expect("new should accept --dev-mim-env");
-        match cli.command {
-            Some(Cmd::New { dev, dev_mim_env, .. }) => {
-                assert_eq!(dev.as_deref(), Some("/src/morloc"));
-                assert_eq!(dev_mim_env.as_deref(), Some("/out/mim-env"));
-            }
-            _ => panic!("expected Cmd::New"),
-        }
-    }
-
-    #[test]
-    fn new_dev_mim_env_requires_dev() {
-        // --dev-mim-env without --dev is rejected before any filesystem access.
-        let cmd = Cli::try_parse_from([
-            "morloc-manager", "new", "e", "--non-interactive", "--dev-mim-env", "/out/mim-env",
-        ])
-        .unwrap()
-        .command
-        .unwrap();
-        let err = dispatch(false, false, cmd).unwrap_err();
-        assert!(err.to_string().contains("--dev-mim-env requires --dev"), "got: {err}");
-    }
-
-    #[test]
     fn setup_subcommand_removed() {
         assert!(Cli::try_parse_from(["morloc-manager", "setup", "--engine", "podman"]).is_err());
     }
@@ -7910,7 +7800,6 @@ mod tests {
             lang: Vec::new(),
             system_packages_file: None,
             conda_packages_file: None,
-            dev_mim_env: None,
             dotfiles,
             cert_bundle: None,
             base: None,
@@ -9012,7 +8901,6 @@ run:
         )
         .with_dev(DevConfig {
             source: "/home/z/src/morloc".to_string(),
-            mim_env: None,
         });
         assert!(ec.is_dev());
         let yaml = serde_yaml::to_string(&ec).unwrap();

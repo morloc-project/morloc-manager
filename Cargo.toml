@@ -1,5 +1,5 @@
 [workspace]
-members = ["morloc-deps", "mim-env", "mim"]
+members = ["morloc-deps", "mim"]
 resolver = "2"
 
 [workspace.package]

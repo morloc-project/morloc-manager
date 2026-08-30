@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build fully static (musl) `mim` + `mim-env` binaries locally -- the SAME
-# artifacts the release CI (.github/workflows/release.yml) ships, so they run on
-# any Linux including NixOS and minimal containers.
+# Build a fully static (musl) `mim` binary locally -- the SAME artifact the release
+# CI (.github/workflows/release.yml) ships, so it runs on any Linux including NixOS
+# and minimal containers.
 #
 # A plain `cargo build --release` targets the host's glibc and will NOT run on
 # NixOS. Use this script whenever you need a portable/distributable binary.
@@ -30,14 +30,14 @@ else
     esac
 fi
 
-echo "=== Building static mim + mim-env for ${target} ==="
+echo "=== Building static mim for ${target} ==="
 # musl targets default to static linking of the C runtime (crt-static), so no
 # RUSTFLAGS are needed -- the result is a fully static binary.
 rustup target add "$target"
-cargo build --release --target "$target" -p mim -p mim-env
+cargo build --release --target "$target" -p mim
 
 mkdir -p out
-for bin in mim mim-env; do
+for bin in mim; do
     src="target/${target}/release/${bin}"
     dst="out/${bin}"
     cp "$src" "$dst"

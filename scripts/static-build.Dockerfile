@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
-# Portable static (musl) build of the mim + mim-env release binaries -- the SAME
-# artifacts release CI (.github/workflows/release.yml) ships, so they run on any
-# Linux including NixOS and minimal containers.
+# Portable static (musl) build of the mim release binary -- the SAME artifact
+# release CI (.github/workflows/release.yml) ships, so it runs on any Linux
+# including NixOS and minimal containers.
 #
 # This is RELEASE tooling, deliberately separate from a dev environment: a dev
 # env builds the morloc compiler + runtime with the conda toolchain and runs as
@@ -19,8 +19,7 @@
 # Artifacts are extracted with `docker cp` (not a bind mount): the CLI writes
 # them to the host as the invoking user, so there is no volume-ownership, SELinux
 # relabel, or rootless-userns mapping to fight. Output:
-#   ./out/mim
-#   ./out/mim-env  (both fully static musl binaries)
+#   ./out/mim  (a fully static musl binary)
 #
 # TARGET must match the BUILD HOST arch (musl-tools provides only the native musl
 # linker); cross-arch builds need a cross linker and are left to CI.
@@ -45,8 +44,8 @@ WORKDIR /src
 COPY . .
 
 # Reuse the same script the host fast-path and this container share: it adds the
-# musl target, builds -p mim -p mim-env, strips, and verifies the binaries are
-# fully static. Output lands in ./out.
+# musl target, builds -p mim, strips, and verifies the binary is fully static.
+# Output lands in ./out.
 RUN bash scripts/build-static.sh "${TARGET}"
 
 # ===========================================================================
