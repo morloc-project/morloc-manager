@@ -796,6 +796,13 @@ pub struct NativeRuntime {
     /// compiler without relying on PATH. `None` for records predating this field.
     #[serde(default)]
     pub morloc_bin: Option<std::path::PathBuf>,
+    /// Absolute path of this env's FHS-sandbox launcher (`bin/morloc-fhs`) on
+    /// hosts that lack a standard FHS (NixOS). When set, every conda/glibc binary
+    /// -- the compiler, the toolchain, the nexus, and the pools it spawns -- is
+    /// launched through this launcher so the missing dynamic loader is supplied.
+    /// `None` on glibc-FHS Linux and macOS, where behavior is unchanged.
+    #[serde(default)]
+    pub fhs_wrapper: Option<String>,
 }
 
 /// Persisted requirement inputs for an environment (native or container), kept

@@ -6,6 +6,7 @@ mod doctor;
 mod dockerfile;
 mod environment;
 mod error;
+mod fhs;
 mod freeze;
 mod hostprobe;
 mod localdeps;
@@ -3152,6 +3153,41 @@ pub(crate) fn apply_activation(cmd: &mut Command, env: &[(String, String)]) {
     }
 }
 
+/// The `PATH` entry of an activation env-map, if present. Passed to
+/// `native_command` so the sandbox re-exports it and the launcher's own FHS
+/// `/usr/bin` ordering cannot shadow the conda toolchain.
+pub(crate) fn activation_path(env: &[(String, String)]) -> Option<&str> {
+    env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.as_str())
+}
+
+/// Build a `Command` that runs `program args...`, transparently wrapped in the
+/// env's FHS sandbox when one is provisioned (NixOS). The caller applies the
+/// activation env-map and any per-invocation overrides to the returned `Command`
+/// afterward; bubblewrap inherits the environment (no `--clearenv`), so those
+/// vars reach the inner process. When `fhs_wrapper` is `None` the `Command` is
+/// the bare program (with `cwd` applied) -- byte-identical to the pre-FHS native
+/// path. Delegates to `morloc_deps::sandbox::command` so the quoting/PATH/cwd
+/// discipline is shared with this crate's pixi solve.
+///
+/// `force_path` (the activation `PATH`) is re-exported inside the sandbox before
+/// the `cd`/`exec`, so the toolchain is found conda-first regardless of how the
+/// launcher orders its own FHS bin dirs.
+pub(crate) fn native_command(
+    fhs_wrapper: Option<&str>,
+    program: &std::path::Path,
+    args: &[std::ffi::OsString],
+    cwd: &std::path::Path,
+    force_path: Option<&str>,
+) -> Command {
+    morloc_deps::sandbox::command(
+        fhs_wrapper.map(std::path::Path::new),
+        program,
+        args,
+        Some(cwd),
+        force_path,
+    )
+}
+
 /// Native-backend `run`: execute a command directly on the host against the
 /// environment's own MORLOC_HOME, reconstructing the provisioned toolchain
 /// environment from the materialization record. Invoked through the `Runner`
@@ -3187,6 +3223,15 @@ pub(crate) fn native_run_env(
     let data_dir = cfg::env_data_dir(env.scope, &env.name);
     let mh = data_dir.to_string_lossy().to_string();
 
+    // On NixOS every conda/glibc binary runs inside the env's FHS sandbox; the
+    // whole process subtree (the nexus and the pools it forks) shares one sandbox
+    // launched by this single wrap. `None` on glibc-FHS Linux / macOS. Preserve
+    // the caller's cwd so compiler-emitted absolute paths + cwd-relative file
+    // packets resolve identically inside the sandbox (the host fs is bound there).
+    let fhs_w = runtime.fhs_wrapper.as_deref();
+    let fhs_path = activation_path(&runtime.activation_env);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| data_dir.clone());
+
     let mut cmd = if req.shell {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             eprintln!("Error: an interactive shell requires a terminal (TTY).");
@@ -3199,8 +3244,9 @@ pub(crate) fn native_run_env(
         // `ZDOTDIR`); each wrapper sources the user's real init, so nothing on
         // disk is touched. Other shells launch untagged.
         let (shell_args, shell_env) = shell_prompt_setup(&shell_exe, &data_dir, &env.name);
-        let mut c = Command::new(&shell_exe);
-        c.args(&shell_args);
+        let args: Vec<std::ffi::OsString> =
+            shell_args.iter().map(|s| std::ffi::OsString::from(s)).collect();
+        let mut c = native_command(fhs_w, std::path::Path::new(&shell_exe), &args, &cwd, fhs_path);
         for (k, v) in &shell_env {
             c.env(k, v);
         }
@@ -3210,9 +3256,9 @@ pub(crate) fn native_run_env(
             .args
             .split_first()
             .ok_or(ManagerError::NoCommand)?;
-        let mut c = Command::new(program);
-        c.args(rest);
-        c
+        let rest_os: Vec<std::ffi::OsString> =
+            rest.iter().map(std::ffi::OsString::from).collect();
+        native_command(fhs_w, std::path::Path::new(program), &rest_os, &cwd, fhs_path)
     };
 
     // Inherited environ + captured toolchain activation + MORLOC_HOME, then the
@@ -3397,13 +3443,16 @@ fn run_native_morloc_init(
     env_dir: &std::path::Path,
     runtime_dir: &std::path::Path,
     activation: &[(String, String)],
+    fhs_wrapper: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
-    let mut cmd = Command::new(morloc_bin);
-    cmd.arg("init").arg("-f");
+    // init execs the conda toolchain (gcc/cargo/python) to build libmorloc.so +
+    // morloc-nexus + shims, so on NixOS it must run inside the FHS sandbox.
+    let mut args: Vec<std::ffi::OsString> = vec!["init".into(), "-f".into()];
     if !verbose {
-        cmd.arg("-q");
+        args.push("-q".into());
     }
+    let mut cmd = native_command(fhs_wrapper, morloc_bin, &args, env_dir, activation_path(activation));
     apply_activation(&mut cmd, activation);
     cmd.env("MORLOC_HOME", env_dir);
     // init builds libmorloc.so + morloc-nexus from source with the env toolchain;
@@ -3765,14 +3814,24 @@ fn materialize_native_env(
         }
     }
 
+    // On a host without a standard FHS (NixOS) build the shared FHS sandbox now;
+    // the solve, activation capture, and `morloc init` below all run conda ELFs
+    // that need the loader it supplies. `None` on glibc-FHS Linux / macOS.
+    let fhs_wrapper: Option<std::path::PathBuf> = if hostprobe::fhs_required() {
+        Some(fhs::ensure_fhs_wrapper(scope)?)
+    } else {
+        None
+    };
+    let fhs = fhs_wrapper.as_deref();
+
     pixi::write_manifest(&pixi_dir, &manifest)?;
     let pixi_bin = provision::provision_pixi(scope)?;
     // Behind a TLS-inspection firewall, point the pixi solve at the env's
     // materialized CA bundle (host bundle = corp certs + public roots).
     let ssl_cert = cert::host_bundle_if_present(scope, name);
     eprintln!("Solving native toolchain with pixi (this may take a few minutes)...");
-    pixi::solve(&pixi_dir, &pixi_bin, ssl_cert.as_deref())?;
-    let mut activation = pixi::capture_activation(&pixi_dir, &pixi_bin, ssl_cert.as_deref())?;
+    pixi::solve(&pixi_dir, &pixi_bin, ssl_cert.as_deref(), fhs)?;
+    let mut activation = pixi::capture_activation(&pixi_dir, &pixi_bin, ssl_cert.as_deref(), fhs)?;
     // Persist the CA env vars into the env's run environment so a later
     // `morloc make` (its uv/pip and any runtime egress) also trusts the CA.
     if let Some(host) = &ssl_cert {
@@ -3786,7 +3845,14 @@ fn materialize_native_env(
     // and `run -- morloc ...` resolve inside the env alongside the conda toolchain.
     prepend_to_path(&mut activation, &[env_dir.join("bin"), req.runtime_dir.clone()]);
 
-    run_native_morloc_init(&req.morloc_bin, &env_dir, &req.runtime_dir, &activation, verbose)?;
+    run_native_morloc_init(
+        &req.morloc_bin,
+        &env_dir,
+        &req.runtime_dir,
+        &activation,
+        fhs_wrapper.as_ref().map(|p| p.to_string_lossy()).as_deref(),
+        verbose,
+    )?;
 
     // Pin the interpreter minors the shims were just built against (see
     // record_abi_lock_or_warn). The env's pixi dir is the EnvContext default.
@@ -3799,6 +3865,7 @@ fn materialize_native_env(
             activation_env: activation,
             manager_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             morloc_bin: Some(req.morloc_bin.clone()),
+            fhs_wrapper: fhs_wrapper.as_ref().map(|p| p.to_string_lossy().into_owned()),
         },
     )?;
     // Record the cache key (manifest + compiler identity) as successfully
@@ -6421,8 +6488,10 @@ fn container_new_dev(
 // Native serve (detached host nexus)
 // ======================================================================
 
-/// Whether a native serve pid is still our nexus: alive, and (on Linux) its
-/// cmdline still looks like morloc-nexus -- a guard against PID reuse.
+/// Whether a native serve pid is still our server: alive, and (on Linux) its
+/// cmdline still looks like ours -- a guard against PID reuse. The tracked pid is
+/// the nexus directly, or (on NixOS) the `morloc-fhs` launcher whose command line
+/// embeds the `morloc-nexus` invocation, so either marker confirms it.
 fn native_serve_alive(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
@@ -6430,7 +6499,10 @@ fn native_serve_alive(pid: u32) -> bool {
         return false;
     }
     match std::fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).contains("morloc-nexus"),
+        Ok(bytes) => {
+            let cmd = String::from_utf8_lossy(&bytes);
+            cmd.contains("morloc-nexus") || cmd.contains("morloc-fhs")
+        }
         Err(_) => true, // no /proc (e.g. macOS): trust the liveness signal
     }
 }
@@ -6617,8 +6689,18 @@ fn native_serve(
         command[0].clone().into()
     };
 
-    let mut cmd = Command::new(&program);
-    cmd.args(&command[1..]);
+    // On NixOS the nexus runs inside the env's FHS sandbox. The launcher is what
+    // gets setsid-detached and tracked as the serve handle; it `exec`s the nexus,
+    // so its lifetime is coupled to the nexus (the immediate-exit probe below still
+    // catches a failed start) and `stop` (SIGTERM->SIGKILL to the launcher) tears
+    // down the whole sandbox. The served TCP port binds on the host loopback
+    // because buildFHSEnv does not unshare the network namespace.
+    let fhs_w = runtime.fhs_wrapper.as_deref();
+    let args_os: Vec<std::ffi::OsString> =
+        command[1..].iter().map(std::ffi::OsString::from).collect();
+    let mut cmd = native_command(
+        fhs_w, &program, &args_os, &data_dir, activation_path(&runtime.activation_env),
+    );
     apply_activation(&mut cmd, &runtime.activation_env);
     cmd.env("MORLOC_HOME", &mh);
     if let Some(t) = &token {
@@ -6631,7 +6713,8 @@ fn native_serve(
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     // Detach into a new session + process group: survives the terminal, and lets
-    // stop kill the whole group (nexus + pool daemons). setsid is async-signal-safe.
+    // stop kill the whole group (the launcher, nexus, and pool daemons -- all in
+    // this group since none call setsid). setsid is async-signal-safe.
     unsafe {
         cmd.pre_exec(|| {
             nix::unistd::setsid()

@@ -5,10 +5,13 @@
 //! pixi/conda-provided toolchain. On Linux, conda binaries bake the glibc
 //! dynamic loader at its conventional FHS path (`/lib64/ld-linux-x86-64.so.2`
 //! on x86_64), so a host can run them natively only if it is a glibc + FHS
-//! Linux; NixOS (no standard FHS) and musl systems (Alpine) cannot, and route
-//! to a container (or, later, the Nix backend). macOS on Apple Silicon runs
-//! them against the system dyld and is native-capable; Intel macOS routes to a
-//! container because no prebuilt compiler artifact is published for it.
+//! Linux -- or, on NixOS, if we can supply the missing FHS at runtime with a
+//! `nix`-built `buildFHSEnv` sandbox (bubblewrap). NixOS is therefore
+//! native-capable when `nix` is present AND unprivileged user namespaces are
+//! usable (bubblewrap needs them); otherwise it routes to a container. musl
+//! systems (Alpine) route to a container. macOS on Apple Silicon runs pool
+//! processes against the system dyld and is native-capable; Intel macOS routes
+//! to a container because no prebuilt compiler artifact is published for it.
 
 use std::path::Path;
 
@@ -35,7 +38,15 @@ fn glibc_loader_path(arch: &str) -> Option<&'static str> {
 
 /// Pure classifier: given the observable facts, decide native capability. Kept
 /// separate from the filesystem/env reads in `probe_host` so it is unit-testable.
-fn classify(os: &str, arch: &str, glibc_loader_present: bool, is_nixos: bool) -> HostProfile {
+/// `fhs_capable` is meaningful only on NixOS: it means a `buildFHSEnv` sandbox
+/// can be built and run here (nix present + unprivileged user namespaces usable).
+fn classify(
+    os: &str,
+    arch: &str,
+    glibc_loader_present: bool,
+    is_nixos: bool,
+    fhs_capable: bool,
+) -> HostProfile {
     let platform = morloc_deps::platform::conda_platform_for(os, arch);
     match os {
         // macOS runs pool processes against a conda toolchain linked by the
@@ -56,11 +67,26 @@ fn classify(os: &str, arch: &str, glibc_loader_present: bool, is_nixos: bool) ->
         },
         "linux" => {
             if is_nixos {
-                HostProfile {
-                    native_capable: false,
-                    reason: "NixOS has no standard FHS, native not yet available"
-                        .to_string(),
-                    platform,
+                // NixOS lacks a standard FHS, so conda binaries cannot launch
+                // directly. We supply one at runtime with a nix-built buildFHSEnv
+                // sandbox -- but that needs `nix` (to build it) and unprivileged
+                // user namespaces (for bubblewrap to enter it).
+                if fhs_capable {
+                    HostProfile {
+                        native_capable: true,
+                        reason: "NixOS via FHS sandbox (native backend supported)".to_string(),
+                        platform,
+                    }
+                } else {
+                    HostProfile {
+                        native_capable: false,
+                        reason: "NixOS needs `nix` and unprivileged user namespaces for the \
+                                 native FHS sandbox (enable `security.unprivileged_userns` / \
+                                 `boot.kernel.sysctl.\"kernel.unprivileged_userns_clone\"`); \
+                                 otherwise use a container backend"
+                            .to_string(),
+                        platform,
+                    }
                 }
             } else if glibc_loader_present {
                 HostProfile {
@@ -86,15 +112,68 @@ fn classify(os: &str, arch: &str, glibc_loader_present: bool, is_nixos: bool) ->
     }
 }
 
+/// Whether this host needs the FHS sandbox to run conda binaries natively. True
+/// only on NixOS; glibc-FHS Linux and macOS run them directly.
+pub fn fhs_required() -> bool {
+    Path::new("/etc/NIXOS").exists()
+}
+
+/// Is the `nix-build` executable reachable? This is the SAME tool the FHS-sandbox
+/// builder (`fhs::ensure_fhs_wrapper`) invokes, so the capability gate and the
+/// build agree -- probing for a different binary (e.g. the `nix` CLI) could pass
+/// the gate and then fail at build time. Checked at the standard NixOS locations
+/// and on PATH (a NixOS host always has it; a non-NixOS host with the Nix package
+/// manager may too).
+fn nix_build_available() -> bool {
+    for p in [
+        "/run/current-system/sw/bin/nix-build",
+        "/nix/var/nix/profiles/default/bin/nix-build",
+    ] {
+        if Path::new(p).exists() {
+            return true;
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.join("nix-build").exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether unprivileged user namespaces (which bubblewrap needs to enter the FHS
+/// sandbox) are usable. `nix-build` runs through the root daemon and proves
+/// nothing about this, so it is a distinct gate. Reads the two kernel knobs:
+/// Debian/Ubuntu's `kernel.unprivileged_userns_clone` (absent on stock NixOS =
+/// allowed) must not be 0, and `user.max_user_namespaces` must be > 0.
+fn unprivileged_userns_available() -> bool {
+    let read_int = |p: &str| -> Option<i64> {
+        std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<i64>().ok())
+    };
+    if let Some(0) = read_int("/proc/sys/kernel/unprivileged_userns_clone") {
+        return false;
+    }
+    match read_int("/proc/sys/user/max_user_namespaces") {
+        Some(n) => n > 0,
+        // Knob absent: user namespaces are compiled out or not exposed; assume
+        // unavailable rather than optimistically claiming native capability.
+        None => false,
+    }
+}
+
 /// Probe the current host.
 pub fn probe_host() -> HostProfile {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let is_nixos = Path::new("/etc/NIXOS").exists();
+    let is_nixos = fhs_required();
     let glibc_loader_present = glibc_loader_path(arch)
         .map(|p| Path::new(p).exists())
         .unwrap_or(false);
-    classify(os, arch, glibc_loader_present, is_nixos)
+    // Only compute the (slightly costlier) FHS facts when they matter.
+    let fhs_capable = is_nixos && nix_build_available() && unprivileged_userns_available();
+    classify(os, arch, glibc_loader_present, is_nixos, fhs_capable)
 }
 
 #[cfg(test)]
@@ -105,7 +184,7 @@ mod tests {
     fn apple_silicon_is_native_capable() {
         // Apple Silicon has a published compiler artifact and runs pools against
         // the system dyld, so no glibc-loader test applies (pass false here).
-        let arm = classify("macos", "aarch64", false, false);
+        let arm = classify("macos", "aarch64", false, false, false);
         assert!(arm.native_capable);
         assert_eq!(arm.platform, "osx-arm64");
     }
@@ -115,35 +194,46 @@ mod tests {
         // No prebuilt compiler artifact is published for Intel macOS, so it
         // routes to a container; the platform string is still reported so the
         // container build targets the right conda platform.
-        let intel = classify("macos", "x86_64", false, false);
+        let intel = classify("macos", "x86_64", false, false, false);
         assert!(!intel.native_capable);
         assert_eq!(intel.platform, "osx-64");
     }
 
     #[test]
     fn glibc_fhs_linux_is_native_capable() {
-        let p = classify("linux", "x86_64", true, false);
+        let p = classify("linux", "x86_64", true, false, false);
         assert!(p.native_capable);
         assert_eq!(p.platform, "linux-64");
     }
 
     #[test]
-    fn nixos_is_not_native_capable_even_with_loader() {
-        // nix-ld can place a loader, but NixOS still routes away from native.
-        let p = classify("linux", "x86_64", true, true);
+    fn nixos_with_fhs_sandbox_is_native_capable() {
+        // NixOS is native-capable when a buildFHSEnv sandbox can be built and
+        // run (nix + unprivileged userns), independent of the glibc-loader test.
+        let p = classify("linux", "x86_64", false, true, true);
+        assert!(p.native_capable);
+        assert!(p.reason.contains("FHS sandbox"));
+        assert_eq!(p.platform, "linux-64");
+    }
+
+    #[test]
+    fn nixos_without_fhs_capability_is_not_native_capable() {
+        // No nix or no unprivileged userns -> cannot build/enter the sandbox ->
+        // route to a container, with an actionable reason.
+        let p = classify("linux", "x86_64", true, true, false);
         assert!(!p.native_capable);
-        assert!(p.reason.contains("NixOS"));
+        assert!(p.reason.contains("NixOS") || p.reason.contains("user namespace"));
     }
 
     #[test]
     fn musl_or_nonfhs_linux_is_not_native_capable() {
-        let p = classify("linux", "x86_64", false, false);
+        let p = classify("linux", "x86_64", false, false, false);
         assert!(!p.native_capable);
     }
 
     #[test]
     fn windows_is_not_native_capable() {
-        let p = classify("windows", "x86_64", false, false);
+        let p = classify("windows", "x86_64", false, false, false);
         assert!(!p.native_capable);
         assert_eq!(p.platform, "unknown");
     }

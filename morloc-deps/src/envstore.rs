@@ -300,8 +300,11 @@ impl EnvContext {
         crate::pixi::write_manifest(&pixi_dir, &manifest)?;
         // In-container path (mim-env): the built image already sets the CA env
         // vars, which the pixi subprocess inherits, so no override is needed.
-        crate::pixi::solve(&pixi_dir, inputs.pixi_bin, None)?;
-        crate::pixi::capture_activation(&pixi_dir, inputs.pixi_bin, None)
+        // No FHS wrapping: the in-env agent already runs inside its execution
+        // environment (the container, or -- on native NixOS -- the FHS sandbox it
+        // was spawned within by the wrapped `morloc make`).
+        crate::pixi::solve(&pixi_dir, inputs.pixi_bin, None, None)?;
+        crate::pixi::capture_activation(&pixi_dir, inputs.pixi_bin, None, None)
     }
 
     /// Merge a program's spec into the declared world under `provenance`,
