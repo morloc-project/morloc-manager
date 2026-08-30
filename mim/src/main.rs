@@ -39,17 +39,17 @@ use crate::error::{ManagerError, Result};
 use crate::selinux::{detect_selinux, volume_suffix, SELinuxMode};
 use crate::types::*;
 
-/// Path under the user's home that morloc-manager exports as
+/// Path under the user's home that mim exports as
 /// `MORLOC_BIN_LINK_DIR` to the in-container `morloc init`. The Haskell side
 /// (SystemConfig.hs) symlinks newly installed nexus/manager binaries here so
 /// they end up on PATH (see the comment in `run_with_config`). Kept as a
 /// relative path because the absolute form depends on the in-container $HOME,
-/// which morloc-manager computes per-invocation.
+/// which mim computes per-invocation.
 const MORLOC_BIN_LINK_REL: &str = ".local/share/morloc/bin";
 
 /// Fixed in-container path the SLURM bridge socket is bind-mounted to.
 /// libmorloc.so reads this via `MORLOC_BRIDGE_SOCKET` (set when
-/// `morloc-manager run --slurm-bridge` is in effect).
+/// `mim run --slurm-bridge` is in effect).
 const BRIDGE_SOCK_IN_CONTAINER: &str = "/run/morloc-bridge.sock";
 
 // ======================================================================
@@ -99,7 +99,7 @@ fn build_help_template() -> String {
 }
 
 #[derive(Parser)]
-#[command(name = "morloc-manager")]
+#[command(name = "mim")]
 #[command(about = "container lifecycle manager for Morloc")]
 #[command(long_about = "Manage containerized Morloc installations, dependency layers, and deployments")]
 #[command(disable_version_flag = true)]
@@ -130,11 +130,11 @@ enum Cmd {
     #[command(display_order = 1)]
     #[command(after_help = "\
 Examples:
-  morloc-manager new                                   # interactive; prompts for version, backend, name, ...
-  morloc-manager new foo --lang py@3.12
-  morloc-manager new bar --engine podman
-  morloc-manager new baz --morloc-version 0.98.0       # names it `v0.98.0`
-  morloc-manager new --morloc-version 0.98.0 --set-default --non-interactive
+  mim new                                   # interactive; prompts for version, backend, name, ...
+  mim new foo --lang py@3.12
+  mim new bar --engine podman
+  mim new baz --morloc-version 0.98.0       # names it `v0.98.0`
+  mim new --morloc-version 0.98.0 --set-default --non-interactive
 
 Without a name, the environment is named after the requested version (`v0.98.0`,
 or `latest`). With no flags on a TTY, all settings are prompted interactively.")]
@@ -208,10 +208,10 @@ or `latest`). With no flags on a TTY, all settings are prompted interactively.")
     #[command(display_order = 2)]
     #[command(after_help = "\
 Examples:
-  # runs in default env (see `morloc-manager ls`)
-  morloc-manager run -- morloc --version
+  # runs in default env (see `mim ls`)
+  mim run -- morloc --version
   # run in specific env
-  morloc-manager run --env dev -- morloc make svc.loc")]
+  mim run --env dev -- morloc make svc.loc")]
     Run {
         /// Command to run inside the container
         command: Vec<String>,
@@ -232,10 +232,10 @@ Examples:
         /// labeled remote calls (`big:fn x`) can submit jobs to the
         /// host's sbatch. Requires the environment to use the
         /// Apptainer engine. Each remote job is launched on its
-        /// compute node via `morloc-manager run --env <name> --
+        /// compute node via `mim run --env <name> --
         /// <nexus> --call-packet ...`, so the same env (same .sif,
         /// same MORLOC_HOME) is used on driver and worker; the
-        /// morloc-manager binary must be reachable at the same path
+        /// mim binary must be reachable at the same path
         /// on every compute node (typical: `~/.local/bin` on
         /// NFS-shared $HOME).
         #[arg(long)]
@@ -245,8 +245,8 @@ Examples:
     #[command(display_order = 2)]
     #[command(after_help = "\
 Examples:
-  morloc-manager shell
-  morloc-manager shell --env dev
+  mim shell
+  mim shell --env dev
 
 Without --env, the default environment is used.")]
     Shell {
@@ -268,8 +268,8 @@ Without --env, the default environment is used.")]
     #[command(display_order = 3)]
     #[command(after_help = "\
 Examples:
-  morloc-manager rm myenv
-  sudo morloc-manager rm myenv --system")]
+  mim rm myenv
+  sudo mim rm myenv --system")]
     Rm {
         /// Environment name(s) to remove
         names: Vec<String>,
@@ -281,11 +281,11 @@ Examples:
     #[command(display_order = 8)]
     #[command(after_help = "\
 Examples:
-  morloc-manager nuke
-  morloc-manager nuke --yes
-  morloc-manager nuke --images
-  sudo morloc-manager nuke --system
-  sudo morloc-manager nuke --system --images --yes")]
+  mim nuke
+  mim nuke --yes
+  mim nuke --images
+  sudo mim nuke --system
+  sudo mim nuke --system --images --yes")]
     Nuke {
         /// Remove system-scope environments instead of local (requires root)
         #[arg(long)]
@@ -301,8 +301,8 @@ Examples:
     #[command(display_order = 4)]
     #[command(after_help = "\
 Examples:
-  morloc-manager ls
-  morloc-manager ls --system")]
+  mim ls
+  mim ls --system")]
     Ls {
         /// Show only system environments
         #[arg(long)]
@@ -315,8 +315,8 @@ Examples:
     #[command(display_order = 5)]
     #[command(after_help = "\
 Examples:
-  morloc-manager info
-  morloc-manager info myenv")]
+  mim info
+  mim info myenv")]
     Info {
         /// Environment name (show details for this environment)
         name: Option<String>,
@@ -332,9 +332,9 @@ Examples:
     #[command(display_order = 6)]
     #[command(after_help = "\
 Examples:
-  morloc-manager doctor
-  morloc-manager doctor --env myenv
-  morloc-manager doctor --deep")]
+  mim doctor
+  mim doctor --env myenv
+  mim doctor --deep")]
     Doctor {
         /// Environment to check (default: the default environment)
         #[arg(long)]
@@ -350,7 +350,7 @@ Examples:
         strict: bool,
         /// Additionally check SLURM-bridge prerequisites (sbatch on
         /// PATH, build.yaml has slurm-support, env image resolvable,
-        /// morloc-manager binary path mirrorable, runtime dir
+        /// mim binary path mirrorable, runtime dir
         /// writable). Run this before relying on `--slurm-bridge` on
         /// a new cluster.
         #[arg(long)]
@@ -360,14 +360,14 @@ Examples:
     #[command(display_order = 7)]
     #[command(after_help = "\
 Examples:
-  morloc-manager update                        # re-solve/rebuild at the current version
-  morloc-manager update --env myenv
-  morloc-manager update --env myenv --force            # force a fresh re-solve
-  morloc-manager update --env myenv --latest           # move to the newest release
-  morloc-manager update --env myenv --morloc-version 0.98.0   # move to a specific version
+  mim update                        # re-solve/rebuild at the current version
+  mim update --env myenv
+  mim update --env myenv --force            # force a fresh re-solve
+  mim update --env myenv --latest           # move to the newest release
+  mim update --env myenv --morloc-version 0.98.0   # move to a specific version
 
 Without --latest/--morloc-version, the environment keeps its current morloc
-version; changing settings (packages, dotfiles, default) is `morloc-manager modify`.")]
+version; changing settings (packages, dotfiles, default) is `mim modify`.")]
     Update {
         /// Environment to update (default: the default environment)
         #[arg(long)]
@@ -394,12 +394,12 @@ version; changing settings (packages, dotfiles, default) is `morloc-manager modi
     #[command(display_order = 8)]
     #[command(after_help = "\
 Examples:
-  morloc-manager modify --env myenv --set-default   # make myenv your default
-  sudo morloc-manager modify --env shared --set-default --system
-  morloc-manager modify --env myenv --dotfiles ~/mydots
-  morloc-manager modify --env myenv --conda-packages-file tools.conda
-  morloc-manager modify --env myenv --system-packages-file tools.apt
-  morloc-manager modify --env myenv --lang py@3.13")]
+  mim modify --env myenv --set-default   # make myenv your default
+  sudo mim modify --env shared --set-default --system
+  mim modify --env myenv --dotfiles ~/mydots
+  mim modify --env myenv --conda-packages-file tools.conda
+  mim modify --env myenv --system-packages-file tools.apt
+  mim modify --env myenv --lang py@3.13")]
     Modify {
         /// Environment to modify (default: the default environment)
         #[arg(long)]
@@ -449,16 +449,16 @@ Examples:
     #[command(display_order = 20)]
     #[command(after_help = "\
 Examples:
-  morloc-manager start                       # serve the default environment's exposed set
-  morloc-manager start --env myenv -p 9090:8080
-  morloc-manager start --mcp mymodule -p 9000:9000   # serve one module as MCP/HTTP")]
+  mim start                       # serve the default environment's exposed set
+  mim start --env myenv -p 9090:8080
+  mim start --mcp mymodule -p 9000:9000   # serve one module as MCP/HTTP")]
     Start {
         /// Environment to serve (default: the default environment)
         #[arg(long)]
         env: Option<String>,
         /// Ad-hoc: serve just this one installed module over MCP, ignoring the
         /// exposed set. Default (no --mcp) serves the environment's exposed
-        /// set (managed with `morloc-manager expose`).
+        /// set (managed with `mim expose`).
         #[arg(long, value_name = "PROGRAM")]
         mcp: Option<String>,
         /// Bearer token required on HTTP requests. Falls back to the
@@ -504,8 +504,8 @@ Examples:
     #[command(display_order = 21)]
     #[command(after_help = "\
 Examples:
-  morloc-manager stop              # stop the default environment
-  morloc-manager stop --env myenv")]
+  mim stop              # stop the default environment
+  mim stop --env myenv")]
     Stop {
         /// Environment to stop (default: the default environment)
         #[arg(long)]
@@ -515,9 +515,9 @@ Examples:
     #[command(display_order = 22)]
     #[command(after_help = "\
 Examples:
-  morloc-manager logs              # logs from only running serve container
-  morloc-manager logs --env myenv
-  morloc-manager logs -f --env myenv     # follow mode")]
+  mim logs              # logs from only running serve container
+  mim logs --env myenv
+  mim logs -f --env myenv     # follow mode")]
     Logs {
         /// Environment whose logs to stream (default: the default environment)
         #[arg(long)]
@@ -530,9 +530,9 @@ Examples:
     #[command(display_order = 23)]
     #[command(after_help = "\
 Examples:
-  morloc-manager freeze
-  morloc-manager freeze --env myenv
-  morloc-manager freeze -o ./my-freeze
+  mim freeze
+  mim freeze --env myenv
+  mim freeze -o ./my-freeze
 
 Requires at least one program compiled with 'morloc make --install'.")]
     Freeze {
@@ -550,8 +550,8 @@ Requires at least one program compiled with 'morloc make --install'.")]
     #[command(display_order = 24)]
     #[command(after_help = "\
 Examples:
-  morloc-manager unfreeze --from ./morloc-freeze/state.tar.gz -t myservice:v1
-  morloc-manager unfreeze --from ./state.tar.gz -t svc:v1 --engine docker")]
+  mim unfreeze --from ./morloc-freeze/state.tar.gz -t myservice:v1
+  mim unfreeze --from ./state.tar.gz -t svc:v1 --engine docker")]
     Unfreeze {
         /// Path to state.tar.gz from freeze
         #[arg(long)]
@@ -574,9 +574,9 @@ Examples:
     #[command(display_order = 25)]
     #[command(after_help = "\
 Examples:
-  morloc-manager eval 'add 1 2'
-  morloc-manager eval --env myenv 'map (add 1) [1,2,3]'
-  morloc-manager eval -p 9090 'greet \"world\"'")]
+  mim eval 'add 1 2'
+  mim eval --env myenv 'map (add 1) [1,2,3]'
+  mim eval -p 9090 'greet \"world\"'")]
     Eval {
         /// Expression to evaluate
         #[arg(allow_hyphen_values = true)]
@@ -593,11 +593,11 @@ Examples:
     #[command(display_order = 4)]
     #[command(after_help = "\
 Examples:
-  morloc-manager install main.loc              # installs under the module name
-  morloc-manager install --env dev ./mypkg     # installs a package directory into 'dev'
+  mim install main.loc              # installs under the module name
+  mim install --env dev ./mypkg     # installs a package directory into 'dev'
 
-Sugar for: morloc-manager run -- morloc make --install <file>
-       (or: morloc-manager run -- morloc install --build <dir> for a directory)")]
+Sugar for: mim run -- morloc make --install <file>
+       (or: mim run -- morloc install --build <dir> for a directory)")]
     Install {
         /// Morloc source file (.loc) or package directory to build and install.
         /// A directory is treated as a package (main.loc + package.yaml). The
@@ -617,10 +617,10 @@ Sugar for: morloc-manager run -- morloc make --install <file>
     #[command(display_order = 10)]
     #[command(after_help = "\
 Examples:
-  morloc-manager demos                       # all demos for the active env's morloc (or latest)
-  morloc-manager demos --list                # list without downloading
-  morloc-manager demos --tag rust-examples   # only the rust-examples group
-  morloc-manager demos --morloc-version 0.98.2
+  mim demos                       # all demos for the active env's morloc (or latest)
+  mim demos --list                # list without downloading
+  mim demos --tag rust-examples   # only the rust-examples group
+  mim demos --morloc-version 0.98.2
 
 Demos are extracted into examples-<tag>-<version>/ in the current directory.")]
     Demos {
@@ -640,15 +640,15 @@ Demos are extracted into examples-<tag>-<version>/ in the current directory.")]
     },
     /// Declare which installed modules are served, and how (edits state only;
     /// run `start` to realize it). Covers the network views (MCP, API) and the
-    /// eval capability; the CLI view is local (`morloc-manager run`).
+    /// eval capability; the CLI view is local (`mim run`).
     #[command(display_order = 23)]
     #[command(after_help = "\
 Examples:
-  morloc-manager expose add dna --as mcp
-  morloc-manager expose add util --as mcp,api
-  morloc-manager expose eval --allow dna,stats
-  morloc-manager expose list
-  morloc-manager expose rm dna")]
+  mim expose add dna --as mcp
+  mim expose add util --as mcp,api
+  mim expose eval --allow dna,stats
+  mim expose list
+  mim expose rm dna")]
     Expose {
         #[command(subcommand)]
         action: ExposeAction,
@@ -657,9 +657,9 @@ Examples:
     #[command(display_order = 9)]
     #[command(after_help = "\
 Examples:
-  morloc-manager env prefix
-  make install --prefix=$(morloc-manager env prefix)
-  R CMD INSTALL --library=$(morloc-manager env prefix --lang r) mypkg")]
+  mim env prefix
+  make install --prefix=$(mim env prefix)
+  R CMD INSTALL --library=$(mim env prefix --lang r) mypkg")]
     Env {
         #[command(subcommand)]
         action: EnvAction,
@@ -668,7 +668,7 @@ Examples:
     #[command(display_order = 27)]
     #[command(after_help = "\
 Examples:
-  morloc-manager status")]
+  mim status")]
     Status,
 
     // -- In-environment dependency agent (hidden) --
@@ -890,8 +890,8 @@ fn main() -> ExitCode {
                     if !inner.is_empty() {
                         eprintln!("Error: unrecognized arguments for 'run'.");
                         eprintln!();
-                        eprintln!("Use -- to separate morloc-manager flags from the container command:");
-                        eprintln!("  morloc-manager run -- {}", inner.join(" "));
+                        eprintln!("Use -- to separate mim flags from the container command:");
+                        eprintln!("  mim run -- {}", inner.join(" "));
                         return ExitCode::from(2);
                     }
                 }
@@ -901,7 +901,7 @@ fn main() -> ExitCode {
     };
     let cli = Cli::from_arg_matches(&matches).unwrap();
     if cli.version {
-        println!("morloc-manager {}", env!("CARGO_PKG_VERSION"));
+        println!("mim {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
     let Some(cmd) = cli.command else {
@@ -986,7 +986,7 @@ fn exec_in_env(
     // EnvironmentNotFound / NoDefaultEnvironment error actually originates.
     let target = resolve_env_or_default(env).map_err(|e| match e {
         ManagerError::EnvironmentNotFound(msg) => ManagerError::EnvironmentNotFound(
-            format!("{msg}. Run 'morloc-manager new' to create an environment")
+            format!("{msg}. Run 'mim new' to create an environment")
         ),
         other => other,
     })?;
@@ -1483,7 +1483,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         return Err(ManagerError::EnvError(format!(
                             "Multiple container engines are installed ({}) and no \
                              default is set.\nPass one with --engine, e.g.:\n  \
-                             morloc-manager new <name> --engine {}\n\
+                             mim new <name> --engine {}\n\
                              The choice is remembered for later environments.",
                             names.join(", "),
                             multi[0].name(),
@@ -1579,7 +1579,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     Ok(()) => {
                         if was_default.as_deref() == Some(name.as_str()) {
                             eprintln!("Removed environment: {name}. It was the default; \
-                                       set a new one with: morloc-manager modify --env <name> --set-default");
+                                       set a new one with: mim modify --env <name> --set-default");
                         } else {
                             eprintln!("Removed environment: {name}");
                         }
@@ -1726,12 +1726,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             if !other_envs.is_empty() {
                 if system {
                     eprintln!(
-                        "{} local environment(s) remain. Use: morloc-manager nuke",
+                        "{} local environment(s) remain. Use: mim nuke",
                         other_envs.len()
                     );
                 } else {
                     eprintln!(
-                        "{} system environment(s) remain. Use: sudo morloc-manager nuke --system",
+                        "{} system environment(s) remain. Use: sudo mim nuke --system",
                         other_envs.len()
                     );
                 }
@@ -1798,7 +1798,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     }
                 }
                 if total == 0 {
-                    println!("No environments found. Create one with: morloc-manager new");
+                    println!("No environments found. Create one with: mim new");
                 }
             }
             Ok(())
@@ -2260,7 +2260,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 return Err(ManagerError::EnvError(format!(
                     "environment '{env_name}' uses a local runtime (--local-runtime); its \
                      morloc version tracks the adopted binary and cannot be moved to a \
-                     release. Rebuild morloc, then run `morloc-manager update --env \
+                     release. Rebuild morloc, then run `mim update --env \
                      {env_name}` (no version) to re-adopt it."
                 )));
             }
@@ -2591,7 +2591,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 return Err(ManagerError::EnvError(format!(
                     "environment '{env_name}' is a dev environment; serving one is not yet \
                      supported (the serve path assumes a baked runtime). Use \
-                     `morloc-manager run --env {env_name} -- ...` to exercise it."
+                     `mim run --env {env_name} -- ...` to exercise it."
                 )));
             }
             // Refuse to replace a live serve -- dispatch on the STORED handle so a
@@ -2781,7 +2781,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // Log content is the primary data of this command, so both the
             // container's original stdout and stderr should go to our stdout.
             // docker/podman logs preserves the original stream split; we merge
-            // them so that `morloc-manager logs | grep ERROR` works.
+            // them so that `mim logs | grep ERROR` works.
             let stdout_handle = std::io::stdout();
             let status = std::process::Command::new(exe)
                 .args(&cmd_args)
@@ -2810,7 +2810,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let (env_name, scope, ec) = resolve_env_or_default(Some(env_arg))?;
                 if !env_serve_alive(scope, &env_name, &ec) {
                     return Err(ManagerError::EnvError(format!(
-                        "No server running for '{env_name}'. Start with: morloc-manager start --env {env_name}"
+                        "No server running for '{env_name}'. Start with: mim start --env {env_name}"
                     )));
                 }
             }
@@ -2823,7 +2823,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let addr = format!("127.0.0.1:{port}");
             let mut stream = std::net::TcpStream::connect(&addr).map_err(|e| {
                 ManagerError::EnvError(format!(
-                    "Cannot connect to serve container on {addr}: {e}\n  Is a serve container running? Start with: morloc-manager start"
+                    "Cannot connect to serve container on {addr}: {e}\n  Is a serve container running? Start with: mim start"
                 ))
             })?;
             stream.write_all(request.as_bytes()).map_err(|e| {
@@ -2979,7 +2979,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if !launcher.exists() {
                     return Err(ManagerError::EnvError(format!(
                         "Module '{module}' is not installed in environment '{env_name}' \
-                         (no bin/{module}).\n  Install it first: morloc-manager install <src>.loc"
+                         (no bin/{module}).\n  Install it first: mim install <src>.loc"
                     )));
                 }
                 let mut ex = cfg::read_exposure(scope, &env_name)?;
@@ -2987,7 +2987,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 cfg::write_exposure(scope, &env_name, &ex)?;
                 let protos: Vec<&str> = protocols.iter().map(|p| p.as_str()).collect();
                 eprintln!(
-                    "Exposed '{module}' over {} in '{env_name}'. Run 'morloc-manager start' to serve.",
+                    "Exposed '{module}' over {} in '{env_name}'. Run 'mim start' to serve.",
                     protos.join(", ")
                 );
                 Ok(())
@@ -2997,7 +2997,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let mut ex = cfg::read_exposure(scope, &env_name)?;
                 if ex.remove(&module) {
                     cfg::write_exposure(scope, &env_name, &ex)?;
-                    eprintln!("Unexposed '{module}' in '{env_name}'. Run 'morloc-manager start' to apply.");
+                    eprintln!("Unexposed '{module}' in '{env_name}'. Run 'mim start' to apply.");
                 } else {
                     eprintln!("'{module}' was not exposed in '{env_name}'.");
                 }
@@ -3276,7 +3276,7 @@ pub(crate) fn native_run_env(
     let runtime = cfg::read_native_runtime(env.scope, &env.name).map_err(|_| {
         ManagerError::EnvError(format!(
             "native environment '{}' has not been materialized. \
-             Run 'morloc-manager update --env {}' to provision its toolchain.",
+             Run 'mim update --env {}' to provision its toolchain.",
             env.name, env.name
         ))
     })?;
@@ -3296,7 +3296,7 @@ pub(crate) fn native_run_env(
     let mut cmd = if req.shell {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             eprintln!("Error: an interactive shell requires a terminal (TTY).");
-            eprintln!("If connecting over SSH, use: ssh -t <host> morloc-manager shell");
+            eprintln!("If connecting over SSH, use: ssh -t <host> mim shell");
             std::process::exit(1);
         }
         let shell_exe = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
@@ -3366,7 +3366,7 @@ pub(crate) fn native_run_env(
 
 /// The release tag to provision the morloc runtime from: `$MORLOC_RELEASE_TAG`
 /// if set (e.g. "dev" or "v0.98.3"), else "latest" (resolved via the releases
-/// API). morloc-manager is self-bootstrapping -- it downloads the compiler +
+/// API). mim is self-bootstrapping -- it downloads the compiler +
 /// Rust source (init builds the runtime) rather than requiring a host morloc install.
 fn resolve_release_tag() -> String {
     std::env::var("MORLOC_RELEASE_TAG")
@@ -3875,7 +3875,7 @@ fn materialize_native_env(
                 return Err(ManagerError::EnvError(format!(
                     "Cannot re-materialize native environment '{name}' while it is being \
                      served: `morloc init` would overwrite the running runtime. \
-                     Run 'morloc-manager stop --env {name}' first."
+                     Run 'mim stop --env {name}' first."
                 )));
             }
         }
@@ -4151,8 +4151,8 @@ fn resolve_new_env_name(
     if cfg::env_config_path(scope, &env_name).is_file() {
         return Err(ManagerError::EnvError(format!(
             "Environment '{env_name}' already exists. Change it with \
-             'morloc-manager modify --env {env_name} ...', or remove it first with \
-             'morloc-manager rm {env_name}'."
+             'mim modify --env {env_name} ...', or remove it first with \
+             'mim rm {env_name}'."
         )));
     }
     Ok(env_name)
@@ -5245,10 +5245,10 @@ fn finalize_new_env(
         if environment::set_default_environment(&ec.name, scope).is_ok() {
             eprintln!("Set '{}' as the default environment.", ec.name);
         } else {
-            eprintln!("Note: could not record '{}' as the default; set it with: morloc-manager modify --env {} --set-default", ec.name, ec.name);
+            eprintln!("Note: could not record '{}' as the default; set it with: mim modify --env {} --set-default", ec.name, ec.name);
         }
     } else {
-        eprintln!("Make it the default with: morloc-manager modify --env {} --set-default", ec.name);
+        eprintln!("Make it the default with: mim modify --env {} --set-default", ec.name);
     }
     Ok(())
 }
@@ -5352,7 +5352,7 @@ fn install_module_root(src: &str, is_dir: bool) -> Result<std::path::PathBuf> {
     if !abs.starts_with(&cwd) {
         return Err(ManagerError::EnvError(format!(
             "the project directory {} is not under the current directory {} -- run \
-             'morloc-manager install' from a directory containing the project so its \
+             'mim install' from a directory containing the project so its \
              local (filesystem-path) dependencies are reachable in the build container.",
             abs.display(),
             cwd.display()
@@ -5407,7 +5407,7 @@ fn native_capture_env(scope: Scope, name: &str, args: &[String]) -> Result<Strin
     let runtime = cfg::read_native_runtime(scope, name).map_err(|_| {
         ManagerError::EnvError(format!(
             "native environment '{name}' has not been materialized. \
-             Run 'morloc-manager update --env {name}' to provision its toolchain."
+             Run 'mim update --env {name}' to provision its toolchain."
         ))
     })?;
     let data_dir = cfg::env_data_dir(scope, name);
@@ -5443,7 +5443,7 @@ fn container_capture_env(
     require_docker_socket(engine)?;
     if !container::image_exists_locally(engine, &image) {
         return Err(ManagerError::EnvError(format!(
-            "Image '{image}' not found. Run 'morloc-manager update --env {name}' to build it."
+            "Image '{image}' not found. Run 'mim update --env {name}' to build it."
         )));
     }
     let data_dir = cfg::env_data_dir(scope, name);
@@ -5476,7 +5476,7 @@ fn container_capture_env(
     cfg.extra_flags = engine_args.to_vec();
 
     if verbose {
-        eprintln!("[morloc-manager] capturing in {}: {}", engine.name(), args.join(" "));
+        eprintln!("[mim] capturing in {}: {}", engine.name(), args.join(" "));
     }
     let (status, stdout, stderr) = container::container_run_quiet(engine, &cfg);
     if !status.success() {
@@ -5549,9 +5549,9 @@ fn current_version_tag(ec: &EnvironmentConfig) -> Option<String> {
 fn require_current_version(ec: &EnvironmentConfig, env_name: &str) -> Result<String> {
     current_version_tag(ec).ok_or_else(|| ManagerError::EnvError(format!(
         "environment '{env_name}' has no usable morloc version. Set one with \
-         `morloc-manager update --env {env_name} --latest`. If this was a dev \
-         environment created by an older morloc-manager, recreate it with \
-         `morloc-manager new --dev <source>`."
+         `mim update --env {env_name} --latest`. If this was a dev \
+         environment created by an older mim, recreate it with \
+         `mim new --dev <source>`."
     )))
 }
 
@@ -5994,7 +5994,7 @@ fn materialize_container_env(
 // ======================================================================
 // Dev environments: provision tooling around a mounted source tree
 //
-// morloc-manager builds the image (base + baked ghcup/stack/cargo toolchain) and
+// mim builds the image (base + baked ghcup/stack/cargo toolchain) and
 // materializes the pixi env. It does NOT build the morloc compiler or runtime: an
 // in-development source may legally not compile, so the developer builds them in
 // the dev shell, where the toolchain and the mounted source are on PATH.
@@ -6221,21 +6221,40 @@ fn apply_dotfiles(
 const SHELLRC_NAME: &str = ".morloc-shellrc";
 
 /// Body of the per-launch bash rcfile for `env_name`. It first sources the
-/// standard bash init (so the user's dotfiles fully apply), then prepends a
-/// bold-orange `(<env>)` tag to whatever `PS1` those produced -- the same
-/// prepend convention conda/venv use, applied to a spawned shell. Nothing the
-/// user owns is written; this file is generated fresh each launch. Bash-only;
-/// other shells launch without it.
+/// standard bash init (so the user's dotfiles fully apply), then installs a
+/// `PROMPT_COMMAND` hook that prepends a bold-orange `(<env>)` tag to `PS1`.
+/// The hook (rather than a one-shot `PS1=` prepend) is what keeps the tag
+/// visible when the user's own prompt is regenerated on every render by a
+/// `PROMPT_COMMAND` or a framework like starship -- such a prompt rewrites
+/// `PS1` wholesale each time, so a startup-only prepend never survives to the
+/// first draw. The hook re-applies the tag after the user's hooks and is
+/// guarded to prepend only when absent, so it neither accumulates on a static
+/// prompt nor is lost on a dynamic one. Nothing the user owns is written; this
+/// file is generated fresh each launch. Bash-only; other shells launch without it.
 fn shell_rcfile_body(env_name: &str) -> String {
     // \033[1;38;5;208m = bold orange (256-colour); \[ \] wrap the non-printing
     // bytes so bash computes the prompt width correctly. A raw string keeps the
     // backslashes verbatim on their way into the file (and thus into PS1).
-    let template = r#"# morloc-manager: interactive shell for environment '__ENV__'.
+    // Appending to PROMPT_COMMAND respects both its scalar and (bash 5.1+) array
+    // forms so an existing user hook is preserved and still runs first.
+    let template = r#"# mim: interactive shell for environment '__ENV__'.
 # Generated per launch -- NOT your ~/.bashrc. Sources the standard bash init so
-# your dotfiles apply, then prepends the environment tag to PS1.
+# your dotfiles apply, then installs a PROMPT_COMMAND hook that tags PS1.
 if [ -r /etc/bash.bashrc ]; then . /etc/bash.bashrc; fi
 if [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
-PS1='\[\033[1;38;5;208m\](__ENV__)\[\033[0m\] '"$PS1"
+__morloc_prompt_tag() {
+  case "$PS1" in
+    *'(__ENV__)'*) ;;
+    *) PS1='\[\033[1;38;5;208m\](__ENV__)\[\033[0m\] '"$PS1" ;;
+  esac
+}
+_morloc_pc="$(declare -p PROMPT_COMMAND 2>/dev/null)"
+if [[ "$_morloc_pc" == "declare -a"* ]]; then
+  PROMPT_COMMAND+=(__morloc_prompt_tag)
+else
+  PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__morloc_prompt_tag"
+fi
+unset _morloc_pc
 "#;
     template.replace("__ENV__", env_name)
 }
@@ -6256,12 +6275,16 @@ const ZDOTDIR_NAME: &str = ".morloc-zdotdir";
 
 /// Write the zsh wrapper `ZDOTDIR` into `dir`, returning its path. The `.zshenv`
 /// chains the user's real `.zshenv`; the `.zshrc` chains the user's real `.zshrc`
-/// then prepends the env tag to `PROMPT` and restores the real `ZDOTDIR`.
+/// then installs a `precmd` hook that tags `PROMPT` and restores the real
+/// `ZDOTDIR`. The hook (rather than a one-shot `PROMPT=` prepend) keeps the tag
+/// visible under prompt frameworks that rebuild `PROMPT` from a `precmd` on every
+/// render (starship, pure); appended to `precmd_functions` it runs after theirs,
+/// and the guard prepends only when absent so it neither accumulates nor is lost.
 fn write_zdotdir(dir: &std::path::Path, env_name: &str) -> Option<std::path::PathBuf> {
     let zdot = dir.join(ZDOTDIR_NAME);
     std::fs::create_dir_all(&zdot).ok()?;
     let zshenv = "\
-# morloc-manager: keep ZDOTDIR pointed here through .zshrc, but source the
+# mim: keep ZDOTDIR pointed here through .zshrc, but source the
 # user's real zshenv so their environment still applies.
 _morloc_real=\"${MORLOC_REAL_ZDOTDIR:-$HOME}\"
 [ -r \"$_morloc_real/.zshenv\" ] && source \"$_morloc_real/.zshenv\"
@@ -6270,11 +6293,17 @@ _morloc_real=\"${MORLOC_REAL_ZDOTDIR:-$HOME}\"
     // width of %-escapes itself, so no non-printing wrappers are needed.
     let zshrc = format!(
         "\
-# morloc-manager: interactive zsh for environment '{env_name}'. Generated per
-# launch -- NOT your ~/.zshrc. Sources your real zsh init, then prepends the tag.
+# mim: interactive zsh for environment '{env_name}'. Generated per launch -- NOT
+# your ~/.zshrc. Sources your real zsh init, then installs a precmd prompt tag.
 _morloc_real=\"${{MORLOC_REAL_ZDOTDIR:-$HOME}}\"
 [ -r \"$_morloc_real/.zshrc\" ] && source \"$_morloc_real/.zshrc\"
-PROMPT=\"%B%F{{208}}({env_name})%f%b ${{PROMPT}}\"
+_morloc_prompt_tag() {{
+  case \"$PROMPT\" in
+    *'({env_name})'*) ;;
+    *) PROMPT=\"%B%F{{208}}({env_name})%f%b $PROMPT\" ;;
+  esac
+}}
+precmd_functions+=(_morloc_prompt_tag)
 export ZDOTDIR=\"$_morloc_real\"
 unset MORLOC_REAL_ZDOTDIR _morloc_real
 "
@@ -6601,7 +6630,7 @@ fn resolve_serve_spec(scope: Scope, name: &str, mcp: &Option<String>) -> Result<
         if ex.is_empty() {
             return Err(ManagerError::EnvError(format!(
                 "Nothing is exposed in '{name}'. Expose a module first:\n    \
-                 morloc-manager expose add <module> --as mcp\n  \
+                 mim expose add <module> --as mcp\n  \
                  (or 'start --mcp <module>' for a one-off)."
             )));
         }
@@ -6657,7 +6686,7 @@ fn native_serve(
     let runtime = cfg::read_native_runtime(scope, env_name).map_err(|_| {
         ManagerError::EnvError(format!(
             "native environment '{env_name}' is not materialized; \
-             run 'morloc-manager update --env {env_name}' first"
+             run 'mim update --env {env_name}' first"
         ))
     })?;
 
@@ -6761,8 +6790,8 @@ pub(crate) fn native_serve_launch(
     } else {
         eprintln!("Serving '{}' on 127.0.0.1:{} (native, host-local).", env.name, req.host_port);
     }
-    eprintln!("  Logs:   morloc-manager logs");
-    eprintln!("  Stop:   morloc-manager stop");
+    eprintln!("  Logs:   mim logs");
+    eprintln!("  Stop:   mim stop");
     eprintln!("  Note:   native serve is unsupervised (no restart; does not survive reboot).");
     Ok(ServeOutcome { handle, url_host, token: req.token.clone() })
 }
@@ -6782,7 +6811,7 @@ pub(crate) fn container_serve(
     let container_name = serve::serve_container_name(env_name);
     if ec.dockerfile.is_some() && ec.built_image.is_none() {
         eprintln!("Warning: Dockerfile is configured but image has not been built. Using base image.");
-        eprintln!("  Run 'morloc-manager update --env {env_name}' to build the Dockerfile layer.");
+        eprintln!("  Run 'mim update --env {env_name}' to build the Dockerfile layer.");
     }
 
     let plan = serve_plan(
@@ -6857,11 +6886,11 @@ fn tail_file(path: &std::path::Path, follow: bool) -> Result<()> {
 /// shuts the bridge down and unlinks the socket.
 ///
 /// The bridge does NOT directly invoke `apptainer exec` on the compute
-/// node; the wrap command is `morloc-manager run --env <name>
+/// node; the wrap command is `mim run --env <name>
 /// --slurm-bridge -- <nexus> --call-packet ...` so each compute-node
 /// nexus comes up under the same env the driver uses (and can
 /// recursively dispatch further remote calls). The bridge carries the
-/// absolute path to the morloc-manager binary (the currently-running
+/// absolute path to the mim binary (the currently-running
 /// process) and the env name to pin on every worker.
 fn setup_slurm_bridge(ec: &EnvironmentConfig) -> Result<bridge::BridgeHandle> {
     // Apptainer is the recommended engine for HPC -- its `.sif` is a
@@ -6880,24 +6909,24 @@ fn setup_slurm_bridge(ec: &EnvironmentConfig) -> Result<bridge::BridgeHandle> {
     }
 
     // Sanity: confirm the env was actually built so the compute-node
-    // `morloc-manager run` won't fail at image lookup. Equivalent to
+    // `mim run` won't fail at image lookup. Equivalent to
     // `active_image()` resolving to a real path/tag.
     let image = ec.active_image();
     if image.is_empty() {
         return Err(ManagerError::EnvError(
-            "Environment has no resolvable image. Run `morloc-manager update` first.".into(),
+            "Environment has no resolvable image. Run `mim update` first.".into(),
         ));
     }
 
     // The wrap command on the compute node is
-    //   <this morloc-manager> run --slurm-bridge -- <nexus> --call-packet ...
+    //   <this mim> run --slurm-bridge -- <nexus> --call-packet ...
     // For path-mirroring to work, this binary must be at the same
     // absolute path on every compute node. The typical setup is
-    // `~/.local/bin/morloc-manager` on NFS-mounted $HOME; users with a
-    // non-mirrored layout need to install morloc-manager at a path
+    // `~/.local/bin/mim` on NFS-mounted $HOME; users with a
+    // non-mirrored layout need to install mim at a path
     // visible to every node.
     let morloc_manager_exe = std::env::current_exe().map_err(|e| {
-        ManagerError::EnvError(format!("resolve morloc-manager path: {e}"))
+        ManagerError::EnvError(format!("resolve mim path: {e}"))
     })?;
 
     let sock_path = bridge_socket_path();
@@ -6910,7 +6939,7 @@ fn setup_slurm_bridge(ec: &EnvironmentConfig) -> Result<bridge::BridgeHandle> {
 
 /// Pick a per-process socket path under `$XDG_RUNTIME_DIR` (or `/tmp`
 /// fallback). The pid suffix avoids collisions across concurrent
-/// `morloc-manager run --slurm-bridge` invocations.
+/// `mim run --slurm-bridge` invocations.
 fn bridge_socket_path() -> std::path::PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR")
         .ok()
@@ -6956,7 +6985,7 @@ pub(crate) fn container_run_env(
     // Warn if a Dockerfile is configured but the layered image hasn't been built
     if ec.dockerfile.is_some() && ec.built_image.is_none() {
         eprintln!("Warning: Dockerfile is configured but image has not been built. Using base image.");
-        eprintln!("  Run 'morloc-manager update --env {env_name}' to build the Dockerfile layer.");
+        eprintln!("  Run 'mim update --env {env_name}' to build the Dockerfile layer.");
     }
 
     // Fail fast with a clear message if docker socket is unreachable
@@ -6982,9 +7011,9 @@ pub(crate) fn container_run_env(
             )));
         }
         let hint = if env_scope == Scope::System {
-            format!("Ask your administrator to run: sudo morloc-manager update --env {env_name}")
+            format!("Ask your administrator to run: sudo mim update --env {env_name}")
         } else {
-            format!("Run 'morloc-manager update --env {env_name}' to build it.")
+            format!("Run 'mim update --env {env_name}' to build it.")
         };
         return Err(ManagerError::EnvError(format!(
             "Image '{image}' not found locally. {hint}"
@@ -7082,7 +7111,7 @@ fn run_with_config(
     if shell {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             eprintln!("Error: an interactive shell requires a terminal (TTY).");
-            eprintln!("If connecting over SSH, use: ssh -t <host> morloc-manager shell");
+            eprintln!("If connecting over SSH, use: ssh -t <host> mim shell");
             std::process::exit(1);
         }
     }
@@ -7118,7 +7147,7 @@ fn run_with_config(
         if !populated {
             return Err(ManagerError::EnvError(format!(
                 "environment at '{v_data_dir}' is not materialized: its {what} is missing \
-                 at '{}'. Provision it first with 'morloc-manager update --env <env>', or recreate \
+                 at '{}'. Provision it first with 'mim update --env <env>', or recreate \
                  the environment without --no-init.",
                 src.display()
             )));
@@ -7299,7 +7328,7 @@ fn ensure_program_installed(env_scope: Scope, env_name: &str, program: &str) -> 
         return Err(ManagerError::EnvError(format!(
             "Program '{program}' is not installed in environment '{env_name}' \
              (looked for bin/{program}).\n  Install it with: \
-             morloc-manager install <file>.loc  (the program is named after its \
+             mim install <file>.loc  (the program is named after its \
              module, so serve it as '{program}' only if that is the module name)."
         )));
     }
@@ -7448,7 +7477,7 @@ fn serve_plan(
                 "On this container engine (Docker Desktop / podman machine) a loopback \
                  MCP server cannot bind the host's loopback directly, so it is published \
                  on a bridge that co-resident containers can reach.\n  Provide a token:\n    \
-                 MORLOC_MCP_TOKEN=$(openssl rand -hex 16) morloc-manager start\n  \
+                 MORLOC_MCP_TOKEN=$(openssl rand -hex 16) mim start\n  \
                  (Or serve off-box with --expose, run on a Linux engine for tokenless loopback, \
                  or pass --unsafe to serve it unauthenticated anyway.)"
                     .to_string(),
@@ -7535,7 +7564,7 @@ fn print_exposure(env: &str, ex: &ExposureConfig, json: bool) {
         return;
     }
     if ex.is_empty() {
-        println!("Nothing exposed in '{env}'. Add with: morloc-manager expose add <module> --as mcp");
+        println!("Nothing exposed in '{env}'. Add with: mim expose add <module> --as mcp");
         return;
     }
     println!("Exposed in '{env}':");
@@ -7548,7 +7577,7 @@ fn print_exposure(env: &str, ex: &ExposureConfig, json: bool) {
         Some(e) => println!("  eval  [enabled; allow: {}]", e.allow.join(", ")),
         None => {}
     }
-    println!("\nRun 'morloc-manager start' to serve this set.");
+    println!("\nRun 'mim start' to serve this set.");
 }
 
 /// Print a client `mcpServers` config entry (HTTP transport) as PURE JSON on
@@ -7704,7 +7733,7 @@ mod tests {
     #[test]
     fn run_takes_env_and_env_var_flags() {
         let cli = Cli::try_parse_from([
-            "morloc-manager", "run", "--env", "dev", "--env-var", "FOO=bar", "--", "echo", "hi",
+            "mim", "run", "--env", "dev", "--env-var", "FOO=bar", "--", "echo", "hi",
         ])
         .expect("run should parse --env and --env-var");
         match cli.command {
@@ -7720,7 +7749,7 @@ mod tests {
     #[test]
     fn run_rejects_removed_shell_flag() {
         // --shell moved to the `shell` subcommand; run must no longer accept it.
-        assert!(Cli::try_parse_from(["morloc-manager", "run", "--shell"]).is_err());
+        assert!(Cli::try_parse_from(["mim", "run", "--shell"]).is_err());
     }
 
     #[test]
@@ -7749,14 +7778,14 @@ mod tests {
     fn lang_accepts_comma_delimited_and_repeated() {
         // `--lang py,r,cpp` (one flag, comma-separated) must resolve to the same
         // pins as `--lang py --lang r --lang cpp`, and both forms may be mixed.
-        let comma = Cli::try_parse_from(["morloc-manager", "new", "foo", "--lang", "py,r,cpp"])
+        let comma = Cli::try_parse_from(["mim", "new", "foo", "--lang", "py,r,cpp"])
             .expect("comma-separated --lang should parse");
         let repeated = Cli::try_parse_from([
-            "morloc-manager", "new", "foo", "--lang", "py", "--lang", "r", "--lang", "cpp",
+            "mim", "new", "foo", "--lang", "py", "--lang", "r", "--lang", "cpp",
         ])
         .expect("repeated --lang should parse");
         let mixed = Cli::try_parse_from([
-            "morloc-manager", "new", "foo", "--lang", "py@3.12,r", "--lang", "cpp",
+            "mim", "new", "foo", "--lang", "py@3.12,r", "--lang", "cpp",
         ])
         .expect("mixed --lang should parse");
         let lang_of = |cli: Cli| match cli.command {
@@ -7784,25 +7813,25 @@ mod tests {
     fn run_rejects_short_e_env_var() {
         // The old `-e/--env` passthrough is renamed to --env-var (no short form),
         // freeing --env for the environment selector.
-        assert!(Cli::try_parse_from(["morloc-manager", "run", "-e", "FOO=bar", "--", "x"]).is_err());
+        assert!(Cli::try_parse_from(["mim", "run", "-e", "FOO=bar", "--", "x"]).is_err());
     }
 
     #[test]
     fn shell_subcommand_parses() {
-        let cli = Cli::try_parse_from(["morloc-manager", "shell", "--env", "dev"])
+        let cli = Cli::try_parse_from(["mim", "shell", "--env", "dev"])
             .expect("shell should parse");
         assert!(matches!(cli.command, Some(Cmd::Shell { env: Some(ref e), .. }) if e == "dev"));
     }
 
     #[test]
     fn select_subcommand_removed() {
-        assert!(Cli::try_parse_from(["morloc-manager", "select", "foo"]).is_err());
+        assert!(Cli::try_parse_from(["mim", "select", "foo"]).is_err());
     }
 
     #[test]
     fn update_takes_version_and_force() {
         let cli = Cli::try_parse_from([
-            "morloc-manager", "update", "--env", "e", "--morloc-version", "0.98.0",
+            "mim", "update", "--env", "e", "--morloc-version", "0.98.0",
         ])
         .expect("update should parse --morloc-version");
         match cli.command {
@@ -7816,12 +7845,12 @@ mod tests {
             _ => panic!("expected Cmd::Update"),
         }
         // --force and --latest parse.
-        let cli = Cli::try_parse_from(["morloc-manager", "update", "--env", "e", "--force", "--latest"])
+        let cli = Cli::try_parse_from(["mim", "update", "--env", "e", "--force", "--latest"])
             .expect("update --force --latest should parse");
         assert!(matches!(cli.command, Some(Cmd::Update { latest: true, force: true, .. })));
         // --ignore-module-compat parses.
         let cli = Cli::try_parse_from(
-            ["morloc-manager", "update", "--env", "e", "--ignore-module-compat"],
+            ["mim", "update", "--env", "e", "--ignore-module-compat"],
         )
         .expect("update --ignore-module-compat should parse");
         assert!(matches!(
@@ -7834,24 +7863,24 @@ mod tests {
     fn update_latest_conflicts_with_morloc_version() {
         // --latest and --morloc-version are mutually exclusive.
         assert!(Cli::try_parse_from([
-            "morloc-manager", "update", "--env", "e", "--latest", "--morloc-version", "0.98.0",
+            "mim", "update", "--env", "e", "--latest", "--morloc-version", "0.98.0",
         ]).is_err());
     }
 
     #[test]
     fn update_no_longer_takes_set_default() {
         // set-default moved to `modify`.
-        assert!(Cli::try_parse_from(["morloc-manager", "update", "--env", "e", "--set-default"]).is_err());
+        assert!(Cli::try_parse_from(["mim", "update", "--env", "e", "--set-default"]).is_err());
     }
 
     #[test]
     fn modify_set_default_is_local_unless_system_flag() {
         // A personal (local) default: no --system.
-        let cli = Cli::try_parse_from(["morloc-manager", "modify", "--env", "shared", "--set-default"])
+        let cli = Cli::try_parse_from(["mim", "modify", "--env", "shared", "--set-default"])
             .expect("modify --set-default should parse");
         assert!(matches!(cli.command, Some(Cmd::Modify { set_default: true, system: false, .. })));
         // The machine-wide default: --system.
-        let cli = Cli::try_parse_from(["morloc-manager", "modify", "--env", "shared", "--set-default", "--system"])
+        let cli = Cli::try_parse_from(["mim", "modify", "--env", "shared", "--set-default", "--system"])
             .expect("modify --set-default --system should parse");
         assert!(matches!(cli.command, Some(Cmd::Modify { set_default: true, system: true, .. })));
     }
@@ -7859,7 +7888,7 @@ mod tests {
     #[test]
     fn modify_parses_package_file_flags_and_dotfiles() {
         let cli = Cli::try_parse_from([
-            "morloc-manager", "modify", "--env", "e",
+            "mim", "modify", "--env", "e",
             "--system-packages-file", "tools.apt",
             "--conda-packages-file", "tools.conda",
             "--dotfiles", "/tmp/d",
@@ -7877,7 +7906,7 @@ mod tests {
 
     #[test]
     fn setup_subcommand_removed() {
-        assert!(Cli::try_parse_from(["morloc-manager", "setup", "--engine", "podman"]).is_err());
+        assert!(Cli::try_parse_from(["mim", "setup", "--engine", "podman"]).is_err());
     }
 
     // The two `modify` guards below fire before any environment/filesystem
@@ -7934,7 +7963,7 @@ mod tests {
     #[test]
     fn new_parses_package_file_flags() {
         let cli = Cli::try_parse_from([
-            "morloc-manager", "new", "e",
+            "mim", "new", "e",
             "--conda-packages-file", "tools.conda",
             "--system-packages-file", "tools.apt",
         ])
@@ -7950,7 +7979,7 @@ mod tests {
 
     #[test]
     fn eval_takes_expr_and_optional_env() {
-        let cli = Cli::try_parse_from(["morloc-manager", "eval", "--env", "e", "add 1 2"])
+        let cli = Cli::try_parse_from(["mim", "eval", "--env", "e", "add 1 2"])
             .expect("eval should parse expr with --env");
         match cli.command {
             Some(Cmd::Eval { expr, env, .. }) => {
@@ -7963,7 +7992,7 @@ mod tests {
 
     #[test]
     fn eval_expr_allows_leading_hyphen() {
-        let cli = Cli::try_parse_from(["morloc-manager", "eval", "-1"])
+        let cli = Cli::try_parse_from(["mim", "eval", "-1"])
             .expect("eval should accept an expression starting with '-'");
         assert!(matches!(cli.command, Some(Cmd::Eval { ref expr, .. }) if expr == "-1"));
     }
@@ -8957,22 +8986,22 @@ run:
 
     #[test]
     fn new_parses_set_default_flag() {
-        let cli = Cli::try_parse_from(["morloc-manager", "new", "foo", "--set-default"])
+        let cli = Cli::try_parse_from(["mim", "new", "foo", "--set-default"])
             .expect("new --set-default should parse");
         assert!(matches!(cli.command, Some(Cmd::New { set_default: true, .. })));
         // Absent by default.
-        let cli = Cli::try_parse_from(["morloc-manager", "new", "foo"])
+        let cli = Cli::try_parse_from(["mim", "new", "foo"])
             .expect("new should parse");
         assert!(matches!(cli.command, Some(Cmd::New { set_default: false, .. })));
     }
 
     #[test]
     fn new_parses_dev_flag() {
-        let cli = Cli::try_parse_from(["morloc-manager", "new", "mydev", "--dev", "/src/morloc"])
+        let cli = Cli::try_parse_from(["mim", "new", "mydev", "--dev", "/src/morloc"])
             .expect("new --dev should parse");
         assert!(matches!(cli.command, Some(Cmd::New { dev: Some(ref p), .. }) if p == "/src/morloc"));
         // Absent by default.
-        let cli = Cli::try_parse_from(["morloc-manager", "new", "foo"]).unwrap();
+        let cli = Cli::try_parse_from(["mim", "new", "foo"]).unwrap();
         assert!(matches!(cli.command, Some(Cmd::New { dev: None, .. })));
     }
 
@@ -9012,10 +9041,10 @@ run:
 
     #[test]
     fn new_parses_local_runtime_flag() {
-        let cli = Cli::try_parse_from(["morloc-manager", "new", "lr", "--local-runtime", "/rt"])
+        let cli = Cli::try_parse_from(["mim", "new", "lr", "--local-runtime", "/rt"])
             .expect("new --local-runtime should parse");
         assert!(matches!(cli.command, Some(Cmd::New { local_runtime: Some(ref p), .. }) if p == "/rt"));
-        let cli = Cli::try_parse_from(["morloc-manager", "new", "foo"]).unwrap();
+        let cli = Cli::try_parse_from(["mim", "new", "foo"]).unwrap();
         assert!(matches!(cli.command, Some(Cmd::New { local_runtime: None, .. })));
     }
 
@@ -9023,11 +9052,11 @@ run:
     fn local_runtime_conflicts_with_version_and_dev() {
         // --local-runtime is mutually exclusive with both --morloc-version and --dev.
         assert!(Cli::try_parse_from([
-            "morloc-manager", "new", "e", "--local-runtime", "/rt", "--morloc-version", "0.98.0",
+            "mim", "new", "e", "--local-runtime", "/rt", "--morloc-version", "0.98.0",
         ])
         .is_err());
         assert!(Cli::try_parse_from([
-            "morloc-manager", "new", "e", "--local-runtime", "/rt", "--dev", "/src",
+            "mim", "new", "e", "--local-runtime", "/rt", "--dev", "/src",
         ])
         .is_err());
     }

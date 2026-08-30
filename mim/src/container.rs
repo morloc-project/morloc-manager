@@ -177,7 +177,7 @@ pub fn container_run_passthrough(
                 }
             })
             .collect();
-        eprintln!("[morloc-manager] {exe} {}", quoted.join(" "));
+        eprintln!("[mim] {exe} {}", quoted.join(" "));
     }
 
     Command::new(exe)
@@ -279,7 +279,7 @@ pub fn container_stop(engine: ContainerEngine, name_or_id: &str) -> (ExitStatus,
             let (code, _, err) = run_process(exe, &["stop".to_string(), name_or_id.to_string()]);
             (code, err)
         }
-        // For Apptainer, `morloc-manager run` is one-shot; there is nothing
+        // For Apptainer, `mim run` is one-shot; there is nothing
         // to stop. Long-running instances are managed in serve.rs via
         // `apptainer instance stop`. Return a successful no-op so callers
         // doing pre-emptive cleanup (e.g. remove_environment) succeed.
@@ -547,7 +547,7 @@ fn warn_dropped(message: &str) {
     let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     let mut guard = seen.lock().unwrap();
     if guard.insert(message.to_string()) {
-        eprintln!("[morloc-manager] note: {message}");
+        eprintln!("[mim] note: {message}");
     }
 }
 
@@ -616,7 +616,7 @@ pub fn build_build_args(cfg: &BuildConfig) -> Vec<String> {
 // ======================================================================
 
 /// Run a process with both stdout and stderr redirected to our stderr.
-/// Returns only the exit status. Use for IO () commands where morloc-manager's
+/// Returns only the exit status. Use for IO () commands where mim's
 /// stdout must stay clean but the user should see all container output.
 fn run_process_to_stderr(exe: &str, args: &[String]) -> ExitStatus {
     let mut child = Command::new(exe)

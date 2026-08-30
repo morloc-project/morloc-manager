@@ -161,15 +161,15 @@ impl EnvSpec {
         })?;
         if peek.envspec_version < ENVSPEC_VERSION {
             return Err(DepsError::Env(format!(
-                "envspec.json is version {} but this morloc-manager requires version {}. \
+                "envspec.json is version {} but this mim requires version {}. \
                  Rebuild the program with a current morloc (morloc make).",
                 peek.envspec_version, ENVSPEC_VERSION
             )));
         }
         if peek.envspec_version > ENVSPEC_VERSION {
             return Err(DepsError::Env(format!(
-                "envspec.json is version {} but this morloc-manager understands only \
-                 up to version {}. Upgrade morloc-manager.",
+                "envspec.json is version {} but this mim understands only \
+                 up to version {}. Upgrade mim.",
                 peek.envspec_version, ENVSPEC_VERSION
             )));
         }

@@ -109,7 +109,7 @@ pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &
     if let Some(engine) = engine {
         // Stop and remove any running serve container for this environment
         // before removing its image. If we skipped this, the serve container
-        // would keep running and be unreachable through morloc-manager.
+        // would keep running and be unreachable through mim.
         let serve_name = serve::serve_container_name(name);
         if container::container_exists(engine, &serve_name) {
             let _ = container::container_stop(engine, &serve_name);
@@ -238,7 +238,7 @@ fn resolve_default_env_name() -> Result<String> {
         available.extend(system_envs.iter().map(|n| format!("{n} (system)")));
         Err(ManagerError::EnvError(format!(
             "No default environment set. Pass --env <name>, or set a default with: \
-             morloc-manager modify --env <name> --set-default\n\
+             mim modify --env <name> --set-default\n\
              Available: {}",
             available.join(", ")
         )))

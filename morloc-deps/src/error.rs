@@ -1,6 +1,6 @@
 //! Error type for the dependency kernel. Kept deliberately small: every failure
 //! carries a message. Consumers convert `DepsError` into their own error at the
-//! crate boundary (e.g. `morloc-manager`'s `ManagerError::EnvError`).
+//! crate boundary (e.g. `mim`'s `ManagerError::EnvError`).
 
 use std::fmt;
 

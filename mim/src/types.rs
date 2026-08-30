@@ -312,7 +312,7 @@ fn default_env_schema() -> u32 {
 /// Dev-environment configuration. Its PRESENCE on an `EnvironmentConfig` marks
 /// the environment as a dev env (`EnvironmentConfig::is_dev`): one that mounts a
 /// morloc source tree so the developer builds the compiler + runtime from it,
-/// rather than downloading a release. morloc-manager only provisions the tooling
+/// rather than downloading a release. mim only provisions the tooling
 /// (the pixi env + the baked ghcup/stack/cargo toolchain); the build itself is
 /// the developer's. There is no separate `is_dev` flag, so an env is either a
 /// normal release env (`dev: None`) or a dev env (`dev: Some(..)`) -- illegal
@@ -778,7 +778,7 @@ fn sorted_union(a: &[String], b: &[String]) -> Vec<String> {
 pub struct NativeRuntime {
     #[serde(default)]
     pub activation_env: Vec<(String, String)>,
-    /// The morloc-manager version that materialized this env (its
+    /// The mim version that materialized this env (its
     /// `CARGO_PKG_VERSION`). `None` for records written before this field
     /// existed. `doctor` compares it to the running manager to flag tooling
     /// drift.

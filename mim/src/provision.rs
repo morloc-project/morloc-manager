@@ -29,7 +29,7 @@ const RELEASE_BASE: &str = "https://github.com/morloc-project/morloc/releases/do
 const RELEASE_TAG_BASE: &str = "https://github.com/morloc-project/morloc/releases/tag";
 /// The manifest asset attached to every release (see .github/workflows/release.yml).
 const MANIFEST_ASSET: &str = "morloc-release-manifest.json";
-/// Pinned pixi version morloc-manager provisions + generates container images
+/// Pinned pixi version mim provisions + generates container images
 /// against (single source of truth for both). Bundling pixi keeps the native
 /// solve self-contained; linking rattler is the eventual replacement.
 pub const PIXI_VERSION: &str = "0.76.2";
@@ -126,8 +126,8 @@ impl ReleaseManifest {
             .map_err(|e| ManagerError::EnvError(format!("Failed to parse {MANIFEST_ASSET}: {e}")))?;
         if m.schema > MANIFEST_SCHEMA {
             return Err(ManagerError::EnvError(format!(
-                "{MANIFEST_ASSET} schema {} is newer than this morloc-manager supports \
-                 (up to {MANIFEST_SCHEMA}); upgrade morloc-manager.",
+                "{MANIFEST_ASSET} schema {} is newer than this mim supports \
+                 (up to {MANIFEST_SCHEMA}); upgrade mim.",
                 m.schema
             )));
         }
@@ -422,7 +422,8 @@ pub fn runtime_morloc_bin(dir: &Path) -> PathBuf {
     dir.join("morloc")
 }
 
-/// GitHub release download base for the morloc-manager (mim) repository. mim IS
+/// GitHub release download base for the mim repository (still named
+/// `morloc-manager` on GitHub). mim IS
 /// the in-environment dependency agent (`mim sync ...`), so a container image or a
 /// cross-arch native env fetches the matching-platform `mim` from here.
 const MIM_RELEASE_BASE: &str = "https://github.com/morloc-project/morloc-manager/releases/download";
@@ -635,7 +636,7 @@ pub fn fetch_manifest(tag: &str) -> Result<ReleaseManifest> {
 /// directory (its `rust/` subdir is `morloc init`'s MORLOC_RUST_DIR). Downloads
 /// the version-matched morloc compiler plus the rust sources; `morloc init`
 /// builds libmorloc.so, morloc-nexus, and rustmorloc locally from that source.
-/// The already-installed `morloc-manager` bootstrap is not re-fetched.
+/// The already-installed `mim` bootstrap is not re-fetched.
 ///
 /// `triple` is the release triple the artifacts must target: the host's for a
 /// native backend, but the CONTAINER's Linux triple for a container backend

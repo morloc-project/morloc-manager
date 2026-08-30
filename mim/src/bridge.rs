@@ -1,6 +1,6 @@
 //! SLURM submission bridge for containerized morloc runs.
 //!
-//! `morloc-manager run --slurm-bridge` spawns this server on a Unix
+//! `mim run --slurm-bridge` spawns this server on a Unix
 //! domain socket on the host, bind-mounts the socket into the
 //! container at `/run/morloc-bridge.sock`, and sets
 //! `MORLOC_BRIDGE_SOCKET=/run/morloc-bridge.sock` inside. The
@@ -59,10 +59,10 @@
 //!
 //! * `inner_argv` - the logical command to run on the compute node,
 //!   expressed as an argv list (one shell token per element). The
-//!   bridge prepends `["<morloc-manager>", "run", "--slurm-bridge",
+//!   bridge prepends `["<mim>", "run", "--slurm-bridge",
 //!   "--"]` then shell-escapes the whole vector into a single string
 //!   for sbatch --wrap. /bin/sh on the compute node parses the
-//!   quoted tokens back into argv, morloc-manager hands everything
+//!   quoted tokens back into argv, mim hands everything
 //!   after `--` to the in-container nexus. The runtime never
 //!   shell-quotes anything; quoting is a bridge-side concern. The
 //!   `--slurm-bridge` flag in the wrap is what enables nested
@@ -160,7 +160,7 @@
 //!   -o /h/u/p/.morloc-cache/a8d.out \
 //!   -e /h/u/p/.morloc-cache/a8d.err \
 //!   --mem=32G --time=0-01:00:00 --cpus-per-task=8 \
-//!   --wrap="'/home/u/.local/bin/morloc-manager' 'run' '--slurm-bridge' '--' '/opt/morloc/bin/nexus' '--call-packet' '/h/u/p/.morloc-cache/a8d-call.dat' '--socket-base' 'py-pipe' '--output-file' '/h/u/p/.morloc-cache/a8d.dat' '--output-form' 'packet'"
+//!   --wrap="'/home/u/.local/bin/mim' 'run' '--slurm-bridge' '--' '/opt/morloc/bin/nexus' '--call-packet' '/h/u/p/.morloc-cache/a8d-call.dat' '--socket-base' 'py-pipe' '--output-file' '/h/u/p/.morloc-cache/a8d.dat' '--output-form' 'packet'"
 //! ```
 //!
 //! Status polling:
@@ -192,26 +192,26 @@ use serde::{Deserialize, Serialize};
 
 /// Static configuration the bridge needs to compose a SLURM wrap.
 ///
-/// The remote container is brought up by `morloc-manager run` on the
+/// The remote container is brought up by `mim run` on the
 /// compute node -- not by the bridge directly calling `apptainer exec`.
 /// That keeps every nexus invocation (driver or compute-node) symmetric
 /// with respect to env lookup, SIF resolution, $HOME mounts, and
-/// MORLOC_HOME setup: morloc-manager owns all of that, and the bridge
+/// MORLOC_HOME setup: mim owns all of that, and the bridge
 /// just shells out to it. The only required information is the
-/// absolute path to the morloc-manager binary (which must be reachable
+/// absolute path to the mim binary (which must be reachable
 /// at the same path on every compute node, typically via NFS-shared
 /// $HOME).
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
     pub morloc_manager_exe: PathBuf,
-    /// Environment the compute-node `morloc-manager run` must target. The bridge
+    /// Environment the compute-node `mim run` must target. The bridge
     /// pins this explicitly (`run --env <name>`) so every worker uses the same
     /// env as the driver, independent of the host's default-environment tag.
     pub env_name: String,
 }
 
 /// Owns the listener thread + socket path. Drop tears the bridge down
-/// cleanly so subsequent `morloc-manager run` invocations don't trip
+/// cleanly so subsequent `mim run` invocations don't trip
 /// over stale sockets.
 pub struct BridgeHandle {
     sock_path: PathBuf,
@@ -294,7 +294,7 @@ fn run_listener(listener: UnixListener, shutdown: Arc<AtomicBool>, cfg: BridgeCo
                 thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                eprintln!("[morloc-manager bridge] accept failed: {}", e);
+                eprintln!("[mim bridge] accept failed: {}", e);
                 thread::sleep(Duration::from_millis(200));
             }
         }
@@ -309,7 +309,7 @@ enum Request {
     Submit {
         /// The inner command to run on the compute node, expressed as
         /// an argv list (one shell token per element). The bridge
-        /// prepends `[<morloc-manager>, run, --slurm-bridge, --]` and
+        /// prepends `[<mim>, run, --slurm-bridge, --]` and
         /// shell-escapes once when composing the sbatch --wrap. The
         /// runtime stays out of shell-quoting entirely.
         inner_argv: Vec<String>,
@@ -392,7 +392,7 @@ fn handle_submit(
     stderr: &str,
     res: &ResourceSpec,
 ) -> String {
-    // Wrap the logical nexus invocation in `morloc-manager run --env
+    // Wrap the logical nexus invocation in `mim run --env
     // <name> --slurm-bridge -- ...`. Each compute node thereby brings
     // up the same env's container (same .sif, same $HOME mount, same
     // MORLOC_HOME) AS THE DRIVER -- the env is pinned explicitly rather
@@ -404,10 +404,10 @@ fn handle_submit(
     // nexus has no bridge to talk to and any nested labeled call fails
     // with "MORLOC_BRIDGE_SOCKET unset".
     //
-    // The full argv `[morloc-manager, run, --env, <name>,
+    // The full argv `[mim, run, --env, <name>,
     // --slurm-bridge, --, <inner_argv>...]` is shell-escaped once into
     // a single string for sbatch --wrap. /bin/sh on the compute node
-    // parses it back into argv, morloc-manager hands everything after
+    // parses it back into argv, mim hands everything after
     // `--` to the in-container nexus. One quoting boundary, end to end.
     let mut argv: Vec<String> = Vec::with_capacity(inner_argv.len() + 6);
     argv.push(cfg.morloc_manager_exe.to_string_lossy().into_owned());

@@ -14,7 +14,7 @@ pub enum ManagerError {
     #[error("Invalid configuration in {path}: {msg}")]
     ConfigParseError { path: String, msg: String },
 
-    #[error("No default environment set. Run: morloc-manager new")]
+    #[error("No default environment set. Run: mim new")]
     NoDefaultEnvironment,
 
     #[error("Environment not found: {0}")]
@@ -27,7 +27,7 @@ pub enum ManagerError {
     BackendUnsupported(String),
 
 
-    #[error("No command specified. Provide a command after --, or use 'morloc-manager shell' for an interactive shell.")]
+    #[error("No command specified. Provide a command after --, or use 'mim shell' for an interactive shell.")]
     NoCommand,
 
     #[error("No container engine found. Install podman or docker.")]
@@ -53,8 +53,8 @@ pub enum ManagerError {
     DoctorFailed(u32),
 
     #[error("{}", match .0 {
-        Scope::Local => "No local configuration found. Run: morloc-manager new",
-        Scope::System => "No system configuration found. Run: sudo morloc-manager new --system",
+        Scope::Local => "No local configuration found. Run: mim new",
+        Scope::System => "No system configuration found. Run: sudo mim new --system",
     })]
     SetupNotComplete(Scope),
 }

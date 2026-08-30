@@ -50,7 +50,7 @@ impl Counts {
             });
         } else {
             // anstream strips the ANSI when stdout is not a TTY (and honors
-            // NO_COLOR), matching the rest of morloc-manager's coloured output.
+            // NO_COLOR), matching the rest of mim's coloured output.
             anstream::println!("  \x1b[1;32m[ok]\x1b[0m {msg}");
         }
     }
@@ -263,7 +263,7 @@ pub fn native_doctor(
     if lock_present {
         check_runtime_artifacts(&mut c, &data_dir, &langs);
     } else {
-        c.warn("cannot inventory language stacks: no pixi.lock (env not solved; re-run: morloc-manager update)");
+        c.warn("cannot inventory language stacks: no pixi.lock (env not solved; re-run: mim update)");
     }
     if let Some(ref rt) = rt {
         check_linkage(&mut c, &data_dir, rt);
@@ -338,7 +338,7 @@ fn check_fhs_sandbox(c: &mut Counts, rt: Option<&NativeRuntime>) {
     } else {
         c.fail(&format!(
             "FHS sandbox launcher missing at {w}; rebuild it with \
-             'morloc-manager update --env <name>' (nix may have garbage-collected it)"
+             'mim update --env <name>' (nix may have garbage-collected it)"
         ));
     }
 }
@@ -355,14 +355,14 @@ fn check_native_runtime(c: &mut Counts, env_name: &str, rt: Option<&NativeRuntim
                     c.pass(&format!("conda toolchain present ({prefix})"));
                 } else {
                     c.fail(&format!(
-                        "conda prefix missing at {prefix} -- re-run: morloc-manager update --env {env_name}"
+                        "conda prefix missing at {prefix} -- re-run: mim update --env {env_name}"
                     ));
                 }
             }
             None => c.warn("runtime record present but no CONDA_PREFIX in the activation env-map"),
         },
         None => c.fail(&format!(
-            "native environment not materialized -- run: morloc-manager update --env {env_name}"
+            "native environment not materialized -- run: mim update --env {env_name}"
         )),
     }
 }
@@ -456,7 +456,7 @@ fn check_activation_toolchain(c: &mut Counts, rt: &NativeRuntime) {
         c.pass("toolchain compiler vars exported (CC, CXX, AR, RANLIB)");
     } else {
         c.fail(&format!(
-            "activation missing {} -- native C/Rust builds will fail (\"failed to find tool ar\"); re-run: morloc-manager update",
+            "activation missing {} -- native C/Rust builds will fail (\"failed to find tool ar\"); re-run: mim update",
             missing.join(", ")
         ));
     }
@@ -541,7 +541,7 @@ fn check_core_artifacts(c: &mut Counts, data_dir: &Path) {
         c.pass("core runtime present (libmorloc, morloc.h, morloc-nexus)");
     } else {
         c.fail(&format!(
-            "core runtime incomplete: missing {} -- re-run: morloc-manager update",
+            "core runtime incomplete: missing {} -- re-run: mim update",
             missing.join(", ")
         ));
     }
@@ -578,7 +578,7 @@ fn check_runtime_artifacts(c: &mut Counts, data_dir: &Path, langs: &[String]) {
             c.pass(&format!("{lang} runtime stack present"));
         } else {
             c.fail(&format!(
-                "{lang} runtime stack incomplete: missing {} -- re-run: morloc-manager update",
+                "{lang} runtime stack incomplete: missing {} -- re-run: mim update",
                 missing.join(", ")
             ));
         }
@@ -634,7 +634,7 @@ fn check_linkage(c: &mut Counts, data_dir: &Path, rt: &NativeRuntime) {
         c.pass("libmorloc resolves its dynamic dependencies");
     } else {
         c.fail(&format!(
-            "libmorloc has unresolved dependencies ({}) -- ABI/toolchain mismatch; re-run: morloc-manager update",
+            "libmorloc has unresolved dependencies ({}) -- ABI/toolchain mismatch; re-run: mim update",
             unresolved.join("; ")
         ));
     }
@@ -657,7 +657,7 @@ fn check_staleness(c: &mut Counts, ec: &EnvironmentConfig, rt: &NativeRuntime) {
                     c.pass(&format!("morloc compiler matches the env runtime ({})", got.show()))
                 }
                 Some(got) => c.fail(&format!(
-                    "on-PATH morloc is {} but this env's runtime is {} -- a different morloc is shadowing it; re-run: morloc-manager update",
+                    "on-PATH morloc is {} but this env's runtime is {} -- a different morloc is shadowing it; re-run: mim update",
                     got.show(),
                     want.show()
                 )),
@@ -673,12 +673,12 @@ fn check_staleness(c: &mut Counts, ec: &EnvironmentConfig, rt: &NativeRuntime) {
             c.pass(&format!("recorded env version matches the runtime store ({})", rec.show()))
         }
         (Some(rec), Some(store)) => c.fail(&format!(
-            "env records morloc {} but the runtime store is {} -- re-run: morloc-manager update",
+            "env records morloc {} but the runtime store is {} -- re-run: mim update",
             rec.show(),
             store.show()
         )),
         (None, _) => c.warn(
-            "materialized env has no recorded morloc version -- re-run: morloc-manager update",
+            "materialized env has no recorded morloc version -- re-run: mim update",
         ),
         (Some(_), None) => {}
     }
@@ -686,10 +686,10 @@ fn check_staleness(c: &mut Counts, ec: &EnvironmentConfig, rt: &NativeRuntime) {
     // The manager that materialized the env vs the running manager.
     match &rt.manager_version {
         Some(v) if v == running => {
-            c.pass(&format!("environment materialized by this morloc-manager ({running})"))
+            c.pass(&format!("environment materialized by this mim ({running})"))
         }
         Some(v) => c.warn(&format!(
-            "env materialized by morloc-manager {v}, running {running} -- re-run: morloc-manager update if tooling misbehaves"
+            "env materialized by mim {v}, running {running} -- re-run: mim update if tooling misbehaves"
         )),
         None => {}
     }
@@ -738,11 +738,11 @@ fn check_dep_world(c: &mut Counts, pixi_dir: &Path) {
     if pixi_dir.join("pixi.lock").is_file() {
         c.pass("environment is solved (pixi.lock present)");
     } else {
-        c.warn("no pixi.lock -- environment not solved (re-run: morloc-manager update)");
+        c.warn("no pixi.lock -- environment not solved (re-run: mim update)");
     }
     if !pixi_dir.join("materialized.toml").is_file() {
         c.warn(
-            "no materialization marker -- the last solve may not have completed; re-run: morloc-manager update",
+            "no materialization marker -- the last solve may not have completed; re-run: mim update",
         );
     }
 }
@@ -803,7 +803,7 @@ fn pid_alive(pid: i32) -> bool {
 /// Deep native check: each installed program launcher exists and is executable.
 fn check_native_programs(c: &mut Counts, data_dir: &Path) {
     let bin = data_dir.join("bin");
-    let reserved = ["morloc-nexus", "morloc", "morloc-manager"];
+    let reserved = ["morloc-nexus", "morloc", "mim"];
     let mut found = 0;
     if let Ok(entries) = fs::read_dir(&bin) {
         for entry in entries.flatten() {
@@ -827,7 +827,7 @@ fn check_native_programs(c: &mut Counts, data_dir: &Path) {
         }
     }
     if found == 0 {
-        c.skip("no programs installed yet (morloc-manager install <file>.loc)");
+        c.skip("no programs installed yet (mim install <file>.loc)");
     }
 }
 
@@ -885,7 +885,7 @@ fn check_cert_bundle(c: &mut Counts, ec: &EnvironmentConfig) {
         )),
         Drifted => c.warn(&format!(
             "Corporate CA bundle {bundle} changed since this environment was built\n       \
-             Rebuild to apply it: morloc-manager modify --env {} --cert-bundle {bundle}",
+             Rebuild to apply it: mim modify --env {} --cert-bundle {bundle}",
             ec.name
         )),
     }
@@ -905,7 +905,7 @@ fn check_base_image(c: &mut Counts, engine: ContainerEngine, base_image: &str) {
     } else {
         c.fail(&format!(
             "Base image {base_image} not found locally\n       \
-             Run: morloc-manager run -- morloc --version  (triggers pull)"
+             Run: mim run -- morloc --version  (triggers pull)"
         ));
     }
 }
@@ -919,7 +919,7 @@ fn check_built_image(c: &mut Counts, engine: ContainerEngine, ec: &EnvironmentCo
             } else {
                 c.fail(&format!(
                     "Base .sif {sif} not found on disk\n       \
-                     Run: morloc-manager update --image <ref> to repull"
+                     Run: mim update --image <ref> to repull"
                 ));
             }
         }
@@ -932,14 +932,14 @@ fn check_built_image(c: &mut Counts, engine: ContainerEngine, ec: &EnvironmentCo
                     } else {
                         c.fail(&format!(
                             "Layered .sif {sif} not found on disk\n       \
-                             Run: morloc-manager update"
+                             Run: mim update"
                         ));
                     }
                 }
                 None => {
                     c.warn(&format!(
                         "{recipe_kind} configured but no layered .sif built yet\n       \
-                         Run: morloc-manager update"
+                         Run: mim update"
                     ));
                 }
             }
@@ -954,7 +954,7 @@ fn check_built_image(c: &mut Counts, engine: ContainerEngine, ec: &EnvironmentCo
     if !df_path.exists() {
         c.warn(&format!(
             "Dockerfile configured but file is missing: {}\n       \
-             Remove stale config or recreate the file, then run: morloc-manager update",
+             Remove stale config or recreate the file, then run: mim update",
             df_path.display()
         ));
         return;
@@ -966,13 +966,13 @@ fn check_built_image(c: &mut Counts, engine: ContainerEngine, ec: &EnvironmentCo
             } else {
                 c.fail(&format!(
                     "Built image {img} not found locally\n       \
-                     Run: morloc-manager update"
+                     Run: mim update"
                 ));
             }
         }
         None => {
             c.warn("Dockerfile configured but no image built yet\n       \
-                    Run: morloc-manager update");
+                    Run: mim update");
         }
     }
 }
@@ -991,7 +991,7 @@ fn check_data_dirs(c: &mut Counts, data_dir: &Path) {
     } else {
         c.fail(&format!(
             "Missing directories: {}\n       \
-             Run: morloc-manager run -- morloc init -f",
+             Run: mim run -- morloc init -f",
             missing.join(", ")
         ));
     }
@@ -1158,7 +1158,7 @@ fn check_one_manifest(
         for issue in &issues {
             c.warn(&format!(
                 "{prog_name} -- {issue}\n       \
-                 Recompile: morloc-manager run -- morloc make --install"
+                 Recompile: mim run -- morloc make --install"
             ));
         }
     }
@@ -1166,7 +1166,7 @@ fn check_one_manifest(
 
 fn check_morloc_version(c: &mut Counts, engine: ContainerEngine, ec: &EnvironmentConfig) {
     // A dev env's compiler is built by the developer from the mounted source, so
-    // morloc-manager does not track its version (the stdlib base is separate).
+    // mim does not track its version (the stdlib base is separate).
     // Report the mode + source; the compiler is the developer's to build/verify.
     if let Some(dev) = &ec.dev {
         let stdlib = ec.morloc_version.as_ref().map(|v| v.show()).unwrap_or_else(|| "?".to_string());
@@ -1258,7 +1258,7 @@ fn check_programs_deep(
         };
         if verbose {
             let exe = engine_executable(engine);
-            eprintln!("[morloc-manager] {exe} run --rm {image} {exe_path} --help");
+            eprintln!("[mim] {exe} run --rm {image} {exe_path} --help");
         }
         let (status, _, stderr) = container_run_quiet(engine, &cfg);
         if status.success() {
@@ -1275,9 +1275,9 @@ fn check_programs_deep(
 // ======================================================================
 
 /// Checks for a containerized SLURM dispatch workflow. Verifies the
-/// host-side prerequisites that `morloc-manager run --slurm-bridge`
+/// host-side prerequisites that `mim run --slurm-bridge`
 /// will rely on: cluster client tools, codegen toggle in the build
-/// config, env image resolvability, NFS-shared morloc-manager binary
+/// config, env image resolvability, NFS-shared mim binary
 /// path, and a writable runtime dir for the bridge UDS.
 fn check_slurm_prereqs(c: &mut Counts, engine: ContainerEngine, ec: &EnvironmentConfig, scope: Scope, env_name: &str) {
     fn which(name: &str) -> bool {
@@ -1311,14 +1311,14 @@ fn check_slurm_prereqs(c: &mut Counts, engine: ContainerEngine, ec: &Environment
                 c.pass(&format!("{} has slurm-support: true", build_yaml.display()));
             } else {
                 c.fail(&format!(
-                    "{} missing `slurm-support: true` (run `morloc-manager update --reinit --init-arg --slurm`, or `morloc-manager run -- morloc init -f --slurm`)",
+                    "{} missing `slurm-support: true` (run `mim update --reinit --init-arg --slurm`, or `mim run -- morloc init -f --slurm`)",
                     build_yaml.display()
                 ));
             }
         }
         Err(_) => {
             c.fail(&format!(
-                "{} does not exist; run `morloc-manager update --reinit --init-arg --slurm`",
+                "{} does not exist; run `mim update --reinit --init-arg --slurm`",
                 build_yaml.display()
             ));
         }
@@ -1327,7 +1327,7 @@ fn check_slurm_prereqs(c: &mut Counts, engine: ContainerEngine, ec: &Environment
     // 4. Env image is resolvable.
     let image = ec.active_image();
     if image.is_empty() {
-        c.fail("env has no resolvable image (run `morloc-manager update`)");
+        c.fail("env has no resolvable image (run `mim update`)");
     } else {
         c.pass(&format!("env image: {}", image));
     }
@@ -1342,24 +1342,24 @@ fn check_slurm_prereqs(c: &mut Counts, engine: ContainerEngine, ec: &Environment
         c.pass("engine is Apptainer (image is a shared-FS file)");
     }
 
-    // 6. morloc-manager binary path looks NFS-mirrorable. Heuristic:
+    // 6. mim binary path looks NFS-mirrorable. Heuristic:
     //    must live under $HOME (the typical NFS-shared root).
     match (std::env::current_exe(), dirs::home_dir()) {
         (Ok(exe), Some(home)) => {
             if exe.starts_with(&home) {
                 c.pass(&format!(
-                    "morloc-manager binary is under $HOME ({})",
+                    "mim binary is under $HOME ({})",
                     exe.display()
                 ));
             } else {
                 c.warn(&format!(
-                    "morloc-manager binary at {} is not under $HOME; compute nodes may not be able to exec the same absolute path. Install under ~/.local/bin or another NFS-shared location.",
+                    "mim binary at {} is not under $HOME; compute nodes may not be able to exec the same absolute path. Install under ~/.local/bin or another NFS-shared location.",
                     exe.display()
                 ));
             }
         }
         _ => {
-            c.warn("could not resolve morloc-manager's own absolute path; --slurm-bridge may fail to compose a working sbatch wrap");
+            c.warn("could not resolve mim's own absolute path; --slurm-bridge may fail to compose a working sbatch wrap");
         }
     }
 

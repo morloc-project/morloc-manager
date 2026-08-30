@@ -1,7 +1,7 @@
 //! Dependency-resolution kernel: environment-spec parsing, constraint
 //! intersection, the language-support table, and pixi manifest rendering.
 //!
-//! Shared by `morloc-manager` (the outside orchestrator) and `morloc-env` (the
+//! Shared by `mim` (the outside orchestrator) and `morloc-env` (the
 //! in-env agent). The kernel is agnostic to how an environment is located; the
 //! caller supplies concrete paths. Its error type is `DepsError`; a consumer
 //! converts it into its own error at the crate boundary.

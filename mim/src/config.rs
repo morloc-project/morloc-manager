@@ -163,14 +163,14 @@ pub fn read_env_config(scope: Scope, name: &str) -> Result<EnvironmentConfig> {
 }
 
 /// Bring an environment record up to `CURRENT_ENV_SCHEMA`, or reject it loudly.
-/// A record from a newer morloc-manager (unknown fields already dropped by
+/// A record from a newer mim (unknown fields already dropped by
 /// serde) is refused rather than half-read; an older record is migrated forward
 /// one version at a time.
 fn migrate_env_config(mut ec: EnvironmentConfig) -> Result<EnvironmentConfig> {
     if ec.schema_version > CURRENT_ENV_SCHEMA {
         return Err(ManagerError::EnvError(format!(
-            "environment '{}' was created by a newer morloc-manager (env schema v{}, this build \
-             understands up to v{}); upgrade morloc-manager to use it",
+            "environment '{}' was created by a newer mim (env schema v{}, this build \
+             understands up to v{}); upgrade mim to use it",
             ec.name, ec.schema_version, CURRENT_ENV_SCHEMA
         )));
     }
@@ -185,7 +185,7 @@ fn migrate_env_config(mut ec: EnvironmentConfig) -> Result<EnvironmentConfig> {
             v => {
                 return Err(ManagerError::EnvError(format!(
                     "environment '{}' uses env schema v{v} with no migration path to v{}; \
-                     recreate it with `morloc-manager new`",
+                     recreate it with `mim new`",
                     ec.name, CURRENT_ENV_SCHEMA
                 )));
             }
@@ -198,7 +198,7 @@ fn migrate_env_config(mut ec: EnvironmentConfig) -> Result<EnvironmentConfig> {
     if ec.dev.is_some() && ec.local_runtime.is_some() {
         return Err(ManagerError::EnvError(format!(
             "environment '{}' sets both `dev` and `local_runtime`, which are mutually \
-             exclusive; recreate it with `morloc-manager new`",
+             exclusive; recreate it with `mim new`",
             ec.name
         )));
     }
@@ -545,7 +545,7 @@ mod tests {
         let err = migrate_env_config(ec).expect_err("future schema must fail");
         let msg = err.to_string();
         assert!(
-            msg.contains("newer morloc-manager"),
+            msg.contains("newer mim"),
             "unexpected error: {msg}"
         );
     }
