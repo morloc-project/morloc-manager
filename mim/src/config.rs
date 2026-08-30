@@ -65,8 +65,13 @@ pub fn env_config_path_legacy_json(scope: Scope, name: &str) -> PathBuf {
     env_config_dir(scope, name).join("env.json")
 }
 
-/// Path to an environment's custom Dockerfile (read by freeze/doctor; not
-/// produced by the requirement-derived build).
+/// Path to an environment's Dockerfile in its config dir. Holds either a custom
+/// recipe (legacy/freeze; recorded in `EnvironmentConfig::dockerfile` and read by
+/// freeze/doctor) OR a documentation copy of the requirement-derived Dockerfile
+/// the build renders -- the latter is written for reproducibility/debugging and
+/// surfaced by `mim info`, but is NOT recorded in `dockerfile`, so freeze/doctor
+/// (which gate on that field) ignore it. The two uses are mutually exclusive per
+/// environment.
 pub fn env_dockerfile_path(scope: Scope, name: &str) -> PathBuf {
     env_config_dir(scope, name).join("Dockerfile")
 }
@@ -185,6 +190,17 @@ fn migrate_env_config(mut ec: EnvironmentConfig) -> Result<EnvironmentConfig> {
                 )));
             }
         }
+    }
+    // `dev` and `local_runtime` are mutually exclusive (a dev env builds its own
+    // compiler; a local-runtime env adopts a prebuilt one). The type permits both
+    // as independent Options, so guard the invariant here rather than let a
+    // hand-edited record be silently resolved as dev-wins downstream.
+    if ec.dev.is_some() && ec.local_runtime.is_some() {
+        return Err(ManagerError::EnvError(format!(
+            "environment '{}' sets both `dev` and `local_runtime`, which are mutually \
+             exclusive; recreate it with `morloc-manager new`",
+            ec.name
+        )));
     }
     Ok(ec)
 }
@@ -541,5 +557,17 @@ mod tests {
         ec.schema_version = 0;
         let err = migrate_env_config(ec).expect_err("schema 0 has no migration path");
         assert!(err.to_string().contains("no migration path"));
+    }
+
+    #[test]
+    fn both_dev_and_local_runtime_is_rejected() {
+        // The type permits both Options; a record (e.g. hand-edited) that sets
+        // both must be refused at read rather than silently resolved downstream.
+        let mut ec = parse(V1_YAML);
+        ec.dev = Some(crate::types::DevConfig { source: "/src".to_string(), mim_env: None });
+        ec.local_runtime =
+            Some(crate::types::LocalRuntimeConfig { source: "/rt".to_string() });
+        let err = migrate_env_config(ec).expect_err("dev + local_runtime must fail");
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
     }
 }

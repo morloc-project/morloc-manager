@@ -1,0 +1,7 @@
+# Keep the static-build context lean: host build artifacts and VCS metadata are
+# not build inputs (the musl target compiles fresh inside the image).
+target/
+out/
+.git
+.github
+.claude

@@ -182,6 +182,14 @@ impl Version {
             None => format!("{}.{}.{}", self.major, self.minor, self.patch),
         }
     }
+
+    /// Parse a version from `morloc --version` output: the compiler prints the
+    /// version as the last whitespace-delimited token, so take that and parse it.
+    /// Returns `None` if there is no parseable token. Shared by every site that
+    /// reads a compiler's self-reported version.
+    pub fn from_command_output(output: &str) -> Option<Version> {
+        output.split_whitespace().last().and_then(|t| t.trim().parse().ok())
+    }
 }
 
 impl Ord for Version {
@@ -308,10 +316,36 @@ fn default_env_schema() -> u32 {
 /// (the pixi env + the baked ghcup/stack/cargo toolchain); the build itself is
 /// the developer's. There is no separate `is_dev` flag, so an env is either a
 /// normal release env (`dev: None`) or a dev env (`dev: Some(..)`) -- illegal
-/// mixed states are unrepresentable.
+/// mixed states are unrepresentable. `dev` and `local_runtime` are mutually
+/// exclusive (a dev env builds its own compiler; a local-runtime env adopts a
+/// prebuilt one).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevConfig {
     /// Absolute host path to the morloc source repo, bind-mounted into the env.
+    pub source: String,
+    /// Host path to the `mim-env` dependency-agent binary to stage into the env's
+    /// runtime bin (so `morloc make` can provision declared deps). `None` falls
+    /// back to the `mim-env` sitting beside the running `mim`. A dev env needs the
+    /// current dev agent, never a downloaded release, so this is chosen explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mim_env: Option<String>,
+}
+
+/// Local-runtime configuration. Its PRESENCE marks an environment that adopts a
+/// developer-assembled runtime directory (`{ morloc, rust/ }`) in place of a
+/// downloaded release (`EnvironmentConfig::is_local_runtime`): the manager
+/// substitutes `source` for the `runtimes/<version>/` store it would otherwise
+/// provision, so mim itself can be tested against a locally-built compiler
+/// without publishing a release. An advanced, developer-only mode. The directory
+/// is BORROWED, never owned: it is only ever read, and env removal must never
+/// delete it. `local_runtime` and `dev` are mutually exclusive; the type permits
+/// both as independent Options, so the invariant is enforced at config read
+/// (`migrate_env_config`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalRuntimeConfig {
+    /// Canonical host path to the runtime directory containing a `morloc` binary
+    /// and a `rust/` workspace source (typically both symlinks into the
+    /// developer's working tree). Re-read live on every `modify`/`update`.
     pub source: String,
 }
 
@@ -364,14 +398,26 @@ pub struct EnvironmentConfig {
     #[serde(default)]
     pub morloc_version: Option<Version>,
     /// Extra OS packages baked into the image via the base package manager
-    /// (apt), for tools conda cannot provide (e.g. jq). Container-only; the
-    /// native backend rejects them at creation.
+    /// (apt), for tools conda cannot provide (e.g. locales, linux-tools).
+    /// Container-only; the native backend rejects them at creation.
     #[serde(default)]
     pub system_packages: Vec<String>,
+    /// Extra conda packages folded into the pixi solve, for utilities the user
+    /// wants in the env (e.g. jq, hyperfine). Unlike `system_packages` (apt,
+    /// image-baked, container-only) these live in the writable host-mounted
+    /// `/env`, so they work on every backend and can be added without an image
+    /// rebuild.
+    #[serde(default)]
+    pub conda_packages: Vec<String>,
     /// Dev-environment config. Present iff this env builds morloc from a mounted
     /// source tree (`is_dev`); `None` for a normal release env.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev: Option<DevConfig>,
+    /// Local-runtime config. Present iff this env adopts a developer-assembled
+    /// runtime dir instead of a downloaded release (`is_local_runtime`); `None`
+    /// otherwise. Mutually exclusive with `dev`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_runtime: Option<LocalRuntimeConfig>,
     /// Host path to a corporate CA bundle trusted by this environment's pixi
     /// solves and (for container backends) baked into the image. `None` unless
     /// created behind a TLS-inspection firewall. See [`crate::cert`].
@@ -400,6 +446,7 @@ impl EnvironmentConfig {
         built_image: Option<String>,
         morloc_version: Option<Version>,
         system_packages: Vec<String>,
+        conda_packages: Vec<String>,
     ) -> Self {
         EnvironmentConfig {
             schema_version: CURRENT_ENV_SCHEMA,
@@ -417,7 +464,9 @@ impl EnvironmentConfig {
             shm_size: default_shm_size(),
             morloc_version,
             system_packages,
+            conda_packages,
             dev: None,
+            local_runtime: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
         }
@@ -432,6 +481,18 @@ impl EnvironmentConfig {
     /// Attach a dev-environment config, marking this as a dev env.
     pub fn with_dev(mut self, dev: DevConfig) -> Self {
         self.dev = Some(dev);
+        self
+    }
+
+    /// True iff this env adopts a local runtime dir instead of a downloaded
+    /// release. Equivalent to `self.local_runtime.is_some()`.
+    pub fn is_local_runtime(&self) -> bool {
+        self.local_runtime.is_some()
+    }
+
+    /// Attach a local-runtime config, marking this as a local-runtime env.
+    pub fn with_local_runtime(mut self, lr: LocalRuntimeConfig) -> Self {
+        self.local_runtime = Some(lr);
         self
     }
 

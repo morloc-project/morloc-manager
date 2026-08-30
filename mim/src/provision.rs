@@ -404,6 +404,15 @@ pub fn sibling_mim_env() -> Option<PathBuf> {
         .and_then(|p| p.parent().map(|d| d.join("mim-env")))
 }
 
+/// Copy a `mim-env` agent binary into a runtime-bin dir and set its exec bit, so
+/// an in-container `morloc make` runs it via MORLOC_BUILD_HOOK. Shared by the
+/// release path (`stage_runtime`) and the dev path (a caller-chosen binary).
+pub fn stage_mim_env_agent(src: &Path, runtime_bin_dir: &Path) -> Result<()> {
+    let dest = runtime_mim_env_bin(runtime_bin_dir);
+    copy_file(src, &dest)?;
+    make_executable(&dest)
+}
+
 /// The Rust workspace source within a provisioned runtime store; this is
 /// `morloc init`'s MORLOC_RUST_DIR.
 pub fn runtime_rust_src(dir: &Path) -> PathBuf {
@@ -603,12 +612,30 @@ fn copy_file(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Recursively copy `src` into `dst`, skipping any directory whose name is in
-/// `skip` (e.g. `target` build artifacts). Real directories are recursed; a
-/// symlink to a file is followed and copied as content, but a symlink to a
-/// directory is NOT recursed into -- following it could form a cycle (infinite
-/// recursion) or escape the source tree (e.g. a dotfiles dir that symlinks to
-/// `$HOME`). Existing files are overwritten (`fs::copy` semantics).
-pub fn copy_dir_excluding(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
+/// `skip` (e.g. `target` build artifacts). A symlink to a file is always followed
+/// and copied as content. A symlink to a DIRECTORY is skipped by default (a
+/// cycle/escape hazard, e.g. a dotfiles dir that symlinks to `$HOME`); pass
+/// `follow_symlinked_dirs = true` to instead recurse into its canonical target
+/// (with a visited-set cycle guard) -- used when copying a vendored local
+/// dependency, whose subpackages may legitimately be symlinks. Existing files are
+/// overwritten (`fs::copy` semantics).
+pub fn copy_dir_excluding(
+    src: &Path,
+    dst: &Path,
+    skip: &[&str],
+    follow_symlinked_dirs: bool,
+) -> Result<()> {
+    let mut visited = std::collections::HashSet::new();
+    copy_dir_inner(src, dst, skip, follow_symlinked_dirs, &mut visited)
+}
+
+fn copy_dir_inner(
+    src: &Path,
+    dst: &Path,
+    skip: &[&str],
+    follow_symlinked_dirs: bool,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> Result<()> {
     std::fs::create_dir_all(dst)
         .map_err(|e| ManagerError::EnvError(format!("cannot create {}: {e}", dst.display())))?;
     let entries = std::fs::read_dir(src)
@@ -624,17 +651,27 @@ pub fn copy_dir_excluding(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
             .map(|t| t.is_symlink())
             .unwrap_or(false);
         if is_symlink {
-            // Skip a symlinked directory (cycle/escape hazard); copy a symlinked
-            // file as its target content (fs::copy follows the link).
             if from.is_dir() {
-                continue;
+                if !follow_symlinked_dirs {
+                    continue;
+                }
+                // Recurse into the canonical target, skipping a target already
+                // seen on this copy (breaks symlink cycles).
+                let canon = std::fs::canonicalize(&from).map_err(|e| {
+                    ManagerError::EnvError(format!("cannot resolve symlink {}: {e}", from.display()))
+                })?;
+                if visited.insert(canon.clone()) {
+                    copy_dir_inner(&canon, &to, skip, follow_symlinked_dirs, visited)?;
+                }
+            } else {
+                // A symlink to a file: copy its target content (fs::copy follows).
+                copy_file(&from, &to)?;
             }
-            copy_file(&from, &to)?;
         } else if from.is_dir() {
             if skip.iter().any(|s| name.to_str() == Some(s)) {
                 continue;
             }
-            copy_dir_excluding(&from, &to, skip)?;
+            copy_dir_inner(&from, &to, skip, follow_symlinked_dirs, visited)?;
         } else {
             copy_file(&from, &to)?;
         }
@@ -663,11 +700,15 @@ pub fn stage_runtime(src: &Path, dest: &Path) -> Result<()> {
     // Stage the mim-env dependency agent into the image alongside the compiler, so
     // an in-container `morloc make` can run it via MORLOC_BUILD_HOOK. (`copy_file`
     // follows a symlink, so a dev-staged symlink copies the real binary in.)
-    let agent = runtime_mim_env_bin(src);
-    if agent.is_file() {
-        let agent_dest = runtime_mim_env_bin(dest);
-        copy_file(&agent, &agent_dest)?;
-        make_executable(&agent_dest)?;
+    // Prefer an agent staged in the runtime store; otherwise fall back to the
+    // `mim-env` beside the running `mim` (versioned with it -- always the matching
+    // one). This covers a `--local-runtime` dir, which carries no agent, and also
+    // closes the gap where a downloaded release store has no mim-env either.
+    let staged = runtime_mim_env_bin(src);
+    if staged.is_file() {
+        stage_mim_env_agent(&staged, dest)?;
+    } else if let Some(sibling) = sibling_mim_env().filter(|p| p.is_file()) {
+        stage_mim_env_agent(&sibling, dest)?;
     }
     let rust = runtime_rust_src(src);
     if !rust.is_dir() {
@@ -676,7 +717,7 @@ pub fn stage_runtime(src: &Path, dest: &Path) -> Result<()> {
             rust.display()
         )));
     }
-    copy_dir_excluding(&rust, &runtime_rust_src(dest), &["target"])?;
+    copy_dir_excluding(&rust, &runtime_rust_src(dest), &["target"], false)?;
     Ok(())
 }
 
@@ -731,7 +772,7 @@ mod tests {
         // A release whose envspec_version exceeds what this mim supports is refused
         // at manifest-parse (install) time with an actionable message.
         let j = r#"{"schema":1,"version":"9.9.9","rust_src":"x",
-          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":2,"lang_support_schema":"1.0"},
+          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":3,"lang_support_schema":"1.0"},
           "triples":{},"sha256":{}}"#;
         assert!(ReleaseManifest::from_json(j).is_err());
         // A newer lang-support MAJOR is likewise refused.

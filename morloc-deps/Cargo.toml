@@ -11,6 +11,9 @@ serde_yaml = "0.9"
 sha2 = { workspace = true }
 pem = "3"
 x509-parser = "0.16"
+# flock(2) advisory locking (the `fs` feature) to serialize concurrent solves
+# against one environment's shared pixi prefix.
+nix = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

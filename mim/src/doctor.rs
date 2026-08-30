@@ -407,8 +407,7 @@ fn runtime_store_version(runtime_dir: &Path) -> Option<String> {
 
 /// The last whitespace token of a `--version` line, parsed as a `Version`.
 fn parse_version_output(out: &[u8]) -> Option<Version> {
-    let s = String::from_utf8_lossy(out);
-    s.split_whitespace().last().and_then(|t| t.trim().parse::<Version>().ok())
+    Version::from_command_output(&String::from_utf8_lossy(out))
 }
 
 /// Activation completeness: the captured activation must export the compiler
