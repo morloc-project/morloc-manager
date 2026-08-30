@@ -617,6 +617,12 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
             "GIT_SSL_CAINFO={}",
             crate::cert::CONTAINER_CA_BUNDLE
         )));
+        // cargo reads none of the other CA vars; without CARGO_HTTP_CAINFO its
+        // crates.io fetch during the Rust runtime build can't trust the corp CA.
+        assert!(got.contains(&format!(
+            "CARGO_HTTP_CAINFO={}",
+            crate::cert::CONTAINER_CA_BUNDLE
+        )));
         // The CA must be trusted before the first network fetch (the pixi
         // installer), so the COPY and the trust ENV precede it.
         let copy_at = got.find("morloc-corp.crt").unwrap();
