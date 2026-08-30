@@ -222,8 +222,23 @@ fn curl_spawn_err(e: std::io::Error) -> ManagerError {
 
 /// Capture a URL's body to a string via curl (follows redirects; fails on HTTP
 /// error). Used to fetch the release manifest.
-fn curl_capture(url: &str) -> Result<String> {
+pub(crate) fn curl_capture(url: &str) -> Result<String> {
     let out = curl_base().arg(url).output().map_err(curl_spawn_err)?;
+    if !out.status.success() {
+        return Err(ManagerError::EnvError(format!("download failed: {url}")));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Like `curl_capture` but silences curl's own stderr. For probes where a 404
+/// is an expected, handled outcome (the caller reports it), so curl's raw error
+/// line does not precede the caller's message.
+pub(crate) fn curl_capture_quiet(url: &str) -> Result<String> {
+    let out = curl_base()
+        .arg(url)
+        .stderr(Stdio::null())
+        .output()
+        .map_err(curl_spawn_err)?;
     if !out.status.success() {
         return Err(ManagerError::EnvError(format!("download failed: {url}")));
     }
@@ -232,7 +247,7 @@ fn curl_capture(url: &str) -> Result<String> {
 
 /// The final URL after following redirects for `url` (an HTTP HEAD; the body is
 /// discarded). Used to resolve the `releases/latest` redirect to its tag page.
-fn curl_effective_url(url: &str) -> Result<String> {
+pub(crate) fn curl_effective_url(url: &str) -> Result<String> {
     let out = curl_base()
         .args(["-I", "-o", "/dev/null", "-w", "%{url_effective}"])
         .arg(url)
@@ -248,7 +263,7 @@ fn curl_effective_url(url: &str) -> Result<String> {
 
 /// Extract the release tag from a `.../releases/tag/<tag>` URL (the target of the
 /// `releases/latest` redirect).
-fn parse_tag_from_release_url(url: &str) -> Option<String> {
+pub(crate) fn parse_tag_from_release_url(url: &str) -> Option<String> {
     url.rsplit_once("/tag/")
         .map(|(_, tag)| tag.trim_end_matches('/').to_string())
         .filter(|t| !t.is_empty())
@@ -292,7 +307,7 @@ pub fn runtimes_dir(scope: Scope, version: &str) -> PathBuf {
 }
 
 /// Download a URL to a path via curl (follows redirects; fails on HTTP error).
-fn curl_download(url: &str, dest: &Path) -> Result<()> {
+pub(crate) fn curl_download(url: &str, dest: &Path) -> Result<()> {
     let status = curl_base()
         .arg("-o")
         .arg(dest)

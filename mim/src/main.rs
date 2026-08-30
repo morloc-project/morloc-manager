@@ -2,6 +2,7 @@ mod bridge;
 mod cert;
 mod config;
 mod container;
+mod demos;
 mod doctor;
 mod dockerfile;
 mod envagent;
@@ -70,6 +71,7 @@ fn build_help_template() -> String {
   {b}new{r}        Build a new morloc environment
   {b}run{r}        Run a command in an environment
   {b}shell{r}      Open an interactive shell in an environment
+  {b}demos{r}      Fetch curated example programs for a morloc version
   {b}ls{r}         List morloc environments
   {b}info{r}       Show configuration and installed environments
   {b}doctor{r}     Check environment health and diagnose issues
@@ -610,6 +612,31 @@ Sugar for: morloc-manager run -- morloc make --install <file>
         /// for this invocation only (repeatable; not persisted)
         #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true)]
         engine_arg: Vec<String>,
+    },
+    /// Fetch curated example programs (the morloc-dungeon) for a morloc version
+    #[command(display_order = 10)]
+    #[command(after_help = "\
+Examples:
+  morloc-manager demos                       # all demos for the active env's morloc (or latest)
+  morloc-manager demos --list                # list without downloading
+  morloc-manager demos --tag rust-examples   # only the rust-examples group
+  morloc-manager demos --morloc-version 0.98.2
+
+Demos are extracted into examples-<tag>-<version>/ in the current directory.")]
+    Demos {
+        /// List the demos and their tags without downloading anything
+        #[arg(long)]
+        list: bool,
+        /// Only demos carrying this tag (a single tag)
+        #[arg(long)]
+        tag: Option<String>,
+        /// morloc version to fetch demos for. Default: the active environment's
+        /// version, or the latest morloc release when not in an environment.
+        #[arg(long = "morloc-version")]
+        morloc_version: Option<String>,
+        /// Overwrite the output directory if it already exists
+        #[arg(long)]
+        force: bool,
     },
     /// Declare which installed modules are served, and how (edits state only;
     /// run `start` to realize it). Covers the network views (MCP, API) and the
@@ -3104,6 +3131,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 return doctor::native_doctor(verbose, &env_name, env_scope, &ec, deep, strict, json);
             }
             doctor::doctor(ec.engine()?, verbose, &env_name, env_scope, &ec, deep, strict, slurm, json)
+        }
+
+        // ---- demos (fetch curated examples) ----
+        Cmd::Demos { list, tag, morloc_version, force } => {
+            demos::run(list, tag, morloc_version, force)
         }
 
         // ---- in-environment dependency agent (hidden; run inside an env) ----
