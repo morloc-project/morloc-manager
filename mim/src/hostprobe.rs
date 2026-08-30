@@ -2,11 +2,13 @@
 //! viable on this machine, and report the conda platform string.
 //!
 //! The native backend runs pool processes directly on the host against a
-//! pixi/conda-provided toolchain. conda binaries bake the glibc dynamic loader
-//! at its conventional FHS path (`/lib64/ld-linux-x86-64.so.2` on x86_64), so a
-//! host can run them natively only if it is macOS, or a glibc + FHS Linux.
-//! NixOS (no standard FHS) and musl systems (Alpine) cannot, and route to a
-//! container (or, later, the Nix backend).
+//! pixi/conda-provided toolchain. On Linux, conda binaries bake the glibc
+//! dynamic loader at its conventional FHS path (`/lib64/ld-linux-x86-64.so.2`
+//! on x86_64), so a host can run them natively only if it is a glibc + FHS
+//! Linux; NixOS (no standard FHS) and musl systems (Alpine) cannot, and route
+//! to a container (or, later, the Nix backend). macOS on Apple Silicon runs
+//! them against the system dyld and is native-capable; Intel macOS routes to a
+//! container because no prebuilt compiler artifact is published for it.
 
 use std::path::Path;
 
@@ -36,12 +38,18 @@ fn glibc_loader_path(arch: &str) -> Option<&'static str> {
 fn classify(os: &str, arch: &str, glibc_loader_present: bool, is_nixos: bool) -> HostProfile {
     let platform = morloc_deps::platform::conda_platform_for(os, arch);
     match os {
-        // The native backend does not yet run on macOS (unresolved gaps in the
-        // IPC and process-supervision layers), so all Macs route to a container
-        // backend for now. Support is planned.
+        // macOS runs pool processes against a conda toolchain linked by the
+        // system dyld (always present), so there is no glibc-loader test as on
+        // Linux. Native support tracks published compiler artifacts: only
+        // Apple Silicon (arm64) has them, so Intel Macs route to a container.
+        "macos" if arch == "aarch64" => HostProfile {
+            native_capable: true,
+            reason: "macOS on Apple Silicon (native backend supported)".to_string(),
+            platform,
+        },
         "macos" => HostProfile {
             native_capable: false,
-            reason: "native backend not yet supported on macOS (coming soon); \
+            reason: "no prebuilt morloc runtime is published for Intel macOS; \
                      use a container backend"
                 .to_string(),
             platform,
@@ -94,13 +102,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn macos_is_not_native_capable_yet() {
-        // The native backend is not yet supported on macOS; the platform string
-        // is still reported so container builds target the right conda platform.
+    fn apple_silicon_is_native_capable() {
+        // Apple Silicon has a published compiler artifact and runs pools against
+        // the system dyld, so no glibc-loader test applies (pass false here).
         let arm = classify("macos", "aarch64", false, false);
-        assert!(!arm.native_capable);
+        assert!(arm.native_capable);
         assert_eq!(arm.platform, "osx-arm64");
+    }
 
+    #[test]
+    fn intel_macos_is_not_native_capable() {
+        // No prebuilt compiler artifact is published for Intel macOS, so it
+        // routes to a container; the platform string is still reported so the
+        // container build targets the right conda platform.
         let intel = classify("macos", "x86_64", false, false);
         assert!(!intel.native_capable);
         assert_eq!(intel.platform, "osx-64");

@@ -1374,8 +1374,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         Some(Backend::Container(_)) => false,
                         // A configured Native default (or no config) still requires
                         // the host to be native-capable NOW: a stale `native` config
-                        // written before a host lost native support (e.g. macOS) must
-                        // not silently create a native env; fall through to container.
+                        // carried onto a host without native support (e.g. NixOS or a
+                        // musl distro) must not silently create a native env; fall
+                        // through to container.
                         _ => hostprobe::probe_host().native_capable,
                     },
                 };
