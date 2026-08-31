@@ -90,11 +90,25 @@ pkgs.buildFHSEnv {{
     gzip
   ]);
   runScript = "bash";
+  # ncurses tools (clear/tput/reset) read a terminfo database. Two dirs are put
+  # on the search path: the sandbox's own ncurses terminfo (linked under /usr,
+  # the standard entries), and the host's system terminfo. The host dir matters
+  # because per-terminal entries ship OUTSIDE ncurses -- e.g. `xterm-kitty` comes
+  # from the kitty package -- so the user's actual $TERM is often absent from the
+  # ncurses set. It is bound below (the store paths it points at are already
+  # visible via /nix/store; only the /run/current-system path needed binding).
+  # Sourced on every `morloc-fhs -c` entry, so shell, run, and serve agree.
+  profile = ''
+    export TERMINFO_DIRS=/run/current-system/sw/share/terminfo:/usr/share/terminfo
+  '';
   # Share the host /dev/shm so morloc's name-based shared-memory volumes have the
   # host's (large) tmpfs rather than a small sandbox default. buildFHSEnv leaves
-  # pid + net shared, so host PIDs / process groups and loopback ports work.
+  # pid + net shared, so host PIDs / process groups and loopback ports work. The
+  # ro-bind-try makes the host terminfo (see profile) reachable inside the mount
+  # namespace; --ro-bind-try is a no-op if the path is absent.
   extraBwrapArgs = [
     "--bind" "/dev/shm" "/dev/shm"
+    "--ro-bind-try" "/run/current-system/sw/share/terminfo" "/run/current-system/sw/share/terminfo"
   ];
 }}
 "#,
