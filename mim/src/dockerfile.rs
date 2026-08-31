@@ -231,9 +231,20 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
         // assignment). Replacing ghcup's `stack` in place (rather than shadowing via
         // PATH) is robust: the run-time PATH is set by serve::container_path, which
         // orders /usr/local/bin AFTER the ghcup dir.
+        //
+        // Prepend /usr/bin so binutils tools Cabal discovers by PATH search rather
+        // than env var (strip, ranlib) resolve to the native /usr/bin copies, not
+        // the pixi env's. CC/CXX/AR/LD as env vars do NOT cover these: Cabal's
+        // stripProgram/ranlibProgram are `simpleProgram` lookups with no env-var
+        // channel, and container PATH puts the pixi bin first (serve::container_path
+        // + the ENTRYPOINT's pixi shell-hook). Worse, Cabal freezes the resolved
+        // path into setup-config at configure time, so a conda `strip` cached there
+        // detonates as `posix_spawnp: does not exist` at the later `copy` step once
+        // the mutable pixi env re-solves and that exact binary moves/vanishes.
+        // Prepending /usr/bin makes configure cache the stable native path instead.
         out.push_str(&format!("  && mv {ghcup_bin}/stack {ghcup_bin}/stack.real \\\n"));
         out.push_str(&format!(
-            "  && printf '#!/bin/sh\\nexec env -u LD_LIBRARY_PATH -u LIBRARY_PATH -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u PKG_CONFIG_PATH -u CMAKE_PREFIX_PATH -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS -u CONDA_BUILD_SYSROOT CC=/usr/bin/gcc CXX=/usr/bin/g++ AR=/usr/bin/ar LD=/usr/bin/ld {ghcup_bin}/stack.real \"$@\"\\n' > {ghcup_bin}/stack \\\n"
+            "  && printf '#!/bin/sh\\nexec env -u LD_LIBRARY_PATH -u LIBRARY_PATH -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u PKG_CONFIG_PATH -u CMAKE_PREFIX_PATH -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS -u CONDA_BUILD_SYSROOT PATH=/usr/bin:/bin:$PATH CC=/usr/bin/gcc CXX=/usr/bin/g++ AR=/usr/bin/ar LD=/usr/bin/ld {ghcup_bin}/stack.real \"$@\"\\n' > {ghcup_bin}/stack \\\n"
         ));
         out.push_str(&format!("  && chmod +x {ghcup_bin}/stack\n"));
         out.push_str(&format!("ENV PATH=\"{ghcup_bin}:${{PATH}}\"\n"));
@@ -498,6 +509,9 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         assert!(got.contains(&format!("mv {ghcup_bin}/stack {ghcup_bin}/stack.real")));
         assert!(got.contains("CC=/usr/bin/gcc"));
         assert!(got.contains("-u CONDA_BUILD_SYSROOT"));
+        // /usr/bin is prepended so Cabal's PATH-discovered binutils tools (strip,
+        // ranlib) resolve to the native copies rather than the mutable pixi env's.
+        assert!(got.contains("PATH=/usr/bin:/bin:$PATH"));
         assert!(got.contains(&format!("{ghcup_bin}/stack.real \"$@\"")));
 
         // A release (non-dev) image ships a prebuilt compiler, so it gets neither
