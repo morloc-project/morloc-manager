@@ -176,6 +176,17 @@ pub fn asset_url(tag: &str, asset: &str) -> String {
     format!("{RELEASE_BASE}/{tag}/{asset}")
 }
 
+/// Fetch the stdlib module-pin snapshot published alongside a morloc release
+/// (asset `stdlib-snapshot.txt` under the `v<version>` tag). This is the default
+/// "latest stdlib for your morloc" that mim deposits into a new environment.
+/// Best-effort: returns None on any failure (a release without the asset,
+/// offline, network error) so provisioning proceeds with no default snapshot
+/// rather than failing.
+pub fn fetch_stdlib_snapshot(version: &str) -> Option<String> {
+    let url = asset_url(&format!("v{version}"), "stdlib-snapshot.txt");
+    curl_capture_quiet(&url).ok()
+}
+
 /// The public release page for `tag` (HTTP 200 if the release exists, 404
 /// otherwise). Used as an asset-independent existence check and in diagnostics.
 pub fn release_page_url(tag: &str) -> String {

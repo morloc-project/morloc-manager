@@ -175,6 +175,15 @@ or `latest`). With no flags on a TTY, all settings are prompted interactively.")
         /// A file of conda match-specs added to the pixi solve, one per line.
         #[arg(long = "conda-packages-file")]
         conda_packages_file: Option<String>,
+        /// A morloc-module pin file (`name hash` per line) deposited into the
+        /// environment. The compiler resolves imports against it on demand;
+        /// modules are NOT installed here. Repeatable.
+        #[arg(long = "modules-file")]
+        modules_file: Vec<String>,
+        /// Do not fetch/deposit the default stdlib snapshot for this environment.
+        /// Use with `--modules-file` to supply your own base library instead.
+        #[arg(long = "no-default-modules")]
+        no_default_modules: bool,
         /// Directory of dotfiles to copy into the environment's home
         /// (.bashrc, .vimrc, .config/...). Docker/podman only.
         #[arg(long)]
@@ -419,6 +428,11 @@ Examples:
         /// `jq` or `hyperfine>=1.18`. Any backend. Triggers a rebuild.
         #[arg(long = "conda-packages-file")]
         conda_packages_file: Option<String>,
+        /// Deposit a morloc-module pin file (`name hash` per line) into the
+        /// environment. The compiler resolves imports against it on demand; no
+        /// rebuild, no install. Repeatable.
+        #[arg(long = "modules-file")]
+        modules_file: Vec<String>,
         /// Directory of dotfiles to copy into the environment's home
         /// (.bashrc, .vimrc, .config/...). Overwrites like `cp -rf`;
         /// docker/podman only. No rebuild.
@@ -1294,6 +1308,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             local_runtime,
             system_packages_file,
             conda_packages_file,
+            modules_file,
+            no_default_modules,
             dotfiles,
             cert_bundle,
             base,
@@ -1316,6 +1332,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 system_packages_file.as_deref().map(read_package_file).transpose()?.unwrap_or_default();
             let conda_package =
                 conda_packages_file.as_deref().map(read_package_file).transpose()?.unwrap_or_default();
+            // Module-pin snapshots are deposited (not solved); read them up front
+            // too so a bad path aborts before provisioning. The default stdlib
+            // snapshot (unless --no-default-modules) is fetched later, once the
+            // concrete morloc version is known.
+            let snapshots = SnapshotPlan {
+                no_default: no_default_modules,
+                user_files: read_snapshot_files(&modules_file)?,
+            };
             let interactive = !non_interactive && io::stdin().is_terminal();
             if !non_interactive && !interactive {
                 eprintln!("Note: No TTY detected, running in non-interactive mode.");
@@ -1353,7 +1377,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         plan.scope, eng, Some(plan.name), src, plan.lang, plan.system_packages,
                         plan.conda_packages, plan.dotfiles, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
-                        plan.requested_version, no_init, plan.make_default,
+                        plan.requested_version, no_init, plan.make_default, &snapshots,
                     );
                 }
                 return match plan.backend {
@@ -1364,13 +1388,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         native_new(
                             plan.scope, Some(plan.name), plan.lang, plan.conda_packages,
                             plan.requested_version, None, plan.cert_bundle, no_init, plan.make_default, verbose,
+                            &snapshots,
                         )
                     }
                     Backend::Container(eng) => container_new_derived(
                         plan.scope, eng, Some(plan.name), plan.lang, plan.system_packages,
                         plan.conda_packages, plan.dotfiles, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
-                        plan.requested_version, None, no_init, plan.make_default,
+                        plan.requested_version, None, no_init, plan.make_default, &snapshots,
                     ),
                 };
             }
@@ -1445,7 +1470,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if base.is_some() {
                     return Err(base_not_supported());
                 }
-                return native_new(scope, name, lang, conda_package, morloc_version, local_runtime, cert_bundle, no_init, set_default, verbose);
+                return native_new(scope, name, lang, conda_package, morloc_version, local_runtime, cert_bundle, no_init, set_default, verbose, &snapshots);
             }
 
             // Resolve engine: explicit flag > config default > auto-detect single > error
@@ -1511,7 +1536,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 return container_new_dev(
                     scope, resolved_engine, name, src, lang, system_package, conda_package,
                     dotfiles, cert_bundle, base_image, morloc_version, no_init,
-                    set_default,
+                    set_default, &snapshots,
                 );
             }
 
@@ -1521,6 +1546,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             container_new_derived(
                 scope, resolved_engine, name, lang, system_package, conda_package, dotfiles,
                 cert_bundle, base_image, morloc_version, local_runtime, no_init, set_default,
+                &snapshots,
             )
         }
 
@@ -2301,6 +2327,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             lang,
             system_packages_file,
             conda_packages_file,
+            modules_file,
             dotfiles,
             cert_bundle,
             base,
@@ -2321,17 +2348,20 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 system_packages_file.as_deref().map(read_package_file).transpose()?;
             let conda_from_file =
                 conda_packages_file.as_deref().map(read_package_file).transpose()?;
+            // Module-pin snapshots are deposited (not solved / not a rebuild);
+            // read them up front so a bad path aborts before any side effect.
+            let module_snapshots = read_snapshot_files(&modules_file)?;
             // apt is container-only; conda works on every backend, so the native
             // rejection below keys on apt alone.
             let touches_apt = system_from_file.is_some();
             let touches_packages = touches_apt || conda_from_file.is_some();
             let will_rebuild =
                 !lang.is_empty() || touches_packages || cert_bundle.is_some() || base.is_some();
-            if !set_default && !will_rebuild && dotfiles.is_none() {
+            if !set_default && !will_rebuild && dotfiles.is_none() && module_snapshots.is_empty() {
                 return Err(ManagerError::EnvError(
                     "nothing to modify: pass --set-default, --dotfiles, --lang, \
-                     --cert-bundle, --base, --system-packages-file, or \
-                     --conda-packages-file".to_string(),
+                     --cert-bundle, --base, --system-packages-file, \
+                     --conda-packages-file, or --modules-file".to_string(),
                 ));
             }
 
@@ -2401,6 +2431,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let data_dir = cfg::env_data_dir(env_scope, &env_name);
                 apply_dotfiles(ec.backend.container_engine(), &data_dir, src)?;
                 eprintln!("Copied dotfiles into '{env_name}'.");
+            }
+
+            // 2b. module-pin snapshots: deposit for on-demand resolution; no
+            //     rebuild, no install (the compiler pulls modules at build time).
+            if !module_snapshots.is_empty() {
+                let data_dir = cfg::env_data_dir(env_scope, &env_name);
+                deposit_snapshot_files(&data_dir, &module_snapshots)?;
+                eprintln!(
+                    "Deposited {} module snapshot file(s) into '{env_name}'.",
+                    module_snapshots.len()
+                );
             }
 
             // 3. Build-affecting changes (system packages, language pins) + rebuild.
@@ -4213,6 +4254,164 @@ fn read_package_file(path: &str) -> Result<Vec<String>> {
     Ok(parse_package_lines(&text))
 }
 
+/// Read `--modules-file` sources into (basename, verbatim content) pairs, up
+/// front, so a bad path aborts before any provisioning. The content is passed
+/// through unparsed -- the compiler validates snapshot lines when it loads them.
+fn read_snapshot_files(paths: &[String]) -> Result<Vec<(String, String)>> {
+    paths
+        .iter()
+        .map(|p| {
+            let content = std::fs::read_to_string(expand_tilde(p)).map_err(|e| {
+                ManagerError::EnvError(format!("cannot read modules file '{p}': {e}"))
+            })?;
+            let basename = std::path::Path::new(p)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "snapshot.txt".to_string());
+            Ok((basename, content))
+        })
+        .collect()
+}
+
+/// Deposit module-pin snapshot files into the env's `snapshots/` directory (the
+/// path the compiler reads on demand: `$MORLOC_STATE/snapshots/`). Each write is
+/// atomic (temp + rename) so a reader never sees a partial file. mim NEVER
+/// installs the modules; the compiler pulls them lazily at build time.
+/// Parse `name hash` lines from a snapshot file (ignoring `#` comments and
+/// blanks), mirroring the compiler's parseSnapshotLine, for deposit-time
+/// validation only.
+fn parse_snapshot_pins(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let body = line.split('#').next().unwrap_or("");
+            let mut it = body.split_whitespace();
+            match (it.next(), it.next()) {
+                (Some(name), Some(hash)) => Some((name.to_string(), hash.to_string())),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Reject a snapshot deposit that would silently lose pins or poison the env:
+/// (1) two files in this deposit sharing a basename (the second clobbers the
+/// first on disk), and (2) a module pinned to two different hashes across the
+/// deposit and the env's existing snapshot files -- which the compiler's
+/// loadSnapshot would otherwise turn into a hard error on every later build.
+fn validate_snapshot_set(env_dir: &std::path::Path, files: &[(String, String)]) -> Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut basenames = BTreeSet::new();
+    for (basename, _) in files {
+        if !basenames.insert(basename.as_str()) {
+            return Err(ManagerError::EnvError(format!(
+                "two --modules-file arguments share the basename '{basename}'; the second \
+                 would silently overwrite the first in the environment -- rename one."
+            )));
+        }
+    }
+    // Effective set = this deposit + existing snapshot files it does not replace.
+    let mut effective: Vec<(String, String)> = files.to_vec();
+    let dir = env_dir.join("snapshots");
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || basenames.contains(name.as_str()) {
+                continue; // skip dotfiles and files this deposit overwrites
+            }
+            if let Ok(content) = std::fs::read_to_string(e.path()) {
+                effective.push((name, content));
+            }
+        }
+    }
+    let mut pins: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for (file, content) in &effective {
+        for (module, hash) in parse_snapshot_pins(content) {
+            match pins.get(&module) {
+                Some((prev_hash, prev_file)) if prev_hash != &hash => {
+                    return Err(ManagerError::EnvError(format!(
+                        "conflicting pins for module '{module}': {prev_hash} (in {prev_file}) vs \
+                         {hash} (in {file}); one environment holds one hash per module."
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    pins.insert(module, (hash, file.clone()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn deposit_snapshot_files(env_dir: &std::path::Path, files: &[(String, String)]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    validate_snapshot_set(env_dir, files)?;
+    let dir = env_dir.join("snapshots");
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        ManagerError::EnvError(format!("cannot create {}: {e}", dir.display()))
+    })?;
+    for (basename, content) in files {
+        let dest = dir.join(basename);
+        let tmp = dir.join(format!(".{basename}.tmp"));
+        std::fs::write(&tmp, content)
+            .and_then(|_| std::fs::rename(&tmp, &dest))
+            .map_err(|e| {
+                ManagerError::EnvError(format!(
+                    "cannot deposit snapshot '{}': {e}",
+                    dest.display()
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+/// A new environment's module-pin snapshots: the default stdlib snapshot (fetched
+/// per morloc version) plus any user `--modules-file` files.
+struct SnapshotPlan {
+    /// `--no-default-modules`: skip fetching/depositing the default stdlib snapshot.
+    no_default: bool,
+    /// `--modules-file` sources, read to (basename, verbatim content).
+    user_files: Vec<(String, String)>,
+}
+
+/// Deposit an environment's module-pin snapshots. The default stdlib snapshot for
+/// `morloc_version` is deposited FIRST (as `stdlib.txt`), then the user's
+/// `--modules-file` files -- so a same-named user file deterministically wins
+/// (an intentional in-place override) rather than depending on directory order.
+/// Fetching the default is best-effort: a missing release asset degrades to "no
+/// default", never a provisioning failure. The compiler treats every file the
+/// same and errors only on a genuine cross-file hash conflict.
+fn deposit_env_snapshots(
+    env_dir: &std::path::Path,
+    morloc_version: Option<&str>,
+    plan: &SnapshotPlan,
+) -> Result<()> {
+    let mut files: Vec<(String, String)> = Vec::new();
+    // A user-supplied `stdlib.txt` replaces the default outright (rather than
+    // colliding by filename); otherwise fetch the release default and warn -- not
+    // silently skip -- if it is unavailable, since the env then loses its pins.
+    let user_overrides_default = plan.user_files.iter().any(|(b, _)| b == "stdlib.txt");
+    if !plan.no_default && !user_overrides_default {
+        if let Some(version) = morloc_version {
+            match provision::fetch_stdlib_snapshot(version) {
+                Some(content) => files.push(("stdlib.txt".to_string(), content)),
+                None => eprintln!(
+                    "warning: could not fetch the default stdlib snapshot for morloc {version} \
+                     (offline, or this release has no stdlib-snapshot.txt asset); stdlib modules \
+                     in this environment will resolve to latest rather than a pinned set. \
+                     Deposit one explicitly with --modules-file, or use --no-default-modules to \
+                     silence this."
+                ),
+            }
+        }
+    }
+    files.extend_from_slice(&plan.user_files);
+    deposit_snapshot_files(env_dir, &files)
+}
+
 /// The terminal width for wrapping echoed lists: `$COLUMNS` when a shell exports
 /// it, else 80. Kept dependency-free (no terminal-size crate).
 fn term_width() -> usize {
@@ -5281,6 +5480,7 @@ fn native_new(
     no_init: bool,
     make_default: bool,
     verbose: bool,
+    snapshots: &SnapshotPlan,
 ) -> Result<()> {
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
 
@@ -5301,6 +5501,12 @@ fn native_new(
             .parse::<Version>()
             .ok()
     };
+
+    // Deposit the default stdlib snapshot (for the just-provisioned version) plus
+    // any --modules-file snapshots for on-demand resolution. Never installs
+    // modules; the compiler pulls them at build time.
+    let version_str = morloc_version.as_ref().map(ToString::to_string);
+    deposit_env_snapshots(&cfg::env_data_dir(scope, &env_name), version_str.as_deref(), snapshots)?;
 
     let mut ec = EnvironmentConfig::new_backend(
         env_name,
@@ -6386,6 +6592,7 @@ fn container_new_derived(
     local_runtime: Option<std::path::PathBuf>,
     no_init: bool,
     make_default: bool,
+    snapshots: &SnapshotPlan,
 ) -> Result<()> {
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
 
@@ -6416,6 +6623,12 @@ fn container_new_derived(
         )?;
         (Some(image), version.parse::<Version>().ok())
     };
+
+    // Deposit the default stdlib snapshot plus any --modules-file snapshots into
+    // the env home (mounted into the container at $MORLOC_STATE) for on-demand
+    // resolution; never installs modules.
+    let version_str = morloc_version.as_ref().map(ToString::to_string);
+    deposit_env_snapshots(&cfg::env_data_dir(scope, &env_name), version_str.as_deref(), snapshots)?;
 
     let mut ec = EnvironmentConfig::new_backend(
         env_name,
@@ -6466,6 +6679,7 @@ fn container_new_dev(
     requested_version: Option<String>,
     no_init: bool,
     make_default: bool,
+    snapshots: &SnapshotPlan,
 ) -> Result<()> {
     // A dev env's tooling (the container image + baked toolchain + pixi env) is
     // provisioned only for docker/podman; the deepest funnel for the OCI-only
@@ -6501,6 +6715,12 @@ fn container_new_dev(
         )?;
         (Some(image_tag), stdlib.parse::<Version>().ok())
     };
+
+    // Deposit the default stdlib snapshot plus any --modules-file snapshots into
+    // the env home (mounted into the container at $MORLOC_STATE); never installs.
+    let version_str = morloc_version.as_ref().map(ToString::to_string);
+    deposit_env_snapshots(&data_dir, version_str.as_deref(), snapshots)?;
+
     let dev = DevConfig { source };
 
     let mut ec = EnvironmentConfig::new_backend(
@@ -7934,12 +8154,124 @@ mod tests {
             lang: Vec::new(),
             system_packages_file: None,
             conda_packages_file: None,
+            modules_file: Vec::new(),
             dotfiles,
             cert_bundle: None,
             base: None,
             set_default,
             system,
         }
+    }
+
+    #[test]
+    fn read_snapshot_files_uses_basename_and_verbatim_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("my-snap.txt");
+        std::fs::write(&p, "root-py abc\n# comment\nmath-py def\n").unwrap();
+        let got = read_snapshot_files(&[p.to_string_lossy().into_owned()]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "my-snap.txt");
+        // content is passed through unparsed; the compiler validates it
+        assert_eq!(got[0].1, "root-py abc\n# comment\nmath-py def\n");
+    }
+
+    #[test]
+    fn read_snapshot_files_missing_path_errors() {
+        let err = read_snapshot_files(&["/no/such/snapshot/file.txt".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("cannot read modules file"), "got: {err}");
+    }
+
+    #[test]
+    fn deposit_snapshot_writes_named_files_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![
+            ("stdlib.txt".to_string(), "root-py abc123\n".to_string()),
+            ("extra.txt".to_string(), "weena/foo def456\n".to_string()),
+        ];
+        deposit_snapshot_files(dir.path(), &files).unwrap();
+        let snap = dir.path().join("snapshots");
+        assert_eq!(std::fs::read_to_string(snap.join("stdlib.txt")).unwrap(), "root-py abc123\n");
+        assert_eq!(std::fs::read_to_string(snap.join("extra.txt")).unwrap(), "weena/foo def456\n");
+        // atomic writes leave no `.tmp` files behind
+        let leftover_tmp = std::fs::read_dir(&snap)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp, "temporary files should be renamed away");
+    }
+
+    #[test]
+    fn deposit_snapshot_empty_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        deposit_snapshot_files(dir.path(), &[]).unwrap();
+        assert!(!dir.path().join("snapshots").exists());
+    }
+
+    #[test]
+    fn deposit_env_snapshots_no_default_deposits_only_user_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = SnapshotPlan {
+            no_default: true,
+            user_files: vec![("biocore.txt".to_string(), "x 111\n".to_string())],
+        };
+        // no_default: the default is never fetched, so this needs no network.
+        deposit_env_snapshots(dir.path(), Some("0.0.0"), &plan).unwrap();
+        let snap = dir.path().join("snapshots");
+        assert_eq!(std::fs::read_to_string(snap.join("biocore.txt")).unwrap(), "x 111\n");
+        assert!(!snap.join("stdlib.txt").exists());
+    }
+
+    #[test]
+    fn parse_snapshot_pins_strips_comments_and_blanks() {
+        let pins = parse_snapshot_pins("# header\nroot-py abc  # trailing\n\nmath def\nlonely\n");
+        assert_eq!(
+            pins,
+            vec![
+                ("root-py".to_string(), "abc".to_string()),
+                ("math".to_string(), "def".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_snapshot_set_rejects_duplicate_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![
+            ("snapshot.txt".to_string(), "root a\n".to_string()),
+            ("snapshot.txt".to_string(), "root a\n".to_string()),
+        ];
+        let err = validate_snapshot_set(dir.path(), &files).unwrap_err();
+        assert!(err.to_string().contains("share the basename"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_snapshot_set_rejects_conflicting_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![
+            ("a.txt".to_string(), "root H1\n".to_string()),
+            ("b.txt".to_string(), "root H2\n".to_string()),
+        ];
+        let err = validate_snapshot_set(dir.path(), &files).unwrap_err();
+        assert!(err.to_string().contains("conflicting pins for module 'root'"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_snapshot_set_allows_same_hash_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![
+            ("a.txt".to_string(), "root H1\nmath M1\n".to_string()),
+            ("b.txt".to_string(), "root H1\ntensor T1\n".to_string()),
+        ];
+        assert!(validate_snapshot_set(dir.path(), &files).is_ok());
+    }
+
+    #[test]
+    fn deposit_env_snapshots_none_version_skips_default() {
+        let dir = tempfile::tempdir().unwrap();
+        // No version => the default fetch is skipped (no network), no user files.
+        let plan = SnapshotPlan { no_default: false, user_files: vec![] };
+        deposit_env_snapshots(dir.path(), None, &plan).unwrap();
+        assert!(!dir.path().join("snapshots").exists());
     }
 
     #[test]
