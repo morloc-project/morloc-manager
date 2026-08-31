@@ -267,8 +267,24 @@ fn aggregate(
         match support.languages.get(lang) {
             Some(entry) => {
                 if let Some(rt) = &entry.runtime {
-                    // clamp: morloc's supported range intersected with the author's
-                    insert_merged_conda(&mut conda, &rt.package, &merge_constraint(&rt.version, author_c), None)?;
+                    // clamp: morloc's supported range intersected with the merged
+                    // author/abi-lock constraint. `resolve_lang_version` returns the
+                    // canonical spec, or a legible conflict error -- so a
+                    // contradiction (e.g. an abi-lock pin outside morloc's supported
+                    // window, `>=3.10,<3.14` AND `>=3.14,<3.15`) surfaces here rather
+                    // than reaching pixi as a cryptic "no candidates" error.
+                    let clamped = crate::constraint::resolve_lang_version(
+                        lang.as_str(),
+                        support.morloc_version.as_str(),
+                        Some(author_c.as_str()),
+                        None,
+                        rt.version.as_str(),
+                        "This usually means the interpreter is pinned (to protect \
+                         already-built language bindings) to a version morloc no longer \
+                         supports. Re-provision to move the interpreter and rebuild the \
+                         bindings: `mim update --env <env>`.",
+                    )?;
+                    insert_merged_conda(&mut conda, &rt.package, &clamped, None)?;
                 }
                 for p in &entry.requires {
                     if !p.optional {
@@ -1098,8 +1114,8 @@ platforms = [\"linux-64\"]
         const PY: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py","constraint":">=3.11"}]}"#;
         let spec = EnvSpec::from_json(PY).unwrap();
         let (conda, _) = aggregate(std::slice::from_ref(&spec), &sample_support()).unwrap();
-        // clamp: author >=3.11 intersected with morloc's >=3.10,<3.14
-        assert_eq!(conda.get("python").map(|(c, _)| c.as_str()), Some(">=3.10,<3.14,>=3.11"));
+        // clamp: author >=3.11 intersected with morloc's >=3.10,<3.14, canonicalized
+        assert_eq!(conda.get("python").map(|(c, _)| c.as_str()), Some(">=3.11,<3.14"));
         // injected non-optional binder deps
         assert_eq!(conda.get("numpy").map(|(c, _)| c.as_str()), Some(">=1.22,<3"));
         assert!(conda.contains_key("setuptools"));
@@ -1108,6 +1124,22 @@ platforms = [\"linux-64\"]
         // core toolchain is always present
         assert!(conda.contains_key("c-compiler"));
         assert!(conda.contains_key("rust"));
+    }
+
+    #[test]
+    fn contradictory_runtime_clamp_errors_legibly() {
+        // An abi-lock pin outside morloc's supported window (python pinned to 3.14
+        // while the table caps at <3.14) enters the solve as a second py language
+        // spec. Its intersection with the window is empty; aggregate must reject it
+        // with morloc's own message pointing at `mim update`, NOT hand pixi a
+        // contradictory `>=3.10,<3.14,>=3.14,<3.15` match-spec.
+        const PROG: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}]}"#;
+        const ABILOCK: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py","constraint":">=3.14,<3.15"}]}"#;
+        let specs = vec![EnvSpec::from_json(PROG).unwrap(), EnvSpec::from_json(ABILOCK).unwrap()];
+        let err = aggregate(&specs, &sample_support()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mim update"), "message should guide re-provisioning: {msg}");
+        assert!(msg.contains("py"), "message should name the language: {msg}");
     }
 
     #[test]

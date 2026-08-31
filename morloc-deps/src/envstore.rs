@@ -225,14 +225,22 @@ impl EnvContext {
     /// `gather_installed`), so a dependency that would bump an interpreter minor
     /// fails the solve legibly rather than silently breaking the shim ABI.
     ///
-    /// The manager calls this at provision time ONLY -- after the solve that
-    /// rebuilds the shims -- so a re-provision is free to move the interpreter;
-    /// the in-env agent's make-time solves are the ones the recorded pin gates (see
-    /// `append_abi_lock`). If the env has no ABI-relevant interpreter, any stale
-    /// lock is removed.
-    pub fn record_abi_lock(&self, morloc_version: &str) -> Result<()> {
+    /// Called after any solve that (re)built the shims: the manager's provision and
+    /// the in-env agent's make-time `sync`/`clean`. A re-provision is free to move
+    /// the interpreter; the recorded pin gates the agent's later make-time solves
+    /// (see `append_abi_lock`). If the env has no ABI-relevant interpreter, any
+    /// stale lock is removed.
+    ///
+    /// `morloc_version` is stamped into the recorded spec (the env's provisioned
+    /// version tag). `support` supplies morloc's supported interpreter windows: an
+    /// interpreter whose solved version falls outside its window (e.g. a python
+    /// pulled transitively by a non-py program, which conda resolves to a release
+    /// morloc bans) is NOT pinned -- pinning it would fold an unsatisfiable interval
+    /// into every later solve. See `abi::abi_lock_spec`.
+    pub fn record_abi_lock(&self, morloc_version: &str, support: &LangSupport) -> Result<()> {
         let prefix = crate::abi::conda_prefix(&self.pixi_dir());
-        match crate::abi::abi_lock_spec(&prefix, morloc_version) {
+        let windows = support.runtime_windows();
+        match crate::abi::abi_lock_spec(&prefix, morloc_version, &windows) {
             Some(spec) => {
                 let json = serde_json::to_string(&spec)
                     .map_err(|e| DepsError::Env(format!("cannot serialize abi lock: {e}")))?;
@@ -415,7 +423,7 @@ impl EnvContext {
                     // part of the same sync: whichever caller adds a language on
                     // demand -- the in-env agent or the manager's provision --
                     // pins the interpreter the moment it is provisioned.
-                    self.record_abi_lock(inputs.lang_support.morloc_version.as_str())?;
+                    self.record_abi_lock(inputs.lang_support.morloc_version.as_str(), inputs.lang_support)?;
                 }
                 // The agent decides whether to build shims from actual SHIM state
                 // (a per-language `morloc init` marker), NOT from a before/after
@@ -484,7 +492,7 @@ impl EnvContext {
         }
         let outcome = self.solve_world(&specs, inputs)?;
         let dropped = if outcome.solved {
-            self.record_abi_lock(inputs.lang_support.morloc_version.as_str())?;
+            self.record_abi_lock(inputs.lang_support.morloc_version.as_str(), inputs.lang_support)?;
             let after = self.runtime_language_set(inputs.platform)?;
             before.into_iter().filter(|l| !after.contains(l)).collect()
         } else {
@@ -695,6 +703,16 @@ mod tests {
         assert_eq!(ctx.program_names().unwrap(), vec!["prog".to_string()]);
     }
 
+    /// A minimal support table whose python runtime window is morloc's real one
+    /// (`>=3.10,<3.14`), so the abi-lock recorder's window filter is exercised.
+    fn support() -> LangSupport {
+        LangSupport::from_json(
+            r#"{"schema_version":"1.0","morloc_version":"0.99.0","languages":{
+                "py":{"runtime":{"package":"python","version":">=3.10,<3.14","default":"3.12"}}}}"#,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn record_abi_lock_pins_solved_interpreter_and_clears_when_absent() {
         let (_d, ctx) = ctx();
@@ -703,7 +721,7 @@ mod tests {
         std::fs::create_dir_all(&meta).unwrap();
         std::fs::write(meta.join("python-3.12.5-0.json"), r#"{"name":"python","version":"3.12.5"}"#).unwrap();
 
-        ctx.record_abi_lock("0.99.0").unwrap();
+        ctx.record_abi_lock("0.99.0", &support()).unwrap();
         let mut solve_set = Vec::new();
         ctx.append_abi_lock(&mut solve_set).unwrap();
         assert_eq!(solve_set.len(), 1);
@@ -713,10 +731,27 @@ mod tests {
         // No interpreter in the prefix -> a subsequent record clears the stale lock.
         std::fs::remove_dir_all(&meta).unwrap();
         std::fs::create_dir_all(&meta).unwrap();
-        ctx.record_abi_lock("0.99.0").unwrap();
+        ctx.record_abi_lock("0.99.0", &support()).unwrap();
         let mut after = Vec::new();
         ctx.append_abi_lock(&mut after).unwrap();
         assert!(after.is_empty());
+    }
+
+    #[test]
+    fn record_abi_lock_skips_python_outside_supported_window() {
+        // A python 3.14 in the prefix (transitively pulled, banned by the window)
+        // must NOT be recorded -- otherwise every later solve folds in an
+        // unsatisfiable `>=3.10,<3.14` AND `>=3.14,<3.15` and pixi fails cryptically.
+        let (_d, ctx) = ctx();
+        let prefix = crate::abi::conda_prefix(&ctx.pixi_dir());
+        let meta = prefix.join("conda-meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(meta.join("python-3.14.0-0.json"), r#"{"name":"python","version":"3.14.0"}"#).unwrap();
+
+        ctx.record_abi_lock("0.99.0", &support()).unwrap();
+        let mut solve_set = Vec::new();
+        ctx.append_abi_lock(&mut solve_set).unwrap();
+        assert!(solve_set.is_empty(), "an out-of-window interpreter must not be pinned");
     }
 
     #[test]

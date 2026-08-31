@@ -85,12 +85,37 @@ fn minor_pin(version: &str) -> Option<String> {
 /// interpreter to its solved minor -- from a solved conda prefix. Returns None
 /// when no ABI-relevant interpreter is present (e.g. a C++/Rust-only env), so the
 /// caller can clear rather than write a spurious lock.
-pub fn abi_lock_spec(conda_prefix: &Path, morloc_version: &str) -> Option<EnvSpec> {
+///
+/// `windows` gives morloc's supported version range per language (short code ->
+/// conda match-spec). An interpreter whose solved version falls OUTSIDE its window
+/// is NOT pinned: such a version is never a valid ABI target for this morloc (a
+/// shim build always clamps to the window), so it can only have arrived by being
+/// pulled transitively by an unrelated package -- conda then picks the latest
+/// release, which may be a version morloc bans (e.g. python 3.14 broke the CPython
+/// C-API pymorloc.c uses). Pinning it would fold an unsatisfiable interval into
+/// every later solve (`>=3.10,<3.14` AND `>=3.14,<3.15`); skipping it lets the
+/// solve proceed and lets a re-provision clear the spurious lock.
+pub fn abi_lock_spec(
+    conda_prefix: &Path,
+    morloc_version: &str,
+    windows: &BTreeMap<String, String>,
+) -> Option<EnvSpec> {
     let versions = abi_versions(conda_prefix);
     let langs: Vec<LangReq> = ABI_PACKAGES
         .iter()
         .filter_map(|(pkg, lang)| {
-            let pin = minor_pin(versions.get(*pkg)?)?;
+            let version = versions.get(*pkg)?;
+            // Only pin an interpreter this morloc actually supports; an
+            // out-of-window version is a transitive pull, not a shim target.
+            if let Some(window) = windows.get(*lang) {
+                if !crate::constraint::VersionRange::parse(window)
+                    .map(|r| r.satisfies(version))
+                    .unwrap_or(true)
+                {
+                    return None;
+                }
+            }
+            let pin = minor_pin(version)?;
             Some(LangReq { lang: lang.to_string(), constraint: Some(pin), std: None })
         })
         .collect();
@@ -127,6 +152,15 @@ mod tests {
         .unwrap();
     }
 
+    /// morloc's supported windows for the ABI interpreters (mirrors the real
+    /// `requirements.yaml`: python capped below 3.14, r-base open above 4.0).
+    fn windows() -> BTreeMap<String, String> {
+        [("py", ">=3.10,<3.14"), ("r", ">=4.0")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     #[test]
     fn abi_lock_pins_present_interpreters_only() {
         let tmp = tempfile::tempdir().unwrap();
@@ -136,7 +170,7 @@ mod tests {
         // A non-ABI package must not enter the lock.
         write_meta(prefix, "numpy", "2.1.0");
 
-        let spec = abi_lock_spec(prefix, "0.99.0").expect("some interpreter present");
+        let spec = abi_lock_spec(prefix, "0.99.0", &windows()).expect("some interpreter present");
         let mut pins: Vec<(String, String)> = spec
             .languages
             .iter()
@@ -153,12 +187,51 @@ mod tests {
     }
 
     #[test]
+    fn abi_lock_skips_interpreter_outside_supported_window() {
+        // A python pulled transitively (no py program, so no window clamp) resolves
+        // to the latest release, 3.14 -- outside morloc's `>=3.10,<3.14` window.
+        // Pinning it would poison every later solve, so it must be dropped; the
+        // in-window r-base beside it is still pinned.
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path();
+        write_meta(prefix, "python", "3.14.0");
+        write_meta(prefix, "r-base", "4.3.3");
+
+        let spec = abi_lock_spec(prefix, "0.99.0", &windows()).expect("r-base is in window");
+        let pins: Vec<(String, String)> = spec
+            .languages
+            .iter()
+            .map(|l| (l.lang.clone(), l.constraint.clone().unwrap()))
+            .collect();
+        assert_eq!(pins, vec![("r".to_string(), ">=4.3,<4.4".to_string())]);
+    }
+
+    #[test]
+    fn abi_lock_absent_when_every_interpreter_out_of_window() {
+        // Only an out-of-window python: nothing valid to pin -> no lock at all.
+        let tmp = tempfile::tempdir().unwrap();
+        write_meta(tmp.path(), "python", "3.14.0");
+        assert!(abi_lock_spec(tmp.path(), "0.99.0", &windows()).is_none());
+    }
+
+    #[test]
+    fn abi_lock_pins_when_no_window_known() {
+        // No window for the language (absent from the table) -> pin as before,
+        // rather than silently dropping an interpreter we cannot check.
+        let tmp = tempfile::tempdir().unwrap();
+        write_meta(tmp.path(), "python", "3.14.0");
+        let spec = abi_lock_spec(tmp.path(), "0.99.0", &BTreeMap::new())
+            .expect("pinned when unchecked");
+        assert_eq!(spec.languages[0].constraint.as_deref(), Some(">=3.14,<3.15"));
+    }
+
+    #[test]
     fn abi_lock_absent_when_no_interpreter() {
         let tmp = tempfile::tempdir().unwrap();
         // Only a non-interpreter package: nothing to protect.
         write_meta(tmp.path(), "libstdcxx-ng", "14.1.0");
-        assert!(abi_lock_spec(tmp.path(), "0.99.0").is_none());
+        assert!(abi_lock_spec(tmp.path(), "0.99.0", &windows()).is_none());
         // A missing prefix is also just "no lock", never a panic.
-        assert!(abi_lock_spec(&tmp.path().join("nope"), "0.99.0").is_none());
+        assert!(abi_lock_spec(&tmp.path().join("nope"), "0.99.0", &windows()).is_none());
     }
 }

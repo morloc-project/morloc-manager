@@ -3575,7 +3575,14 @@ fn resolve_lang_pin(
         .and_then(|e| e.runtime.as_ref())
         .map(|r| r.version.as_str())
         .unwrap_or("*");
-    let spec = constraint::resolve_lang_version(lang, morloc_version, None, pin, supported)?;
+    let spec = constraint::resolve_lang_version(
+        lang,
+        morloc_version,
+        None,
+        pin,
+        supported,
+        "Loosen the pin or use a different backend.",
+    )?;
     let constraint = (spec != "*").then_some(spec);
     Ok(envspec::LangReq { lang: lang.to_string(), constraint, std: None })
 }
@@ -3676,6 +3683,10 @@ struct ResolvedRequirements {
     /// Pinned script-provisioned languages (name, install.sh content) to run in
     /// the OCI image build. Empty on native/apptainer (rejected before here).
     lang_installs: Vec<(String, String)>,
+    /// morloc's language-support table for the provisioned compiler: carries the
+    /// supported interpreter windows the ABI-lock recorder consults so it never
+    /// pins an interpreter morloc does not support.
+    support: langsupport::LangSupport,
 }
 
 /// Provision the morloc runtime (download the compiler + Rust source; no host install),
@@ -3764,6 +3775,7 @@ fn resolve_env_requirements(
         lang_spec,
         requirements,
         lang_installs,
+        support,
     })
 }
 
@@ -3923,7 +3935,7 @@ fn materialize_native_env(
 
     // Pin the interpreter minors the shims were just built against (see
     // record_abi_lock_or_warn). The env's pixi dir is the EnvContext default.
-    record_abi_lock_or_warn(&env_dir, name, &req.version);
+    record_abi_lock_or_warn(&env_dir, name, &req.version, &req.support);
 
     cfg::write_native_runtime(
         scope,
@@ -4040,8 +4052,13 @@ fn prime_requirements_store(env_dir: &std::path::Path, lang_spec: Option<&envspe
 /// Record the shim-ABI pin AFTER the solve (see `envstore::record_abi_lock`),
 /// identically for both backends; a failure is a warning, not fatal. The env's
 /// pixi dir is the `EnvContext` default (`<env_dir>/pixi`) for both.
-fn record_abi_lock_or_warn(env_dir: &std::path::Path, name: &str, version: &str) {
-    if let Err(e) = envstore::EnvContext::new(env_dir).record_abi_lock(version) {
+fn record_abi_lock_or_warn(
+    env_dir: &std::path::Path,
+    name: &str,
+    version: &str,
+    support: &langsupport::LangSupport,
+) {
+    if let Err(e) = envstore::EnvContext::new(env_dir).record_abi_lock(version, support) {
         eprintln!("Warning: could not record the ABI lock for '{name}': {e}");
     }
 }
@@ -5904,7 +5921,7 @@ fn build_requirement_derived_image(
 
     // Pin the interpreter minors the shims were just built against, read from the
     // now-solved conda prefix under the env's (host-mounted) pixi dir.
-    record_abi_lock_or_warn(&env_dir, name, &req.version);
+    record_abi_lock_or_warn(&env_dir, name, &req.version, &req.support);
 
     // Record the cache key (manifest + compiler identity) as successfully built +
     // materialized, written only now that both have succeeded.
@@ -6151,7 +6168,7 @@ fn build_dev_container_image(
     if !up_to_date {
         eprintln!("Provisioning the dev environment (pixi install)...");
         materialize_container_env(engine, &image_tag, &env_dir, false)?;
-        record_abi_lock_or_warn(&env_dir, name, stdlib_version);
+        record_abi_lock_or_warn(&env_dir, name, stdlib_version, &support);
         let _ = std::fs::write(&marker, &img_key);
     }
 
