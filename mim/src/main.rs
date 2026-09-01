@@ -2317,6 +2317,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
 
             rematerialize_env(env_scope, &env_name, &[], requested, verbose)?;
             report_rematerialized(ec.backend.is_native(), &env_name);
+            // Surface a broken conda extra (unresolved shared libs) LOUDLY now,
+            // rather than leaving it to be discovered by running the tool.
+            doctor::warn_unloadable_extras(env_scope, &env_name, &ec);
             Ok(())
         }
 
@@ -2454,6 +2457,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             if will_rebuild {
                 let prev_ec = ec.clone();
                 let prev_inputs = cfg::read_env_inputs(env_scope, &env_name);
+                // Snapshot the requirements-store artifacts the rebuild's prime step
+                // overwrites (toolchain pins + conda extras) BEFORE it runs, so a
+                // failed rebuild restores them exactly -- like the cert snapshot.
+                let req_snapshot = envstore::EnvContext::new(&cfg::env_data_dir(env_scope, &env_name))
+                    .snapshot_requirements();
 
                 // Each file is the env's whole list for its source; edit and
                 // re-apply to change it.
@@ -2486,13 +2494,23 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 // Rebuild at the CURRENT morloc version; `modify` never moves it.
                 let keep = require_current_version(&ec, &env_name)?;
                 match rematerialize_env(env_scope, &env_name, &[], Some(keep), verbose) {
-                    Ok(()) => report_rematerialized(ec.backend.is_native(), &env_name),
+                    Ok(()) => {
+                        report_rematerialized(ec.backend.is_native(), &env_name);
+                        // `modify --conda-packages` is the usual way a broken extra
+                        // enters an env; warn LOUDLY now if one doesn't load.
+                        doctor::warn_unloadable_extras(env_scope, &env_name, &ec);
+                    }
                     Err(e) => {
-                        // Roll back config, inputs, AND the re-materialized cert
-                        // files, so a broken build leaves no stored state (or stale
-                        // on-disk certs) that re-break later operations.
+                        // Roll back config, inputs, the re-materialized cert files,
+                        // AND the requirements-store artifacts the rebuild primed from
+                        // the new config (toolchain pins + conda extras), so a broken
+                        // build leaves no stored state that re-breaks later operations
+                        // -- including the in-env agent's make-time solve, which reads
+                        // toolchain.json/extras.json.
                         let _ = cfg::write_env_config(env_scope, &env_name, &prev_ec);
                         let _ = cfg::write_env_inputs(env_scope, &env_name, &prev_inputs);
+                        let _ = envstore::EnvContext::new(&cfg::env_data_dir(env_scope, &env_name))
+                            .restore_requirements(&req_snapshot);
                         if let Some(snap) = &cert_snapshot {
                             let _ = cert::restore_certs(env_scope, &env_name, snap);
                         }
@@ -3736,7 +3754,6 @@ struct ResolvedRequirements {
 /// before pixi runs).
 fn resolve_env_requirements(
     scope: Scope,
-    name: &str,
     program_specs: &[envspec::EnvSpec],
     lang_pins: &[(String, Option<String>)],
     conda_packages: &[String],
@@ -3806,7 +3823,7 @@ fn resolve_env_requirements(
         None => hostprobe::probe_host().platform,
     };
     let (specs, lang_spec, requirements) =
-        build_env_requirements(name, &version, &platform, program_specs, lang_pins, conda_packages, &support)?;
+        build_env_requirements(&version, &platform, program_specs, lang_pins, conda_packages, &support)?;
 
     Ok(ResolvedRequirements {
         runtime_dir,
@@ -3826,7 +3843,6 @@ fn resolve_env_requirements(
 /// which differ only in where `version`/`platform`/`support` come from. Returns
 /// the full spec list, the synthesized language spec (if any), and the solved set.
 fn build_env_requirements(
-    name: &str,
     version: &str,
     platform: &str,
     program_specs: &[envspec::EnvSpec],
@@ -3846,19 +3862,18 @@ fn build_env_requirements(
         lang_spec = Some(ls);
     }
     let channels = pixi::default_channels();
-    let mut requirements = pixi::resolve_requirements(&pixi::PixiManifestInput {
-        env_name: name,
-        platform,
-        channels: &channels,
-        specs: &specs,
-        lang_support: support,
-    })?;
-    // Fold the user's conda package pins into the solve (LangSupport's own
-    // dev_conda is injected by `aggregate`). `add_conda_spec` splits name from
-    // version constraint and merges against any existing entry.
-    for pkg in conda_packages {
-        requirements.add_conda_spec(pkg)?;
-    }
+    // The ONE shared builder (resolve + fold user conda extras); the in-env agent
+    // uses the same `pixi::build_requirement_set`, so the manager and agent cannot
+    // diverge on how the declared world is assembled.
+    let requirements = pixi::build_requirement_set(
+        &pixi::PixiManifestInput {
+            platform,
+            channels: &channels,
+            specs: &specs,
+            lang_support: support,
+        },
+        conda_packages,
+    )?;
     Ok((specs, lang_spec, requirements))
 }
 
@@ -3882,7 +3897,7 @@ fn materialize_native_env(
     // Native: the compiler runs on the host, so the base image is unused (it only
     // matters for the container lang-support fallback, which native never hits).
     let req = resolve_env_requirements(
-        scope, name, program_specs, lang_pins, conda_packages, None, requested_version, local_runtime, CONTAINER_BASE_IMAGE,
+        scope, program_specs, lang_pins, conda_packages, None, requested_version, local_runtime, CONTAINER_BASE_IMAGE,
     )?;
 
     // Phase 1 of the impurity gate: a fast reject on host/vcpkg system deps that
@@ -3896,7 +3911,7 @@ fn materialize_native_env(
     }
 
     let env_dir = cfg::env_data_dir(scope, name);
-    prime_requirements_store(&env_dir, req.lang_spec.as_ref());
+    prime_requirements_store(&env_dir, req.lang_spec.as_ref(), conda_packages);
     let pixi_dir = env_dir.join("pixi");
     let manifest = pixi::render_manifest(&req.requirements);
 
@@ -3907,7 +3922,7 @@ fn materialize_native_env(
     // rebuild is not falsely skipped on retry.
     let key = format!(
         "{}{}",
-        cache_key(&manifest, &req.morloc_bin, &[]),
+        cache_key(&pixi::requirement_digest(&req.requirements), &req.morloc_bin, &[]),
         cert::cache_fragment_for_env(scope, name),
     );
     let marker = materialized_marker(scope, name, true);
@@ -4083,11 +4098,20 @@ fn seed_installed_store(env_dir: &std::path::Path) {
 /// seed the installed baseline from each program's build-dir envspec, and persist
 /// the env's --lang pins as its toolchain spec. Without this the in-env agent
 /// re-solves a world missing the installed programs' deps or the interpreter pins.
-fn prime_requirements_store(env_dir: &std::path::Path, lang_spec: Option<&envspec::EnvSpec>) {
+fn prime_requirements_store(
+    env_dir: &std::path::Path,
+    lang_spec: Option<&envspec::EnvSpec>,
+    conda_extras: &[String],
+) {
     seed_installed_store(env_dir);
+    let ctx = envstore::EnvContext::new(env_dir);
     if let Some(json) = lang_spec.and_then(|ls| serde_json::to_string(ls).ok()) {
-        let _ = envstore::EnvContext::new(env_dir).write_toolchain(&json);
+        let _ = ctx.write_toolchain(&json);
     }
+    // Persist the env-level conda extras so the in-env agent folds them into its
+    // make-time re-solve (it re-renders from the store, not the manager's config);
+    // without this the re-solve prunes them from the pixi prefix.
+    let _ = ctx.write_conda_extras(conda_extras);
 }
 
 /// Record the shim-ABI pin AFTER the solve (see `envstore::record_abi_lock`),
@@ -5466,6 +5490,10 @@ fn finalize_new_env(
     } else {
         eprintln!("Make it the default with: mim modify --env {} --set-default", ec.name);
     }
+    // Surface a broken conda extra (unresolved shared libs) LOUDLY at creation, so a
+    // malformed package build is caught now, not by later running the tool. Shared by
+    // every `new` backend; best-effort, never fails a successful create.
+    doctor::warn_unloadable_extras(scope, &ec.name, ec);
     Ok(())
 }
 
@@ -5748,9 +5776,15 @@ fn system_packages_key_fragment(system_packages: &[String]) -> String {
     }
 }
 
-fn cache_key(manifest: &str, morloc_bin: &std::path::Path, system_packages: &[String]) -> String {
+/// The manager's materialize cache key. Keyed on the STRUCTURED requirement digest
+/// (`pixi::requirement_digest`), not the rendered `pixi.toml` text, so it agrees with
+/// the in-env agent's digest cache and is not perturbed by the cosmetic workspace
+/// name or formatting. The compiler fingerprint and the (image-layer, non-pixi)
+/// system packages ride alongside, so a rebuilt compiler or a changed apt list still
+/// invalidates.
+fn cache_key(world_digest: &str, morloc_bin: &std::path::Path, system_packages: &[String]) -> String {
     format!(
-        "{manifest}\n# morloc-compiler: {}\n{}",
+        "{world_digest}\n# morloc-compiler: {}\n{}",
         compiler_fingerprint(morloc_bin),
         system_packages_key_fragment(system_packages),
     )
@@ -6021,12 +6055,19 @@ fn build_requirement_derived_image(
     // Pass the engine so the language-support table can be generated in a
     // container when the host cannot run the compiler (NixOS/musl).
     let req = resolve_env_requirements(
-        scope, name, program_specs, lang_pins, conda_packages, Some(engine), requested_version, local_runtime, base_image,
+        scope, program_specs, lang_pins, conda_packages, Some(engine), requested_version, local_runtime, base_image,
     )?;
 
-    let context = cfg::env_data_dir(scope, name).join(CONTAINER_BUILD_SUBDIR);
+    let env_dir = cfg::env_data_dir(scope, name);
+    let context = env_dir.join(CONTAINER_BUILD_SUBDIR);
     let manifest = pixi::render_manifest(&req.requirements);
     let image_tag = format!("localhost/morloc-env:{name}");
+
+    // Prime the requirements store unconditionally (like the native path), BEFORE
+    // the cache-hit early return: the store reflects the env's config/inputs, so a
+    // re-run with an unchanged manifest still refreshes it. Idempotent writes; the
+    // single writer for both the toolchain pins and the conda extras.
+    prime_requirements_store(&env_dir, req.lang_spec.as_ref(), conda_packages);
 
     // Solve cache (mirrors the native path): skip the multi-minute solve + image
     // rebuild when the requirements AND the compiler are unchanged and the image
@@ -6036,7 +6077,7 @@ fn build_requirement_derived_image(
     // compiler forces a fresh image without a manual `podman rmi`.
     let key = format!(
         "{}{}{}base:{base_image}\n",
-        cache_key(&manifest, &req.morloc_bin, system_packages),
+        cache_key(&pixi::requirement_digest(&req.requirements), &req.morloc_bin, system_packages),
         lang_installs_key_fragment(&req.lang_installs),
         cert::cache_fragment_for_env(scope, name),
     );
@@ -6054,16 +6095,12 @@ fn build_requirement_derived_image(
     // /env, `<env_dir>/runtime` -> MORLOC_HOME) so an in-container `morloc make`
     // can mutate them in place. Render + lock the pixi env directly in the host
     // pixi dir (mounted at /env during materialize + every run).
-    let env_dir = cfg::env_data_dir(scope, name);
     let pixi_host = env_dir.join("pixi");
     let home_host = env_dir.join("runtime");
     for d in [&pixi_host, &home_host] {
         std::fs::create_dir_all(d)
             .map_err(|e| ManagerError::EnvError(format!("cannot create {}: {e}", d.display())))?;
     }
-    // Prime the requirements store for the in-container morloc-env agent, exactly
-    // as the native path does.
-    prime_requirements_store(&env_dir, req.lang_spec.as_ref());
     pixi::write_manifest(&pixi_host, &manifest)?;
     let pixi_bin = provision::provision_pixi(scope)?;
     // The host `pixi lock` runs on the host, so it uses the host bundle (corp +
@@ -6242,8 +6279,8 @@ fn short_hash(data: &[u8]) -> String {
 /// baked ghcup/stack/cargo toolchain). A change to either re-solves + rebuilds the
 /// image and re-materializes the pixi env. Distinct from the release `cache_key`,
 /// which fingerprints a prebuilt compiler binary that does not exist in a dev env.
-fn dev_image_key(manifest: &str, dockerfile: &str) -> String {
-    format!("{manifest}\n# dockerfile: {}", short_hash(dockerfile.as_bytes()))
+fn dev_image_key(world_digest: &str, dockerfile: &str) -> String {
+    format!("{world_digest}\n# dockerfile: {}", short_hash(dockerfile.as_bytes()))
 }
 
 /// Provision a dev environment: build the image (base + baked ghcup/stack/cargo
@@ -6282,7 +6319,7 @@ fn build_dev_container_image(
 
     let platform = container_conda_platform();
     let (_specs, lang_spec, requirements) =
-        build_env_requirements(name, stdlib_version, &platform, program_specs, lang_pins, conda_packages, &support)?;
+        build_env_requirements(stdlib_version, &platform, program_specs, lang_pins, conda_packages, &support)?;
     let manifest = pixi::render_manifest(&requirements);
     let image_tag = format!("localhost/morloc-env:{name}");
 
@@ -6327,12 +6364,18 @@ fn build_dev_container_image(
         lang_installs_key_fragment(&script_langs),
         cert::cache_fragment_for_env(scope, name),
     );
-    let img_key = dev_image_key(&manifest, &image_inputs);
+    let img_key = dev_image_key(&pixi::requirement_digest(&requirements), &image_inputs);
     let marker = materialized_marker(scope, name, false);
     let up_to_date = std::fs::read_to_string(&marker).ok().as_deref() == Some(img_key.as_str());
 
+    // Prime the requirements store unconditionally (like the native path), even
+    // when the image is cache-fresh: the store reflects the env's config/inputs,
+    // so a re-run with an unchanged manifest (e.g. re-adding a conda extra that was
+    // already pinned) still refreshes it. Idempotent writes; the single writer for
+    // both the toolchain pins and the conda extras.
+    prime_requirements_store(&env_dir, lang_spec.as_ref(), conda_packages);
+
     if !(up_to_date && container::image_exists_locally(engine, &image_tag)) {
-        prime_requirements_store(&env_dir, lang_spec.as_ref());
         pixi::write_manifest(&pixi_host, &manifest)?;
         let pixi_bin = provision::provision_pixi(scope)?;
         let ssl_cert = cert::host_bundle_if_present(scope, name);
@@ -7501,6 +7544,14 @@ fn run_with_config(
             BRIDGE_SOCK_IN_CONTAINER.to_string(),
         ));
     }
+    // Conda CLI tools added as extras (e.g. `nvim`) resolve their shared libraries
+    // via their own `$ORIGIN/../lib` conda-forge RUNPATH, and the image ENTRYPOINT
+    // (`morloc-activate`) already sets CONDA_PREFIX + sources activate.d for every
+    // run. We deliberately do NOT put the conda lib dir on `LD_LIBRARY_PATH`: it
+    // would shadow the SYSTEM libgmp/libffi/libtinfo/libz the source-built morloc
+    // compiler and stack/ghc link against (the dev image apt-installs those), which
+    // would break `morloc`/`stack` invoked from the dev shell. A conda tool whose
+    // own RUNPATH is broken is a packaging bug to pin/fix, not to paper over here.
     // MORLOC_RUST_DIR is intentionally NOT set for a dev env: the source tree is
     // not mounted at a fixed path, so the developer points `morloc init`/`make`
     // at their working copy (e.g. `MORLOC_RUST_DIR=$PWD/data/rust`) themselves.

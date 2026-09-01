@@ -38,6 +38,15 @@ pub struct SolveOutcome {
     pub solved: bool,
 }
 
+/// The env-level requirements artifacts captured before a rebuild so a failed
+/// rebuild can roll them back. `None` = the file was absent at snapshot time.
+/// Produced by [`EnvContext::snapshot_requirements`], consumed by
+/// [`EnvContext::restore_requirements`].
+pub struct RequirementsSnapshot {
+    toolchain: Option<String>,
+    extras: Option<String>,
+}
+
 /// Locates an environment's on-disk layout. Constructed from the env's home
 /// directory: the manager derives that from its config, the in-env agent from
 /// its environment variables. Deliberately agnostic to how the env was located.
@@ -219,6 +228,61 @@ impl EnvContext {
         self.abi_lock_path().exists()
     }
 
+    /// `<env_home>/requirements/extras.json` -- the env-level user conda extras
+    /// (utilities added via `mim modify --conda-packages`), a plain list of
+    /// conda match-specs. Kept OUTSIDE `installed/`/`scratch/` (like
+    /// `toolchain.json`/`abi-lock.json`) so it is never mistaken for a program.
+    /// Folded into `rendered_manifest`, so the in-env agent's make-time re-solve
+    /// keeps these packages the manager installed instead of pruning them.
+    fn conda_extras_path(&self) -> PathBuf {
+        self.requirements_dir().join("extras.json")
+    }
+
+    /// Persist the env's conda extras. An empty list removes the file, so clearing
+    /// the extras (e.g. `mim modify` with a shorter list) truly clears them from
+    /// later solves rather than leaving a stale set behind.
+    pub fn write_conda_extras(&self, extras: &[String]) -> Result<()> {
+        if extras.is_empty() {
+            return remove_if_present(&self.conda_extras_path());
+        }
+        let json = serde_json::to_string(extras)
+            .map_err(|e| DepsError::Env(format!("cannot serialize conda extras: {e}")))?;
+        self.write_requirements_file(&self.conda_extras_path(), &json)
+    }
+
+    /// The env's conda extras, or an empty list if none are recorded.
+    pub fn read_conda_extras(&self) -> Result<Vec<String>> {
+        let path = self.conda_extras_path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|e| DepsError::Env(format!("cannot parse {}: {e}", path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(DepsError::Env(format!("cannot read {}: {e}", path.display()))),
+        }
+    }
+
+    /// Snapshot the env-level requirements artifacts a rebuild's prime step
+    /// overwrites -- the `--lang` toolchain pins and the conda extras -- so a
+    /// failed `mim modify`/`update` can restore them, exactly as the cert files are
+    /// snapshotted. The abi-lock and per-program `installed/` specs are NOT primed
+    /// from the (mutated) config, so they are not part of the snapshot.
+    pub fn snapshot_requirements(&self) -> RequirementsSnapshot {
+        RequirementsSnapshot {
+            toolchain: std::fs::read_to_string(self.toolchain_path()).ok(),
+            extras: std::fs::read_to_string(self.conda_extras_path()).ok(),
+        }
+    }
+
+    /// Restore the requirements artifacts captured by [`snapshot_requirements`]:
+    /// each file is rewritten to its snapshotted content, or removed if it was
+    /// absent when the snapshot was taken (so a modify that ADDED extras/pins rolls
+    /// all the way back to none).
+    pub fn restore_requirements(&self, snap: &RequirementsSnapshot) -> Result<()> {
+        restore_or_remove(&self.toolchain_path(), snap.toolchain.as_deref())?;
+        restore_or_remove(&self.conda_extras_path(), snap.extras.as_deref())?;
+        Ok(())
+    }
+
     /// Record the shim-ABI pin from this env's freshly solved conda prefix: pin
     /// each interpreter (python, r-base) to the MINOR version `morloc init` just
     /// built its shims against. Folded into every later solve (see
@@ -298,77 +362,111 @@ impl EnvContext {
         }
     }
 
-    /// The environment's name, taken from its home directory's final component
-    /// (env homes live at `.../envs/<name>`). Used only as the pixi workspace
-    /// name, so a fallback is harmless.
-    fn env_name(&self) -> String {
-        self.env_home
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("morloc-env")
-            .to_string()
-    }
-
     /// Render the given specs to a pixi manifest (the merged, backend-neutral
     /// requirement set lowered to `pixi.toml` text). No solve, no I/O. Fails on a
     /// cross-program conda channel conflict for one package.
     pub fn rendered_manifest(&self, specs: &[EnvSpec], inputs: &SolveInputs) -> Result<String> {
-        let name = self.env_name();
-        let requirements = crate::pixi::resolve_requirements(&crate::pixi::PixiManifestInput {
-            env_name: name.as_str(),
-            platform: inputs.platform,
-            channels: inputs.channels,
-            specs,
-            lang_support: inputs.lang_support,
-        })?;
-        Ok(crate::pixi::render_manifest(&requirements))
+        Ok(crate::pixi::render_manifest(&self.requirement_set(specs, inputs)?))
+    }
+
+    /// Build this env's declared world (the `RequirementSet`) from the gathered specs
+    /// + language support + the persisted conda extras, via the ONE shared
+    /// `pixi::build_requirement_set` the manager also uses (`build_env_requirements`).
+    /// The single builder is what keeps the manager and agent from diverging on how
+    /// the world is assembled -- the two-writer drift behind the byte-identity bugs.
+    fn requirement_set(
+        &self,
+        specs: &[EnvSpec],
+        inputs: &SolveInputs,
+    ) -> Result<crate::pixi::RequirementSet> {
+        crate::pixi::build_requirement_set(
+            &crate::pixi::PixiManifestInput {
+                platform: inputs.platform,
+                channels: inputs.channels,
+                specs,
+                lang_support: inputs.lang_support,
+            },
+            &self.read_conda_extras()?,
+        )
     }
 
     /// Render the given specs to a pixi manifest and solve it into this env's
     /// pixi prefix, returning the captured activation env-map. Does NOT persist
     /// specs or rebuild the morloc runtime -- callers own those steps.
     ///
-    /// A solve-cache short-circuits the (multi-process) pixi solve + activation
-    /// capture when the rendered manifest matches the on-disk `pixi.toml`, the
-    /// solved prefix already exists, and a cached activation is present. A
-    /// managed `morloc make` runs a sync on nearly every build (see
-    /// `Build.syncEnvDeps`), so the common "nothing changed" case must be cheap.
+    /// Materialize the declared world into this env's pixi prefix.
+    ///
+    /// Invalidation is keyed on a DIGEST of the structured declared world
+    /// (`requirement_digest`), not the rendered `pixi.toml` TEXT: the workspace name,
+    /// whitespace, and constraint atom order are irrelevant, so the manager and agent
+    /// (which derive the env name differently) can no longer force a spurious
+    /// re-solve. A managed `morloc make` syncs on nearly every build, so the common
+    /// "nothing changed" case (digest unchanged + prefix + cached activation) is free.
+    ///
+    /// When the world DID change, `try_locked` picks the strategy:
+    /// - `true` (sync): try `pixi install --locked` FIRST -- if the existing lock still
+    ///   satisfies the manifest (e.g. only the abi-lock narrowed an already-locked
+    ///   interpreter), the manager's TESTED versions are reused with ZERO drift; only
+    ///   if the lock cannot satisfy the world do we re-solve (`solved = true`).
+    /// - `false` (clean): always re-solve. Clean's job is to DROP an unreferenced
+    ///   language; installing the old lock would keep it, so the lock must be rebuilt.
+    ///
+    /// `solved` is `true` only when a real re-solve ran (a `--locked` install reuses
+    /// the lock, so the world is unchanged -> `false`), which is exactly the signal
+    /// `sync`/`clean` use to decide whether to re-record the abi-lock.
     pub fn solve_world(
         &self,
         specs: &[EnvSpec],
         inputs: &SolveInputs,
+        try_locked: bool,
     ) -> Result<SolveOutcome> {
-        let manifest = self.rendered_manifest(specs, inputs)?;
+        let reqs = self.requirement_set(specs, inputs)?;
+        let digest = crate::pixi::requirement_digest(&reqs);
         let pixi_dir = self.pixi_dir();
         let cache_path = self.activation_cache_path();
+        let digest_path = self.solved_digest_path();
         let prefix = crate::abi::conda_prefix(&pixi_dir);
-        let unchanged = matches!(
-            std::fs::read_to_string(pixi_dir.join("pixi.toml")),
-            Ok(on_disk) if on_disk == manifest
-        );
+        let unchanged = std::fs::read_to_string(&digest_path)
+            .map(|prev| prev == digest)
+            .unwrap_or(false);
         if unchanged && prefix.is_dir() {
             if let Some(activation) = read_activation_cache(&cache_path) {
                 return Ok(SolveOutcome { activation, solved: false });
             }
         }
-        // Invalidate the cached activation BEFORE a real solve. Otherwise an
-        // interrupted solve (SIGKILL mid `pixi install`) that has already written
-        // the new pixi.toml would leave the manifest matching on-disk, a
-        // half-installed prefix that still passes `is_dir()`, and a STALE cache --
-        // so the next build would cache-hit with the wrong activation and skip the
-        // corrective re-solve. With no cache present, the next build re-solves.
+        // Invalidate the cached activation BEFORE touching the prefix. Otherwise an
+        // interrupted materialize (SIGKILL mid install) that has already written the
+        // new digest would leave a half-installed prefix that still passes `is_dir()`
+        // plus a STALE cache -- so the next build would cache-hit with the wrong
+        // activation. Written last (after success), it is absent until the prefix is
+        // whole, forcing a corrective re-materialize.
         let _ = std::fs::remove_file(&cache_path);
-        crate::pixi::write_manifest(&pixi_dir, &manifest)?;
-        // In-container path (mim-env): the built image already sets the CA env
-        // vars, which the pixi subprocess inherits, so no override is needed.
-        // No FHS wrapping: the in-env agent already runs inside its execution
-        // environment (the container, or -- on native NixOS -- the FHS sandbox it
-        // was spawned within by the wrapped `morloc make`).
-        crate::pixi::solve(&pixi_dir, inputs.pixi_bin, None, None)?;
+        let _ = std::fs::remove_file(&digest_path);
+        crate::pixi::write_manifest(&pixi_dir, &crate::pixi::render_manifest(&reqs))?;
+        // In-container path (mim-env): the built image already sets the CA env vars,
+        // which the pixi subprocess inherits, so no override is needed. No FHS
+        // wrapping: the in-env agent already runs inside its execution environment.
+        let solved = if try_locked
+            && crate::pixi::install_locked(&pixi_dir, inputs.pixi_bin, None, None)?
+        {
+            false
+        } else {
+            crate::pixi::solve(&pixi_dir, inputs.pixi_bin, None, None)?;
+            true
+        };
         let activation =
             crate::pixi::capture_activation(&pixi_dir, inputs.pixi_bin, None, None)?;
         write_activation_cache(&cache_path, &activation);
-        Ok(SolveOutcome { activation, solved: true })
+        // Record the digest of the world we just materialized so the next make can
+        // fast-path. Written only after success, so a failed build is retried.
+        let _ = std::fs::write(&digest_path, &digest);
+        Ok(SolveOutcome { activation, solved })
+    }
+
+    /// The digest of the declared world last successfully materialized into the pixi
+    /// prefix (the structured `requirement_digest`, not the `pixi.toml` text).
+    fn solved_digest_path(&self) -> PathBuf {
+        self.pixi_dir().join(".morloc-solved-digest")
     }
 
     /// The cached toolchain activation env-map file for the current solve.
@@ -414,7 +512,9 @@ impl EnvContext {
         self.write_spec(program, provenance, spec_json)?;
         let mut specs = self.gather()?;
         self.append_abi_lock(&mut specs)?;
-        match self.solve_world(&specs, inputs) {
+        // Prefer the manager's tested lock (`--locked`); re-solve only if it cannot
+        // satisfy this program's world.
+        match self.solve_world(&specs, inputs, true) {
             Ok(outcome) => {
                 if outcome.solved {
                     // Pin the interpreter minor the (about-to-be-built) shims
@@ -490,7 +590,9 @@ impl EnvContext {
                 specs.push(abi);
             }
         }
-        let outcome = self.solve_world(&specs, inputs)?;
+        // Force a real re-solve (never `--locked`): clean's purpose is to DROP an
+        // unreferenced language, and installing the existing lock would keep it.
+        let outcome = self.solve_world(&specs, inputs, false)?;
         let dropped = if outcome.solved {
             self.record_abi_lock(inputs.lang_support.morloc_version.as_str(), inputs.lang_support)?;
             let after = self.runtime_language_set(inputs.platform)?;
@@ -537,6 +639,24 @@ fn read_activation_cache(path: &Path) -> Option<Vec<(String, String)>> {
 fn write_activation_cache(path: &Path, activation: &[(String, String)]) {
     if let Ok(json) = serde_json::to_string(activation) {
         let _ = std::fs::write(path, json);
+    }
+}
+
+/// Rewrite `path` to `content`, or remove it if `content` is `None` (the file was
+/// absent when snapshotted). Creates the parent dir on write. The rollback
+/// counterpart of a snapshot capture.
+fn restore_or_remove(path: &Path, content: Option<&str>) -> Result<()> {
+    match content {
+        Some(text) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    DepsError::Env(format!("cannot create {}: {e}", parent.display()))
+                })?;
+            }
+            std::fs::write(path, text)
+                .map_err(|e| DepsError::Env(format!("cannot write {}: {e}", path.display())))
+        }
+        None => remove_if_present(path),
     }
 }
 
@@ -701,6 +821,102 @@ mod tests {
         assert_eq!(solve_set.len(), 2);
         // ...but the pin is NOT a program: never surfaced in conflict attribution.
         assert_eq!(ctx.program_names().unwrap(), vec!["prog".to_string()]);
+    }
+
+    #[test]
+    fn conda_extras_round_trip_and_clear() {
+        let (_d, ctx) = ctx();
+        assert!(ctx.read_conda_extras().unwrap().is_empty());
+        ctx.write_conda_extras(&["nvim".into(), "bat>=0.24".into()]).unwrap();
+        assert_eq!(
+            ctx.read_conda_extras().unwrap(),
+            vec!["nvim".to_string(), "bat>=0.24".to_string()]
+        );
+        // An empty list removes the file, so a shrunk extras list truly clears
+        // (a later solve must not re-add a package the user dropped).
+        ctx.write_conda_extras(&[]).unwrap();
+        assert!(ctx.read_conda_extras().unwrap().is_empty());
+        assert!(!ctx.conda_extras_path().exists());
+    }
+
+    #[test]
+    fn requirements_snapshot_restores_toolchain_and_extras() {
+        // A failed `mim modify` must roll the requirements store back to exactly its
+        // pre-modify state: files that existed are restored to their old content,
+        // and files the modify ADDED are removed (not left with the new values).
+        let (_d, ctx) = ctx();
+        // Pre-modify state: a toolchain pin exists, no extras yet.
+        ctx.write_toolchain(&spec(r#"{"lang":"py","constraint":"==3.12"}"#)).unwrap();
+        let snap = ctx.snapshot_requirements();
+
+        // The (failed) modify's prime step overwrites toolchain and adds extras.
+        ctx.write_toolchain(&spec(r#"{"lang":"py","constraint":"==3.13"}"#)).unwrap();
+        ctx.write_conda_extras(&["nvim".into()]).unwrap();
+
+        // Rollback restores the old toolchain and clears the added extras.
+        ctx.restore_requirements(&snap).unwrap();
+        assert_eq!(ctx.pinned_languages().unwrap(), vec!["py".to_string()]);
+        assert_eq!(
+            ctx.read_toolchain().unwrap().unwrap().languages[0].constraint.as_deref(),
+            Some("==3.12")
+        );
+        assert!(ctx.read_conda_extras().unwrap().is_empty());
+        assert!(!ctx.conda_extras_path().exists());
+    }
+
+    /// A support table whose py binder pulls numpy, so a user extra can COLLIDE
+    /// with an injected dep -- the case that exposes any manager/agent drift.
+    fn support_with_numpy() -> LangSupport {
+        LangSupport::from_json(
+            r#"{"schema_version":"1.0","morloc_version":"0.99.0","languages":{
+                "py":{"runtime":{"package":"python","version":">=3.10,<3.14","default":"3.12"},
+                      "requires":[{"package":"numpy","constraint":">=1.22,<3","optional":false}]}}}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn extras_render_identically_in_manager_and_agent_paths() {
+        // This is the regression guard for the whole fix: the in-env agent
+        // (rendered_manifest, reading extras.json) and the manager (resolve then
+        // add_conda_specs) must produce a byte-identical manifest, INCLUDING a
+        // constraint that collides with an injected binder dep -- otherwise the
+        // make-time solve-cache text compare fails and every build re-solves.
+        let (_d, ctx) = ctx();
+        ctx.write_spec("prog", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
+        let extras = vec!["numpy>=1.20".to_string(), "nvim".to_string()];
+        ctx.write_conda_extras(&extras).unwrap();
+
+        let support = support_with_numpy();
+        let channels = crate::pixi::default_channels();
+        let pixi_bin = std::path::Path::new("/nonexistent/pixi"); // render never invokes pixi
+        let inputs = SolveInputs {
+            lang_support: &support,
+            pixi_bin,
+            platform: "linux-64",
+            channels: &channels,
+        };
+        let specs = ctx.gather_installed().unwrap();
+
+        // AGENT: render from the store (installed specs) + extras.json.
+        let agent = ctx.rendered_manifest(&specs, &inputs).unwrap();
+
+        // MANAGER: resolve the same specs, then fold the same extras via the same
+        // helper AFTER resolve (mirrors build_env_requirements), and render.
+        let mut req = crate::pixi::resolve_requirements(&crate::pixi::PixiManifestInput {
+            platform: "linux-64",
+            channels: &channels,
+            specs: &specs,
+            lang_support: &support,
+        })
+        .unwrap();
+        req.add_conda_specs(&extras).unwrap();
+        let manager = crate::pixi::render_manifest(&req);
+
+        assert_eq!(agent, manager, "manager and agent must render byte-identical manifests");
+        // The collision merged into one numpy entry; the fresh extra is present.
+        assert_eq!(agent.matches("\"numpy\" =").count(), 1, "numpy must appear once:\n{agent}");
+        assert!(agent.contains("\"nvim\""), "nvim extra must be present:\n{agent}");
     }
 
     /// A minimal support table whose python runtime window is morloc's real one

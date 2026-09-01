@@ -161,12 +161,17 @@ pub fn doctor(
     c.set_category("manifests");
     check_manifests(&mut c, &data_dir, expected_manifest_version(ec));
 
+    // ==== Dependencies ====
+    c.set_category("dependencies");
+    check_extras_store_consistency(&mut c, ec, &data_dir);
+
     // ==== Deep checks ====
     c.set_category("deep");
     if deep {
         if !json_mode { println!("\nDeep checks"); }
         check_morloc_version(&mut c, engine, ec);
         check_programs_deep(&mut c, engine, verbose, ec, &data_dir);
+        check_extra_loadability_container(&mut c, engine, ec, &data_dir);
     } else {
         if !json_mode { println!("\nDeep checks"); }
         c.skip("Use --deep to run container-side checks");
@@ -267,6 +272,7 @@ pub fn native_doctor(
     }
     if let Some(ref rt) = rt {
         check_linkage(&mut c, &data_dir, rt);
+        check_extra_loadability(&mut c, ec, &pixi_dir, rt);
     }
 
     if !json_mode { println!("\nVersions"); }
@@ -279,6 +285,7 @@ pub fn native_doctor(
     if !json_mode { println!("\nDependencies"); }
     c.set_category("dependencies");
     check_dep_world(&mut c, &pixi_dir);
+    check_extras_store_consistency(&mut c, ec, &data_dir);
 
     if !json_mode { println!("\nManifests"); }
     c.set_category("manifests");
@@ -625,11 +632,7 @@ fn check_linkage(c: &mut Counts, data_dir: &Path, rt: &NativeRuntime) {
         None => return, // ldd unavailable (e.g. macOS) or timed out; skip
     };
     let text = String::from_utf8_lossy(&out.stdout);
-    let unresolved: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("not found"))
-        .map(|l| l.trim())
-        .collect();
+    let unresolved = morloc_deps::abi::unresolved_libs(&text);
     if unresolved.is_empty() {
         c.pass("libmorloc resolves its dynamic dependencies");
     } else {
@@ -638,6 +641,226 @@ fn check_linkage(c: &mut Counts, data_dir: &Path, rt: &NativeRuntime) {
             unresolved.join("; ")
         ));
     }
+}
+
+/// One requested conda extra's loadability result: the (possibly empty) set of
+/// shared libraries its binaries could not resolve. Only extras that were actually
+/// probed (a real ELF binary that `ldd` traced) are represented -- a library-only
+/// extra, a script entry point, or one not yet installed is omitted, so callers
+/// never assert on something that wasn't tested.
+pub(crate) struct ExtraLoadability {
+    pub name: String,
+    pub unresolved: Vec<String>,
+}
+
+/// Probe each requested conda extra's binaries for unresolved shared libraries.
+/// `conda_prefix` locates the host-side `conda-meta/` (to map extra -> `bin/*`); the
+/// `ldd` closure runs `ldd` on a prefix-relative binary path in the RIGHT context
+/// (native activation, or in-container) and returns its stdout, or `None` if the
+/// binary was not a real ELF probe (empty output). Unlike morloc's own dlopen-shims,
+/// a normal conda CLI tool `ldd`s cleanly, so an unresolved lib is a real broken or
+/// mismatched package (the nvim/libunibilium class).
+fn probe_extras<F>(conda_prefix: &Path, extras: &[String], ldd: F) -> Vec<ExtraLoadability>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // The conda-meta record name (channel-stripped) for each requested extra; a
+    // `channel::pkg` spec records under just `pkg` (defensive -- extras are normally
+    // bare). One conda-meta scan then resolves every extra's `bin/*` at once.
+    let names: Vec<String> = extras
+        .iter()
+        .map(|spec| {
+            let (name, _) = morloc_deps::pixi::split_conda_matchspec(spec);
+            name.rsplit("::").next().unwrap_or(name).to_string()
+        })
+        .collect();
+    let bins_by_pkg = morloc_deps::abi::package_binaries(conda_prefix, &names);
+    let mut findings = Vec::new();
+    for (name, bins) in &bins_by_pkg {
+        let mut unresolved: Vec<String> = Vec::new();
+        let mut probed = false;
+        for rel in bins {
+            if let Some(stdout) = ldd(rel) {
+                probed = true;
+                unresolved.extend(morloc_deps::abi::unresolved_libs(&stdout));
+            }
+        }
+        if !probed {
+            continue; // nothing ldd-checkable (scripts / static / not installed)
+        }
+        unresolved.sort();
+        unresolved.dedup();
+        findings.push(ExtraLoadability { name: name.clone(), unresolved });
+    }
+    findings
+}
+
+/// Native loadability probe: `ldd` each extra binary under the captured activation.
+pub(crate) fn probe_extras_native(
+    ec: &EnvironmentConfig,
+    pixi_dir: &Path,
+    rt: &NativeRuntime,
+) -> Vec<ExtraLoadability> {
+    let prefix = morloc_deps::abi::conda_prefix(pixi_dir);
+    probe_extras(&prefix, &ec.conda_packages, |rel| {
+        let bin = prefix.join(rel);
+        let path = bin.to_str()?;
+        let out = run_with_activation(rt, "ldd", &[path])?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        // ldd traces a real dynamic ELF to STDOUT (exit 0 even with "not found"); a
+        // missing file / script / static bin prints to stderr with empty stdout ->
+        // NOT a probe, so we never assert on it.
+        (out.status.success() || !stdout.is_empty()).then_some(stdout)
+    })
+}
+
+/// Container loadability probe: `ldd` each extra binary INSIDE the image, where its
+/// shared libraries live. `conda-meta/` is read host-side (the bind-mount source);
+/// the binary is probed at its in-container path (activated by the entrypoint; it
+/// also self-resolves via `$ORIGIN/../lib`). One `ldd` run per binary keeps the
+/// parse trivial. Apptainer is skipped here (its `exec` bypasses the runscript, so
+/// `activate.d` never runs -> false "not found"); the skip lives with the probe so
+/// no caller can forget it.
+pub(crate) fn probe_extras_container(
+    engine: ContainerEngine,
+    ec: &EnvironmentConfig,
+    data_dir: &Path,
+) -> Vec<ExtraLoadability> {
+    if matches!(engine, ContainerEngine::Apptainer) {
+        return Vec::new();
+    }
+    let image = ec.active_image();
+    let host_prefix = morloc_deps::abi::conda_prefix(&data_dir.join("pixi"));
+    let container_prefix = format!("{}/.pixi/envs/default", crate::serve::CONTAINER_PIXI_DIR);
+    let bind_mounts = vec![(
+        data_dir.join("pixi").to_string_lossy().to_string(),
+        crate::serve::CONTAINER_PIXI_DIR.to_string(),
+    )];
+    probe_extras(&host_prefix, &ec.conda_packages, |rel| {
+        let in_container = format!("{container_prefix}/{rel}");
+        let cfg = RunConfig {
+            command: Some(vec!["ldd".to_string(), in_container]),
+            bind_mounts: bind_mounts.clone(),
+            ..RunConfig::new(image)
+        };
+        let (status, stdout, _) = container_run_quiet(engine, &cfg);
+        (status.success() || !stdout.is_empty()).then_some(stdout)
+    })
+}
+
+/// The shared diagnosis clause for an extra whose binaries have unresolved shared
+/// libraries -- the common half of the doctor warning and the provision-time
+/// warning, which each append their own context-specific advice. One home so the
+/// wording cannot drift between the two sites.
+fn unresolved_extra_diagnosis(f: &ExtraLoadability) -> String {
+    format!(
+        "conda extra `{}` has unresolved shared libraries ({}) -- the installed \
+         package build is likely broken or mismatched",
+        f.name,
+        f.unresolved.join("; ")
+    )
+}
+
+/// Emit a doctor pass/warn line for one probed extra.
+fn report_extra_loadability(c: &mut Counts, f: &ExtraLoadability) {
+    if f.unresolved.is_empty() {
+        c.pass(&format!("conda extra `{}` loads its shared libraries", f.name));
+    } else {
+        c.warn(&format!(
+            "{}; pin a known-good version in conda-requirements and re-provision",
+            unresolved_extra_diagnosis(f)
+        ));
+    }
+}
+
+/// Doctor loadability check (native): probe each requested conda extra and report a
+/// pass/warn line. A WARNING (not an error) so a broken extra is legible without
+/// failing the whole health check.
+fn check_extra_loadability(
+    c: &mut Counts,
+    ec: &EnvironmentConfig,
+    pixi_dir: &Path,
+    rt: &NativeRuntime,
+) {
+    if ec.conda_packages.is_empty() {
+        return;
+    }
+    for f in probe_extras_native(ec, pixi_dir, rt) {
+        report_extra_loadability(c, &f);
+    }
+}
+
+/// Doctor loadability check (container).
+fn check_extra_loadability_container(
+    c: &mut Counts,
+    engine: ContainerEngine,
+    ec: &EnvironmentConfig,
+    data_dir: &Path,
+) {
+    if ec.conda_packages.is_empty() {
+        return;
+    }
+    for f in probe_extras_container(engine, ec, data_dir) {
+        report_extra_loadability(c, &f);
+    }
+}
+
+/// Provision-time (`mim new`/`modify`) loadability warning: after an env with conda
+/// extras is materialized, `ldd`-probe each requested extra and warn LOUDLY on stderr
+/// for any with unresolved libraries -- so a broken package (the nvim/libunibilium
+/// class) is surfaced the moment it lands, not discovered later by opening a file.
+/// Best-effort: reuses the doctor probes, never fails the command, never prints for a
+/// healthy or unprobeable extra. Apptainer and un-materialized native envs are skipped.
+pub(crate) fn warn_unloadable_extras(scope: Scope, env_name: &str, ec: &EnvironmentConfig) {
+    if ec.conda_packages.is_empty() {
+        return;
+    }
+    let data_dir = cfg::env_data_dir(scope, env_name);
+    let findings = if ec.backend.is_native() {
+        let Ok(rt) = cfg::read_native_runtime(scope, env_name) else {
+            return;
+        };
+        probe_extras_native(ec, &data_dir.join("pixi"), &rt)
+    } else if let Some(engine) = ec.backend.container_engine() {
+        // Apptainer is a no-op probe (handled inside probe_extras_container).
+        probe_extras_container(engine, ec, &data_dir)
+    } else {
+        return;
+    };
+    for f in findings.iter().filter(|f| !f.unresolved.is_empty()) {
+        eprintln!(
+            "Warning: {}. Pin a known-good version in conda-requirements and \
+             re-provision, or run `mim doctor --deep`.",
+            unresolved_extra_diagnosis(f)
+        );
+    }
+}
+
+/// Consistency of the two records of an env's conda extras: the config
+/// (`ec.conda_packages`, the manager's input) and the requirements store
+/// (`extras.json`, what the in-env agent solves from). They are primed together, so
+/// drift means a partial/failed `mim modify` left them out of sync -- the in-env
+/// solve would then use a different extra set than `mim info` shows. Host-side and
+/// backend-independent. A tripwire for the invariant Phase 4 will make structural.
+fn check_extras_store_consistency(c: &mut Counts, ec: &EnvironmentConfig, data_dir: &Path) {
+    let mut stored = morloc_deps::envstore::EnvContext::new(data_dir)
+        .read_conda_extras()
+        .unwrap_or_default();
+    let mut config = ec.conda_packages.clone();
+    config.sort();
+    config.dedup();
+    stored.sort();
+    stored.dedup();
+    if config == stored {
+        return; // in sync (including both empty) -- nothing to report
+    }
+    c.warn(&format!(
+        "conda extras out of sync: config=[{}] vs requirements store=[{}] -- a partial \
+         `mim modify` left them divergent; re-run `mim modify --conda-packages-file <file>` \
+         to resync",
+        config.join(", "),
+        stored.join(", "),
+    ));
 }
 
 /// Version staleness: the morloc/manager/agent this env resolves vs what it was

@@ -33,6 +33,11 @@ use crate::langsupport::LangSupport;
 /// omitted per-dep channel means this; it is the sole entry in `default_channels`.
 const CONDA_FORGE: &str = "conda-forge";
 
+/// The pixi `[workspace] name`, rendered as a FIXED constant so the manager and the
+/// in-env agent -- which derive the env name from different sources -- never emit a
+/// divergent `name =` line (see `render_manifest`). Cosmetic to the solve.
+const WORKSPACE_NAME: &str = "morloc-env";
+
 /// Set the portable CA-bundle environment variables on a pixi/bash command so it
 /// trusts a corporate CA behind a TLS-inspection firewall. A no-op when no
 /// bundle is configured; see [`crate::cert`].
@@ -46,7 +51,6 @@ fn apply_cert_env(cmd: &mut Command, ssl_cert_file: Option<&Path>) {
 
 /// Inputs for rendering an environment's pixi manifest.
 pub struct PixiManifestInput<'a> {
-    pub env_name: &'a str,
     /// conda platform: "linux-64" | "osx-64" | "osx-arm64".
     pub platform: &'a str,
     /// conda channels, in priority order (typically just ["conda-forge"]).
@@ -101,24 +105,94 @@ fn merge_channel(name: &str, a: Option<&str>, b: Option<&str>) -> Result<Option<
     }
 }
 
-/// Combine two version constraints for the same package. conda match-specs use
-/// `,` as AND, so we simply intersect. `*` (any) yields to a real constraint.
+/// A version match-spec as a boolean formula in disjunctive normal form: an OR of
+/// AND-groups. conda/pixi match-specs use `|` for OR (the lowest-precedence
+/// operator) and `,` for AND, so `>=1.0,<2|>=3` is `(>=1.0 AND <2) OR (>=3)` and
+/// parses to `[["<2", ">=1.0"], [">=3"]]`. Atoms are sorted+deduplicated within a
+/// group and the groups are sorted+deduplicated between, so two formulas that are
+/// logically equal (AND and OR are both commutative) share one byte-identical
+/// rendering. An empty AND-group is always-true (`*`).
+type Dnf = Vec<Vec<String>>;
+
+/// Parse a match-spec constraint into DNF. `*` (any version) and empty atoms are
+/// the AND-identity, so they drop out of their group; a group left with no atoms
+/// is the always-true group that `render_dnf` collapses back to `*`.
+fn parse_dnf(constraint: &str) -> Dnf {
+    constraint
+        .split('|')
+        .map(|clause| {
+            let mut atoms: Vec<String> = clause
+                .split(',')
+                .map(str::trim)
+                .filter(|a| !a.is_empty() && *a != "*")
+                .map(str::to_string)
+                .collect();
+            atoms.sort_unstable();
+            atoms.dedup();
+            atoms
+        })
+        .collect()
+}
+
+/// Intersect (logical AND) two DNF formulas: the product of their AND-groups, each
+/// product element the union of one group from each side. This is the correct
+/// distribution of `(a|b) AND c` into `(a,c)|(b,c)`, which a naive comma-join
+/// would get wrong under conda's `,`-binds-tighter-than-`|` precedence.
+fn intersect_dnf(a: &Dnf, b: &Dnf) -> Dnf {
+    let mut groups: Dnf = Vec::new();
+    for ga in a {
+        for gb in b {
+            let mut group: Vec<String> = ga.iter().chain(gb).cloned().collect();
+            group.sort_unstable();
+            group.dedup();
+            groups.push(group);
+        }
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    groups
+}
+
+/// Render a DNF formula back to a canonical match-spec string. A single always-true
+/// (empty) AND-group makes the whole disjunction true, so it collapses to `*`;
+/// otherwise atoms join with `,` (AND) within a group and groups join with `|`
+/// (OR), in the sorted order the DNF already carries.
+fn render_dnf(groups: &Dnf) -> String {
+    if groups.iter().any(|g| g.is_empty()) {
+        return "*".to_string();
+    }
+    groups
+        .iter()
+        .map(|g| g.join(","))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Combine two version constraints for the same package by logical intersection.
+/// A `*` (any) or identical side is returned verbatim -- there is nothing to
+/// intersect, so this just skips the DNF round-trip; the stored value is normalized
+/// for output later by `canonical_constraint` (at render and digest time), not here.
+/// A genuine intersection of two different specs goes through the DNF, so the result
+/// is independent of merge order and correct even when a spec contains `|`.
 fn merge_constraint(existing: &str, incoming: &str) -> String {
     if existing == incoming || incoming == "*" {
         existing.to_string()
     } else if existing == "*" {
         incoming.to_string()
     } else {
-        // Deduplicate the comma-separated atoms, preserving order.
-        let mut atoms: Vec<&str> = Vec::new();
-        for atom in existing.split(',').chain(incoming.split(',')) {
-            let a = atom.trim();
-            if !a.is_empty() && !atoms.contains(&a) {
-                atoms.push(a);
-            }
-        }
-        atoms.join(",")
+        render_dnf(&intersect_dnf(&parse_dnf(existing), &parse_dnf(incoming)))
     }
+}
+
+/// Canonicalize a single constraint string (sort/dedup atoms and OR-groups) WITHOUT
+/// intersecting anything. Applied at render AND digest time so a package's value is a
+/// pure function of its atom set -- independent of how many merges produced it, so a
+/// constraint stored verbatim from a single spec and the same constraint stored via a
+/// merge canonicalize identically. That is what makes `requirement_digest` (the
+/// coherence key) order-independent, so the manager's and agent's worlds compare
+/// equal instead of forcing a spurious make-time re-solve.
+fn canonical_constraint(constraint: &str) -> String {
+    render_dnf(&parse_dnf(constraint))
 }
 
 /// A pypi (`[pypi-dependencies]`) requirement: a version match-spec, or a local
@@ -218,6 +292,18 @@ impl RequirementSet {
             )));
         }
         insert_merged_conda(&mut self.conda, name, constraint, None)
+    }
+
+    /// Fold a list of env-level conda extras into the solve (see `add_conda_spec`).
+    /// The one entry point for user conda utilities, so the manager (after its own
+    /// `resolve_requirements`) and the in-env agent (`EnvContext::rendered_manifest`)
+    /// apply them identically -- the two paths rendering a different manifest is the
+    /// exact drift that lets a make-time re-solve prune these packages.
+    pub fn add_conda_specs(&mut self, specs: &[String]) -> Result<()> {
+        for spec in specs {
+            self.add_conda_spec(spec)?;
+        }
+        Ok(())
     }
 }
 
@@ -399,7 +485,6 @@ fn toml_escape(s: &str) -> std::borrow::Cow<'_, str> {
 /// any future backend consume structured data rather than re-parsing a manifest.
 #[derive(Debug, Clone)]
 pub struct RequirementSet {
-    pub env_name: String,
     /// conda platform string ("linux-64" | "osx-arm64" | ...).
     pub platform: String,
     pub channels: Vec<String>,
@@ -425,12 +510,75 @@ pub fn default_channels() -> Vec<String> {
 pub fn resolve_requirements(input: &PixiManifestInput) -> Result<RequirementSet> {
     let (conda, pypi) = aggregate(input.specs, input.lang_support)?;
     Ok(RequirementSet {
-        env_name: input.env_name.to_string(),
         platform: input.platform.to_string(),
         channels: input.channels.to_vec(),
         conda,
         pypi,
     })
+}
+
+/// The single entry point that turns gathered specs + language support + user conda
+/// extras into a `RequirementSet`: `resolve_requirements` then `add_conda_specs`. The
+/// manager (`build_env_requirements`) and the in-env agent (`EnvContext`) BOTH call
+/// this, so they cannot diverge on how the declared world is built -- the two-writer
+/// drift that caused the byte-identity bugs.
+pub fn build_requirement_set(
+    input: &PixiManifestInput,
+    conda_extras: &[String],
+) -> Result<RequirementSet> {
+    let mut req = resolve_requirements(input)?;
+    req.add_conda_specs(conda_extras)?;
+    Ok(req)
+}
+
+/// A stable digest of the SEMANTIC declared world -- the sorted conda/pypi maps,
+/// platform, and channels. The env name is not part of the world and never enters
+/// the digest. Two `RequirementSet`s that request the same packages/platform/
+/// channels produce the same digest regardless of env name, whitespace, or
+/// constraint atom order (each
+/// constraint is canonicalized). This replaces the rendered-`pixi.toml`-TEXT compare
+/// that coupled the manager and agent by byte-identity; comparing digests instead
+/// makes the workspace name and formatting irrelevant. The digest is the canonical
+/// serialization itself (small; equality is a string compare), not a hash, so it is
+/// deterministic across mim versions.
+pub fn requirement_digest(req: &RequirementSet) -> String {
+    let mut s = String::new();
+    s.push_str("platform:");
+    s.push_str(&req.platform);
+    s.push('\n');
+    s.push_str("channels:");
+    s.push_str(&req.channels.join(","));
+    s.push('\n');
+    s.push_str("[conda]\n");
+    for (name, (constraint, channel)) in &req.conda {
+        s.push_str(name);
+        s.push('=');
+        s.push_str(&canonical_constraint(constraint));
+        if let Some(ch) = channel {
+            s.push('@');
+            s.push_str(ch);
+        }
+        s.push('\n');
+    }
+    s.push_str("[pypi]\n");
+    for (name, req) in &req.pypi {
+        s.push_str(name);
+        match req {
+            PypiReq::Version(c) => {
+                s.push('=');
+                s.push_str(&canonical_constraint(c));
+            }
+            PypiReq::Local { path, editable } => {
+                s.push_str("=path:");
+                s.push_str(path);
+                if *editable {
+                    s.push_str(":editable");
+                }
+            }
+        }
+        s.push('\n');
+    }
+    s
 }
 
 /// Render the pixi manifest text from a resolved `RequirementSet`. Deterministic
@@ -455,22 +603,32 @@ pub fn render_manifest(req: &RequirementSet) -> String {
 
     let mut out = String::new();
     out.push_str("[workspace]\n");
-    out.push_str(&format!("name = \"{}\"\n", req.env_name));
+    // The pixi workspace name is a FIXED constant, never the env name. It is
+    // cosmetic to the solve, but the manager and agent derive the env name from
+    // different sources (the real name vs the basename of MORLOC_STATE =
+    // "morloc-state" in a container), so rendering the name from it made the two
+    // manifests diverge. The coherence key is now `requirement_digest` (which never
+    // reads a name), so nothing depends on this line; a render-invariant constant
+    // keeps it that way.
+    out.push_str(&format!("name = \"{WORKSPACE_NAME}\"\n"));
     out.push_str(&format!("channels = [{channels}]\n"));
     out.push_str(&format!("platforms = [\"{}\"]\n", req.platform));
 
     out.push_str("\n[dependencies]\n");
     for (name, (constraint, channel)) in &req.conda {
+        // Canonicalize at render so the text is independent of merge history (see
+        // `canonical_constraint`); the stored map value may be verbatim.
+        let constraint = canonical_constraint(constraint);
         match channel {
             // A non-conda-forge channel lowers to a pixi inline table so the dep
             // is pinned to that channel; conda-forge (None) keeps the flat form.
             Some(ch) => out.push_str(&format!(
                 "{} = {{ version = \"{}\", channel = \"{}\" }}\n",
                 key(name),
-                toml_escape(constraint),
+                toml_escape(&constraint),
                 toml_escape(ch)
             )),
-            None => out.push_str(&format!("{} = \"{}\"\n", key(name), toml_escape(constraint))),
+            None => out.push_str(&format!("{} = \"{}\"\n", key(name), toml_escape(&constraint))),
         }
     }
 
@@ -478,9 +636,11 @@ pub fn render_manifest(req: &RequirementSet) -> String {
         out.push_str("\n[pypi-dependencies]\n");
         for (name, req) in &req.pypi {
             match req {
-                PypiReq::Version(constraint) => {
-                    out.push_str(&format!("{} = \"{}\"\n", key(name), toml_escape(constraint)))
-                }
+                PypiReq::Version(constraint) => out.push_str(&format!(
+                    "{} = \"{}\"\n",
+                    key(name),
+                    toml_escape(&canonical_constraint(constraint))
+                )),
                 // A local dep lowers to a uv path source; `editable` keeps the
                 // source live in interactive contexts (serve/freeze pass false).
                 PypiReq::Local { path, editable } => out.push_str(&format!(
@@ -538,10 +698,11 @@ pub fn solve(
         .map_err(|e| DepsError::Env(format!("could not run pixi ({}): {e}", pixi_bin.display())))?;
     if !status.success() {
         return Err(DepsError::Env(
-            "pixi could not solve this environment: a required package is unavailable on \
-             conda-forge for this platform. The native backend can only provide what conda \
-             offers; rebuild with a container backend (--engine podman) for host or system \
-             dependencies."
+            "pixi failed to provision this environment (its output is shown above). If the \
+             cause there is a package conda-forge does not offer for this platform, a \
+             container backend (--engine podman) can supply host/system dependencies the \
+             native backend cannot -- but a sandbox, network, or toolchain error above is a \
+             different cause and --engine podman will not fix it."
                 .to_string(),
         ));
     }
@@ -552,6 +713,42 @@ pub fn solve(
 /// the host. The lock is what a container image reproduces with `pixi install
 /// --locked`, so the container's conda world is pinned to the same solve. A
 /// failure here is phase 2 of the impurity gate (a package conda cannot provide).
+/// Try to materialize the environment from its EXISTING lock WITHOUT re-solving:
+/// `pixi install --locked`. Returns `Ok(true)` when the lock still satisfies the
+/// manifest and the prefix is installed from it (zero version drift); `Ok(false)`
+/// when pixi exits non-zero -- the lock is stale (`lock file not up-to-date`) or any
+/// other failure -- in which case the caller falls back to a bare `solve`, which
+/// re-solves AND surfaces any genuine error (network/disk), so a real failure is
+/// never masked as a benign re-solve. Output is CAPTURED (not shown): a stale-lock
+/// exit is expected and its scary "not up-to-date" message must not alarm the user;
+/// the fallback `solve` is the visible step. `Err` only for a spawn failure.
+pub fn install_locked(
+    env_dir: &Path,
+    pixi_bin: &Path,
+    ssl_cert_file: Option<&Path>,
+    fhs: Option<&Path>,
+) -> Result<bool> {
+    let manifest = env_dir.join("pixi.toml");
+    let mut cmd = crate::sandbox::command(
+        fhs,
+        pixi_bin,
+        &[
+            OsString::from("install"),
+            OsString::from("--locked"),
+            OsString::from("--manifest-path"),
+            manifest.into(),
+        ],
+        None,
+        None,
+    );
+    cmd.stdin(Stdio::null());
+    apply_cert_env(&mut cmd, ssl_cert_file);
+    let out = cmd
+        .output()
+        .map_err(|e| DepsError::Env(format!("could not run pixi ({}): {e}", pixi_bin.display())))?;
+    Ok(out.status.success())
+}
+
 pub fn lock(env_dir: &Path, pixi_bin: &Path, ssl_cert_file: Option<&Path>) -> Result<()> {
     let manifest = env_dir.join("pixi.toml");
     let mut cmd = Command::new(pixi_bin);
@@ -562,8 +759,9 @@ pub fn lock(env_dir: &Path, pixi_bin: &Path, ssl_cert_file: Option<&Path>) -> Re
         .map_err(|e| DepsError::Env(format!("could not run pixi ({}): {e}", pixi_bin.display())))?;
     if !status.success() {
         return Err(DepsError::Env(
-            "pixi could not lock this environment: a required package is unavailable on \
-             conda-forge for this platform (see the solver output above)."
+            "pixi failed to lock this environment (its output is shown above). One common \
+             cause is a package conda-forge does not offer for this platform; a sandbox or \
+             network error above is a different cause with a different fix."
                 .to_string(),
         ));
     }
@@ -897,7 +1095,6 @@ mod tests {
     #[test]
     fn add_conda_spec_renders_as_name_keyed_dependency() {
         let mut req = RequirementSet {
-            env_name: "e".into(),
             platform: "linux-64".into(),
             channels: default_channels(),
             conda: BTreeMap::new(),
@@ -945,7 +1142,6 @@ mod tests {
         let support = sample_support();
         let channels = vec!["conda-forge".to_string()];
         let input = PixiManifestInput {
-            env_name: "morloc-env-demo",
             platform: "linux-64",
             channels: &channels,
             specs: std::slice::from_ref(&spec),
@@ -960,7 +1156,7 @@ mod tests {
         // injected numpy>=1.22,<3. cxx-compiler comes from the cpp entry.
         let expected = "\
 [workspace]
-name = \"morloc-env-demo\"
+name = \"morloc-env\"
 channels = [\"conda-forge\"]
 platforms = [\"linux-64\"]
 
@@ -968,9 +1164,9 @@ platforms = [\"linux-64\"]
 \"blas\" = \"*\"
 \"c-compiler\" = \"*\"
 \"cxx-compiler\" = \"*\"
-\"numpy\" = \">=1.22,<3,>=2\"
+\"numpy\" = \"<3,>=1.22,>=2\"
 \"opencv\" = \">=4.8\"
-\"python\" = \">=3.10,<3.14\"
+\"python\" = \"<3.14,>=3.10\"
 \"rust\" = \"*\"
 \"setuptools\" = \"*\"
 
@@ -1035,7 +1231,6 @@ platforms = [\"linux-64\"]
         let support = sample_support();
         let channels = default_channels();
         let input = PixiManifestInput {
-            env_name: "e",
             platform: "linux-64",
             channels: &channels,
             specs: std::slice::from_ref(&spec),
@@ -1165,10 +1360,96 @@ platforms = [\"linux-64\"]
 
     #[test]
     fn constraints_merge_across_specs() {
-        assert_eq!(merge_constraint(">=2", "<3"), ">=2,<3");
+        // A real intersection is canonicalized (atoms sorted), so the result is
+        // independent of which side (or which merge order) contributed each atom.
+        assert_eq!(merge_constraint(">=2", "<3"), "<3,>=2");
+        assert_eq!(merge_constraint("<3", ">=2"), "<3,>=2");
+        // `*` (any) and identical sides are returned verbatim, preserving the
+        // author-written order of a single-contribution constraint.
         assert_eq!(merge_constraint("*", ">=1"), ">=1");
         assert_eq!(merge_constraint(">=1", "*"), ">=1");
-        assert_eq!(merge_constraint(">=2,<3", ">=2"), ">=2,<3");
+        assert_eq!(merge_constraint(">=3.10,<3.14", ">=3.10,<3.14"), ">=3.10,<3.14");
+        // A subset merge collapses to the same canonical set.
+        assert_eq!(merge_constraint(">=2,<3", ">=2"), "<3,>=2");
+    }
+
+    #[test]
+    fn merge_constraint_is_order_independent() {
+        // The whole point of canonicalization: the same result regardless of the
+        // order the atoms are contributed in (this is what keeps the manager's and
+        // the in-env agent's requirement digests equal instead of re-solving).
+        let a = merge_constraint(">=1.20", ">=1.22,<3");
+        let b = merge_constraint(">=1.22,<3", ">=1.20");
+        assert_eq!(a, b);
+        assert_eq!(a, "<3,>=1.20,>=1.22");
+    }
+
+    #[test]
+    fn render_canonicalizes_regardless_of_stored_order() {
+        // A constraint stored verbatim (a single spec's contribution) and the same
+        // atoms in a different order (from a merge) must RENDER identically -- the
+        // order-independence the manager/agent coherence digest depends on, even
+        // though the stored map value is not canonicalized on insert.
+        let mk = |c: &str| {
+            let mut conda = BTreeMap::new();
+            conda.insert("numpy".to_string(), (c.to_string(), None));
+            RequirementSet {
+                platform: "linux-64".into(),
+                channels: default_channels(),
+                conda,
+                pypi: BTreeMap::new(),
+            }
+        };
+        assert_eq!(render_manifest(&mk(">=1,<2")), render_manifest(&mk("<2,>=1")));
+        assert!(render_manifest(&mk(">=1,<2")).contains("\"numpy\" = \"<2,>=1\""));
+    }
+
+    #[test]
+    fn render_uses_the_fixed_workspace_name() {
+        // The manager and agent derive the env name differently (the real name vs
+        // the basename of MORLOC_STATE = "morloc-state" in a container), so the
+        // rendered `name =` line is a FIXED constant, never the env name -- otherwise
+        // the two manifests diverge and the caches take a spurious re-solve.
+        let req = RequirementSet {
+            platform: "linux-64".into(),
+            channels: default_channels(),
+            conda: BTreeMap::new(),
+            pypi: BTreeMap::new(),
+        };
+        assert!(render_manifest(&req).contains("name = \"morloc-env\"\n"));
+    }
+
+    #[test]
+    fn requirement_digest_tracks_the_world() {
+        let mk = |constraint: &str| {
+            let mut conda = BTreeMap::new();
+            conda.insert("numpy".to_string(), (constraint.to_string(), None));
+            RequirementSet {
+                platform: "linux-64".into(),
+                channels: default_channels(),
+                conda,
+                pypi: BTreeMap::new(),
+            }
+        };
+        // atom order is canonicalized -> order-independent.
+        assert_eq!(
+            requirement_digest(&mk(">=1,<2")),
+            requirement_digest(&mk("<2,>=1"))
+        );
+        // a changed constraint changes the digest (a real world change re-solves).
+        assert_ne!(requirement_digest(&mk(">=1")), requirement_digest(&mk(">=2")));
+    }
+
+    #[test]
+    fn merge_constraint_distributes_over_or() {
+        // `,` binds tighter than `|` in a conda match-spec, so intersecting an
+        // OR-spec with a constraint must DISTRIBUTE (a|b) AND c -> (a,c)|(b,c),
+        // not comma-join into the mis-parsed `a|b,c` (= a OR (b AND c)).
+        assert_eq!(merge_constraint(">=1|>=2", "<3"), "<3,>=1|<3,>=2");
+        // OR is commutative: the alternatives sort into a canonical order.
+        assert_eq!(merge_constraint(">=2|>=1", "<3"), "<3,>=1|<3,>=2");
+        // Intersecting two OR-specs is the full cross product.
+        assert_eq!(merge_constraint("a|b", "c|d"), "a,c|a,d|b,c|b,d");
     }
 
     #[test]
