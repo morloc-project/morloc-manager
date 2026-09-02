@@ -1,10 +1,17 @@
 //! The environment's persisted dependency-spec store.
 //!
 //! Each program contributes its compiler-produced `envspec.json` to
-//! `<env_home>/requirements/{installed,scratch}/<program>.json`. The union of
-//! these is the environment's declared dependency world; `installed/` alone is
-//! the canonical baseline that `clean` resets to. Scratch holds the specs of
-//! programs that were built (`morloc make`) but not installed.
+//! `<env_home>/requirements/{installed,scratch}/...`. The union of these is the
+//! environment's declared dependency world; `installed/` alone is the canonical
+//! baseline that `clean` resets to. Scratch holds the specs of programs that were
+//! built (`morloc make`) but not installed.
+//!
+//! An installed program occupies `installed/<program>.json`: the environment owns
+//! one `exe/<program>` per name, so the name is a unique slot. A scratch build is a
+//! `morloc make` anywhere on the filesystem and its name is NOT unique -- `-o nexus`
+//! is the overwhelmingly common default -- so it occupies
+//! `scratch/<world-digest>/<program>.json`, keyed on the declared world itself. See
+//! [`EnvContext::write_spec`].
 //!
 //! Specs are stored as the raw JSON the compiler emitted -- storing verbatim
 //! avoids a second (Rust) serializer for a schema the compiler already owns.
@@ -14,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
+use sha2::{Digest, Sha256};
 
 use crate::envspec::EnvSpec;
 use crate::error::{DepsError, Result};
@@ -75,6 +83,31 @@ impl Provenance {
     }
 }
 
+/// A spec's exact location in the store, returned by [`EnvContext::write_spec`] so
+/// the writer can undo precisely the write it made -- and nothing else. The `sync`
+/// rollback needs that precision: sweeping every slot sharing the program's name
+/// would discard a different, still-good declared world built earlier under the
+/// same name.
+#[derive(Debug, Clone)]
+pub struct SpecSlot(PathBuf);
+
+/// The scratch sub-directory for a declared world: the first 16 hex digits of the
+/// SHA-256 of its canonical JSON. Truncated because it only has to separate the
+/// worlds present in one environment, and the full digest makes for an unreadable
+/// path.
+///
+/// It digests the spec re-serialized through [`EnvSpec`] rather than the raw text,
+/// so formatting alone cannot split one world across two slots. What CAN split one
+/// is a difference the type still carries: list order, or the `morloc_version`
+/// stamp after a compiler upgrade. That only ever yields an extra slot, which
+/// over-states the environment's world -- the direction that keeps a built program
+/// working.
+fn world_digest(spec: &EnvSpec) -> Result<String> {
+    let canonical = spec.to_json()?;
+    let digest = Sha256::digest(canonical.as_bytes());
+    Ok(digest.iter().take(8).map(|b| format!("{b:02x}")).collect())
+}
+
 impl EnvContext {
     pub fn new(env_home: impl AsRef<Path>) -> Self {
         EnvContext { env_home: env_home.as_ref().to_path_buf(), pixi_dir: None }
@@ -100,24 +133,73 @@ impl EnvContext {
     }
 
     /// Persist a program's compiler-produced envspec JSON under the given
-    /// provenance. The spec is validated before it is written so a malformed
-    /// spec never enters the store.
-    pub fn write_spec(&self, program: &str, provenance: Provenance, json: &str) -> Result<()> {
+    /// provenance, returning the slot it landed in. The spec is validated before it
+    /// is written so a malformed spec never enters the store.
+    ///
+    /// An INSTALLED program occupies `installed/<program>.json`: the environment
+    /// owns one `exe/<program>`, so its name is a unique slot.
+    ///
+    /// A SCRATCH build occupies `scratch/<world-digest>/<program>.json`, keyed on
+    /// the declared world it is reporting. Its name cannot key it: the name is the
+    /// `-o`/`--name` value, defaulting to the source basename, and unrelated
+    /// programs share one constantly (`-o nexus` above all). Keyed by name, the
+    /// second program to build overwrites the first's declared dependencies, and
+    /// the next solve then evicts packages the first still needs -- from a prefix it
+    /// may be running out of. Keyed by world, two programs declaring different
+    /// worlds hold two slots and the gathered union covers both, while rebuilding
+    /// either with unchanged dependencies rewrites its own slot in place.
+    ///
+    /// A build whose dependencies CHANGE lands in a new slot and leaves its previous
+    /// world behind, to be reclaimed by `clean`. That is deliberate: a scratch build
+    /// is a program somewhere on the filesystem that mim cannot see, so mim cannot
+    /// tell "this program dropped a dependency" from "a different program built
+    /// under the same name". Retaining the old world over-states the environment,
+    /// which keeps a built program working; dropping it would break one.
+    pub fn write_spec(
+        &self,
+        program: &str,
+        provenance: Provenance,
+        json: &str,
+    ) -> Result<SpecSlot> {
         validate_program_name(program)?;
-        EnvSpec::from_json(json)?;
-        let dir = self.provenance_dir(provenance);
+        let spec = EnvSpec::from_json(json)?;
+        let dir = match provenance {
+            Provenance::Installed => self.provenance_dir(provenance),
+            Provenance::Scratch => self.provenance_dir(provenance).join(world_digest(&spec)?),
+        };
         std::fs::create_dir_all(&dir)
             .map_err(|e| DepsError::Env(format!("cannot create {}: {e}", dir.display())))?;
         let path = dir.join(format!("{program}.json"));
         std::fs::write(&path, json)
-            .map_err(|e| DepsError::Env(format!("cannot write {}: {e}", path.display())))
+            .map_err(|e| DepsError::Env(format!("cannot write {}: {e}", path.display())))?;
+        Ok(SpecSlot(path))
     }
 
-    /// Remove a program's spec from a provenance tier (uninstall, or promoting a
-    /// scratch build to installed). A missing file is not an error.
-    pub fn remove_spec(&self, program: &str, provenance: Provenance) -> Result<()> {
+    /// Remove exactly the spec [`write_spec`](Self::write_spec) wrote, and nothing
+    /// else -- the rollback of a failed `sync`. A missing file is not an error.
+    pub fn remove_spec(&self, slot: &SpecSlot) -> Result<()> {
+        remove_if_present(&slot.0)?;
+        // Reclaim the containing directory once it is empty -- an empty store
+        // directory reads exactly like an absent one everywhere here. Non-empty is
+        // the normal case and fails harmlessly.
+        if let Some(parent) = slot.0.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+        Ok(())
+    }
+
+    /// Remove EVERY spec stored under `program` in a provenance tier, whichever
+    /// declared world keyed it. Installing a program supersedes its scratch builds,
+    /// which sit in per-world slots, so superseding must sweep them all rather than
+    /// guess a world.
+    pub fn remove_named(&self, program: &str, provenance: Provenance) -> Result<()> {
         validate_program_name(program)?;
-        remove_if_present(&self.provenance_dir(provenance).join(format!("{program}.json")))
+        for path in json_paths(&self.provenance_dir(provenance))? {
+            if path.file_stem().and_then(|s| s.to_str()) == Some(program) {
+                self.remove_spec(&SpecSlot(path))?;
+            }
+        }
+        Ok(())
     }
 
     /// Delete every scratch spec: the `clean` reset to the installed baseline.
@@ -338,6 +420,13 @@ impl EnvContext {
     /// [`Flock`] releases on drop (end of the caller's scope), including on the
     /// error/rollback path. A first non-blocking attempt lets us tell the user we
     /// are waiting rather than pausing silently.
+    ///
+    /// It serializes solves against each other, NOT against programs RUNNING out of
+    /// the prefix -- those neither take nor could hold this lock for their lifetime
+    /// (a served daemon would block every later build forever). A solve that changes
+    /// the world can therefore still relink or move a package under a running
+    /// program's pools; the store's per-world scratch slots keep the declared world
+    /// from SHRINKING under one, which is the reachable half of that hazard.
     fn lock_solve(&self) -> Result<Flock<File>> {
         let path = self.solve_lock_path();
         // env_home normally exists (it is the state root), but be defensive.
@@ -509,7 +598,7 @@ impl EnvContext {
         // Serialize concurrent solves against this env's shared prefix; held
         // through the write/gather/solve/record, released when `_lock` drops.
         let _lock = self.lock_solve()?;
-        self.write_spec(program, provenance, spec_json)?;
+        let slot = self.write_spec(program, provenance, spec_json)?;
         let mut specs = self.gather()?;
         self.append_abi_lock(&mut specs)?;
         // Prefer the manager's tested lock (`--locked`); re-solve only if it cannot
@@ -534,7 +623,7 @@ impl EnvContext {
                 Ok(outcome.activation)
             }
             Err(e) => {
-                let _ = self.remove_spec(program, provenance);
+                let _ = self.remove_spec(&slot);
                 Err(e)
             }
         }
@@ -669,21 +758,40 @@ fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
-/// The `*.json` files directly under `dir`, sorted by name for a stable order.
-/// A missing directory yields an empty list.
+/// Every spec file under `dir`: the name-only slots (`<name>.json`) plus the
+/// world-keyed ones one level down (`<world-digest>/<name>.json`). Sorted by
+/// program name, then by path, so the gather order is deterministic (it feeds the
+/// merged requirement set) and reads in program order. A missing directory yields
+/// an empty list.
 fn json_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_json(dir, true, &mut files)?;
+    files.sort_by(|a, b| {
+        let stem = |p: &PathBuf| p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        stem(a).cmp(&stem(b)).then_with(|| a.cmp(b))
+    });
+    Ok(files)
+}
+
+/// Append the `*.json` files directly under `dir` to `out`, descending one level
+/// into subdirectories when `descend` is set. World slots nest exactly one level,
+/// so this never recurses further.
+fn collect_json(dir: &Path, descend: bool, out: &mut Vec<PathBuf>) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(DepsError::Env(format!("cannot read {}: {e}", dir.display()))),
     };
-    let mut files: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
-        .collect();
-    files.sort();
-    Ok(files)
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.is_dir() {
+            if descend {
+                collect_json(&path, false, out)?;
+            }
+        } else if path.extension().and_then(|x| x.to_str()) == Some("json") {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// Read and parse every `*.json` in `dir`, sorted for a stable order.
@@ -771,6 +879,78 @@ mod tests {
         let after = ctx.gather().unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].languages[0].lang, "py");
+    }
+
+    #[test]
+    fn scratch_builds_declaring_different_worlds_do_not_overwrite_each_other() {
+        let (_d, ctx) = ctx();
+        // Two unrelated programs, both built as `nexus` (the -o default), declaring
+        // different worlds. Keyed on the name alone the second erases the first, and
+        // the next solve drops what the first still needs.
+        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
+
+        let mut langs: Vec<String> =
+            ctx.gather().unwrap().iter().map(|s| s.languages[0].lang.clone()).collect();
+        langs.sort();
+        assert_eq!(langs, vec!["py".to_string(), "r".to_string()]);
+        // Still one program: the two slots are two declared worlds of one NAME.
+        assert_eq!(ctx.program_names().unwrap(), vec!["nexus".to_string()]);
+    }
+
+    #[test]
+    fn rebuilding_an_unchanged_world_rewrites_one_slot() {
+        let (_d, ctx) = ctx();
+        // The common case: the same program rebuilt over and over. Its world is
+        // unchanged, so it must not accumulate a slot per build.
+        for _ in 0..5 {
+            ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
+        }
+        assert_eq!(ctx.gather().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn install_supersedes_every_scratch_world_of_that_name() {
+        let (_d, ctx) = ctx();
+        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
+        ctx.write_spec("nexus", Provenance::Installed, &spec(r#"{"lang":"cpp"}"#)).unwrap();
+
+        ctx.remove_named("nexus", Provenance::Scratch).unwrap();
+        let all = ctx.gather().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].languages[0].lang, "cpp");
+        // A superseded name leaves no empty world directories behind.
+        assert!(std::fs::read_dir(ctx.requirements_dir().join("scratch"))
+            .map(|d| d.count() == 0)
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn sync_rollback_removes_only_the_slot_it_wrote() {
+        let (_d, ctx) = ctx();
+        // An earlier, good build under this name.
+        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
+        // A later build whose solve fails: `sync` rolls back exactly its own write.
+        let slot = ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
+        ctx.remove_spec(&slot).unwrap();
+
+        let all = ctx.gather().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].languages[0].lang, "py");
+    }
+
+    #[test]
+    fn clear_scratch_drops_every_world_slot() {
+        let (_d, ctx) = ctx();
+        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
+        ctx.write_spec("keep", Provenance::Installed, &spec(r#"{"lang":"cpp"}"#)).unwrap();
+        ctx.clear_scratch().unwrap();
+
+        let all = ctx.gather().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].languages[0].lang, "cpp");
     }
 
     #[test]
@@ -1019,14 +1199,15 @@ mod tests {
     #[test]
     fn remove_and_promote_semantics() {
         let (_d, ctx) = ctx();
-        ctx.write_spec("p", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
+        let scratch = ctx.write_spec("p", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
         // promote: write to installed, drop from scratch
         ctx.write_spec("p", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
-        ctx.remove_spec("p", Provenance::Scratch).unwrap();
+        ctx.remove_spec(&scratch).unwrap();
         assert_eq!(ctx.gather().unwrap().len(), 1);
         assert_eq!(ctx.gather_installed().unwrap().len(), 1);
         // removing a missing spec is a no-op
-        ctx.remove_spec("p", Provenance::Scratch).unwrap();
+        ctx.remove_spec(&scratch).unwrap();
+        ctx.remove_named("p", Provenance::Scratch).unwrap();
     }
 
     #[test]

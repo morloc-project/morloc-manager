@@ -3022,7 +3022,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     // and supersede any prior scratch build (its stale /work editable
                     // path must not linger in the solve).
                     store.write_spec(&key, envstore::Provenance::Installed, &spec.to_json()?)?;
-                    let _ = store.remove_spec(&key, envstore::Provenance::Scratch);
+                    // Sweep every per-world scratch slot for this name: the install
+                    // supersedes any `morloc make` of it, whatever it declared.
+                    let _ = store.remove_named(&key, envstore::Provenance::Scratch);
                 }
                 rematerialize_env(scope, &env_name, &[], current_version_tag(&ec), verbose)?;
             }
