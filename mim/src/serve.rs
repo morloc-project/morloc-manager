@@ -226,6 +226,7 @@ pub fn serve_environment(
     shm_size: &Option<String>,
     user_env: &[(String, String)],
     command: &[String],
+    mount_home: Option<&str>,
 ) -> Result<()> {
     if matches!(engine, ContainerEngine::Apptainer) {
         // Apptainer already runs in the host netns; `network`/`publish_host`
@@ -275,6 +276,9 @@ pub fn serve_environment(
     // Mount the host env dir at MORLOC_STATE (mutable), NOT over MORLOC_HOME (the
     // baked runtime), so the runtime is never shadowed.
     cfg.bind_mounts = vec![(data_dir.to_string(), CONTAINER_MORLOC_STATE.to_string())];
+    // A host-mounted home shadows the env-owned one for served daemons too, so a
+    // program reading `~/.config` sees the same home as `mim shell`.
+    cfg.bind_mounts.extend(home_mount(mount_home)?);
     // Docker/podman run as the host UID without mounting the host $HOME; pool
     // daemons may touch $HOME (matplotlib config, R tempdir), so oci_base_env
     // points it at a writable, mounted target ($MORLOC_STATE/home). Create it on
@@ -645,6 +649,33 @@ pub const CONTAINER_MORLOC_STATE: &str = "/opt/morloc-state";
 /// (`/opt/morloc-state/home`), where dotfiles land. Apptainer keeps the host
 /// $HOME and does not use this.
 pub const CONTAINER_HOME: &str = "/home/morloc";
+
+/// Bind mount for a host-mounted `$HOME` (`EnvironmentConfig::mount_home`), or
+/// no mount when the environment owns its home. The target is the state-relative
+/// home (`<state>/home`), NOT `CONTAINER_HOME`: the latter is an image-baked
+/// symlink to the former, so binding the resolved target keeps the mount
+/// independent of how an engine treats a symlinked mount point. It nests inside
+/// the state mount, which docker and podman both apply in destination order.
+///
+/// Errors (rather than mounting) when the recorded directory has gone: docker
+/// and podman silently CREATE a missing bind source as a root-owned empty
+/// directory, which would hand the user an empty, unwritable home in place of
+/// the one they persisted.
+pub fn home_mount(mount_home: Option<&str>) -> Result<Vec<(String, String)>> {
+    let Some(src) = mount_home else {
+        return Ok(Vec::new());
+    };
+    if !std::path::Path::new(src).is_dir() {
+        return Err(ManagerError::EnvError(format!(
+            "the environment's host home '{src}' is missing. Restore that directory, \
+             or drop the mount with `mim modify --env <env> --mount-home none`."
+        )));
+    }
+    Ok(vec![(
+        src.to_string(),
+        format!("{CONTAINER_MORLOC_STATE}/home"),
+    )])
+}
 
 /// Fixed in-container mount point + working directory for the host cwd on the
 /// run/shell/capture paths. A constant (not the literal host path) so the work

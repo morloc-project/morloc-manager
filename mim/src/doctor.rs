@@ -153,6 +153,7 @@ pub fn doctor(
     check_base_image(&mut c, engine, &ec.base_image);
     check_built_image(&mut c, engine, ec, scope, env_name);
     check_cert_bundle(&mut c, ec);
+    check_mount_home(&mut c, ec);
     check_data_dirs(&mut c, &data_dir);
     check_file_readability(&mut c, &data_dir);
 
@@ -1111,6 +1112,27 @@ fn check_cert_bundle(c: &mut Counts, ec: &EnvironmentConfig) {
              Rebuild to apply it: mim modify --env {} --cert-bundle {bundle}",
             ec.name
         )),
+    }
+}
+
+/// A configured host `$HOME` must still be a readable directory. Docker and
+/// podman create a missing bind source as a root-owned empty dir, so a vanished
+/// one would replace the user's files with a home they cannot write; `run`
+/// refuses in that state, and this reports it with the two ways out.
+fn check_mount_home(c: &mut Counts, ec: &EnvironmentConfig) {
+    let Some(src) = ec.mount_home.as_deref() else {
+        return;
+    };
+    if Path::new(src).is_dir() {
+        c.pass(&format!(
+            "Host home {src} is mounted as $HOME (kept when the environment is removed)"
+        ));
+    } else {
+        c.fail(&format!(
+            "Host home {src} is mounted as $HOME but is missing\n       \
+             Restore that directory, or drop the mount: mim modify --env {} --mount-home none",
+            ec.name
+        ));
     }
 }
 

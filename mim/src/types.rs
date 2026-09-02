@@ -301,7 +301,7 @@ impl Default for Config {
 
 /// Current on-disk schema version for `env.yaml`. Bump when the field set
 /// changes incompatibly and add a matching arm to `migrate_env_config`.
-pub const CURRENT_ENV_SCHEMA: u32 = 3;
+pub const CURRENT_ENV_SCHEMA: u32 = 4;
 
 /// Records written before schema versioning existed carry no `schema_version`
 /// field; they are the v1 baseline.
@@ -423,6 +423,14 @@ pub struct EnvironmentConfig {
     /// when no cert bundle is configured.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cert_fingerprints: Vec<String>,
+    /// Absolute host directory bind-mounted as the environment's `$HOME`. When
+    /// set, it SHADOWS the env-owned home (`<data_dir>/home`) for every run,
+    /// shell and serve, so its contents outlive `mim rm` -- the manager only ever
+    /// mounts it and never deletes it. `None` means the env owns its home.
+    /// Docker/podman only: apptainer inherits the host `$HOME` and the native
+    /// backend uses the real one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_home: Option<String>,
 }
 
 fn default_shm_size() -> String {
@@ -463,6 +471,7 @@ impl EnvironmentConfig {
             local_runtime: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
+            mount_home: None,
         }
     }
 

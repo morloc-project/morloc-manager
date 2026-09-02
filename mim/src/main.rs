@@ -76,7 +76,7 @@ fn build_help_template() -> String {
   {b}info{r}       Show configuration and installed environments
   {b}doctor{r}     Check environment health and diagnose issues
   {b}update{r}     Rebuild an environment (optionally move its morloc version)
-  {b}modify{r}     Change an environment's settings (packages, dotfiles, default)
+  {b}modify{r}     Change an environment's settings (packages, home, default)
   {b}rm{r}         Remove a morloc environment
   {b}nuke{r}       Remove all morloc environments
 
@@ -188,6 +188,13 @@ or `latest`). With no flags on a TTY, all settings are prompted interactively.")
         /// (.bashrc, .vimrc, .config/...). Docker/podman only.
         #[arg(long)]
         dotfiles: Option<String>,
+        /// Host directory to bind-mount as the environment's $HOME, created if
+        /// absent. Its contents live on the host, so they survive `mim rm` and
+        /// are shared with it in both directions. Every program run in the
+        /// environment gets full read/write access to that directory.
+        /// Docker/podman only; not combinable with --dotfiles.
+        #[arg(long = "mount-home", conflicts_with = "dotfiles")]
+        mount_home: Option<String>,
         /// Path to a corporate CA bundle (PEM/DER) to trust for this
         /// environment's package fetches, for use behind a TLS-inspection
         /// firewall. The certificates are validated and normalized; the file is
@@ -406,6 +413,7 @@ Examples:
   mim modify --env myenv --set-default   # make myenv your default
   sudo mim modify --env shared --set-default --system
   mim modify --env myenv --dotfiles ~/mydots
+  mim modify --env myenv --mount-home ~/morloc-homes/myenv
   mim modify --env myenv --conda-packages-file tools.conda
   mim modify --env myenv --system-packages-file tools.apt
   mim modify --env myenv --lang py@3.13")]
@@ -438,6 +446,12 @@ Examples:
         /// docker/podman only. No rebuild.
         #[arg(long)]
         dotfiles: Option<String>,
+        /// Host directory to bind-mount as the environment's $HOME (created if
+        /// absent), or `none` to go back to the env-owned home. The host
+        /// directory itself is never copied, moved or deleted. Docker/podman
+        /// only. No rebuild.
+        #[arg(long = "mount-home", conflicts_with = "dotfiles")]
+        mount_home: Option<String>,
         /// Replace the corporate CA bundle trusted by this environment (host
         /// path to a PEM/DER file). Re-validates the certificates and triggers a
         /// rebuild so the new CA is applied. Use after the corporate CA rotates.
@@ -1311,6 +1325,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             modules_file,
             no_default_modules,
             dotfiles,
+            mount_home,
             cert_bundle,
             base,
             system,
@@ -1346,7 +1361,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             }
 
             // Interactive: prompt (in order) for dev source, version, backend,
-            // language pins, system packages, scope, dotfiles, name, and default --
+            // language pins, system packages, scope, home, name, and default --
             // skipping any dimension already fixed by a flag -- then dispatch.
             // A local-runtime build is flag-only (advanced): skip prompting and fall
             // through to the direct dispatch below.
@@ -1360,6 +1375,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     cli_conda_package: conda_package,
                     cli_system: system,
                     cli_dotfiles: dotfiles,
+                    cli_mount_home: mount_home,
                     cli_set_default: set_default,
                     cli_dev: dev,
                     cli_cert_bundle: cert_bundle,
@@ -1375,7 +1391,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     let Backend::Container(eng) = plan.backend else { unreachable!() };
                     return container_new_dev(
                         plan.scope, eng, Some(plan.name), src, plan.lang, plan.system_packages,
-                        plan.conda_packages, plan.dotfiles, plan.cert_bundle,
+                        plan.conda_packages, plan.dotfiles, plan.mount_home, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
                         plan.requested_version, no_init, plan.make_default, &snapshots,
                     );
@@ -1385,6 +1401,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         if base.is_some() {
                             return Err(base_not_supported());
                         }
+                        if plan.mount_home.is_some() {
+                            return Err(mount_home_not_supported());
+                        }
                         native_new(
                             plan.scope, Some(plan.name), plan.lang, plan.conda_packages,
                             plan.requested_version, None, plan.cert_bundle, no_init, plan.make_default, verbose,
@@ -1393,7 +1412,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     }
                     Backend::Container(eng) => container_new_derived(
                         plan.scope, eng, Some(plan.name), plan.lang, plan.system_packages,
-                        plan.conda_packages, plan.dotfiles, plan.cert_bundle,
+                        plan.conda_packages, plan.dotfiles, plan.mount_home, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
                         plan.requested_version, None, no_init, plan.make_default, &snapshots,
                     ),
@@ -1467,6 +1486,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if dotfiles.is_some() {
                     return Err(dotfiles_not_supported());
                 }
+                if mount_home.is_some() {
+                    return Err(mount_home_not_supported());
+                }
                 if base.is_some() {
                     return Err(base_not_supported());
                 }
@@ -1535,7 +1557,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             if let Some(src) = dev {
                 return container_new_dev(
                     scope, resolved_engine, name, src, lang, system_package, conda_package,
-                    dotfiles, cert_bundle, base_image, morloc_version, no_init,
+                    dotfiles, mount_home, cert_bundle, base_image, morloc_version, no_init,
                     set_default, &snapshots,
                 );
             }
@@ -1545,8 +1567,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // native backend's lowering. There is no pull/recipe/base-image path.
             container_new_derived(
                 scope, resolved_engine, name, lang, system_package, conda_package, dotfiles,
-                cert_bundle, base_image, morloc_version, local_runtime, no_init, set_default,
-                &snapshots,
+                mount_home, cert_bundle, base_image, morloc_version, local_runtime, no_init,
+                set_default, &snapshots,
             )
         }
 
@@ -1584,7 +1606,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // Attempt each removal; collect failures, continue past errors
             let mut failures: Vec<String> = Vec::new();
             for name in &names {
-                let result: Result<()> = (|| {
+                // The closure yields the env's host-mounted home (if any) so the
+                // success message can say what `rm` deliberately did NOT delete.
+                let result: Result<Option<String>> = (|| {
                     let scope = if system {
                         Scope::System
                     } else {
@@ -1599,15 +1623,18 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     // container_engine() is None for native envs, whose removal
                     // is purely file cleanup (no container/image to tear down).
                     environment::remove_environment(ec.backend.container_engine(), scope, name)?;
-                    Ok(())
+                    Ok(ec.mount_home.clone())
                 })();
                 match result {
-                    Ok(()) => {
+                    Ok(mount_home) => {
                         if was_default.as_deref() == Some(name.as_str()) {
                             eprintln!("Removed environment: {name}. It was the default; \
                                        set a new one with: mim modify --env <name> --set-default");
                         } else {
                             eprintln!("Removed environment: {name}");
+                        }
+                        if let Some(h) = mount_home {
+                            eprintln!("  Kept its host home: {h}");
                         }
                     }
                     Err(e) => failures.push(format!("{name}: {e}")),
@@ -1669,7 +1696,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
 
             // Collect env info before removal (configs are deleted during
             // removal). The engine is None for native envs (file-only cleanup).
-            let mut env_list: Vec<(String, Option<ContainerEngine>)> = Vec::new();
+            let mut env_list: Vec<(String, Option<ContainerEngine>, Option<String>)> = Vec::new();
             let mut base_images: HashSet<String> = HashSet::new();
 
             for name in cfg::list_env_names(scope) {
@@ -1680,7 +1707,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                             base_images.insert(orig.clone());
                         }
                     }
-                    env_list.push((name, ec.backend.container_engine()));
+                    env_list.push((name, ec.backend.container_engine(), ec.mount_home.clone()));
                 }
             }
 
@@ -1690,11 +1717,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let mut removed = 0usize;
                 let mut failures: Vec<String> = Vec::new();
 
-                for (name, engine) in &env_list {
+                for (name, engine, mount_home) in &env_list {
                     eprintln!("Removing environment: {name}...");
                     match environment::remove_environment(*engine, scope, name) {
                         Ok(()) => {
                             eprintln!("  Removed: {name}");
+                            if let Some(h) = mount_home {
+                                eprintln!("  Kept its host home: {h}");
+                            }
                             removed += 1;
                         }
                         Err(e) => {
@@ -1865,7 +1895,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     Some(_) => data_dir.join("runtime"),
                     None => data_dir.clone(),
                 };
-                let home_dir = if is_oci { Some(cfg::env_home_dir(&data_dir)) } else { None };
+                // The EFFECTIVE home: a configured host mount shadows the
+                // env-owned `<data_dir>/home` for every run, shell and serve.
+                let home_dir = if is_oci { Some(cfg::effective_env_home(&ec, &data_dir)) } else { None };
                 // Provisioned yet? Native writes a runtime record on success; a
                 // container env has a built image.
                 let materialized = match engine {
@@ -1904,6 +1936,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         cache: String,
                         #[serde(skip_serializing_if = "Option::is_none")]
                         home: Option<String>,
+                        /// Set only when `home` is a host directory bind-mounted
+                        /// as $HOME, which `rm` never deletes.
+                        #[serde(skip_serializing_if = "Option::is_none")]
+                        mount_home: Option<String>,
                         config: String,
                     }
                     // `languages`/`installed`/`pinned` are the morloc-DECLARED
@@ -2017,6 +2053,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                             requirements: requirements_dir.display().to_string(),
                             cache: cache_dir.display().to_string(),
                             home: home_dir.as_ref().map(|h| h.display().to_string()),
+                            mount_home: ec.mount_home.clone(),
                             config: config_path.display().to_string(),
                         },
                         environment: exports.into_iter().collect(),
@@ -2069,7 +2106,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     println!("  Requirements: {}", requirements_dir.display());
                     println!("  Cache:        {}", cache_dir.display());
                     if let Some(ref h) = home_dir {
-                        println!("  Home:         {}  (shell $HOME; drop dotfiles here)", h.display());
+                        match ec.mount_home {
+                            Some(_) => println!(
+                                "  Home:         {}  (host-mounted $HOME; kept by `mim rm`)",
+                                h.display()
+                            ),
+                            None => println!(
+                                "  Home:         {}  (shell $HOME; drop dotfiles here)",
+                                h.display()
+                            ),
+                        }
                     }
                     println!("  Config:       {}", config_path.display());
 
@@ -2332,6 +2378,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             conda_packages_file,
             modules_file,
             dotfiles,
+            mount_home,
             cert_bundle,
             base,
             set_default,
@@ -2360,10 +2407,15 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let touches_packages = touches_apt || conda_from_file.is_some();
             let will_rebuild =
                 !lang.is_empty() || touches_packages || cert_bundle.is_some() || base.is_some();
-            if !set_default && !will_rebuild && dotfiles.is_none() && module_snapshots.is_empty() {
+            if !set_default
+                && !will_rebuild
+                && dotfiles.is_none()
+                && mount_home.is_none()
+                && module_snapshots.is_empty()
+            {
                 return Err(ManagerError::EnvError(
-                    "nothing to modify: pass --set-default, --dotfiles, --lang, \
-                     --cert-bundle, --base, --system-packages-file, \
+                    "nothing to modify: pass --set-default, --dotfiles, --mount-home, \
+                     --lang, --cert-bundle, --base, --system-packages-file, \
                      --conda-packages-file, or --modules-file".to_string(),
                 ));
             }
@@ -2390,6 +2442,35 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 // native runs against your real home and apptainer mounts host $HOME.
                 return Err(dotfiles_not_supported());
             }
+            // `none` clears the mount and returns the env to its own home; any
+            // other value is resolved (and created) before any side effect runs.
+            let mount_home_change: Option<Option<String>> = match &mount_home {
+                None => None,
+                Some(raw) if raw.trim().eq_ignore_ascii_case("none") || raw.trim().is_empty() => {
+                    if !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
+                        return Err(mount_home_not_supported());
+                    }
+                    Some(None)
+                }
+                Some(raw) => Some(Some(resolve_mount_home(
+                    raw,
+                    ec.backend.container_engine(),
+                    env_scope,
+                    &cfg::env_data_dir(env_scope, &env_name),
+                )?)),
+            };
+            // A dotfiles copy into a mounted host home would overwrite the user's
+            // own files there (their real ~/.bashrc, if they mounted a real home),
+            // so the two are exclusive on a configured env as well as on one
+            // command line.
+            if dotfiles.is_some() && ec.mount_home.is_some() {
+                return Err(ManagerError::EnvError(format!(
+                    "environment '{env_name}' mounts a host home ({}); --dotfiles would \
+                     overwrite files in it. Edit that directory directly, or clear the \
+                     mount with --mount-home none.",
+                    ec.mount_home.as_deref().unwrap_or_default()
+                )));
+            }
             if set_default && system && env_scope != Scope::System {
                 return Err(ManagerError::EnvError(format!(
                     "environment '{env_name}' is local; only a system-scope environment \
@@ -2399,7 +2480,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // Any write into a system-scope env's own data/config (dotfiles copy,
             // package/lang edits + rebuild) needs root. A personal (local)
             // set-default does not, and is handled in its own block below.
-            if env_scope == Scope::System && (will_rebuild || dotfiles.is_some()) {
+            if env_scope == Scope::System
+                && (will_rebuild || dotfiles.is_some() || mount_home_change.is_some())
+            {
                 check_system_write_access()?;
             }
             // Cert bundle: preflight + materialize up front so an invalid bundle
@@ -2434,6 +2517,20 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let data_dir = cfg::env_data_dir(env_scope, &env_name);
                 apply_dotfiles(ec.backend.container_engine(), &data_dir, src)?;
                 eprintln!("Copied dotfiles into '{env_name}'.");
+            }
+
+            // 2a. mounted home: pure metadata (the mount happens at run time), so
+            //     no rebuild. Clearing it leaves the host directory in place.
+            if let Some(change) = mount_home_change {
+                ec.mount_home = change;
+                cfg::write_env_config(env_scope, &env_name, &ec)?;
+                match &ec.mount_home {
+                    Some(p) => eprintln!("Environment '{env_name}' now uses host home {p}."),
+                    None => eprintln!(
+                        "Environment '{env_name}' now uses its own home; the host \
+                         directory was left in place."
+                    ),
+                }
             }
 
             // 2b. module-pin snapshots: deposit for on-demand resolution; no
@@ -2546,6 +2643,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                      compiler is an unreleased local build, so it cannot be frozen into a \
                      reproducible artifact. Freeze a release env instead."
                 )));
+            }
+            if let Some(ref h) = ec.mount_home {
+                // The mount is a run-time bind, not an image layer: a freeze is
+                // reproducible without it, but the frozen artifact runs against
+                // its own home, not this one.
+                eprintln!(
+                    "Warning: environment '{env_name}' mounts the host home {h}, which the \
+                     frozen artifact will not carry. Anything it needs from that directory \
+                     must be baked in or supplied where the freeze is restored."
+                );
             }
             if ec.backend.is_native() {
                 return Err(ManagerError::FreezeError(format!(
@@ -4274,10 +4381,28 @@ fn parse_package_lines(text: &str) -> Vec<String> {
 /// Read a package-list file into its deduped package list. A named file that
 /// cannot be read is a hard error, not a silent empty list.
 fn read_package_file(path: &str) -> Result<Vec<String>> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        ManagerError::EnvError(format!("cannot read package file '{path}': {e}"))
-    })?;
+    let text = read_list_file(std::path::Path::new(path), path, "package file", "one package per line")?;
     Ok(parse_package_lines(&text))
+}
+
+/// Read a user-named list file. A directory is rejected by name: the read
+/// syscall's own "Is a directory (os error 21)" says nothing about what the
+/// field wanted, and reads like a permissions fault rather than a mis-typed
+/// path. `shown` is the path as the user wrote it (before `~` expansion), so
+/// the message quotes what they typed.
+fn read_list_file(
+    path: &std::path::Path,
+    shown: &str,
+    what: &str,
+    expected: &str,
+) -> Result<String> {
+    if path.is_dir() {
+        return Err(ManagerError::EnvError(format!(
+            "{what} '{shown}' is a directory, not a file (expected {expected})"
+        )));
+    }
+    std::fs::read_to_string(path)
+        .map_err(|e| ManagerError::EnvError(format!("cannot read {what} '{shown}': {e}")))
 }
 
 /// Read `--modules-file` sources into (basename, verbatim content) pairs, up
@@ -4287,9 +4412,12 @@ fn read_snapshot_files(paths: &[String]) -> Result<Vec<(String, String)>> {
     paths
         .iter()
         .map(|p| {
-            let content = std::fs::read_to_string(expand_tilde(p)).map_err(|e| {
-                ManagerError::EnvError(format!("cannot read modules file '{p}': {e}"))
-            })?;
+            let content = read_list_file(
+                &expand_tilde(p),
+                p,
+                "modules file",
+                "one `name hash` pin per line",
+            )?;
             let basename = std::path::Path::new(p)
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -4467,14 +4595,23 @@ fn eprintln_columns(items: &[String]) {
 /// echoed in columns as immediate feedback. A bad path is reported and
 /// re-prompted rather than aborting the session.
 fn prompt_package_file(label: &str) -> prompt::Result<Vec<String>> {
+    let help = "path to a file with one package per line";
+    let mut rejected: Option<String> = None;
     loop {
-        let ans = prompt::path(label, "path to a file with one package per line")?;
-        let ans = ans.trim();
+        // A retry re-offers the rejected text on the editable line. Re-prompting
+        // blank would make the very next Enter mean "no packages", turning a
+        // reported mistake into a silent skip; clearing the line stays a
+        // deliberate act.
+        let ans = match &rejected {
+            Some(prev) => prompt::path_seeded(label, help, prev)?,
+            None => prompt::path(label, help)?,
+        };
+        let ans = ans.trim().to_string();
         if ans.is_empty() || ans.eq_ignore_ascii_case("none") {
             return Ok(Vec::new());
         }
         // Expand ~ like every other path prompt, so a hand-typed ~/pkgs.txt works.
-        match read_package_file(&expand_tilde(ans).to_string_lossy()) {
+        match read_package_file(&expand_tilde(&ans).to_string_lossy()) {
             Ok(list) if list.is_empty() => {
                 eprintln!("  (file lists no packages)");
                 return Ok(list);
@@ -4484,7 +4621,11 @@ fn prompt_package_file(label: &str) -> prompt::Result<Vec<String>> {
                 eprintln_columns(&list);
                 return Ok(list);
             }
-            Err(e) => eprintln!("  {e}"),
+            Err(e) => {
+                eprintln!("  {e}");
+                eprintln!("  Fix the path, or clear the line to skip.");
+                rejected = Some(ans);
+            }
         }
     }
 }
@@ -4706,6 +4847,114 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
+/// Anchor a relative path to the current directory. A path a prompt records for
+/// later use must not depend on where mim happened to be run from.
+fn absolutize(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// The single rejection for `--mount-home` on a non-OCI backend: apptainer
+/// mounts the host `$HOME` and native uses the real host home, so neither has an
+/// env-owned home for a host directory to stand in for. Mirrors
+/// `dotfiles_not_supported`.
+fn mount_home_not_supported() -> ManagerError {
+    ManagerError::EnvError(
+        "--mount-home applies only to docker/podman environments; apptainer \
+         inherits the host $HOME and the native backend uses your real home"
+            .to_string(),
+    )
+}
+
+/// Resolve a raw `--mount-home` path to the absolute host directory bind-mounted
+/// as the environment's `$HOME`: expand `~`, create it if absent, canonicalize,
+/// and reject what cannot serve as a home. The one entry point for both `new`
+/// and `modify`, so the rules cannot drift between them.
+///
+/// The directory is BORROWED, never owned: it is only ever mounted, so `mim rm`
+/// leaves it (and everything the user put in it) untouched.
+fn resolve_mount_home(
+    raw: &str,
+    engine: Option<ContainerEngine>,
+    scope: Scope,
+    data_dir: &std::path::Path,
+) -> Result<String> {
+    if !matches!(engine, Some(e) if e.is_oci()) {
+        return Err(mount_home_not_supported());
+    }
+    let expanded = expand_tilde(raw);
+    // Created rather than rejected: a fresh persistent home is the common case,
+    // and the mount would otherwise materialize it root-owned inside the engine.
+    if !expanded.exists() {
+        std::fs::create_dir_all(&expanded).map_err(|e| {
+            ManagerError::EnvError(format!(
+                "--mount-home cannot create {}: {e}",
+                expanded.display()
+            ))
+        })?;
+        eprintln!("Created home directory {}", expanded.display());
+    }
+    if !expanded.is_dir() {
+        return Err(ManagerError::EnvError(format!(
+            "--mount-home path is not a directory: {}",
+            expanded.display()
+        )));
+    }
+    let abs = std::fs::canonicalize(&expanded).map_err(|e| {
+        ManagerError::EnvError(format!(
+            "--mount-home path {} is not accessible: {e}",
+            expanded.display()
+        ))
+    })?;
+    // Persisted as a String and reused verbatim as a bind-mount host path, so a
+    // non-UTF-8 path is rejected here rather than lossily mangled later.
+    let Some(abs) = abs.to_str().map(str::to_string) else {
+        return Err(ManagerError::EnvError(format!(
+            "--mount-home path {} contains non-UTF-8 characters, which morloc cannot record",
+            abs.display()
+        )));
+    };
+    if abs == "/" {
+        return Err(ManagerError::EnvError(
+            "--mount-home cannot be the root directory (/); choose a subdirectory".to_string(),
+        ));
+    }
+    // The env's own state root is already mounted at MORLOC_STATE, and its `home`
+    // subdir IS the default home; mounting it back over itself as $HOME gives a
+    // home full of exe/, pixi/ and runtime/.
+    if std::fs::canonicalize(data_dir).map(|d| d.to_string_lossy() == abs).unwrap_or(false) {
+        return Err(ManagerError::EnvError(format!(
+            "--mount-home is the environment's own data directory ({}); pick a \
+             directory outside it",
+            data_dir.display()
+        )));
+    }
+    // Relabeling a whole home (or another unsafe root) with `:z` would recurse
+    // over every file in it, so refuse here rather than at first run.
+    if !volume_suffix(detect_selinux()).is_empty() {
+        selinux::validate_mount_path(&abs)?;
+    }
+    // Mounting a tree that contains mim's own config/data (the usual case when
+    // the host home is mounted) is legal and useful, but it makes the host's
+    // environments visible -- and writable -- from inside the container.
+    let mounted = std::path::Path::new(&abs);
+    let exposes_manager_state = [cfg::config_dir(scope), cfg::data_dir(scope)]
+        .iter()
+        .any(|d| std::fs::canonicalize(d).map(|d| d.starts_with(mounted)).unwrap_or(false));
+    if exposes_manager_state {
+        eprintln!(
+            "Warning: {abs} contains mim's own config/data, so a mim run inside \
+             the container sees and can modify your host environments."
+        );
+    }
+    Ok(abs)
+}
+
 /// Resolve a raw `--dev` path to a canonical morloc source tree: expand `~`,
 /// canonicalize, and validate the layout. The single entry point for turning a
 /// user-supplied path into a validated source, so the checks can't drift between
@@ -4806,16 +5055,20 @@ fn stage_dev_agent(scope: Scope, name: &str) -> Result<()> {
 fn interactive_choose_dotfiles(current: Option<&str>) -> prompt::Result<Option<String>> {
     let msg = "Dotfiles directory (blank for none)";
     let help = "copied into the env home";
+    // A rejected entry is re-offered on the editable line (see
+    // `prompt_package_file`): re-prompting blank would let the next Enter turn a
+    // reported mistake into a silent "none".
+    let mut seed: Option<String> = current.map(str::to_string);
     loop {
-        let choice = match current {
+        let choice = match &seed {
             Some(cur) => prompt::path_seeded(msg, help, cur)?,
             None => prompt::path(msg, help)?,
         };
-        let choice = choice.trim();
+        let choice = choice.trim().to_string();
         if choice.is_empty() || choice.eq_ignore_ascii_case("none") {
             return Ok(None);
         }
-        let expanded = expand_tilde(choice);
+        let expanded = expand_tilde(&choice);
         if expanded.is_dir() {
             let mut names: Vec<String> = match std::fs::read_dir(&expanded) {
                 Ok(entries) => entries
@@ -4824,6 +5077,7 @@ fn interactive_choose_dotfiles(current: Option<&str>) -> prompt::Result<Option<S
                     .collect(),
                 Err(e) => {
                     eprintln!("  cannot read {}: {e}", expanded.display());
+                    seed = Some(choice);
                     continue;
                 }
             };
@@ -4831,7 +5085,8 @@ fn interactive_choose_dotfiles(current: Option<&str>) -> prompt::Result<Option<S
             // Guardrails against the common footguns (an empty pick, or an
             // accidental $HOME / huge tree that would be copied wholesale).
             if names.is_empty() {
-                eprintln!("  {} is empty; nothing would be copied. Choose another, or blank for none.", expanded.display());
+                eprintln!("  {} is empty; nothing would be copied. Choose another, or clear the line for none.", expanded.display());
+                seed = Some(choice);
                 continue;
             }
             // Canonicalize both sides so a symlinked / `..`-spelled home is caught.
@@ -4840,11 +5095,13 @@ fn interactive_choose_dotfiles(current: Option<&str>) -> prompt::Result<Option<S
             if canon.is_some() && canon == home_canon {
                 eprintln!("  Warning: that is your home directory; copying all of it is unusual.");
                 if !prompt::confirm("Copy the entire home directory?", false)? {
+                    seed = Some(choice);
                     continue;
                 }
             } else if names.len() > 200 {
                 eprintln!("  That directory has {} top-level entries.", names.len());
                 if !prompt::confirm("Copy all of them into the env home?", false)? {
+                    seed = Some(choice);
                     continue;
                 }
             }
@@ -4854,7 +5111,55 @@ fn interactive_choose_dotfiles(current: Option<&str>) -> prompt::Result<Option<S
             eprintln_columns(&names);
             return Ok(Some(expanded.to_string_lossy().into_owned()));
         }
-        eprintln!("  Not a directory: {choice}.");
+        if expanded.is_file() {
+            eprintln!("  {choice} is a file, not a directory (this field takes the FOLDER holding your dotfiles).");
+        } else {
+            eprintln!("  No such directory: {choice}.");
+        }
+        eprintln!("  Fix the path, or clear the line to skip.");
+        seed = Some(choice);
+    }
+}
+
+/// Prompt for an optional host directory to bind-mount as the environment's
+/// `$HOME`. Empty / "none" means the env owns its home. The path may not exist
+/// yet (it is created when the plan is applied), so only its parent is checked
+/// here; the full validation lives in `resolve_mount_home`. The answer is made
+/// absolute before it is returned -- it is recorded in the setup file and later
+/// resolved from a possibly different working directory, so a relative entry
+/// (`z/`) must not stay relative. Docker/podman only.
+fn interactive_choose_mount_home(current: Option<&str>) -> prompt::Result<Option<String>> {
+    let msg = "Persistent home directory (blank for none)";
+    let help = "host dir mounted as $HOME; survives `mim rm`; shared both ways";
+    // A rejected entry is re-offered on the editable line (see
+    // `prompt_package_file`), so a reported mistake cannot become a silent skip.
+    let mut seed: Option<String> = current.map(str::to_string);
+    loop {
+        let choice = match &seed {
+            Some(cur) => prompt::path_seeded(msg, help, cur)?,
+            None => prompt::path(msg, help)?,
+        };
+        let choice = choice.trim().to_string();
+        if choice.is_empty() || choice.eq_ignore_ascii_case("none") {
+            return Ok(None);
+        }
+        let expanded = absolutize(&expand_tilde(&choice));
+        if expanded.is_dir() {
+            return Ok(Some(expanded.to_string_lossy().into_owned()));
+        }
+        if expanded.exists() {
+            eprintln!("  {choice} is a file, not a directory.");
+        } else {
+            match expanded.parent() {
+                Some(parent) if parent.is_dir() => {
+                    eprintln!("  {} does not exist yet; it will be created.", expanded.display());
+                    return Ok(Some(expanded.to_string_lossy().into_owned()));
+                }
+                _ => eprintln!("  No such directory, and its parent does not exist: {choice}."),
+            }
+        }
+        eprintln!("  Fix the path, or clear the line to skip.");
+        seed = Some(choice);
     }
 }
 
@@ -4871,8 +5176,11 @@ fn interactive_choose_cert_bundle(current: Option<&str>) -> prompt::Result<Optio
     {
         return Ok(None);
     }
+    // A rejected entry is re-offered on the editable line (see
+    // `prompt_package_file`), so a reported mistake cannot become a silent skip.
+    let mut seed: Option<String> = current.map(str::to_string);
     loop {
-        let choice = match current {
+        let choice = match &seed {
             Some(cur) => prompt::path_seeded(
                 "CA bundle path (PEM/DER; blank to remove)",
                 "trusted for package fetches",
@@ -4880,17 +5188,27 @@ fn interactive_choose_cert_bundle(current: Option<&str>) -> prompt::Result<Optio
             )?,
             None => prompt::path("CA bundle path (PEM/DER)", "trusted for package fetches; blank to skip")?,
         };
-        let choice = choice.trim();
+        let choice = choice.trim().to_string();
         if choice.is_empty() {
             return Ok(None);
         }
-        let expanded = expand_tilde(choice);
+        let expanded = expand_tilde(&choice);
+        if expanded.is_dir() {
+            eprintln!("  {choice} is a directory, not a file (expected a PEM/DER bundle).");
+            eprintln!("  Fix the path, or clear the line to skip.");
+            seed = Some(choice);
+            continue;
+        }
         match cert::quick_check(&expanded) {
             Ok(n) => {
                 eprintln!("  CA bundle OK ({n} certificate{}).", if n == 1 { "" } else { "s" });
                 return Ok(Some(expanded.to_string_lossy().into_owned()));
             }
-            Err(e) => eprintln!("  {e}"),
+            Err(e) => {
+                eprintln!("  {e}");
+                eprintln!("  Fix the path, or clear the line to skip.");
+                seed = Some(choice);
+            }
         }
     }
 }
@@ -4976,6 +5294,9 @@ struct NewPlan {
     system_packages: Vec<String>,
     conda_packages: Vec<String>,
     dotfiles: Option<String>,
+    /// `Some(path)` bind-mounts that host directory as the env's `$HOME`
+    /// (docker/podman only). Mutually exclusive with `dotfiles`.
+    mount_home: Option<String>,
     make_default: bool,
     /// `Some(path)` builds a DEV env from that morloc source tree (container-only,
     /// local scope). `None` for a normal release env.
@@ -4995,6 +5316,7 @@ struct NewSessionInput {
     cli_conda_package: Vec<String>,
     cli_system: bool,
     cli_dotfiles: Option<String>,
+    cli_mount_home: Option<String>,
     cli_set_default: bool,
     cli_dev: Option<String>,
     cli_cert_bundle: Option<String>,
@@ -5013,6 +5335,7 @@ enum EditField {
     Packages,
     CondaPackages,
     Dotfiles,
+    MountHome,
     Default,
 }
 
@@ -5029,6 +5352,7 @@ impl EditField {
             EditField::Packages => "system packages",
             EditField::CondaPackages => "conda packages",
             EditField::Dotfiles => "dotfiles",
+            EditField::MountHome => "persistent home",
             EditField::Default => "default",
         }
     }
@@ -5046,6 +5370,7 @@ impl EditField {
             EditField::Packages => list_or_none(&plan.system_packages),
             EditField::CondaPackages => list_or_none(&plan.conda_packages),
             EditField::Dotfiles => plan.dotfiles.clone().unwrap_or_else(|| "none".to_string()),
+            EditField::MountHome => plan.mount_home.clone().unwrap_or_else(|| "none".to_string()),
             EditField::Default => if plan.make_default { "yes" } else { "no" }.to_string(),
         }
     }
@@ -5099,8 +5424,20 @@ impl EditField {
                 plan.conda_packages =
                     prompt_package_file("Conda packages file (blank for none)")?;
             }
+            // Dotfiles and a mounted home are exclusive: a dotfiles copy into a
+            // host home would overwrite the user's own files there. Choosing one
+            // clears the other.
             EditField::Dotfiles => {
-                plan.dotfiles = interactive_choose_dotfiles(plan.dotfiles.as_deref())?
+                plan.dotfiles = interactive_choose_dotfiles(plan.dotfiles.as_deref())?;
+                if plan.dotfiles.is_some() && plan.mount_home.take().is_some() {
+                    eprintln!("  Cleared the mounted home (dotfiles and a mounted home are exclusive).");
+                }
+            }
+            EditField::MountHome => {
+                plan.mount_home = interactive_choose_mount_home(plan.mount_home.as_deref())?;
+                if plan.mount_home.is_some() && plan.dotfiles.take().is_some() {
+                    eprintln!("  Cleared the dotfiles copy (dotfiles and a mounted home are exclusive).");
+                }
             }
             EditField::Default => {
                 let current = environment::resolve_default_environment().ok().map(|(n, _, _)| n);
@@ -5112,8 +5449,9 @@ impl EditField {
 }
 
 /// The editable fields for a plan, in display order. Scope and system packages
-/// apply to container backends; dotfiles and the dev mim-env to docker/podman
-/// and dev respectively; the dev source and (local-only) scope shape the dev case.
+/// apply to container backends; the home settings and the dev mim-env to
+/// docker/podman and dev respectively; the dev source and (local-only) scope
+/// shape the dev case.
 fn confirm_fields(plan: &NewPlan) -> Vec<EditField> {
     let is_container = matches!(plan.backend, Backend::Container(_));
     let is_oci = matches!(plan.backend, Backend::Container(e) if e.is_oci());
@@ -5138,6 +5476,7 @@ fn confirm_fields(plan: &NewPlan) -> Vec<EditField> {
     // image), so they are always offered.
     fields.push(EditField::CondaPackages);
     if is_oci {
+        fields.push(EditField::MountHome);
         fields.push(EditField::Dotfiles);
     }
     fields.push(EditField::Default);
@@ -5164,11 +5503,69 @@ fn interactive_confirm(plan: &mut NewPlan) -> prompt::Result<bool> {
     }
 }
 
+/// Which root a setup-file path is written against when it lies under both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PathAnchor {
+    /// Project-adjacent inputs (dotfiles, a CA bundle, a source tree): the
+    /// working directory the setup file is written into.
+    Cwd,
+    /// A mounted home: a durable location, normally under `$HOME`, that has no
+    /// relation to wherever `mim new` happened to run.
+    Home,
+}
+
+/// Render an absolute path for the setup file against `cwd` and `home`, in the
+/// order `prefer` asks for, falling back to the other root and then to the path
+/// itself. The home form is `~`-prefixed, which `expand_tilde` reads back, and
+/// the cwd form is a plain relative path, which every path input already
+/// resolves against the working directory -- so both round-trip.
+///
+/// Only descendants are rewritten: a path elsewhere is left absolute rather than
+/// spelled with a chain of `..`, which is neither shorter nor clearer.
+fn render_setup_path(
+    abs: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+    prefer: PathAnchor,
+) -> String {
+    let under = |root: Option<&std::path::Path>, prefix: &str| -> Option<String> {
+        let rest = abs.strip_prefix(root?).ok()?;
+        Some(match (rest.as_os_str().is_empty(), prefix) {
+            (true, "") => ".".to_string(),
+            (true, p) => p.to_string(),
+            (false, "") => rest.to_string_lossy().into_owned(),
+            (false, p) => format!("{p}/{}", rest.to_string_lossy()),
+        })
+    };
+    let by_cwd = || under(cwd, "");
+    let by_home = || under(home, "~");
+    match prefer {
+        PathAnchor::Cwd => by_cwd().or_else(by_home),
+        PathAnchor::Home => by_home().or_else(by_cwd),
+    }
+    .unwrap_or_else(|| abs.to_string_lossy().into_owned())
+}
+
+/// `render_setup_path` against this process's working and home directories,
+/// taking a raw plan value (which may be `~`-spelled or relative).
+fn setup_path(raw: &str, prefer: PathAnchor) -> String {
+    let abs = absolutize(&expand_tilde(raw));
+    render_setup_path(
+        &abs,
+        std::env::current_dir().ok().as_deref(),
+        dirs::home_dir().as_deref(),
+        prefer,
+    )
+}
+
 /// A flat, flag-shaped snapshot of a confirmed `new` plan, written as JSON for
-/// local reproducibility. Package lists are stored by value (self-contained);
-/// dotfiles/cert/dev entries are absolute host paths, so the file reproduces the
-/// environment only on this machine. `schema`/`mim_version` head the file for a
-/// future `--from-setup` importer.
+/// local reproducibility. Package lists are stored by value (self-contained).
+/// Every path is written in its most portable form (see `setup_path`) rather
+/// than as the absolute host path mim uses internally: the file is meant to be
+/// readable and shareable, and an absolute path leaks the account it was made
+/// on. A path outside both the working directory and the home directory is still
+/// written absolute -- portability past that point is the user's call.
+/// `schema`/`mim_version` head the file for a future `--from-setup` importer.
 #[derive(serde::Serialize)]
 struct SetupFile {
     schema: &'static str,
@@ -5185,6 +5582,8 @@ struct SetupFile {
     conda_packages: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dotfiles: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mount_home: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cert_bundle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5205,6 +5604,7 @@ impl SetupFile {
             system_packages,
             conda_packages,
             dotfiles,
+            mount_home,
             make_default,
             dev_source,
             cert_bundle,
@@ -5223,9 +5623,10 @@ impl SetupFile {
             languages: lang.clone(),
             system_packages: system_packages.clone(),
             conda_packages: conda_packages.clone(),
-            dotfiles: dotfiles.clone(),
-            cert_bundle: cert_bundle.clone(),
-            dev_source: dev_source.clone(),
+            dotfiles: dotfiles.as_deref().map(|p| setup_path(p, PathAnchor::Cwd)),
+            mount_home: mount_home.as_deref().map(|p| setup_path(p, PathAnchor::Home)),
+            cert_bundle: cert_bundle.as_deref().map(|p| setup_path(p, PathAnchor::Cwd)),
+            dev_source: dev_source.as_deref().map(|p| setup_path(p, PathAnchor::Cwd)),
             set_default: *make_default,
         }
     }
@@ -5282,8 +5683,9 @@ fn interactive_new_session(input: NewSessionInput) -> Result<Option<NewPlan>> {
 
 /// The prompt-driven body of the session. Prompts in order for dev source,
 /// version, backend, languages, CA bundle (firewall), system/conda packages,
-/// scope, dotfiles, name, and default; any dimension fixed by a flag skips its
-/// prompt. Returns the resolved plan, or `Cancelled` if the user aborts.
+/// scope, persistent home, dotfiles, name, and default; any dimension fixed by a
+/// flag skips its prompt. Returns the resolved plan, or `Cancelled` if the user
+/// aborts.
 fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
     let NewSessionInput {
         name,
@@ -5294,6 +5696,7 @@ fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
         cli_conda_package,
         cli_system,
         cli_dotfiles,
+        cli_mount_home,
         cli_set_default,
         cli_dev,
         cli_cert_bundle,
@@ -5401,11 +5804,23 @@ fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
         Scope::Local
     };
 
-    // 6. Dotfiles. Prompted only for docker/podman (the only backends that own a
-    //    per-env home). A --dotfiles path on a non-OCI backend is an error.
+    // 6. Home. Both settings apply only to docker/podman (the only backends that
+    //    own a per-env home), and they are exclusive: a persistent home replaces
+    //    the env home with a host directory, so copying dotfiles over it would
+    //    overwrite the user's own files there. The persistent home is asked
+    //    first; choosing one skips the dotfiles prompt entirely. Either flag on a
+    //    non-OCI backend is an error.
+    if cli_mount_home.is_some() && !is_oci {
+        return Err(mount_home_not_supported().into());
+    }
+    let mount_home = match cli_mount_home {
+        Some(m) => Some(m),
+        None if is_oci && cli_dotfiles.is_none() => interactive_choose_mount_home(None)?,
+        None => None,
+    };
     let dotfiles = match cli_dotfiles {
         Some(d) => Some(d),
-        None if is_oci => interactive_choose_dotfiles(None)?,
+        None if is_oci && mount_home.is_none() => interactive_choose_dotfiles(None)?,
         None => None,
     };
     if dotfiles.is_some() && !is_oci {
@@ -5435,6 +5850,7 @@ fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
         name,
         requested_version,
         lang,
+        mount_home,
         system_packages,
         conda_packages,
         dotfiles,
@@ -5720,6 +6136,7 @@ fn container_capture_env(
     if ec.dev.is_some() {
         mounts.extend(dev_mounts(&v_data_dir));
     }
+    mounts.extend(serve::home_mount(ec.mount_home.as_deref())?);
     cfg.bind_mounts = mounts;
     cfg.env = serve::oci_base_env(serve::CONTAINER_MORLOC_HOME);
     cfg.command = Some(args.to_vec());
@@ -6631,6 +7048,7 @@ fn container_new_derived(
     system_packages: Vec<String>,
     conda_packages: Vec<String>,
     dotfiles: Option<String>,
+    mount_home: Option<String>,
     cert_bundle: Option<String>,
     base_image: String,
     requested_version: Option<String>,
@@ -6640,6 +7058,18 @@ fn container_new_derived(
     snapshots: &SnapshotPlan,
 ) -> Result<()> {
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
+
+    // Resolve the host home before the (multi-minute) image build, so a bad path
+    // fails fast.
+    let mount_home = match &mount_home {
+        Some(raw) => Some(resolve_mount_home(
+            raw,
+            Some(engine),
+            scope,
+            &cfg::env_data_dir(scope, &env_name),
+        )?),
+        None => None,
+    };
 
     // Preflight + materialize the CA bundle before the (host-side) pixi lock and
     // the image build stage it. Aborts on an unambiguous problem.
@@ -6687,6 +7117,7 @@ fn container_new_derived(
     if let Some(lr) = &local_runtime {
         ec = ec.with_local_runtime(LocalRuntimeConfig { source: lr.to_string_lossy().into_owned() });
     }
+    ec.mount_home = mount_home;
     if let Some(p) = prepared {
         p.apply_to(&mut ec);
     }
@@ -6719,6 +7150,7 @@ fn container_new_dev(
     system_packages: Vec<String>,
     conda_packages: Vec<String>,
     dotfiles: Option<String>,
+    mount_home: Option<String>,
     cert_bundle: Option<String>,
     base_image: String,
     requested_version: Option<String>,
@@ -6739,6 +7171,16 @@ fn container_new_dev(
     // the version (matching the interactive default).
     let name = name.or_else(|| Some("dev".to_string()));
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
+    // Resolve the host home before the image build, so a bad path fails fast.
+    let mount_home = match &mount_home {
+        Some(raw) => Some(resolve_mount_home(
+            raw,
+            Some(engine),
+            scope,
+            &cfg::env_data_dir(scope, &env_name),
+        )?),
+        None => None,
+    };
     // Preflight + materialize the CA bundle before the image build.
     let prepared = cert::prepare_for_env(scope, &env_name, cert_bundle.as_deref())?;
     // Seed the per-env home (and any --dotfiles) before provisioning the tooling.
@@ -6778,6 +7220,7 @@ fn container_new_dev(
         conda_packages,
     )
     .with_dev(dev);
+    ec.mount_home = mount_home;
     if let Some(p) = prepared {
         p.apply_to(&mut ec);
     }
@@ -7114,6 +7557,7 @@ pub(crate) fn container_serve(
         engine, req.verbose, &image, &data_dir.to_string_lossy(), &container_name,
         &[(req.host_port, req.container_port)], plan.publish_host.as_deref(), plan.network.as_deref(),
         &extra_flags, &Some(ec.shm_size.clone()), &user_env, &plan.command,
+        ec.mount_home.as_deref(),
     )?;
 
     let url_host = if req.expose {
@@ -7339,7 +7783,7 @@ pub(crate) fn container_run_env(
         run_with_config(
             engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd, suffix,
             shell, args, false, &ec.shm_size, &extra_flags, user_env,
-            bridge_mount.as_deref(), is_dev,
+            bridge_mount.as_deref(), is_dev, ec.mount_home.as_deref(),
         )
     } else {
         let (cwd_final, skip_work_mount) = if is_home_dir && !suffix.is_empty() && !is_init {
@@ -7353,7 +7797,7 @@ pub(crate) fn container_run_env(
         run_with_config(
             engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd_final, suffix,
             shell, args, is_init || skip_work_mount, &ec.shm_size, &extra_flags, user_env,
-            bridge_mount.as_deref(), is_dev,
+            bridge_mount.as_deref(), is_dev, ec.mount_home.as_deref(),
         )
     }
 }
@@ -7389,6 +7833,7 @@ fn run_with_config(
     user_env: &[(String, String)],
     bridge_socket: Option<&std::path::Path>,
     is_dev: bool,
+    mount_home: Option<&str>,
 ) -> Result<()> {
     if shell {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -7463,11 +7908,14 @@ fn run_with_config(
     } else {
         Vec::new()
     };
+    // A configured host home shadows the env-owned `<data_dir>/home` for this run.
+    let home_mount = serve::home_mount(mount_home)?;
     let all_mounts: Vec<(String, String)> = base_mounts
         .into_iter()
         .chain(work_mount)
         .chain(bridge_mount)
         .chain(dev_mount)
+        .chain(home_mount)
         .collect();
     let work_dir = if is_init {
         mh.to_string()
@@ -7950,6 +8398,7 @@ mod tests {
             system_packages: vec!["jq".to_string()],
             conda_packages: vec![],
             dotfiles: None,
+            mount_home: None,
             make_default: true,
             dev_source: None,
             cert_bundle: None,
@@ -7980,6 +8429,7 @@ mod tests {
             system_packages: vec![],
             conda_packages: vec![],
             dotfiles: None,
+            mount_home: None,
             make_default: false,
             dev_source: None,
             cert_bundle: None,
@@ -8209,6 +8659,7 @@ mod tests {
             conda_packages_file: None,
             modules_file: Vec::new(),
             dotfiles,
+            mount_home: None,
             cert_bundle: None,
             base: None,
             set_default,
@@ -8353,6 +8804,25 @@ mod tests {
                 "a#b".to_string(),
             ],
         );
+    }
+
+    #[test]
+    fn read_package_file_rejects_a_directory_by_name() {
+        // A folder typed into a file field must fail with what went wrong, not
+        // the bare "Is a directory (os error 21)" the read syscall gives, and
+        // never with an empty package list.
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_package_file(&dir.path().to_string_lossy()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("is a directory, not a file"), "got: {msg}");
+        assert!(msg.contains("one package per line"), "got: {msg}");
+    }
+
+    #[test]
+    fn read_snapshot_files_rejects_a_directory_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_snapshot_files(&[dir.path().to_string_lossy().into_owned()]).unwrap_err();
+        assert!(err.to_string().contains("is a directory, not a file"), "got: {err}");
     }
 
     #[test]
@@ -8742,6 +9212,7 @@ mod tests {
             local_runtime: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
+            mount_home: None,
         };
         cfg::write_config(&path, &ec).unwrap();
         let ec2: EnvironmentConfig = cfg::read_config(&path).unwrap();
@@ -9181,6 +9652,7 @@ run:
             local_runtime: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
+            mount_home: None,
         };
         let yaml = serde_yaml::to_string(&ec).unwrap();
         std::fs::write(&path, yaml).unwrap();
@@ -9236,6 +9708,7 @@ run:
             local_runtime: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
+            mount_home: None,
         };
         assert_eq!(ec.active_image(), "/layered.sif");
     }
@@ -9263,6 +9736,7 @@ run:
             local_runtime: None,
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
+            mount_home: None,
         };
         assert_eq!(ec.active_image(), "/base.sif");
     }
@@ -9286,6 +9760,228 @@ run:
         let d = std::path::Path::new("/nonexistent");
         assert!(apply_dotfiles(None, d, "/whatever").is_err());
         assert!(apply_dotfiles(Some(ContainerEngine::Apptainer), d, "/whatever").is_err());
+    }
+
+    // ---- --mount-home ----
+
+    #[test]
+    fn resolve_mount_home_rejects_non_oci() {
+        // The engine gate fires before any filesystem work, so the paths below
+        // are never touched: native (None) and apptainer both reject.
+        let d = std::path::Path::new("/nonexistent");
+        assert!(resolve_mount_home("/whatever", None, Scope::Local, d).is_err());
+        assert!(resolve_mount_home(
+            "/whatever",
+            Some(ContainerEngine::Apptainer),
+            Scope::Local,
+            d
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn resolve_mount_home_creates_missing_dir_and_canonicalizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("homes").join("dev");
+        let data_dir = tmp.path().join("data");
+        let got = resolve_mount_home(
+            target.to_str().unwrap(),
+            Some(ContainerEngine::Podman),
+            Scope::Local,
+            &data_dir,
+        )
+        .unwrap();
+        assert!(target.is_dir(), "the host home is created, not rejected");
+        assert_eq!(got, std::fs::canonicalize(&target).unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_mount_home_rejects_a_file_and_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("notadir");
+        std::fs::write(&file, b"x").unwrap();
+        let data_dir = tmp.path().join("data");
+        assert!(resolve_mount_home(
+            file.to_str().unwrap(),
+            Some(ContainerEngine::Podman),
+            Scope::Local,
+            &data_dir
+        )
+        .is_err());
+        // `/` exists and is a directory, so only the explicit guard rejects it.
+        assert!(
+            resolve_mount_home("/", Some(ContainerEngine::Podman), Scope::Local, &data_dir).is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_mount_home_rejects_the_envs_own_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        // The state root is already mounted at MORLOC_STATE; mounting it back as
+        // $HOME would fill the home with exe/, pixi/ and runtime/.
+        assert!(resolve_mount_home(
+            data_dir.to_str().unwrap(),
+            Some(ContainerEngine::Podman),
+            Scope::Local,
+            &data_dir
+        )
+        .is_err());
+        // A directory beside it is fine.
+        let sibling = tmp.path().join("beside");
+        assert!(resolve_mount_home(
+            sibling.to_str().unwrap(),
+            Some(ContainerEngine::Podman),
+            Scope::Local,
+            &data_dir
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn setup_paths_hide_the_account_they_were_made_on() {
+        let cwd = std::path::Path::new("/home/ada/projects/demo");
+        let home = std::path::Path::new("/home/ada");
+        let render = |p: &str, a: PathAnchor| {
+            render_setup_path(std::path::Path::new(p), Some(cwd), Some(home), a)
+        };
+        // Project-adjacent inputs anchor on the working directory...
+        assert_eq!(render("/home/ada/projects/demo/mydots", PathAnchor::Cwd), "mydots");
+        assert_eq!(render("/home/ada/projects/demo", PathAnchor::Cwd), ".");
+        // ...and fall back to the home form when they sit outside it.
+        assert_eq!(render("/home/ada/dotfiles", PathAnchor::Cwd), "~/dotfiles");
+        // A mounted home prefers the home form even when it is under the cwd,
+        // since it is a durable location, not a project input.
+        assert_eq!(
+            render("/home/ada/projects/demo/envhome", PathAnchor::Home),
+            "~/projects/demo/envhome"
+        );
+        assert_eq!(render("/home/ada", PathAnchor::Home), "~");
+        // Outside both roots there is nothing to hide behind; left absolute
+        // rather than spelled with a chain of `..`.
+        assert_eq!(render("/etc/ssl/certs/corp.pem", PathAnchor::Cwd), "/etc/ssl/certs/corp.pem");
+        // No home or cwd known (a daemon-ish environment): still absolute.
+        assert_eq!(
+            render_setup_path(
+                std::path::Path::new("/home/ada/dotfiles"),
+                None,
+                None,
+                PathAnchor::Cwd
+            ),
+            "/home/ada/dotfiles"
+        );
+    }
+
+    #[test]
+    fn setup_file_writes_no_absolute_paths_for_home_inputs() {
+        let home = dirs::home_dir().expect("a home directory");
+        let plan = NewPlan {
+            scope: Scope::Local,
+            backend: Backend::Container(ContainerEngine::Podman),
+            name: "demo".to_string(),
+            requested_version: None,
+            lang: Vec::new(),
+            system_packages: Vec::new(),
+            conda_packages: Vec::new(),
+            dotfiles: Some(home.join("mydots").to_string_lossy().into_owned()),
+            mount_home: Some(home.join("morloc-homes/demo").to_string_lossy().into_owned()),
+            make_default: false,
+            dev_source: None,
+            cert_bundle: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&SetupFile::from_plan(&plan)).unwrap())
+                .unwrap();
+        assert_eq!(v["mount_home"], "~/morloc-homes/demo");
+        assert!(
+            !v["dotfiles"].as_str().unwrap().starts_with('/'),
+            "a path under $HOME must not be written absolute: {}",
+            v["dotfiles"]
+        );
+    }
+
+    #[test]
+    fn absolutize_anchors_a_relative_path_to_the_cwd() {
+        // A prompt answer like `z/` is recorded in the setup file and resolved
+        // later, possibly from another directory, so it cannot stay relative.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(absolutize(std::path::Path::new("z/")), cwd.join("z/"));
+        assert_eq!(
+            absolutize(std::path::Path::new("/host/homes/dev")),
+            std::path::PathBuf::from("/host/homes/dev")
+        );
+    }
+
+    #[test]
+    fn oci_review_lists_the_persistent_home_before_dotfiles() {
+        let plan = NewPlan {
+            scope: Scope::Local,
+            backend: Backend::Container(ContainerEngine::Podman),
+            name: "demo".to_string(),
+            requested_version: None,
+            lang: Vec::new(),
+            system_packages: Vec::new(),
+            conda_packages: Vec::new(),
+            dotfiles: None,
+            mount_home: Some("/host/homes/demo".to_string()),
+            make_default: false,
+            dev_source: None,
+            cert_bundle: None,
+        };
+        let labels: Vec<&str> = confirm_fields(&plan).iter().map(|f| f.label(&plan)).collect();
+        let home = labels.iter().position(|l| *l == "persistent home").unwrap();
+        let dots = labels.iter().position(|l| *l == "dotfiles").unwrap();
+        assert!(home < dots, "the home settings follow the prompt order: {labels:?}");
+        assert_eq!(EditField::MountHome.value(&plan), "/host/homes/demo");
+        // An apptainer/native plan owns no per-env home, so neither is offered.
+        let native = NewPlan { backend: Backend::Native, mount_home: None, ..plan };
+        let labels: Vec<&str> = confirm_fields(&native).iter().map(|f| f.label(&native)).collect();
+        assert!(!labels.contains(&"persistent home"));
+        assert!(!labels.contains(&"dotfiles"));
+    }
+
+    #[test]
+    fn home_mount_errors_when_the_host_home_is_gone() {
+        // Docker/podman would create a missing bind source as a root-owned empty
+        // directory, silently replacing the home the user persisted.
+        assert!(serve::home_mount(Some("/nonexistent/home")).is_err());
+    }
+
+    #[test]
+    fn home_mount_targets_the_state_home_not_the_symlink() {
+        assert!(serve::home_mount(None).unwrap().is_empty());
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().to_str().unwrap();
+        let m = serve::home_mount(Some(src)).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].0, src);
+        // CONTAINER_HOME is an image-baked symlink; binding its resolved target
+        // keeps the mount independent of how an engine treats a symlinked target.
+        assert_eq!(m[0].1, format!("{}/home", serve::CONTAINER_MORLOC_STATE));
+        assert_ne!(m[0].1, serve::CONTAINER_HOME);
+    }
+
+    #[test]
+    fn mounted_home_nests_inside_the_state_mount_in_run_args() {
+        let mut cfg = container::RunConfig::new("img");
+        cfg.bind_mounts = vec![(
+            "/host/env".to_string(),
+            serve::CONTAINER_MORLOC_STATE.to_string(),
+        )];
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().to_str().unwrap().to_string();
+        cfg.bind_mounts.extend(serve::home_mount(Some(&src)).unwrap());
+        let args = container::build_run_args(ContainerEngine::Podman, &[], &cfg);
+        let state = format!("/host/env:{}", serve::CONTAINER_MORLOC_STATE);
+        let home = format!("{src}:{}/home", serve::CONTAINER_MORLOC_STATE);
+        assert!(args.contains(&state));
+        assert!(args.contains(&home));
+        // The state mount is declared first; engines apply nested mounts in
+        // destination order, so the home lands on top of it.
+        assert!(
+            args.iter().position(|a| *a == state) < args.iter().position(|a| *a == home)
+        );
     }
 
     // ---- native Runner seam ----
@@ -9315,6 +10011,7 @@ run:
                 local_runtime: None,
                 cert_bundle: None,
                 cert_fingerprints: Vec::new(),
+                mount_home: None,
             },
         }
     }

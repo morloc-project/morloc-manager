@@ -17,6 +17,17 @@ pub fn env_home_dir(data_dir: impl AsRef<Path>) -> PathBuf {
     data_dir.as_ref().join("home")
 }
 
+/// The host directory that actually backs the environment's `$HOME`: the
+/// configured `mount_home` when the env has one (it shadows the env-owned home
+/// at run time), else `<data_dir>/home`. The single answer for every site that
+/// reports or reasons about "the env's home on the host".
+pub fn effective_env_home(ec: &EnvironmentConfig, data_dir: impl AsRef<Path>) -> PathBuf {
+    match &ec.mount_home {
+        Some(p) => PathBuf::from(p),
+        None => env_home_dir(data_dir),
+    }
+}
+
 /// Create `<data_dir>/home` if absent and return it. Best-effort: a failure to
 /// create (an unwritable data dir) surfaces loudly downstream. Idempotent, so
 /// it doubles as the seed point that the run-time paths share.
@@ -182,6 +193,11 @@ fn migrate_env_config(mut ec: EnvironmentConfig) -> Result<EnvironmentConfig> {
             // v2 -> v3: added the optional `cert_bundle` path (defaults to None).
             // Purely additive.
             2 => ec.schema_version = 3,
+            // v3 -> v4: added the optional `mount_home` path (defaults to None).
+            // Additive on disk, but a v4 record read by a v3 mim would silently
+            // drop the mount and run with the env-owned home, so the version is
+            // bumped to make that record refuse to load there.
+            3 => ec.schema_version = 4,
             v => {
                 return Err(ManagerError::EnvError(format!(
                     "environment '{}' uses env schema v{v} with no migration path to v{}; \
@@ -536,6 +552,37 @@ mod tests {
         let ec = parse(V1_YAML);
         let migrated = migrate_env_config(ec).expect("v1 migrates");
         assert_eq!(migrated.schema_version, CURRENT_ENV_SCHEMA);
+    }
+
+    #[test]
+    fn v3_record_migrates_to_v4_without_a_mounted_home() {
+        // The `mount_home` field is additive on disk: a v3 record simply has no
+        // host home, and the version bump is the whole migration.
+        let mut ec = parse(V1_YAML);
+        ec.schema_version = 3;
+        let migrated = migrate_env_config(ec).expect("v3 migrates");
+        assert_eq!(migrated.schema_version, 4);
+        assert!(migrated.mount_home.is_none());
+    }
+
+    #[test]
+    fn mounted_home_round_trips_through_yaml() {
+        let mut ec = parse(V1_YAML);
+        ec.mount_home = Some("/host/homes/dev".to_string());
+        let back = parse(&serde_yaml::to_string(&ec).unwrap());
+        assert_eq!(back.mount_home.as_deref(), Some("/host/homes/dev"));
+        // An env without one writes no key at all.
+        let plain = parse(V1_YAML);
+        assert!(!serde_yaml::to_string(&plain).unwrap().contains("mount_home"));
+    }
+
+    #[test]
+    fn effective_home_prefers_the_mounted_one() {
+        let mut ec = parse(V1_YAML);
+        let data = Path::new("/data/env");
+        assert_eq!(effective_env_home(&ec, data), data.join("home"));
+        ec.mount_home = Some("/host/homes/dev".to_string());
+        assert_eq!(effective_env_home(&ec, data), PathBuf::from("/host/homes/dev"));
     }
 
     #[test]
