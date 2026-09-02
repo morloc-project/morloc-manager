@@ -162,9 +162,14 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     out.push_str("# Pinned pixi (conda package manager)\n");
     out.push_str("ENV PIXI_HOME=/opt/pixi\n");
     out.push_str("ENV PATH=\"/opt/pixi/bin:${PATH}\"\n");
+    // The `test -x` is load-bearing, not belt-and-braces: a failed download pipes
+    // an EMPTY script into bash, which exits 0 and commits an image with no pixi.
+    // Without the check the build "succeeds" and the missing binary only surfaces
+    // when the environment is materialized.
     out.push_str(&format!(
-        "RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v{} bash\n",
-        input.pixi_version
+        "RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v{} bash \\\n  && test -x {}\n",
+        input.pixi_version,
+        crate::serve::CONTAINER_PIXI_BIN
     ));
     out.push('\n');
 
@@ -403,7 +408,8 @@ RUN mkdir -p /home && ln -sfn /opt/morloc-state/home /home/morloc
 # Pinned pixi (conda package manager)
 ENV PIXI_HOME=/opt/pixi
 ENV PATH=\"/opt/pixi/bin:${PATH}\"
-RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v0.76.2 bash
+RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v0.76.2 bash \\
+  && test -x /opt/pixi/bin/pixi
 
 # morloc compiler + rust source (from the build context)
 COPY runtime/ /opt/morloc-runtime/
@@ -424,6 +430,30 @@ RUN printf '%s\\n' '#!/bin/bash' 'if [ -f /usr/local/lib/morloc-nss-wrapper.so ]
 ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
 ";
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn pixi_install_step_verifies_the_binary_landed() {
+        // `curl ... | bash` cannot fail the build on its own: a failed download
+        // feeds bash an empty script, which exits 0 and commits an image with no
+        // pixi -- the failure then surfaces much later, at materialization.
+        let input = DockerfileInput {
+            base_image: "debian:bookworm-slim",
+            pixi_version: "0.76.2",
+            morloc_home: "/opt/morloc",
+            extras: &BuildExtras::default(),
+            lang_installs: &[],
+            dev: false,
+            cert_file: None,
+        };
+        let got = generate_dockerfile(&input);
+        // The step is a line-continued RUN, so take it up to the blank line.
+        let at = got.find("pixi.sh/install.sh").expect("a pixi install step");
+        let step = &got[at..got[at..].find("\n\n").map(|e| at + e).unwrap_or(got.len())];
+        assert!(
+            step.contains(&format!("test -x {}", crate::serve::CONTAINER_PIXI_BIN)),
+            "pixi install must be verified in the same RUN: {step}"
+        );
     }
 
     #[test]
