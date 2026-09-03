@@ -4020,6 +4020,9 @@ fn materialize_native_env(
     }
 
     let env_dir = cfg::env_data_dir(scope, name);
+    // The conda prefix lives under this root and its activation feeds
+    // CFLAGS/CXXFLAGS, which every C build tool word-splits.
+    cfg::reject_whitespace_root(&env_dir)?;
     prime_requirements_store(&env_dir, req.lang_spec.as_ref(), conda_packages);
     let pixi_dir = env_dir.join("pixi");
     let manifest = pixi::render_manifest(&req.requirements);

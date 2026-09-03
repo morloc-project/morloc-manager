@@ -37,11 +37,70 @@ pub fn ensure_env_home(data_dir: impl AsRef<Path>) -> PathBuf {
     home
 }
 
+/// True when any component of the path contains whitespace.
+pub fn path_has_whitespace(path: impl AsRef<Path>) -> bool {
+    path.as_ref()
+        .as_os_str()
+        .to_string_lossy()
+        .chars()
+        .any(char::is_whitespace)
+}
+
+/// Pick the user-level base for one of mim's trees: an explicit absolute `xdg`
+/// override, else the platform's own answer, else `<home>/<rel>`.
+///
+/// The platform answer is skipped when it contains whitespace. macOS names it
+/// `~/Library/Application Support`, and the native toolchain is a conda prefix
+/// under the data dir: conda's compiler activation exports an unquoted
+/// `-isystem <prefix>/include` in CFLAGS/CXXFLAGS, which cc-rs, autoconf and
+/// setuptools all word-split, so a prefix with a space is torn in half and no
+/// native build can link or compile. The XDG layout is space-free on every
+/// platform, so mim uses it everywhere.
+fn user_base(
+    xdg: Option<String>,
+    conventional: Option<PathBuf>,
+    home: Option<PathBuf>,
+    rel: &str,
+) -> PathBuf {
+    if let Some(p) = xdg.map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return p;
+    }
+    if let Some(p) = conventional.filter(|p| !path_has_whitespace(p)) {
+        return p;
+    }
+    home.unwrap_or_else(|| PathBuf::from("~")).join(rel)
+}
+
+/// Refuse a native environment root whose path contains whitespace. Conda's
+/// compiler activation writes this path into CFLAGS/CXXFLAGS unquoted and the
+/// build tools that read them split on whitespace, so nothing native can be
+/// built under such a root; there is no quoting fix on mim's side because the
+/// flags are composed by conda. Fail here with the reason rather than a
+/// thousand lines of `no such file or directory` from cc-rs.
+pub fn reject_whitespace_root(dir: &Path) -> Result<()> {
+    if !path_has_whitespace(dir) {
+        return Ok(());
+    }
+    Err(ManagerError::EnvError(format!(
+        "the native environment root contains whitespace:\n  {}\n\
+         Conda's compiler activation puts this path into CFLAGS/CXXFLAGS \
+         unquoted, and cargo, autoconf and setuptools all split those on \
+         whitespace, so no native build can succeed here.\n\
+         Set XDG_DATA_HOME and XDG_CONFIG_HOME to whitespace-free directories \
+         and re-run, or use the container backend.",
+        dir.display()
+    )))
+}
+
 pub fn config_dir(scope: Scope) -> PathBuf {
     match scope {
-        Scope::Local => dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.config"))
-            .join("morloc"),
+        Scope::Local => user_base(
+            std::env::var("XDG_CONFIG_HOME").ok(),
+            dirs::config_dir(),
+            dirs::home_dir(),
+            ".config",
+        )
+        .join("morloc"),
         Scope::System => PathBuf::from("/etc/morloc"),
     }
 }
@@ -52,9 +111,13 @@ pub fn config_path(scope: Scope) -> PathBuf {
 
 pub fn data_dir(scope: Scope) -> PathBuf {
     match scope {
-        Scope::Local => dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-            .join("morloc"),
+        Scope::Local => user_base(
+            std::env::var("XDG_DATA_HOME").ok(),
+            dirs::data_dir(),
+            dirs::home_dir(),
+            ".local/share",
+        )
+        .join("morloc"),
         Scope::System => PathBuf::from("/usr/local/share/morloc"),
     }
 }
@@ -536,6 +599,73 @@ mod tests {
 
     // A minimal env.yaml body omitting `schema_version` (a pre-versioning record).
     const V1_YAML: &str = "name: test\nbase_image: \"img:1\"\nengine: podman\n";
+
+    #[test]
+    fn user_base_skips_a_conventional_dir_with_a_space() {
+        // macOS: `dirs::data_dir()` is `~/Library/Application Support`.
+        let base = user_base(
+            None,
+            Some(PathBuf::from("/Users/weena/Library/Application Support")),
+            Some(PathBuf::from("/Users/weena")),
+            ".local/share",
+        );
+        assert_eq!(base, PathBuf::from("/Users/weena/.local/share"));
+        assert!(!path_has_whitespace(&base));
+    }
+
+    #[test]
+    fn user_base_keeps_a_space_free_conventional_dir() {
+        // Linux: the platform answer is already usable, so it wins.
+        let base = user_base(
+            None,
+            Some(PathBuf::from("/home/weena/.local/share")),
+            Some(PathBuf::from("/home/weena")),
+            ".local/share",
+        );
+        assert_eq!(base, PathBuf::from("/home/weena/.local/share"));
+    }
+
+    #[test]
+    fn user_base_prefers_an_absolute_xdg_override() {
+        let base = user_base(
+            Some("/data/xdg".to_string()),
+            Some(PathBuf::from("/home/weena/.local/share")),
+            Some(PathBuf::from("/home/weena")),
+            ".local/share",
+        );
+        assert_eq!(base, PathBuf::from("/data/xdg"));
+    }
+
+    #[test]
+    fn user_base_ignores_a_relative_xdg_override() {
+        // Matches `dirs`: XDG vars are honored only when absolute.
+        let base = user_base(
+            Some("relative/share".to_string()),
+            Some(PathBuf::from("/home/weena/.local/share")),
+            Some(PathBuf::from("/home/weena")),
+            ".local/share",
+        );
+        assert_eq!(base, PathBuf::from("/home/weena/.local/share"));
+    }
+
+    #[test]
+    fn whitespace_env_root_is_rejected_with_the_reason() {
+        let err = reject_whitespace_root(Path::new(
+            "/Users/weena/Library/Application Support/morloc/environments/latest",
+        ))
+        .expect_err("a root with a space must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("CFLAGS"), "unexpected error: {msg}");
+        assert!(msg.contains("Application Support"), "names the path: {msg}");
+    }
+
+    #[test]
+    fn space_free_env_root_is_accepted() {
+        assert!(reject_whitespace_root(Path::new(
+            "/Users/weena/.local/share/morloc/environments/latest"
+        ))
+        .is_ok());
+    }
 
     fn parse(yaml: &str) -> EnvironmentConfig {
         serde_yaml::from_str(yaml).expect("valid env config")
