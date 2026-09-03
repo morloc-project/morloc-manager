@@ -130,14 +130,16 @@ enum Cmd {
     #[command(display_order = 1)]
     #[command(after_help = "\
 Examples:
-  mim new                                   # interactive; prompts for version, backend, name, ...
+  mim new                                   # latest morloc, default backend
   mim new foo --lang py@3.12
   mim new bar --engine podman
   mim new baz --morloc-version 0.98.0       # names it `v0.98.0`
-  mim new --morloc-version 0.98.0 --set-default --non-interactive
+  mim new --morloc-version 0.98.0 --set-default
+  mim new --wizard                          # prompt for every setting
 
 Without a name, the environment is named after the requested version (`v0.98.0`,
-or `latest`). With no flags on a TTY, all settings are prompted interactively.")]
+or `latest`). Every setting has a default, so the bare command creates a usable
+environment; pass `--wizard` to be prompted for each one instead.")]
     New {
         /// Environment name. Defaults to the requested morloc version
         /// (`v0.90.0`), or `latest` when tracking the latest release.
@@ -216,8 +218,12 @@ or `latest`). With no flags on a TTY, all settings are prompted interactively.")
         /// Skip provisioning + morloc init after creation
         #[arg(long)]
         no_init: bool,
-        /// Skip interactive prompts, use defaults
-        #[arg(long)]
+        /// Choose every setting through interactive prompts instead of taking
+        /// the defaults. Requires a terminal.
+        #[arg(long, conflicts_with_all = ["non_interactive", "local_runtime"])]
+        wizard: bool,
+        /// Accepted for compatibility and ignored: this is the default.
+        #[arg(long, hide = true)]
         non_interactive: bool,
     },
     /// Run a command in an environment
@@ -1331,7 +1337,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             system,
             set_default,
             no_init,
-            non_interactive,
+            wizard,
+            non_interactive: _,
         } => {
             if system { check_system_write_access()?; }
             // Resolve/validate the local runtime dir up front (clap already makes it
@@ -1355,17 +1362,22 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 no_default: no_default_modules,
                 user_files: read_snapshot_files(&modules_file)?,
             };
-            let interactive = !non_interactive && io::stdin().is_terminal();
-            if !non_interactive && !interactive {
-                eprintln!("Note: No TTY detected, running in non-interactive mode.");
+            // Prompting is opt-in. Creating an environment is the first thing a
+            // new user does, and the defaults are the answer they almost always
+            // want, so the bare command takes them rather than interrogating.
+            if wizard && !io::stdin().is_terminal() {
+                return Err(ManagerError::EnvError(
+                    "--wizard needs a terminal to prompt on, and stdin is not one. \
+                     Drop the flag to create the environment from defaults, or pass \
+                     the settings as flags (see `mim new --help`)."
+                        .to_string(),
+                ));
             }
 
-            // Interactive: prompt (in order) for dev source, version, backend,
-            // language pins, system packages, scope, home, name, and default --
-            // skipping any dimension already fixed by a flag -- then dispatch.
-            // A local-runtime build is flag-only (advanced): skip prompting and fall
-            // through to the direct dispatch below.
-            if interactive && local_runtime.is_none() {
+            // Prompt (in order) for dev source, version, backend, language pins,
+            // system packages, scope, home, name, and default -- skipping any
+            // dimension already fixed by a flag -- then dispatch.
+            if wizard {
                 let plan = match interactive_new_session(NewSessionInput {
                     name,
                     cli_version: morloc_version,
@@ -10095,6 +10107,38 @@ run:
         let cli = Cli::try_parse_from(["mim", "new", "foo"])
             .expect("new should parse");
         assert!(matches!(cli.command, Some(Cmd::New { set_default: false, .. })));
+    }
+
+    #[test]
+    fn new_defaults_to_no_prompting() {
+        let cli = Cli::try_parse_from(["mim", "new"]).expect("bare new should parse");
+        assert!(matches!(cli.command, Some(Cmd::New { wizard: false, .. })));
+    }
+
+    #[test]
+    fn new_parses_wizard_flag() {
+        let cli = Cli::try_parse_from(["mim", "new", "--wizard"])
+            .expect("new --wizard should parse");
+        assert!(matches!(cli.command, Some(Cmd::New { wizard: true, .. })));
+    }
+
+    #[test]
+    fn new_still_accepts_non_interactive() {
+        // Scripts written against the old default keep working; the flag now
+        // only restates what happens anyway.
+        let cli = Cli::try_parse_from(["mim", "new", "foo", "--non-interactive"])
+            .expect("new --non-interactive should still parse");
+        assert!(matches!(cli.command, Some(Cmd::New { wizard: false, .. })));
+    }
+
+    #[test]
+    fn new_rejects_wizard_with_contradictory_flags() {
+        // Asking to be prompted and asking not to be is a contradiction, not a
+        // precedence puzzle to resolve silently.
+        assert!(Cli::try_parse_from(["mim", "new", "--wizard", "--non-interactive"]).is_err());
+        // The local-runtime build is flag-only: it was never offered by the
+        // prompts, so combining the two would silently ignore --wizard.
+        assert!(Cli::try_parse_from(["mim", "new", "--wizard", "--local-runtime", "/rt"]).is_err());
     }
 
     #[test]
