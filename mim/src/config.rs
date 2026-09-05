@@ -17,6 +17,17 @@ pub fn env_home_dir(data_dir: impl AsRef<Path>) -> PathBuf {
     data_dir.as_ref().join("home")
 }
 
+/// The host directory that actually backs the environment's `$HOME`: the
+/// configured `mount_home` when the env has one (it shadows the env-owned home
+/// at run time), else `<data_dir>/home`. The single answer for every site that
+/// reports or reasons about "the env's home on the host".
+pub fn effective_env_home(ec: &EnvironmentConfig, data_dir: impl AsRef<Path>) -> PathBuf {
+    match &ec.mount_home {
+        Some(p) => PathBuf::from(p),
+        None => env_home_dir(data_dir),
+    }
+}
+
 /// Create `<data_dir>/home` if absent and return it. Best-effort: a failure to
 /// create (an unwritable data dir) surfaces loudly downstream. Idempotent, so
 /// it doubles as the seed point that the run-time paths share.
@@ -26,11 +37,70 @@ pub fn ensure_env_home(data_dir: impl AsRef<Path>) -> PathBuf {
     home
 }
 
+/// True when any component of the path contains whitespace.
+pub fn path_has_whitespace(path: impl AsRef<Path>) -> bool {
+    path.as_ref()
+        .as_os_str()
+        .to_string_lossy()
+        .chars()
+        .any(char::is_whitespace)
+}
+
+/// Pick the user-level base for one of mim's trees: an explicit absolute `xdg`
+/// override, else the platform's own answer, else `<home>/<rel>`.
+///
+/// The platform answer is skipped when it contains whitespace. macOS names it
+/// `~/Library/Application Support`, and the native toolchain is a conda prefix
+/// under the data dir: conda's compiler activation exports an unquoted
+/// `-isystem <prefix>/include` in CFLAGS/CXXFLAGS, which cc-rs, autoconf and
+/// setuptools all word-split, so a prefix with a space is torn in half and no
+/// native build can link or compile. The XDG layout is space-free on every
+/// platform, so mim uses it everywhere.
+fn user_base(
+    xdg: Option<String>,
+    conventional: Option<PathBuf>,
+    home: Option<PathBuf>,
+    rel: &str,
+) -> PathBuf {
+    if let Some(p) = xdg.map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return p;
+    }
+    if let Some(p) = conventional.filter(|p| !path_has_whitespace(p)) {
+        return p;
+    }
+    home.unwrap_or_else(|| PathBuf::from("~")).join(rel)
+}
+
+/// Refuse a native environment root whose path contains whitespace. Conda's
+/// compiler activation writes this path into CFLAGS/CXXFLAGS unquoted and the
+/// build tools that read them split on whitespace, so nothing native can be
+/// built under such a root; there is no quoting fix on mim's side because the
+/// flags are composed by conda. Fail here with the reason rather than a
+/// thousand lines of `no such file or directory` from cc-rs.
+pub fn reject_whitespace_root(dir: &Path) -> Result<()> {
+    if !path_has_whitespace(dir) {
+        return Ok(());
+    }
+    Err(ManagerError::EnvError(format!(
+        "the native environment root contains whitespace:\n  {}\n\
+         Conda's compiler activation puts this path into CFLAGS/CXXFLAGS \
+         unquoted, and cargo, autoconf and setuptools all split those on \
+         whitespace, so no native build can succeed here.\n\
+         Set XDG_DATA_HOME and XDG_CONFIG_HOME to whitespace-free directories \
+         and re-run, or use the container backend.",
+        dir.display()
+    )))
+}
+
 pub fn config_dir(scope: Scope) -> PathBuf {
     match scope {
-        Scope::Local => dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.config"))
-            .join("morloc"),
+        Scope::Local => user_base(
+            std::env::var("XDG_CONFIG_HOME").ok(),
+            dirs::config_dir(),
+            dirs::home_dir(),
+            ".config",
+        )
+        .join("morloc"),
         Scope::System => PathBuf::from("/etc/morloc"),
     }
 }
@@ -41,9 +111,13 @@ pub fn config_path(scope: Scope) -> PathBuf {
 
 pub fn data_dir(scope: Scope) -> PathBuf {
     match scope {
-        Scope::Local => dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-            .join("morloc"),
+        Scope::Local => user_base(
+            std::env::var("XDG_DATA_HOME").ok(),
+            dirs::data_dir(),
+            dirs::home_dir(),
+            ".local/share",
+        )
+        .join("morloc"),
         Scope::System => PathBuf::from("/usr/local/share/morloc"),
     }
 }
@@ -182,6 +256,11 @@ fn migrate_env_config(mut ec: EnvironmentConfig) -> Result<EnvironmentConfig> {
             // v2 -> v3: added the optional `cert_bundle` path (defaults to None).
             // Purely additive.
             2 => ec.schema_version = 3,
+            // v3 -> v4: added the optional `mount_home` path (defaults to None).
+            // Additive on disk, but a v4 record read by a v3 mim would silently
+            // drop the mount and run with the env-owned home, so the version is
+            // bumped to make that record refuse to load there.
+            3 => ec.schema_version = 4,
             v => {
                 return Err(ManagerError::EnvError(format!(
                     "environment '{}' uses env schema v{v} with no migration path to v{}; \
@@ -521,6 +600,73 @@ mod tests {
     // A minimal env.yaml body omitting `schema_version` (a pre-versioning record).
     const V1_YAML: &str = "name: test\nbase_image: \"img:1\"\nengine: podman\n";
 
+    #[test]
+    fn user_base_skips_a_conventional_dir_with_a_space() {
+        // macOS: `dirs::data_dir()` is `~/Library/Application Support`.
+        let base = user_base(
+            None,
+            Some(PathBuf::from("/Users/weena/Library/Application Support")),
+            Some(PathBuf::from("/Users/weena")),
+            ".local/share",
+        );
+        assert_eq!(base, PathBuf::from("/Users/weena/.local/share"));
+        assert!(!path_has_whitespace(&base));
+    }
+
+    #[test]
+    fn user_base_keeps_a_space_free_conventional_dir() {
+        // Linux: the platform answer is already usable, so it wins.
+        let base = user_base(
+            None,
+            Some(PathBuf::from("/home/weena/.local/share")),
+            Some(PathBuf::from("/home/weena")),
+            ".local/share",
+        );
+        assert_eq!(base, PathBuf::from("/home/weena/.local/share"));
+    }
+
+    #[test]
+    fn user_base_prefers_an_absolute_xdg_override() {
+        let base = user_base(
+            Some("/data/xdg".to_string()),
+            Some(PathBuf::from("/home/weena/.local/share")),
+            Some(PathBuf::from("/home/weena")),
+            ".local/share",
+        );
+        assert_eq!(base, PathBuf::from("/data/xdg"));
+    }
+
+    #[test]
+    fn user_base_ignores_a_relative_xdg_override() {
+        // Matches `dirs`: XDG vars are honored only when absolute.
+        let base = user_base(
+            Some("relative/share".to_string()),
+            Some(PathBuf::from("/home/weena/.local/share")),
+            Some(PathBuf::from("/home/weena")),
+            ".local/share",
+        );
+        assert_eq!(base, PathBuf::from("/home/weena/.local/share"));
+    }
+
+    #[test]
+    fn whitespace_env_root_is_rejected_with_the_reason() {
+        let err = reject_whitespace_root(Path::new(
+            "/Users/weena/Library/Application Support/morloc/environments/latest",
+        ))
+        .expect_err("a root with a space must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("CFLAGS"), "unexpected error: {msg}");
+        assert!(msg.contains("Application Support"), "names the path: {msg}");
+    }
+
+    #[test]
+    fn space_free_env_root_is_accepted() {
+        assert!(reject_whitespace_root(Path::new(
+            "/Users/weena/.local/share/morloc/environments/latest"
+        ))
+        .is_ok());
+    }
+
     fn parse(yaml: &str) -> EnvironmentConfig {
         serde_yaml::from_str(yaml).expect("valid env config")
     }
@@ -536,6 +682,37 @@ mod tests {
         let ec = parse(V1_YAML);
         let migrated = migrate_env_config(ec).expect("v1 migrates");
         assert_eq!(migrated.schema_version, CURRENT_ENV_SCHEMA);
+    }
+
+    #[test]
+    fn v3_record_migrates_to_v4_without_a_mounted_home() {
+        // The `mount_home` field is additive on disk: a v3 record simply has no
+        // host home, and the version bump is the whole migration.
+        let mut ec = parse(V1_YAML);
+        ec.schema_version = 3;
+        let migrated = migrate_env_config(ec).expect("v3 migrates");
+        assert_eq!(migrated.schema_version, 4);
+        assert!(migrated.mount_home.is_none());
+    }
+
+    #[test]
+    fn mounted_home_round_trips_through_yaml() {
+        let mut ec = parse(V1_YAML);
+        ec.mount_home = Some("/host/homes/dev".to_string());
+        let back = parse(&serde_yaml::to_string(&ec).unwrap());
+        assert_eq!(back.mount_home.as_deref(), Some("/host/homes/dev"));
+        // An env without one writes no key at all.
+        let plain = parse(V1_YAML);
+        assert!(!serde_yaml::to_string(&plain).unwrap().contains("mount_home"));
+    }
+
+    #[test]
+    fn effective_home_prefers_the_mounted_one() {
+        let mut ec = parse(V1_YAML);
+        let data = Path::new("/data/env");
+        assert_eq!(effective_env_home(&ec, data), data.join("home"));
+        ec.mount_home = Some("/host/homes/dev".to_string());
+        assert_eq!(effective_env_home(&ec, data), PathBuf::from("/host/homes/dev"));
     }
 
     #[test]

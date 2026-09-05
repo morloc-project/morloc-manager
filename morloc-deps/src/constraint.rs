@@ -342,22 +342,28 @@ fn upper_parts(u: &Upper) -> (&Version, bool) {
 /// Resolve a language's effective version constraint by intersecting the three
 /// sources, erroring legibly (in morloc's vocabulary, at the command typed) when
 /// they cannot all be satisfied. `program` = the constraint the installed
-/// programs need (from EnvSpec); `pin` = the user's `--lang` pin; `supported` =
-/// morloc's supported range from the language-support table. Returns the
-/// effective conda match-spec.
+/// programs need (from EnvSpec, already merged across programs and any recorded
+/// abi-lock pin); `pin` = the user's `--lang` pin; `supported` = morloc's
+/// supported range from the language-support table. `remedy` closes the conflict
+/// message with the fix appropriate to the caller's context (loosening a pin at
+/// `mim new` time vs re-provisioning a pinned interpreter at solve time). Returns
+/// the effective conda match-spec in canonical form. Propagates a parse error
+/// when a source is not a version range, rather than passing an unchecked spec on
+/// to the solver.
 pub fn resolve_lang_version(
     lang: &str,
     morloc_version: &str,
     program: Option<&str>,
     pin: Option<&str>,
     supported: &str,
+    remedy: &str,
 ) -> Result<String> {
     let mut range = VersionRange::parse(supported)?;
     let mut sources: Vec<(&str, String)> = vec![("morloc supports", supported.to_string())];
 
     if let Some(p) = program.filter(|s| !s.trim().is_empty() && s.trim() != "*") {
         range = range.intersect(&VersionRange::parse(p)?);
-        sources.push(("a program needs", p.to_string()));
+        sources.push(("this environment requires", p.to_string()));
     }
     if let Some(p) = pin.filter(|s| !s.trim().is_empty()) {
         let pr = VersionRange::from_pin(p)?;
@@ -373,7 +379,7 @@ pub fn resolve_lang_version(
             .join("\n");
         return Err(bad(format!(
             "no {lang} version satisfies all constraints (morloc {morloc_version}):\n{detail}\n\
-             The requirements do not overlap. Loosen the pin or use a different backend."
+             The requirements do not overlap. {remedy}"
         )));
     }
     Ok(range.to_spec())
@@ -461,20 +467,27 @@ mod tests {
 
     #[test]
     fn resolve_ok_and_err() {
+        let remedy = "Loosen the pin.";
         // ok: default py, supported range, no pin/program
-        let got = resolve_lang_version("python", "0.99.0", None, None, ">=3.10,<3.14").unwrap();
+        let got = resolve_lang_version("python", "0.99.0", None, None, ">=3.10,<3.14", remedy).unwrap();
         assert_eq!(got, ">=3.10,<3.14");
         // ok: pin within range
-        let got = resolve_lang_version("python", "0.99.0", None, Some("3.12"), ">=3.10,<3.14").unwrap();
+        let got = resolve_lang_version("python", "0.99.0", None, Some("3.12"), ">=3.10,<3.14", remedy).unwrap();
         assert_eq!(got, ">=3.12,<3.13");
-        // err: pin above the supported ceiling
-        let err = resolve_lang_version("python", "0.99.0", None, Some("3.14"), ">=3.10,<3.14")
+        // ok: program constraint narrows within the window, canonical form
+        let got = resolve_lang_version("python", "0.99.0", Some(">=3.11"), None, ">=3.10,<3.14", remedy).unwrap();
+        assert_eq!(got, ">=3.11,<3.14");
+        // err: pin above the supported ceiling, remedy appended
+        let err = resolve_lang_version("python", "0.99.0", None, Some("3.14"), ">=3.10,<3.14", remedy)
             .unwrap_err()
             .to_string();
         assert!(err.contains("no python version"), "got: {err}");
         assert!(err.contains("you pinned"), "got: {err}");
         assert!(err.contains("morloc supports"), "got: {err}");
-        // err: program needs newer than supported
-        assert!(resolve_lang_version("python", "0.99.0", Some(">=3.14"), None, ">=3.10,<3.14").is_err());
+        assert!(err.contains(remedy), "got: {err}");
+        // err: a program/env constraint newer than supported
+        assert!(resolve_lang_version("python", "0.99.0", Some(">=3.14"), None, ">=3.10,<3.14", remedy).is_err());
+        // err: a non-version-range source is a hard parse error, not passed through
+        assert!(resolve_lang_version("python", "0.99.0", Some("=3.12=*cpython"), None, ">=3.10,<3.14", remedy).is_err());
     }
 }

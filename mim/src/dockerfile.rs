@@ -162,9 +162,14 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     out.push_str("# Pinned pixi (conda package manager)\n");
     out.push_str("ENV PIXI_HOME=/opt/pixi\n");
     out.push_str("ENV PATH=\"/opt/pixi/bin:${PATH}\"\n");
+    // The `test -x` is load-bearing, not belt-and-braces: a failed download pipes
+    // an EMPTY script into bash, which exits 0 and commits an image with no pixi.
+    // Without the check the build "succeeds" and the missing binary only surfaces
+    // when the environment is materialized.
     out.push_str(&format!(
-        "RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v{} bash\n",
-        input.pixi_version
+        "RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v{} bash \\\n  && test -x {}\n",
+        input.pixi_version,
+        crate::serve::CONTAINER_PIXI_BIN
     ));
     out.push('\n');
 
@@ -231,9 +236,20 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
         // assignment). Replacing ghcup's `stack` in place (rather than shadowing via
         // PATH) is robust: the run-time PATH is set by serve::container_path, which
         // orders /usr/local/bin AFTER the ghcup dir.
+        //
+        // Prepend /usr/bin so binutils tools Cabal discovers by PATH search rather
+        // than env var (strip, ranlib) resolve to the native /usr/bin copies, not
+        // the pixi env's. CC/CXX/AR/LD as env vars do NOT cover these: Cabal's
+        // stripProgram/ranlibProgram are `simpleProgram` lookups with no env-var
+        // channel, and container PATH puts the pixi bin first (serve::container_path
+        // + the ENTRYPOINT's pixi shell-hook). Worse, Cabal freezes the resolved
+        // path into setup-config at configure time, so a conda `strip` cached there
+        // detonates as `posix_spawnp: does not exist` at the later `copy` step once
+        // the mutable pixi env re-solves and that exact binary moves/vanishes.
+        // Prepending /usr/bin makes configure cache the stable native path instead.
         out.push_str(&format!("  && mv {ghcup_bin}/stack {ghcup_bin}/stack.real \\\n"));
         out.push_str(&format!(
-            "  && printf '#!/bin/sh\\nexec env -u LD_LIBRARY_PATH -u LIBRARY_PATH -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u PKG_CONFIG_PATH -u CMAKE_PREFIX_PATH -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS -u CONDA_BUILD_SYSROOT CC=/usr/bin/gcc CXX=/usr/bin/g++ AR=/usr/bin/ar LD=/usr/bin/ld {ghcup_bin}/stack.real \"$@\"\\n' > {ghcup_bin}/stack \\\n"
+            "  && printf '#!/bin/sh\\nexec env -u LD_LIBRARY_PATH -u LIBRARY_PATH -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u PKG_CONFIG_PATH -u CMAKE_PREFIX_PATH -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS -u CONDA_BUILD_SYSROOT PATH=/usr/bin:/bin:$PATH CC=/usr/bin/gcc CXX=/usr/bin/g++ AR=/usr/bin/ar LD=/usr/bin/ld {ghcup_bin}/stack.real \"$@\"\\n' > {ghcup_bin}/stack \\\n"
         ));
         out.push_str(&format!("  && chmod +x {ghcup_bin}/stack\n"));
         out.push_str(&format!("ENV PATH=\"{ghcup_bin}:${{PATH}}\"\n"));
@@ -392,7 +408,8 @@ RUN mkdir -p /home && ln -sfn /opt/morloc-state/home /home/morloc
 # Pinned pixi (conda package manager)
 ENV PIXI_HOME=/opt/pixi
 ENV PATH=\"/opt/pixi/bin:${PATH}\"
-RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v0.76.2 bash
+RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v0.76.2 bash \\
+  && test -x /opt/pixi/bin/pixi
 
 # morloc compiler + rust source (from the build context)
 COPY runtime/ /opt/morloc-runtime/
@@ -413,6 +430,30 @@ RUN printf '%s\\n' '#!/bin/bash' 'if [ -f /usr/local/lib/morloc-nss-wrapper.so ]
 ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
 ";
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn pixi_install_step_verifies_the_binary_landed() {
+        // `curl ... | bash` cannot fail the build on its own: a failed download
+        // feeds bash an empty script, which exits 0 and commits an image with no
+        // pixi -- the failure then surfaces much later, at materialization.
+        let input = DockerfileInput {
+            base_image: "debian:bookworm-slim",
+            pixi_version: "0.76.2",
+            morloc_home: "/opt/morloc",
+            extras: &BuildExtras::default(),
+            lang_installs: &[],
+            dev: false,
+            cert_file: None,
+        };
+        let got = generate_dockerfile(&input);
+        // The step is a line-continued RUN, so take it up to the blank line.
+        let at = got.find("pixi.sh/install.sh").expect("a pixi install step");
+        let step = &got[at..got[at..].find("\n\n").map(|e| at + e).unwrap_or(got.len())];
+        assert!(
+            step.contains(&format!("test -x {}", crate::serve::CONTAINER_PIXI_BIN)),
+            "pixi install must be verified in the same RUN: {step}"
+        );
     }
 
     #[test]
@@ -498,6 +539,9 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         assert!(got.contains(&format!("mv {ghcup_bin}/stack {ghcup_bin}/stack.real")));
         assert!(got.contains("CC=/usr/bin/gcc"));
         assert!(got.contains("-u CONDA_BUILD_SYSROOT"));
+        // /usr/bin is prepended so Cabal's PATH-discovered binutils tools (strip,
+        // ranlib) resolve to the native copies rather than the mutable pixi env's.
+        assert!(got.contains("PATH=/usr/bin:/bin:$PATH"));
         assert!(got.contains(&format!("{ghcup_bin}/stack.real \"$@\"")));
 
         // A release (non-dev) image ships a prebuilt compiler, so it gets neither

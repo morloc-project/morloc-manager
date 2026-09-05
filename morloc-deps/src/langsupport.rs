@@ -181,6 +181,22 @@ impl LangSupport {
             languages,
         })
     }
+
+    /// The supported runtime version window (a conda match-spec) for each language
+    /// that has a versioned runtime, keyed by canonical short name (py/r/...).
+    /// This is morloc's HARD support range for the interpreter (from each
+    /// `requirements.yaml`'s `runtime.version`); the ABI-lock recorder consults it
+    /// so it never pins an interpreter to a version morloc does not support (e.g. a
+    /// python pulled transitively by a non-py program, which conda would resolve to
+    /// the latest release outside the window).
+    pub fn runtime_windows(&self) -> BTreeMap<String, String> {
+        self.languages
+            .iter()
+            .filter_map(|(lang, entry)| {
+                entry.runtime.as_ref().map(|rt| (lang.clone(), rt.version.clone()))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
