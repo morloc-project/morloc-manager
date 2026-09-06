@@ -1,0 +1,8 @@
+name: dna
+version: 0.1.0
+synopsis: A one-function demo module for the deployment walkthrough
+license: MIT
+dependencies: []
+# Sourced files must be listed here, or `morloc make --install` installs a
+# program whose Python source did not travel with it.
+include: ["dna.py"]
