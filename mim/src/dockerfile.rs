@@ -86,9 +86,16 @@ pub struct DeployDockerfileInput<'a> {
 /// is engine storage rather than a directory, and reinstalling from the lock is
 /// what makes the artifact reproducible instead of merely copied.
 ///
-/// The prefix is installed at the same path the environment used, which is what
-/// keeps the language bindings loadable: they were linked against that prefix,
-/// and a Python binding carries the interpreter's ABI tag in its own filename.
+/// Every path here is the one the environment itself uses, and that is a
+/// requirement rather than a tidiness. A compiled pool carries absolute paths
+/// baked in at compile time: a Python pool's first statement puts
+/// `<MORLOC_HOME>/opt`, `<MORLOC_STATE>/src/morloc/plane` and
+/// `<MORLOC_STATE>/modules/python` on its search path as literals. An image
+/// that collapsed the runtime and the state into one prefix, or moved either,
+/// would leave every pool unable to find the binding it calls through. The
+/// conda prefix is installed at the environment's path for the same reason: the
+/// bindings were linked against it, and a Python binding carries the
+/// interpreter's ABI tag in its own filename.
 ///
 /// The image is a CLI and a server at once, which is the point of deriving both
 /// from one type. The entrypoint is the activation wrapper alone, so the default
@@ -640,6 +647,23 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         assert!(full.contains("COPY fdb/ /opt/morloc-state/fdb/"), "{full}");
         assert!(full.contains("COPY modules/ /opt/morloc-state/modules/"), "{full}");
         assert!(!full.contains("COPY src/"), "{full}");
+    }
+
+    #[test]
+    fn a_deployment_image_reproduces_the_environment_layout_exactly() {
+        // Pools bake absolute paths at compile time -- a Python pool's search
+        // path names <MORLOC_HOME>/opt and <MORLOC_STATE>/... as literals -- so
+        // an image that moved either would break every pool it carries. These
+        // are the same constants the pliable environment mounts at.
+        let df = deploy(&SERVE_CMD, &["src", "modules"], false);
+        let mh = crate::serve::CONTAINER_MORLOC_HOME;
+        let state = crate::serve::CONTAINER_MORLOC_STATE;
+        assert_ne!(mh, state, "the runtime and the state are distinct prefixes");
+        assert!(df.contains(&format!("COPY runtime/ {mh}/")), "{df}");
+        assert!(df.contains(&format!("COPY src/ {state}/src/")), "{df}");
+        assert!(df.contains(&format!("COPY modules/ {state}/modules/")), "{df}");
+        assert!(df.contains(&format!("ENV MORLOC_HOME={mh}")), "{df}");
+        assert!(df.contains(&format!("ENV MORLOC_STATE={state}")), "{df}");
     }
 
     #[test]
