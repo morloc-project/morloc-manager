@@ -4985,10 +4985,10 @@ fn eprintln_columns(items: &[String]) {
     }
 }
 
-/// Prompt for an optional package-file path (interactive `new`); blank / "none"
-/// yields an empty list, otherwise the file is read, parsed, and its contents
-/// echoed in columns as immediate feedback. A bad path is reported and
-/// re-prompted rather than aborting the session.
+/// Prompt for an optional package-file path (interactive `new`); a blank line
+/// yields an empty list, otherwise the answer is taken as a path -- the file is
+/// read, parsed, and its contents echoed in columns as immediate feedback. A bad
+/// path is reported and re-prompted rather than aborting the session.
 fn prompt_package_file(label: &str) -> prompt::Result<Vec<String>> {
     let help = "path to a file with one package per line";
     let mut rejected: Option<String> = None;
@@ -5002,7 +5002,9 @@ fn prompt_package_file(label: &str) -> prompt::Result<Vec<String>> {
             None => prompt::path(label, help)?,
         };
         let ans = ans.trim().to_string();
-        if ans.is_empty() || ans.eq_ignore_ascii_case("none") {
+        // Blank is the only skip: every other answer is a path, so a file really
+        // named `none` is reachable.
+        if ans.is_empty() {
             return Ok(Vec::new());
         }
         // Expand ~ like every other path prompt, so a hand-typed ~/pkgs.txt works.
@@ -5453,10 +5455,10 @@ fn stage_dev_agent(scope: Scope, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Prompt for an optional dotfiles directory to seed the environment's home.
-/// Empty / "none" means no dotfiles. A given path (with ~ expanded) is checked
-/// for existence and re-prompted on error. `current` (when re-editing) is
-/// pre-filled so a bare Enter keeps it. Docker/podman only.
+/// Prompt for an optional dotfiles directory to seed the environment's home. A
+/// blank line means no dotfiles; every other answer is a path (with ~ expanded),
+/// checked for existence and re-prompted on error. `current` (when re-editing)
+/// is pre-filled so a bare Enter keeps it. Docker/podman only.
 fn interactive_choose_dotfiles(current: Option<&str>) -> prompt::Result<Option<String>> {
     let msg = "Dotfiles directory (blank for none)";
     let help = "copied into the env home";
@@ -5470,7 +5472,9 @@ fn interactive_choose_dotfiles(current: Option<&str>) -> prompt::Result<Option<S
             None => prompt::path(msg, help)?,
         };
         let choice = choice.trim().to_string();
-        if choice.is_empty() || choice.eq_ignore_ascii_case("none") {
+        // Blank is the only skip: every other answer is a path, so a dotfiles
+        // profile directory really named `none` is reachable.
+        if choice.is_empty() {
             return Ok(None);
         }
         let expanded = expand_tilde(&choice);
