@@ -17,6 +17,35 @@ pub fn env_home_dir(data_dir: impl AsRef<Path>) -> PathBuf {
     data_dir.as_ref().join("home")
 }
 
+/// The environment's morloc runtime prefix (MORLOC_HOME) as the HOST sees it.
+///
+/// A native environment is materialized flat: its data dir is both the runtime
+/// prefix and the mutable state, so `morloc init` writes `bin/` and `lib/`
+/// straight into it. A container environment separates the two, because they
+/// mount at different places inside the container, and the runtime lives one
+/// level down under `runtime/`. Anything looking for the nexus, a shared
+/// library, or an installed program's launcher has to know which shape it is
+/// looking at -- a check written for the flat layout reports every program in
+/// every container environment as missing.
+pub fn env_runtime_dir(ec: &EnvironmentConfig, data_dir: impl AsRef<Path>) -> PathBuf {
+    let data_dir = data_dir.as_ref();
+    if ec.backend.is_native() {
+        data_dir.to_path_buf()
+    } else {
+        data_dir.join("runtime")
+    }
+}
+
+/// The launcher an installed program is invoked through, as the HOST sees it.
+/// `morloc make --install` writes it into the runtime prefix's `bin/`.
+pub fn env_program_launcher(
+    ec: &EnvironmentConfig,
+    data_dir: impl AsRef<Path>,
+    program: &str,
+) -> PathBuf {
+    env_runtime_dir(ec, data_dir).join("bin").join(program)
+}
+
 /// The host directory that actually backs the environment's `$HOME`: the
 /// configured `mount_home` when the env has one (it shadows the env-owned home
 /// at run time), else `<data_dir>/home`. The single answer for every site that
@@ -599,6 +628,37 @@ mod tests {
 
     // A minimal env.yaml body omitting `schema_version` (a pre-versioning record).
     const V1_YAML: &str = "name: test\nbase_image: \"img:1\"\nengine: podman\n";
+
+    fn env_with(backend: Backend) -> EnvironmentConfig {
+        EnvironmentConfig::new_backend(
+            "test".to_string(),
+            backend,
+            "img:1".to_string(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn a_container_environment_keeps_its_runtime_one_level_down() {
+        // A launcher check written for the flat native layout reports every
+        // program in every container environment as missing, which is what kept
+        // `expose add` and `start` from ever working there.
+        let data = Path::new("/data/environments/dev");
+        let container = env_with(Backend::Container(ContainerEngine::Docker));
+        assert_eq!(
+            env_program_launcher(&container, data, "dna"),
+            Path::new("/data/environments/dev/runtime/bin/dna")
+        );
+
+        let native = env_with(Backend::Native);
+        assert_eq!(
+            env_program_launcher(&native, data, "dna"),
+            Path::new("/data/environments/dev/bin/dna")
+        );
+    }
 
     #[test]
     fn user_base_skips_a_conventional_dir_with_a_space() {

@@ -3114,7 +3114,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // Backend-neutral orchestration: WHAT to serve (a --mcp one-off or the
             // exposed set) + the port. One listener serves both adapters; MCP
             // defaults to 9000, API-only to 8080, auto-picking a free port.
-            let spec = resolve_serve_spec(env_scope, &env_name, &mcp)?;
+            let spec = resolve_serve_spec(&ec, env_scope, &env_name, &mcp)?;
             let eval_on = spec.eval_allow.is_some();
             let serves_mcp = !spec.mcp.is_empty() || eval_on;
             let serves_api = !spec.api.is_empty() || eval_on;
@@ -3426,13 +3426,15 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         // ---- expose ----
         Cmd::Expose { action } => match action {
             ExposeAction::Add { module, protocols, env } => {
-                let (env_name, scope, _ec) = resolve_env_or_default(env)?;
+                let (env_name, scope, ec) = resolve_env_or_default(env)?;
                 // Exposure is a view of an INSTALLED program; catch typos early.
-                let launcher = cfg::env_data_dir(scope, &env_name).join("bin").join(&module);
+                let launcher =
+                    cfg::env_program_launcher(&ec, cfg::env_data_dir(scope, &env_name), &module);
                 if !launcher.exists() {
                     return Err(ManagerError::EnvError(format!(
                         "Module '{module}' is not installed in environment '{env_name}' \
-                         (no bin/{module}).\n  Install it first: mim install <src>.loc"
+                         (no launcher at {}).\n  Install it first: mim install <src>.loc",
+                        launcher.display()
                     )));
                 }
                 let mut ex = cfg::read_exposure(scope, &env_name)?;
@@ -7926,9 +7928,14 @@ fn native_running_serves() -> Vec<serve::ServeContainerInfo> {
 /// Resolve WHAT to serve: a `--mcp <program>` one-off, or the environment's
 /// exposed set (expose.yaml). Ensures each program is installed. Shared by the
 /// container and native start paths.
-fn resolve_serve_spec(scope: Scope, name: &str, mcp: &Option<String>) -> Result<ServeSpec> {
+fn resolve_serve_spec(
+    ec: &EnvironmentConfig,
+    scope: Scope,
+    name: &str,
+    mcp: &Option<String>,
+) -> Result<ServeSpec> {
     if let Some(program) = mcp {
-        ensure_program_installed(scope, name, program)?;
+        ensure_program_installed(ec, scope, name, program)?;
         Ok(ServeSpec { mcp: vec![program.clone()], api: Vec::new(), eval_allow: None })
     } else {
         let ex = cfg::read_exposure(scope, name)?;
@@ -7940,7 +7947,7 @@ fn resolve_serve_spec(scope: Scope, name: &str, mcp: &Option<String>) -> Result<
             )));
         }
         for m in ex.exposed_modules() {
-            ensure_program_installed(scope, name, &m)?;
+            ensure_program_installed(ec, scope, name, &m)?;
         }
         let eval_allow = ex.eval.as_ref().map(|e| e.allow.join(","));
         Ok(ServeSpec { mcp: ex.mcp.clone(), api: ex.api.clone(), eval_allow })
@@ -8604,16 +8611,21 @@ fn run_with_config(
 /// (the `-o` name); the launcher's exec line carries the real manifest path,
 /// so the nexus resolves it. (The build dir under exe/ is keyed on the source
 /// basename, not the program name, so it is not a reliable lookup key.)
-fn ensure_program_installed(env_scope: Scope, env_name: &str, program: &str) -> Result<()> {
-    let host_launcher = cfg::env_data_dir(env_scope, env_name)
-        .join("bin")
-        .join(program);
-    if !host_launcher.exists() {
+fn ensure_program_installed(
+    ec: &EnvironmentConfig,
+    env_scope: Scope,
+    env_name: &str,
+    program: &str,
+) -> Result<()> {
+    let launcher =
+        cfg::env_program_launcher(ec, cfg::env_data_dir(env_scope, env_name), program);
+    if !launcher.exists() {
         return Err(ManagerError::EnvError(format!(
             "Program '{program}' is not installed in environment '{env_name}' \
-             (looked for bin/{program}).\n  Install it with: \
+             (looked for {}).\n  Install it with: \
              mim install <file>.loc  (the program is named after its \
-             module, so serve it as '{program}' only if that is the module name)."
+             module, so serve it as '{program}' only if that is the module name).",
+            launcher.display()
         )));
     }
     Ok(())
