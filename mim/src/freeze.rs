@@ -98,22 +98,7 @@ pub fn freeze_environment(
     }
 
     let exposure = config::read_exposure(scope, env_name).unwrap_or_default();
-    let cmd = match spec_from_exposure(&exposure) {
-        // The image does not waive eval's token requirement. Whether this
-        // container is reachable is the operator's decision, made outside it with
-        // a published port or a network, and the image cannot see that decision;
-        // it can only see that eval is expensive and unbounded by what the author
-        // declared. An operator who wants open eval sets MORLOC_EVAL_ALLOW_NO_AUTH.
-        Some(spec) => crate::build_router_command(
-            crate::serve::CONTAINER_MORLOC_STATE,
-            DEPLOY_HTTP_PORT,
-            "0.0.0.0",
-            &spec,
-            false,
-            false,
-        ),
-        None => Vec::new(),
-    };
+    let cmd = deploy_command(&exposure);
     let optional_state: Vec<String> = paths
         .iter()
         .filter(|p| OPTIONAL_STATE.contains(&p.as_str()))
@@ -164,6 +149,35 @@ pub fn freeze_environment(
         eprintln!("Wrote {path} (load it elsewhere with `{} load -i {path}`)", engine.name());
     }
     Ok(())
+}
+
+/// The default command a deployment image serves under: the router over the
+/// environment's declared set, or nothing at all when it declared nothing.
+///
+/// The image serves without a bearer token, and the nexus says so at startup.
+/// Inside a container the bind address carries no information about exposure --
+/// it is always the wildcard, because a container's loopback is its own -- so
+/// refusing on that basis would fire identically whether a port was published
+/// or not. What can reach a container is decided outside it, by a published
+/// port or a network or a gateway, and that is where access control belongs.
+///
+/// Eval is the exception and keeps its requirement. The image cannot see the
+/// operator's exposure decision, but it can see that eval runs expressions the
+/// caller writes rather than the functions the author exported, and that one
+/// call can rebuild a pool. An operator who wants it open sets
+/// MORLOC_EVAL_ALLOW_NO_AUTH.
+fn deploy_command(exposure: &ExposureConfig) -> Vec<String> {
+    match spec_from_exposure(exposure) {
+        Some(spec) => crate::build_router_command(
+            crate::serve::CONTAINER_MORLOC_STATE,
+            DEPLOY_HTTP_PORT,
+            "0.0.0.0",
+            &spec,
+            true,
+            false,
+        ),
+        None => Vec::new(),
+    }
 }
 
 /// Where a freeze stages its build context, under the environment's own data
@@ -440,31 +454,25 @@ mod tests {
             api: vec!["util".to_string()],
             eval: None,
         };
-        let spec = spec_from_exposure(&ex).expect("a spec");
-        let cmd = crate::build_router_command(
-            crate::serve::CONTAINER_MORLOC_STATE,
-            DEPLOY_HTTP_PORT,
-            "0.0.0.0",
-            &spec,
-            false,
-            false,
-        );
+        let cmd = deploy_command(&ex);
         assert!(cmd.windows(2).any(|w| w == ["--mcp", "dna"]), "{cmd:?}");
         assert!(cmd.windows(2).any(|w| w == ["--api", "util"]), "{cmd:?}");
         // A container's loopback is its own, so a published port only reaches a
         // service bound to all interfaces.
         assert!(cmd.windows(2).any(|w| w == ["--http-host", "0.0.0.0"]), "{cmd:?}");
-        // And nothing waives authentication on that bind: the nexus refuses to
-        // start until the operator supplies a token or overrides the command.
-        assert!(!cmd.iter().any(|a| a == "--allow-no-auth"), "{cmd:?}");
-        // Nor eval's own requirement. Whether this container is reachable is
-        // decided outside it, so the image cannot waive on the operator's behalf.
+        // The image serves without a token, because inside a container the bind
+        // address says nothing about who can reach the process.
+        assert!(cmd.iter().any(|a| a == "--allow-no-auth"), "{cmd:?}");
+        // Eval is the exception and keeps its requirement: the image cannot see
+        // the operator's exposure decision, but it can see that eval is
+        // expensive and unbounded by what the author declared.
         assert!(!cmd.iter().any(|a| a == "--eval-allow-no-auth"), "{cmd:?}");
     }
 
     #[test]
     fn an_environment_that_exposed_nothing_gets_no_default_command() {
         assert!(spec_from_exposure(&ExposureConfig::default()).is_none());
+        assert!(deploy_command(&ExposureConfig::default()).is_empty());
     }
 
     #[test]
