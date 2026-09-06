@@ -99,11 +99,17 @@ pub fn freeze_environment(
 
     let exposure = config::read_exposure(scope, env_name).unwrap_or_default();
     let cmd = match spec_from_exposure(&exposure) {
+        // The image does not waive eval's token requirement. Whether this
+        // container is reachable is the operator's decision, made outside it with
+        // a published port or a network, and the image cannot see that decision;
+        // it can only see that eval is expensive and unbounded by what the author
+        // declared. An operator who wants open eval sets MORLOC_EVAL_ALLOW_NO_AUTH.
         Some(spec) => crate::build_router_command(
             crate::serve::CONTAINER_MORLOC_STATE,
             DEPLOY_HTTP_PORT,
             "0.0.0.0",
             &spec,
+            false,
             false,
         ),
         None => Vec::new(),
@@ -441,6 +447,7 @@ mod tests {
             "0.0.0.0",
             &spec,
             false,
+            false,
         );
         assert!(cmd.windows(2).any(|w| w == ["--mcp", "dna"]), "{cmd:?}");
         assert!(cmd.windows(2).any(|w| w == ["--api", "util"]), "{cmd:?}");
@@ -450,6 +457,9 @@ mod tests {
         // And nothing waives authentication on that bind: the nexus refuses to
         // start until the operator supplies a token or overrides the command.
         assert!(!cmd.iter().any(|a| a == "--allow-no-auth"), "{cmd:?}");
+        // Nor eval's own requirement. Whether this container is reachable is
+        // decided outside it, so the image cannot waive on the operator's behalf.
+        assert!(!cmd.iter().any(|a| a == "--eval-allow-no-auth"), "{cmd:?}");
     }
 
     #[test]

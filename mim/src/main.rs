@@ -565,6 +565,12 @@ Examples:
         /// engine's network. Only use on a host you fully trust.
         #[arg(long = "unsafe")]
         unsafe_serve: bool,
+        /// Serve eval without a bearer token even off-box. Eval asks for one
+        /// because it runs expressions the caller writes rather than the
+        /// functions you exported, and a single call can rebuild a pool. It is
+        /// already waived for a host-confined endpoint.
+        #[arg(long)]
+        eval_allow_no_auth: bool,
         /// Port mapping HOST:CONTAINER (default: 8080:8080, or 9000:9000 with --mcp)
         #[arg(short, long, value_parser = parse_port)]
         port: Vec<(u16, u16)>,
@@ -2986,7 +2992,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         }
 
         // ---- start ----
-        Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, port, env_vars, env_file, engine_arg, force } => {
+        Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, eval_allow_no_auth, port, env_vars, env_file, engine_arg, force } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
             if ec.is_dev() {
                 return Err(ManagerError::EnvError(format!(
@@ -3057,7 +3063,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let req = ServeRequest {
                 spec, host_port, container_port, user_env,
                 expose, allow_plaintext, allow_no_auth, unsafe_serve,
-                engine_args: engine_arg, token, verbose,
+                eval_allow_no_auth, engine_args: engine_arg, token, verbose,
             };
             let env = runner::ResolvedEnv { name: env_name.clone(), scope: env_scope, ec };
             let ServeOutcome { handle, url_host, token: eff_token } =
@@ -7967,7 +7973,12 @@ fn native_serve(
 
     let data_dir = cfg::env_data_dir(scope, env_name);
     let mh = data_dir.to_string_lossy().to_string();
-    let command = build_router_command(&mh, host_port, http_host, spec, need_allow_no_auth);
+    // A native serve shares the host's network namespace, so the bind address
+    // really does say who can reach it: loopback is host-confined and eval needs
+    // no token there.
+    let command = build_router_command(
+        &mh, host_port, http_host, spec, need_allow_no_auth, !expose,
+    );
 
     // The stored activation env-map puts the env's bin (morloc-nexus) + conda
     // toolchain on PATH; its absence means the env was never materialized.
@@ -8105,7 +8116,7 @@ pub(crate) fn container_serve(
     let plan = serve_plan(
         engine, &req.spec, req.container_port, req.host_port,
         req.expose, req.allow_plaintext, req.allow_no_auth, req.unsafe_serve,
-        cfg!(target_os = "linux"), req.token.clone(),
+        req.eval_allow_no_auth, cfg!(target_os = "linux"), req.token.clone(),
     )?;
     let mut user_env = req.user_env.clone();
     let mut mcp_token: Option<String> = None;
@@ -8663,6 +8674,10 @@ impl ServeSpec {
 /// backend impl differs only in how it launches + tracks the process.
 pub(crate) struct ServeRequest {
     pub spec: ServeSpec,
+    /// Serve eval without a bearer token even where this endpoint is reachable
+    /// off the host. Eval is otherwise waived only when the endpoint is
+    /// host-confined; see `serve_plan`.
+    pub eval_allow_no_auth: bool,
     pub host_port: u16,
     pub container_port: u16,
     pub user_env: Vec<(String, String)>,
@@ -8710,6 +8725,7 @@ fn serve_plan(
     allow_plaintext: bool,
     allow_no_auth: bool,
     unsafe_serve: bool,
+    eval_allow_no_auth: bool,
     // Whether docker/podman can bind the host's loopback via the shared netns
     // (true on a Linux manager; false on a VM-backed engine). The production
     // caller passes `cfg!(target_os = "linux")`; kept a parameter so both the
@@ -8776,6 +8792,12 @@ fn serve_plan(
 
     // The nexus refuses a non-loopback bind with no token unless --allow-no-auth.
     let need_allow_no_auth = http_host == "0.0.0.0" && token.is_none();
+    // Eval's token requirement is waived where this endpoint cannot be reached
+    // from off the host: local development is the case eval exists for, and a
+    // token there is ceremony against a caller who is already the operator.
+    // Exposing off-box keeps the requirement, since that is the case where an
+    // expensive, caller-written computation is reachable by someone else.
+    let waive_eval_auth = eval_allow_no_auth || !expose;
     // Container: programs are installed under the mounted MORLOC_STATE, not the
     // baked MORLOC_HOME (mh), so point the router's --fdb at the state root.
     let command = build_router_command(
@@ -8784,6 +8806,7 @@ fn serve_plan(
         &http_host,
         spec,
         need_allow_no_auth,
+        waive_eval_auth,
     );
     Ok(ServePlan { command, network, publish_host, token, unsafe_unconfined })
 }
@@ -8803,6 +8826,7 @@ pub(crate) fn build_router_command(
     http_host: &str,
     spec: &ServeSpec,
     need_allow_no_auth: bool,
+    eval_allow_no_auth: bool,
 ) -> Vec<String> {
     let mut command = vec![
         "morloc-nexus".to_string(),
@@ -8826,6 +8850,14 @@ pub(crate) fn build_router_command(
     }
     if need_allow_no_auth {
         command.push("--allow-no-auth".to_string());
+    }
+    // Eval asks for a bearer token even where the rest of the endpoint does not:
+    // it runs expressions the caller writes rather than the functions the author
+    // declared, and rebuilding a pool for one costs seconds to tens of seconds.
+    // Waived only where the endpoint is host-confined, or where the operator
+    // asked for it.
+    if eval_allow_no_auth {
+        command.push("--eval-allow-no-auth".to_string());
     }
     command
 }
@@ -9874,8 +9906,40 @@ mod tests {
         };
         serve_plan(
             engine, &spec, 9000, 9000,
-            expose, plaintext, noauth, unsafe_serve, host_net, tok.map(str::to_string),
+            expose, plaintext, noauth, unsafe_serve, false, host_net, tok.map(str::to_string),
         )
+    }
+
+    #[test]
+    fn eval_needs_no_token_on_a_host_confined_endpoint() {
+        // Local development is what eval exists for, and the caller there is
+        // already the operator, so a token would be ceremony.
+        let p = plan(ContainerEngine::Docker, false, false, false, false, true, None).unwrap();
+        assert!(p.command.iter().any(|a| a == "--eval-allow-no-auth"), "{:?}", p.command);
+    }
+
+    #[test]
+    fn eval_keeps_its_token_off_box() {
+        // Reachable by someone else, and one call can rebuild a pool: this is the
+        // case the requirement exists for.
+        let p = plan(ContainerEngine::Docker, true, true, false, false, true, Some("t")).unwrap();
+        assert!(!p.command.iter().any(|a| a == "--eval-allow-no-auth"), "{:?}", p.command);
+    }
+
+    #[test]
+    fn an_operator_can_waive_eval_auth_off_box() {
+        // The documented way out, for someone whose gateway already gates it.
+        let spec = ServeSpec {
+            mcp: vec!["dna".to_string()],
+            api: Vec::new(),
+            eval_allow: Some("dna".to_string()),
+        };
+        let p = serve_plan(
+            ContainerEngine::Docker, &spec, 9000, 9000,
+            true, true, false, false, true, true, Some("t".to_string()),
+        )
+        .unwrap();
+        assert!(p.command.iter().any(|a| a == "--eval-allow-no-auth"), "{:?}", p.command);
     }
 
     #[test]
@@ -9953,7 +10017,7 @@ mod tests {
         };
         let p = serve_plan(
             ContainerEngine::Docker, &spec, 9000, 9000,
-            false, false, false, false, true, None,
+            false, false, false, false, false, true, None,
         ).unwrap();
         // The front-end is the `router` mode, not the single-program `mcp` mode.
         assert_eq!(p.command.first().map(String::as_str), Some("morloc-nexus"));
