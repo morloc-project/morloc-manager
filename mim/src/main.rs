@@ -5,6 +5,7 @@ mod container;
 mod demos;
 mod doctor;
 mod dockerfile;
+mod dotfiles;
 mod envagent;
 mod environment;
 mod error;
@@ -430,6 +431,7 @@ what the corresponding flag set:
   mim modify --env myenv --no-conda-packages-file   # drop the conda extras
   mim modify --env myenv --no-cert-bundle       # stop trusting the corporate CA
   mim modify --env myenv --no-mount-home        # back to the env-owned home
+  mim modify --env myenv --no-dotfiles          # take the copied dotfiles back
   mim modify --env myenv --no-modules-file extra.txt   # drop one pin file
   mim modify --env myenv --unset-default        # stop being the default")]
     Modify {
@@ -475,10 +477,15 @@ what the corresponding flag set:
         #[arg(long = "no-modules-file", value_name = "NAME")]
         no_modules_file: Vec<String>,
         /// Directory of dotfiles to copy into the environment's home
-        /// (.bashrc, .vimrc, .config/...). Overwrites like `cp -rf`;
-        /// docker/podman only. No rebuild.
+        /// (.bashrc, .vimrc, .config/...). Overwrites like `cp -rf`, and
+        /// replaces any previous set; docker/podman only. No rebuild.
         #[arg(long)]
         dotfiles: Option<String>,
+        /// Take back the copied dotfiles: remove the files still identical to
+        /// what was copied in, and keep (reporting) any edited since.
+        /// Docker/podman only. No rebuild.
+        #[arg(long = "no-dotfiles", conflicts_with = "dotfiles")]
+        no_dotfiles: bool,
         /// Host directory to bind-mount as the environment's $HOME (created if
         /// absent), or `none` to go back to the env-owned home. The host
         /// directory itself is never copied, moved or deleted. Docker/podman
@@ -1963,6 +1970,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let pinned_langs = dep_ctx.pinned_languages().unwrap_or_default();
                 let installed = dep_ctx.installed_program_names().unwrap_or_default();
                 let module_pins = deposited_snapshot_names(&data_dir);
+                // The recorded dotfiles copy, if any. Reported so `--no-dotfiles`
+                // names state the user can see first.
+                let dotfiles_manifest = dotfiles::read_manifest(&data_dir);
                 // The actual solved world from pixi.lock (host-side for every
                 // backend). Empty if the env has not been solved yet.
                 let platform = morloc_deps::platform::conda_platform();
@@ -2057,6 +2067,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         source: String,
                         fingerprints: Vec<String>,
                     }
+                    /// The dotfiles copied into this env's home: where they came
+                    /// from and how many files the copy still accounts for.
+                    #[derive(serde::Serialize)]
+                    struct DotfilesInfo {
+                        source: String,
+                        files: usize,
+                    }
                     #[derive(serde::Serialize)]
                     struct InfoDetail {
                         name: String,
@@ -2075,6 +2092,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         dependencies: Deps,
                         #[serde(skip_serializing_if = "Option::is_none")]
                         cert_bundle: Option<CertInfo>,
+                        #[serde(skip_serializing_if = "Option::is_none")]
+                        dotfiles: Option<DotfilesInfo>,
                         #[serde(skip_serializing_if = "Option::is_none")]
                         container: Option<Container>,
                     }
@@ -2139,6 +2158,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                             source: src.clone(),
                             fingerprints: ec.cert_fingerprints.clone(),
                         }),
+                        dotfiles: dotfiles_manifest.as_ref().map(|m| DotfilesInfo {
+                            source: m.source.clone(),
+                            files: m.files.len(),
+                        }),
                         container,
                     };
                     println!("{}", serde_json::to_string_pretty(&output).unwrap());
@@ -2174,6 +2197,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         println!(
                             "CA bundle: {src}  ({} certificate(s), source not owned by mim)",
                             ec.cert_fingerprints.len()
+                        );
+                    }
+                    if let Some(ref m) = dotfiles_manifest {
+                        println!(
+                            "Dotfiles:  {}  ({} file(s); `modify --no-dotfiles` takes them back)",
+                            m.source,
+                            m.files.len()
                         );
                     }
 
@@ -2470,6 +2500,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             modules_file,
             no_modules_file,
             dotfiles,
+            no_dotfiles,
             mount_home,
             no_mount_home,
             cert_bundle,
@@ -2521,6 +2552,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 && !unset_default
                 && !will_rebuild
                 && dotfiles.is_none()
+                && !no_dotfiles
                 && mount_home.is_none()
                 && !no_mount_home
                 && module_snapshots.is_empty()
@@ -2558,9 +2590,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             if base.is_some() && ec.backend.is_native() {
                 return Err(base_not_supported());
             }
-            if dotfiles.is_some() && !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
+            if (dotfiles.is_some() || no_dotfiles)
+                && !ec.backend.container_engine().is_some_and(|e| e.is_oci())
+            {
                 // Same rule as `new`: dotfiles land in a docker/podman env home;
                 // native runs against your real home and apptainer mounts host $HOME.
+                // Removal is gated identically -- there is no such home to take
+                // files back out of.
                 return Err(dotfiles_not_supported());
             }
             // `--no-mount-home` (and the `none` value `--mount-home` accepts)
@@ -2605,6 +2641,38 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                      can be the machine-wide default. Omit --system to set your personal default."
                 )));
             }
+            // A removal that removes nothing is a misunderstanding worth naming:
+            // left alone it reports success at undoing something that was never
+            // set. `--no-mount-home` is exempt -- it is a spelling of
+            // `--mount-home none`, which has always been lenient, and two
+            // spellings of one operation must not diverge.
+            let nothing_to_remove = |what: &str, fix: &str| {
+                Err(ManagerError::EnvError(format!(
+                    "environment '{env_name}' has no {what}, so there is nothing to \
+                     remove. {fix}"
+                )))
+            };
+            if no_lang && cfg::read_env_inputs(env_scope, &env_name).lang_pins.is_empty() {
+                return nothing_to_remove(
+                    "pinned languages",
+                    "Its languages are already provisioned on demand at `morloc make`.",
+                );
+            }
+            if no_system_packages_file && ec.system_packages.is_empty() {
+                return nothing_to_remove("apt packages", "Its apt package list is already empty.");
+            }
+            if no_conda_packages_file && ec.conda_packages.is_empty() {
+                return nothing_to_remove(
+                    "conda packages",
+                    "Its conda package list is already empty.",
+                );
+            }
+            if no_cert_bundle && ec.cert_bundle.is_none() {
+                return nothing_to_remove(
+                    "corporate CA bundle configured",
+                    "It already trusts only the public roots.",
+                );
+            }
             // Clearing a default only ever clears THIS environment's: refuse when
             // the recorded default names someone else, rather than silently
             // dropping a default the user did not mean to touch.
@@ -2639,6 +2707,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             if env_scope == Scope::System
                 && (will_rebuild
                     || dotfiles.is_some()
+                    || no_dotfiles
                     || mount_home_change.is_some()
                     || !no_modules_file.is_empty())
             {
@@ -2694,11 +2763,27 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 }
             }
 
-            // 2. dotfiles: copy into the mounted home; no rebuild.
+            // 2. dotfiles: copy into (or retract from) the env-owned home; no
+            //    rebuild. Removal takes back only files still byte-identical to
+            //    what was copied, so anything edited in the env stays the user's.
             if let Some(src) = &dotfiles {
                 let data_dir = cfg::env_data_dir(env_scope, &env_name);
                 apply_dotfiles(ec.backend.container_engine(), &data_dir, src)?;
-                eprintln!("Copied dotfiles into '{env_name}'.");
+            }
+            if no_dotfiles {
+                let data_dir = cfg::env_data_dir(env_scope, &env_name);
+                let report = dotfiles::forget(&data_dir)?;
+                eprintln!(
+                    "Removed {} dotfile(s) copied from {} out of '{env_name}'.",
+                    report.removed, report.source
+                );
+                if !report.kept.is_empty() {
+                    eprintln!(
+                        "Kept {} file(s) edited since they were copied: {}",
+                        report.kept.len(),
+                        report.kept.join(", ")
+                    );
+                }
             }
 
             // 2a. mounted home: pure metadata (the mount happens at run time), so
@@ -7143,16 +7228,11 @@ fn build_dev_container_image(
     Ok(image_tag)
 }
 
-/// The single rejection for `--dotfiles` on a non-OCI backend: apptainer mounts
-/// the host `$HOME` and native uses the real host home, so neither consults the
-/// env-owned home this flag populates. Both the `new` native guard and
-/// `apply_dotfiles` return this so the message has one source of truth.
+/// The single rejection for `--dotfiles` on a non-OCI backend. Lives in the
+/// dotfiles module with the code that enforces it; re-exported here because the
+/// `new` guards reject before they ever reach a copy.
 fn dotfiles_not_supported() -> ManagerError {
-    ManagerError::EnvError(
-        "--dotfiles applies only to docker/podman environments; apptainer \
-         inherits the host $HOME and the native backend uses your real home"
-            .to_string(),
-    )
+    dotfiles::not_supported()
 }
 
 /// Rejection for `--dev` with a non-OCI backend (native or apptainer): a dev env's
@@ -7176,27 +7256,14 @@ fn dev_is_local_scope_only() -> ManagerError {
 }
 
 /// Copy a user dotfiles directory into the environment's home (`<data_dir>/home`,
-/// the docker/podman shell `$HOME`), overwriting like `cp -rf`. Rejected on
-/// apptainer and native (see `dotfiles_not_supported`).
+/// the docker/podman shell `$HOME`), recording what was written so it can be
+/// removed again. Rejected on apptainer and native (see `dotfiles_not_supported`).
 fn apply_dotfiles(
     engine: Option<ContainerEngine>,
     data_dir: &std::path::Path,
-    dotfiles: &str,
+    src: &str,
 ) -> Result<()> {
-    if !matches!(engine, Some(e) if e.is_oci()) {
-        return Err(dotfiles_not_supported());
-    }
-    let src = std::path::Path::new(dotfiles);
-    if !src.is_dir() {
-        return Err(ManagerError::EnvError(format!(
-            "--dotfiles path is not a directory: {}",
-            src.display()
-        )));
-    }
-    let home = cfg::ensure_env_home(data_dir);
-    provision::copy_dir_excluding(src, &home, &[], false)?;
-    eprintln!("Copied dotfiles from {} into {}", src.display(), home.display());
-    Ok(())
+    dotfiles::apply(engine, data_dir, src)
 }
 
 /// Filename of the morloc-owned rcfile that tags an interactive `shell`
@@ -8952,6 +9019,7 @@ mod tests {
             "--no-system-packages-file",
             "--no-conda-packages-file",
             "--no-modules-file", "extra.txt",
+            "--no-dotfiles",
             "--no-mount-home",
             "--no-cert-bundle",
         ])
@@ -8962,6 +9030,7 @@ mod tests {
                 no_system_packages_file,
                 no_conda_packages_file,
                 no_modules_file,
+                no_dotfiles,
                 no_mount_home,
                 no_cert_bundle,
                 ..
@@ -8970,6 +9039,7 @@ mod tests {
                 assert!(no_system_packages_file);
                 assert!(no_conda_packages_file);
                 assert_eq!(no_modules_file, vec!["extra.txt".to_string()]);
+                assert!(no_dotfiles);
                 assert!(no_mount_home);
                 assert!(no_cert_bundle);
             }
@@ -9002,6 +9072,7 @@ mod tests {
             vec!["--lang", "py", "--no-lang"],
             vec!["--system-packages-file", "a.apt", "--no-system-packages-file"],
             vec!["--conda-packages-file", "a.conda", "--no-conda-packages-file"],
+            vec!["--dotfiles", "/tmp/d", "--no-dotfiles"],
             vec!["--mount-home", "/tmp/h", "--no-mount-home"],
             vec!["--cert-bundle", "/tmp/ca.pem", "--no-cert-bundle"],
             vec!["--set-default", "--unset-default"],
@@ -9046,6 +9117,7 @@ mod tests {
         unset_default: bool,
         system: bool,
         dotfiles: Option<String>,
+        no_dotfiles: bool,
         no_lang: bool,
         no_system_packages_file: bool,
         no_conda_packages_file: bool,
@@ -9066,6 +9138,7 @@ mod tests {
             modules_file: Vec::new(),
             no_modules_file: f.no_modules_file,
             dotfiles: f.dotfiles,
+            no_dotfiles: f.no_dotfiles,
             mount_home: None,
             no_mount_home: f.no_mount_home,
             cert_bundle: None,
@@ -9300,6 +9373,7 @@ mod tests {
                 "--no-conda-packages-file",
                 ModifyFlags { no_conda_packages_file: true, ..Default::default() },
             ),
+            ("--no-dotfiles", ModifyFlags { no_dotfiles: true, ..Default::default() }),
             ("--no-mount-home", ModifyFlags { no_mount_home: true, ..Default::default() }),
             ("--no-cert-bundle", ModifyFlags { no_cert_bundle: true, ..Default::default() }),
             (
