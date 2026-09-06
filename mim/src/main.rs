@@ -3685,7 +3685,10 @@ fn find_running_serve_container() -> Result<(String, ContainerEngine)> {
 // ======================================================================
 
 /// Apply a captured activation env-map to a `Command` (the inherited environ
-/// stays in place; callers add their own overrides afterwards).
+/// stays in place; callers add their own overrides afterwards). Callers pair
+/// this with `morloc_deps::ambient::scrub` -- via `native_command`, or directly
+/// -- so the map is applied over an environment with no other conda activation
+/// in it, matching the clean-shell case the map was captured for.
 pub(crate) fn apply_activation(cmd: &mut Command, env: &[(String, String)]) {
     for (k, v) in env {
         cmd.env(k, v);
@@ -6492,8 +6495,20 @@ fn native_capture_env(scope: Scope, name: &str, args: &[String]) -> Result<Strin
     })?;
     let data_dir = cfg::env_data_dir(scope, name);
     let (program, rest) = args.split_first().ok_or(ManagerError::NoCommand)?;
-    let mut cmd = Command::new(program);
-    cmd.args(rest);
+    let rest_os: Vec<std::ffi::OsString> =
+        rest.iter().map(std::ffi::OsString::from).collect();
+    // The captured program is a conda/glibc ELF (`morloc envspec`), so on NixOS it
+    // needs the env's FHS sandbox for its loader exactly as `run` does -- outside
+    // it the capture fails while every other native path works. Preserve the
+    // caller's cwd: the envspec target is a cwd-relative source path.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| data_dir.clone());
+    let mut cmd = native_command(
+        runtime.fhs_wrapper.as_deref(),
+        std::path::Path::new(program),
+        &rest_os,
+        &cwd,
+        activation_path(&runtime.activation_env),
+    );
     apply_activation(&mut cmd, &runtime.activation_env);
     cmd.env("MORLOC_HOME", data_dir.to_string_lossy().to_string());
     let out = cmd

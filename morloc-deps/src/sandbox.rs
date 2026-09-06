@@ -34,7 +34,24 @@ pub fn sh_quote(s: &str) -> String {
 /// `None` for `fhs` yields the bare command (with `cwd` applied via
 /// `current_dir`, matching the sandboxed cwd behavior) -- identical to the
 /// pre-FHS path on glibc-FHS Linux and macOS.
+///
+/// Every command built here runs against a morloc environment's conda world, so
+/// any conda/pixi environment active in the CALLER's shell is stripped from the
+/// child first (see [`crate::ambient`]); the caller's own activation map, applied
+/// afterwards, is then the only conda world the child sees.
 pub fn command(
+    fhs: Option<&Path>,
+    program: &Path,
+    args: &[OsString],
+    cwd: Option<&Path>,
+    force_path: Option<&str>,
+) -> Command {
+    let mut cmd = build(fhs, program, args, cwd, force_path);
+    crate::ambient::scrub(&mut cmd);
+    cmd
+}
+
+fn build(
     fhs: Option<&Path>,
     program: &Path,
     args: &[OsString],
