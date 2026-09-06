@@ -137,9 +137,13 @@ The artifact is an image, so the ways to move it are the ordinary ones.
 
 ```console
 $ docker push ghcr.io/you/dna-service:v1
-$ docker save -o dna-service-v1.tar dna-service:v1   # a file, for an airgap
-$ docker load -i dna-service-v1.tar                  # on the far side
+$ docker load -i dna-service-v1.tar    # on the far side of an airgap
 ```
+
+`mim freeze --save ./dna-service-v1.tar` writes that tarball for you at freeze
+time, which is the same thing `docker save` does and saves you knowing the
+engine's CLI. There is no morloc-specific archive format: the image is the
+artifact, and every layer including the base travels with it.
 
 ## 7. Use it
 
@@ -161,6 +165,17 @@ loopback belongs to the container and a published port never reaches
 `127.0.0.1` in there. It therefore refuses to start without a bearer token.
 Set `MORLOC_MCP_TOKEN`, or override the command with `--allow-no-auth` if you
 mean to serve openly.
+
+## Where mim stops
+
+mim manages environments, not images. It is the producer of a frozen image and
+never its manager, the way `cargo build` makes a binary and has no opinion
+about running it.
+
+So `mim status`, `mim logs` and `mim stop` apply to serves mim started from
+environments mim owns. A frozen image you `docker run` is invisible to them,
+and that is the point: it is an ordinary OCI image with no dependency on mim,
+on the environment it came from, or on the machine that built it.
 
 ## Where the image lives
 
@@ -191,17 +206,25 @@ every layer including the base, and `docker load` restores it anywhere.
 - A missing piece is named. Freezing an environment that was never provisioned
   fails saying what it lacks, rather than producing an artifact with holes.
 
+## What the image says about itself
+
+An image that has left mim's world has nothing tracking it, so it carries its
+own provenance as labels:
+
+```console
+$ docker inspect -f '{{json .Config.Labels}}' dna-service:v1
+```
+
+The morloc version, the environment it came from, the programs inside, the
+modules behind them, and which of them answer on MCP, on the API, and to eval.
+Whoever meets this image without its environment can still find out what it is.
+
 ## Status
 
-Steps 1 through 4 work today.
+Every step above is implemented. None of it has been exercised end to end: the
+machine this was written on has no container engine, so the image build, the
+save, and the serve are tested as generated Dockerfile text and argv rather
+than by running them. That is what this demo is for.
 
-Step 5 does not yet build an image. `mim freeze` currently writes an archive
-(`state.tar.gz` plus a manifest) that `mim unfreeze --from ... -t <tag>` turns
-into an image, and that archive is only usable on a machine that already has
-the environment image. Collapsing the two commands into one that builds the
-image directly is the work this demo specifies. See
-`plans/deployment/NOTE-01` in the workspace.
-
-No container engine was available where this was written, so every `mim` and
-`docker` transcript above is the intended invocation rather than a recorded
-one. The `morloc make` and `./dna` output in "The module" is real.
+The `morloc make` and `./dna` output under "The module" is real. Every `mim`
+and `docker` transcript is the intended invocation.
