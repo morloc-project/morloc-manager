@@ -8599,6 +8599,14 @@ pub(crate) struct ServeSpec {
     eval_allow: Option<String>,
 }
 
+impl ServeSpec {
+    /// A spec from an exposed set: the modules answering on each adapter, and
+    /// the eval allow-list as the comma-separated form the nexus takes.
+    pub(crate) fn new(mcp: Vec<String>, api: Vec<String>, eval_allow: Option<String>) -> Self {
+        ServeSpec { mcp, api, eval_allow }
+    }
+}
+
 /// Everything a backend needs to launch a serve, after the neutral orchestration
 /// (spec resolution, port pick, env, token) has run in the `start` handler. The
 /// backend impl differs only in how it launches + tracks the process.
@@ -8734,7 +8742,7 @@ fn serve_plan(
 /// installed programs); the nexus listens on `http_host:bind_port`.
 /// `need_allow_no_auth` is set when a non-loopback bind has no token (the nexus
 /// otherwise refuses it).
-fn build_router_command(
+pub(crate) fn build_router_command(
     // The exe/fdb tree lives under MORLOC_STATE, not MORLOC_HOME. Native: state
     // == home == data_dir. Container: state is the mounted /opt/morloc-state,
     // NOT the baked /opt/morloc, so the router must scan the mounted dir or it
@@ -10068,13 +10076,18 @@ mod tests {
                 name: "svc".to_string(),
                 commands: vec!["hello".to_string(), "compute".to_string()],
             }],
-            base_image: "morloc-full:0.67.0".to_string(),
+            base_image: "localhost/morloc-env:latest".to_string(),
             env_layer: Some(FrozenEnvLayer {
                 name: "ml".to_string(),
                 dockerfile: "FROM scratch".to_string(),
                 content_hash: "abc".to_string(),
                 image_tag: None,
             }),
+            exposure: ExposureConfig {
+                mcp: vec!["svc".to_string()],
+                api: Vec::new(),
+                eval: None,
+            },
             env_vars: Vec::new(),
         };
         cfg::write_config(&path, &fm).unwrap();
@@ -10083,6 +10096,10 @@ mod tests {
         assert_eq!(fm2.modules.len(), 1);
         assert_eq!(fm2.programs.len(), 1);
         assert_eq!(fm2.programs[0].commands, vec!["hello", "compute"]);
+        // The exposed set travels with the artifact: a deployment image serves
+        // what the environment declared, not what happened to be installed.
+        assert_eq!(fm2.exposure.mcp, vec!["svc"]);
+        assert!(fm2.exposure.api.is_empty());
         // env_vars is no longer written but can still be read from old manifests
         assert!(fm2.env_vars.is_empty());
     }

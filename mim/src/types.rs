@@ -622,8 +622,19 @@ pub struct FreezeManifest {
     pub frozen_at: chrono::DateTime<chrono::Utc>,
     pub modules: Vec<ModuleEntry>,
     pub programs: Vec<ProgramEntry>,
+    /// The environment's own image, which a deployment image is built on. Not
+    /// the generic base underneath it: the deployment image needs pixi to
+    /// install the toolchain from this artifact's lock, the activation wrapper,
+    /// and the compiler a sandboxed eval forks -- all of which the environment
+    /// image has and a bare base does not.
     pub base_image: String,
     pub env_layer: Option<FrozenEnvLayer>,
+    /// What the frozen environment exposed, and how. A deployment image serves
+    /// exactly this, so the artifact carries the intent rather than rediscovering
+    /// it from whatever happens to be installed. Empty means the image has no
+    /// default command and is a command line only.
+    #[serde(default)]
+    pub exposure: ExposureConfig,
     /// Deprecated: previously held expected env var names. Retained for backward
     /// compatibility when reading older freeze manifests.
     #[serde(default, skip_serializing)]

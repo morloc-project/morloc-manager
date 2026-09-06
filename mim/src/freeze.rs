@@ -36,23 +36,16 @@ pub fn freeze_from_dir(
         ));
     }
 
-    // Validate programs work before freezing. Mount the host env dir at
-    // MORLOC_STATE (mutable), not over the baked runtime.
-    let bind_mounts = vec![(
-        v_data_dir.to_string(),
-        crate::serve::CONTAINER_MORLOC_STATE.to_string(),
-    )];
-    crate::serve::validate_programs(engine, image, &programs, bind_mounts, verbose)?;
+    // Validate programs work before freezing, in the environment as it actually
+    // runs: the runtime and the toolchain are mounts, not image layers, so a
+    // validation without them probes an empty directory.
+    let (bind_mounts, volumes) = crate::base_mounts(v_data_dir);
+    crate::serve::validate_programs(engine, image, &programs, bind_mounts, volumes, verbose)?;
 
     eprintln!("Freezing installed state from {v_data_dir}...");
     let tar_path = Path::new(output_dir).join("state.tar.gz");
     let tar_path = tar_path.to_string_lossy();
-    let mut tar_dirs: Vec<&str> = Vec::new();
-    for dir in &["lib", "fdb", "bin", "exe", "opt", "src"] {
-        if Path::new(&format!("{v_data_dir}/{dir}")).is_dir() {
-            tar_dirs.push(dir);
-        }
-    }
+    let tar_dirs = frozen_paths(Path::new(v_data_dir))?;
 
     // Pre-flight: verify all files are readable before invoking tar
     for dir in &tar_dirs {
@@ -76,12 +69,17 @@ pub fn freeze_from_dir(
     eprintln!("Created {tar_path}");
     let now = Utc::now();
 
-    // Get base image from the environment being frozen (resolved by the caller).
+    // The image a deployment image will be built on: the environment's OWN
+    // image, not the generic base underneath it. That image carries pixi (to
+    // install the toolchain from the lock this artifact holds), the activation
+    // wrapper every container process goes through, and the morloc compiler a
+    // sandboxed eval forks; a deployment image is that image with the
+    // environment's mounted halves baked in.
     let (base_img, env_layer) = {
         let env_scope = config::find_env_scope(env_name).unwrap_or(scope);
         match config::read_env_config(env_scope, env_name) {
             Ok(ec) => {
-                let base = ec.base_image.clone();
+                let base = ec.active_image().to_string();
                 // Capture env layer info if there's a Dockerfile
                 let layer = if ec.dockerfile.is_some() {
                     let df_path = config::env_dockerfile_path(env_scope, env_name);
@@ -111,6 +109,12 @@ pub fn freeze_from_dir(
         }
     };
 
+    // What this environment exposes travels with it: a deployment image serves
+    // the declared set, not whatever programs happen to be installed. An
+    // environment that exposes nothing still freezes -- the image is then a
+    // command line rather than a server.
+    let exposure = config::read_exposure(scope, env_name).unwrap_or_default();
+
     let manifest = FreezeManifest {
         morloc_version: ver,
         frozen_at: now,
@@ -118,6 +122,7 @@ pub fn freeze_from_dir(
         programs,
         base_image: base_img,
         env_layer,
+        exposure,
         env_vars: Vec::new(),
     };
     let manifest_path = Path::new(output_dir).join("freeze-manifest.json");
@@ -126,6 +131,56 @@ pub fn freeze_from_dir(
     eprintln!("Wrote {manifest_path}");
     eprintln!("Frozen state written to {output_dir}");
     Ok(())
+}
+
+/// The parts of an environment a deployment artifact carries, as paths relative
+/// to the environment data dir.
+///
+/// An environment is an image plus three host-side pieces, and a frozen artifact
+/// has to carry the two the image does not hold. `runtime` is MORLOC_HOME: the
+/// nexus, libmorloc, the language bindings, and the launcher of every installed
+/// program -- all built after the image was, so none of it is in a layer.
+/// `pixi.toml` and `pixi.lock` are the toolchain: the solved prefix itself is
+/// engine storage rather than a directory, so what travels is the lock that
+/// reproduces it. `exe` holds the programs being deployed, which is the point.
+///
+/// `fdb`, `src` and `modules` travel when present: module sources are what a
+/// sandboxed eval reads, and `modules` is the install prefix for any local
+/// native dependency a pool links against at run time.
+///
+/// Anything required and absent is an error naming it. A missing piece used to
+/// be skipped in silence, which produced an artifact that looked whole, failed
+/// its image build several steps later on a `COPY` of a path that was never
+/// written, and gave no hint that the environment was the problem.
+pub(crate) fn frozen_paths(v_data_dir: &Path) -> Result<Vec<String>> {
+    const REQUIRED: [&str; 4] = ["runtime", "exe", "pixi/pixi.toml", "pixi/pixi.lock"];
+    const OPTIONAL: [&str; 3] = ["fdb", "src", "modules"];
+
+    let mut missing: Vec<&str> = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
+    for rel in REQUIRED {
+        if v_data_dir.join(rel).exists() {
+            paths.push(rel.to_string());
+        } else {
+            missing.push(rel);
+        }
+    }
+    if !missing.is_empty() {
+        return Err(ManagerError::FreezeError(format!(
+            "environment at '{}' is missing {} a deployment artifact cannot do without:\n  {}\n\
+             Provision the environment first with 'mim update --env <env>'.",
+            v_data_dir.display(),
+            if missing.len() == 1 { "something" } else { "things" },
+            missing.join("\n  ")
+        )));
+    }
+    paths.extend(
+        OPTIONAL
+            .iter()
+            .filter(|rel| v_data_dir.join(rel).exists())
+            .map(|rel| rel.to_string()),
+    );
+    Ok(paths)
 }
 
 pub fn write_freeze_manifest(path: &str, manifest: &FreezeManifest) -> Result<()> {
@@ -263,4 +318,81 @@ fn check_readable_recursive(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An environment data dir holding `present`, as a container environment
+    /// lays one out: the runtime under `runtime/`, never at the root.
+    fn env_dir(present: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for rel in present {
+            let path = tmp.path().join(rel);
+            if rel.contains('.') {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "").unwrap();
+            } else {
+                std::fs::create_dir_all(&path).unwrap();
+            }
+        }
+        tmp
+    }
+
+    const WHOLE: [&str; 4] = ["runtime", "exe", "pixi/pixi.toml", "pixi/pixi.lock"];
+
+    #[test]
+    fn a_whole_environment_carries_its_runtime_and_its_lock() {
+        let tmp = env_dir(&WHOLE);
+        let got = frozen_paths(tmp.path()).unwrap();
+        // The runtime is the half the image does not hold, and the lock is what
+        // reproduces the toolchain where the artifact lands.
+        assert!(got.contains(&"runtime".to_string()), "{got:?}");
+        assert!(got.contains(&"pixi/pixi.lock".to_string()), "{got:?}");
+        assert!(got.contains(&"exe".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn optional_parts_travel_only_when_present() {
+        let bare = env_dir(&WHOLE);
+        let got = frozen_paths(bare.path()).unwrap();
+        assert!(!got.contains(&"fdb".to_string()), "{got:?}");
+
+        let mut with_extras: Vec<&str> = WHOLE.to_vec();
+        with_extras.extend(["fdb", "src", "modules"]);
+        let full = env_dir(&with_extras);
+        let got = frozen_paths(full.path()).unwrap();
+        for rel in ["fdb", "src", "modules"] {
+            assert!(got.contains(&rel.to_string()), "{rel} missing from {got:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_runtime_is_named_not_skipped() {
+        // The old behaviour: absent directories were dropped from the archive
+        // without a word, and the artifact failed its image build later on a
+        // path nobody had been told was never written.
+        let tmp = env_dir(&["exe", "pixi/pixi.toml", "pixi/pixi.lock"]);
+        let err = frozen_paths(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("runtime"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_lock_is_named() {
+        let tmp = env_dir(&["runtime", "exe", "pixi/pixi.toml"]);
+        let err = frozen_paths(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("pixi/pixi.lock"), "{err}");
+    }
+
+    #[test]
+    fn every_missing_part_is_reported_at_once() {
+        // One round trip per missing piece is a bad way to learn what an
+        // environment lacks.
+        let tmp = env_dir(&["exe"]);
+        let err = frozen_paths(tmp.path()).unwrap_err().to_string();
+        for rel in ["runtime", "pixi/pixi.toml", "pixi/pixi.lock"] {
+            assert!(err.contains(rel), "{rel} missing from: {err}");
+        }
+    }
 }
