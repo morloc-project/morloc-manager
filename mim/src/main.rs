@@ -7122,6 +7122,41 @@ fn report_newly_installed(
     }
 }
 
+/// Whether a mounted half was actually populated. An empty directory is the
+/// shadow that an unmounted or never-installed half leaves behind, which is
+/// exactly what must not be mistaken for a provisioned one.
+fn is_populated(p: &std::path::Path) -> bool {
+    std::fs::read_dir(p).map(|mut d| d.next().is_some()).unwrap_or(false)
+}
+
+/// The refusal for an environment whose conda prefix is still on the host,
+/// where an older mim kept it and this one no longer looks. Such an environment
+/// is provisioned, just into a layout that is no longer read, so it needs a
+/// re-provision rather than the first one it never had.
+///
+/// `None` when no prefix is there, which is an environment that genuinely was
+/// never provisioned.
+fn older_layout_error(v_data_dir: &str, pixi_dir: &std::path::Path) -> Option<ManagerError> {
+    let prefix = morloc_deps::abi::conda_prefix(pixi_dir);
+    if !is_populated(&prefix.join("conda-meta")) {
+        return None;
+    }
+    let env_name = std::path::Path::new(v_data_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "<env>".to_string());
+    Some(ManagerError::EnvError(format!(
+        "environment at '{v_data_dir}' was provisioned by an older mim than the one \
+         running, and the two disagree about where its conda toolchain lives: the older \
+         mim solved it onto the host at '{}', while this one keeps it in a container \
+         volume, which for this environment is empty. Nothing is damaged; the toolchain \
+         has to be installed again for the current layout:\n  mim update --env {env_name}\n\
+         That reinstalls it from the environment's existing lock, after which the prefix \
+         left on the host is unused and can be deleted.",
+        prefix.display()
+    )))
+}
+
 /// Refuse to launch against an environment whose mounted halves were never
 /// materialized.
 ///
@@ -7134,16 +7169,26 @@ fn report_newly_installed(
 /// The toolchain is checked through its record mirror rather than the project
 /// dir, because the solved prefix is an engine volume: the project dir holds a
 /// manifest from the moment one is rendered, whereas materialize writes the
-/// mirror only once the prefix is installed. An environment provisioned before
-/// the prefix moved off the host has no mirror and is correctly reported here,
-/// since its prefix is no longer where its container will look for one.
+/// mirror only once the prefix is installed.
+///
+/// An environment provisioned before the prefix moved off the host has no
+/// mirror, and is refused here for a different reason than a missing install:
+/// it holds a solved prefix, just at a path this mim no longer mounts, so it
+/// gets a refusal that names the layout change rather than one that sends its
+/// owner looking for an install that failed.
 ///
 /// `runtime_may_be_empty` covers the two launches that legitimately precede a
 /// runtime: `morloc init` itself, which is what writes it, and a dev env, whose
 /// developer builds it from mounted source.
 fn require_materialized(v_data_dir: &str, runtime_may_be_empty: bool) -> Result<()> {
     let root = std::path::Path::new(v_data_dir);
-    let pixi_src = root.join("pixi").join(morloc_deps::abi::CONDA_META_MIRROR);
+    let pixi_dir = root.join("pixi");
+    let pixi_src = pixi_dir.join(morloc_deps::abi::CONDA_META_MIRROR);
+    if !is_populated(&pixi_src) {
+        if let Some(err) = older_layout_error(v_data_dir, &pixi_dir) {
+            return Err(err);
+        }
+    }
     let runtime_src = root.join("runtime");
     let mut required: Vec<(&std::path::Path, &str)> =
         vec![(pixi_src.as_path(), "conda toolchain (/env)")];
@@ -7151,8 +7196,7 @@ fn require_materialized(v_data_dir: &str, runtime_may_be_empty: bool) -> Result<
         required.push((runtime_src.as_path(), "morloc runtime (MORLOC_HOME)"));
     }
     for (src, what) in required {
-        let populated = std::fs::read_dir(src).map(|mut d| d.next().is_some()).unwrap_or(false);
-        if !populated {
+        if !is_populated(src) {
             return Err(ManagerError::EnvError(format!(
                 "environment at '{v_data_dir}' is not materialized: its {what} is missing \
                  at '{}'. Provision it first with 'mim update --env <env>', or recreate \
@@ -9151,6 +9195,37 @@ mod tests {
             )),
             "{script}"
         );
+    }
+
+    #[test]
+    fn a_prefix_left_on_the_host_is_reported_as_an_older_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("k");
+        // What an environment provisioned before the prefix moved looks like:
+        // a solved prefix on the host, and no record mirror beside the manifest.
+        let prefix = morloc_deps::abi::conda_prefix(&root.join("pixi")).join("conda-meta");
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::fs::write(prefix.join("python-3.13.1-h1234.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join("runtime").join("bin")).unwrap();
+
+        let err = require_materialized(&root.to_string_lossy(), false).unwrap_err().to_string();
+        assert!(err.contains("provisioned by an older mim"), "{err}");
+        assert!(err.contains("mim update --env k"), "{err}");
+        assert!(err.contains(&prefix.parent().unwrap().display().to_string()), "{err}");
+        // The generic wording sends the user hunting for an install that failed.
+        assert!(!err.contains("not materialized"), "{err}");
+    }
+
+    #[test]
+    fn an_environment_that_was_never_provisioned_still_reports_that() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("k");
+        std::fs::create_dir_all(root.join("pixi")).unwrap();
+        std::fs::create_dir_all(root.join("runtime").join("bin")).unwrap();
+
+        let err = require_materialized(&root.to_string_lossy(), false).unwrap_err().to_string();
+        assert!(err.contains("not materialized"), "{err}");
+        assert!(!err.contains("older mim"), "{err}");
     }
 
     #[test]
