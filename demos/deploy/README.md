@@ -1,8 +1,9 @@
 # Deploying a morloc module
 
-This directory is the target for the deployment work: the walkthrough below is
-what should pass when it is done. It is a specification, not a report. Where a
-step does not work yet, the last section says so.
+This directory is the deployment path end to end, small enough to read in one
+sitting. Every step below is implemented; none of it has been exercised against
+a real container engine, which is what this demo is for. The last section says
+exactly which parts are claims rather than recordings.
 
 The story it describes is the whole point of the deployment path. You start a
 pliable container, you install and experiment and modify inside it, and when
@@ -124,8 +125,8 @@ $ mim stop
 ```
 
 This is the iteration loop. Reinstall, change the views, restart. The
-environment is
-still mounted, so a rebuild is a rebuild and not an image build.
+environment is still mounted, so a rebuild is a rebuild and not an image
+build.
 
 ## 5. Freeze
 
