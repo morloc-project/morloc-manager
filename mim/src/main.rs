@@ -487,8 +487,8 @@ what the corresponding flag set:
         #[arg(long = "no-dotfiles", conflicts_with = "dotfiles")]
         no_dotfiles: bool,
         /// Host directory to bind-mount as the environment's $HOME (created if
-        /// absent), or `none` to go back to the env-owned home. The host
-        /// directory itself is never copied, moved or deleted. Docker/podman
+        /// absent). The host directory itself is never copied, moved or deleted.
+        /// Use --no-mount-home to go back to the env-owned home. Docker/podman
         /// only. No rebuild.
         #[arg(long = "mount-home", conflicts_with = "dotfiles")]
         mount_home: Option<String>,
@@ -2599,9 +2599,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 // files back out of.
                 return Err(dotfiles_not_supported());
             }
-            // `--no-mount-home` (and the `none` value `--mount-home` accepts)
-            // clears the mount and returns the env to its own home; any other
-            // value is resolved (and created) before any side effect runs.
+            // `--no-mount-home` clears the mount and returns the env to its own
+            // home; a value is a path, resolved (and created) before any side
+            // effect runs. Every value is taken as a path -- there is no word
+            // that means "no mount", since any such word would be a directory
+            // name someone could legitimately choose.
             let mount_home_change: Option<Option<String>> = match &mount_home {
                 None if no_mount_home => {
                     if !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
@@ -2610,12 +2612,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     Some(None)
                 }
                 None => None,
-                Some(raw) if raw.trim().eq_ignore_ascii_case("none") || raw.trim().is_empty() => {
-                    if !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
-                        return Err(mount_home_not_supported());
-                    }
-                    Some(None)
-                }
                 Some(raw) => Some(Some(resolve_mount_home(
                     raw,
                     ec.backend.container_engine(),
@@ -2631,7 +2627,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 return Err(ManagerError::EnvError(format!(
                     "environment '{env_name}' mounts a host home ({}); --dotfiles would \
                      overwrite files in it. Edit that directory directly, or clear the \
-                     mount with --mount-home none.",
+                     mount with --no-mount-home.",
                     ec.mount_home.as_deref().unwrap_or_default()
                 )));
             }
@@ -2643,9 +2639,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             }
             // A removal that removes nothing is a misunderstanding worth naming:
             // left alone it reports success at undoing something that was never
-            // set. `--no-mount-home` is exempt -- it is a spelling of
-            // `--mount-home none`, which has always been lenient, and two
-            // spellings of one operation must not diverge.
+            // set.
             let nothing_to_remove = |what: &str, fix: &str| {
                 Err(ManagerError::EnvError(format!(
                     "environment '{env_name}' has no {what}, so there is nothing to \
@@ -2671,6 +2665,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 return nothing_to_remove(
                     "corporate CA bundle configured",
                     "It already trusts only the public roots.",
+                );
+            }
+            if no_mount_home && ec.mount_home.is_none() {
+                return nothing_to_remove(
+                    "host home mounted",
+                    "It already uses its own home.",
                 );
             }
             // Clearing a default only ever clears THIS environment's: refuse when
@@ -5282,6 +5282,16 @@ fn resolve_mount_home(
     if !matches!(engine, Some(e) if e.is_oci()) {
         return Err(mount_home_not_supported());
     }
+    // An empty path names no directory. `create_dir_all("")` succeeds without
+    // creating anything, so without this the caller would be told the empty
+    // string is not a directory, having just been told it was created.
+    if raw.trim().is_empty() {
+        return Err(ManagerError::EnvError(
+            "--mount-home was given an empty path; pass a directory, or omit the \
+             flag. `mim modify --no-mount-home` clears an existing mount."
+                .to_string(),
+        ));
+    }
     let expanded = expand_tilde(raw);
     // Created rather than rejected: a fresh persistent home is the common case,
     // and the mount would otherwise materialize it root-owned inside the engine.
@@ -5517,7 +5527,9 @@ fn interactive_choose_dotfiles(current: Option<&str>) -> prompt::Result<Option<S
 }
 
 /// Prompt for an optional host directory to bind-mount as the environment's
-/// `$HOME`. Empty / "none" means the env owns its home. The path may not exist
+/// `$HOME`. A blank line means the env owns its home; every other answer is
+/// taken as a path, so a directory really named `none` is reachable. The path
+/// may not exist
 /// yet (it is created when the plan is applied), so only its parent is checked
 /// here; the full validation lives in `resolve_mount_home`. The answer is made
 /// absolute before it is returned -- it is recorded in the setup file and later
@@ -5535,7 +5547,7 @@ fn interactive_choose_mount_home(current: Option<&str>) -> prompt::Result<Option
             None => prompt::path(msg, help)?,
         };
         let choice = choice.trim().to_string();
-        if choice.is_empty() || choice.eq_ignore_ascii_case("none") {
+        if choice.is_empty() {
             return Ok(None);
         }
         let expanded = absolutize(&expand_tilde(&choice));
@@ -10407,6 +10419,39 @@ run:
         .unwrap();
         assert!(target.is_dir(), "the host home is created, not rejected");
         assert_eq!(got, std::fs::canonicalize(&target).unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_mount_home_treats_none_as_an_ordinary_directory_name() {
+        // There is no word that means "no mount": every value is a path, so a
+        // directory genuinely named `none` is reachable. Clearing a mount is
+        // `--no-mount-home` and nothing else.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("none");
+        let data_dir = tmp.path().join("data");
+        let got = resolve_mount_home(
+            target.to_str().unwrap(),
+            Some(ContainerEngine::Podman),
+            Scope::Local,
+            &data_dir,
+        )
+        .unwrap();
+        assert!(target.is_dir(), "a directory named `none` is created like any other");
+        assert_eq!(got, std::fs::canonicalize(&target).unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_mount_home_rejects_an_empty_path() {
+        // The empty string once meant "clear the mount"; now that clearing has
+        // its own flag, it names nothing and must say so.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        for raw in ["", "   "] {
+            let err =
+                resolve_mount_home(raw, Some(ContainerEngine::Podman), Scope::Local, &data_dir)
+                    .unwrap_err();
+            assert!(err.to_string().contains("empty path"), "got: {err}");
+        }
     }
 
     #[test]
