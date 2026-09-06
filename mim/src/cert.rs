@@ -277,6 +277,41 @@ fn restore_one(path: &Path, bytes: &Option<Vec<u8>>) -> Result<()> {
     }
 }
 
+/// Drop this environment's materialized CA files, so a later build renders and
+/// solves as if no bundle had ever been configured.
+///
+/// Only the two files this module itself wrote are removed, addressed through
+/// [`host_bundle_path`] / [`corp_path`]. The configured SOURCE bundle is never
+/// touched: it is a canonicalized host path (often under `/etc/ssl`, and
+/// possibly the resolved target of a symlink) that mim reads and never owns.
+/// The `certs/` directory is left in place -- an empty directory costs nothing
+/// and removing directories is how a path bug turns into data loss.
+///
+/// Removing `corp.pem` also empties [`cache_fragment_for_env`], which is what
+/// forces the rebuild that actually drops the certs from the image / activation.
+pub fn forget_bundle(scope: Scope, name: &str) -> Result<()> {
+    forget_bundle_in(&cfg::env_data_dir(scope, name))
+}
+
+/// [`forget_bundle`] against an explicit env data dir, mirroring
+/// [`materialize_bundles`] (whose writes this undoes).
+pub fn forget_bundle_in(env_data_dir: &Path) -> Result<()> {
+    let dir = env_data_dir.join(CERTS_SUBDIR);
+    for path in [dir.join(HOST_BUNDLE_FILE), dir.join(CORP_FILE)] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(ManagerError::EnvError(format!(
+                    "could not remove {}: {e}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The Dockerfile-relative cert path if a corp bundle is materialized, without
 /// performing the copy. Pairs with [`stage_into_context`] (which copies) for
 /// build paths that render the Dockerfile before staging.
@@ -431,6 +466,51 @@ mod tests {
     #[test]
     fn drift_status_none_when_unconfigured() {
         assert!(matches!(drift_status(&native_ec("t")), DriftStatus::NotConfigured));
+    }
+
+    #[test]
+    fn forget_bundle_removes_only_the_materialized_copies() {
+        let env = tempfile::tempdir().unwrap();
+        // The configured SOURCE bundle: a host file mim reads and never owns.
+        // Put it inside the env dir -- the worst case for an over-broad delete.
+        let source = env.path().join("corporate-source.pem");
+        fs::write(&source, sample_bundle()).unwrap();
+        let report = preflight(&source).unwrap();
+        materialize_bundles(&report, env.path()).unwrap();
+        let certs = env.path().join(CERTS_SUBDIR);
+        assert!(certs.join(HOST_BUNDLE_FILE).is_file());
+        assert!(certs.join(CORP_FILE).is_file());
+        // A sibling file mim did not write must survive too.
+        fs::write(certs.join("notes.txt"), b"user file").unwrap();
+
+        forget_bundle_in(env.path()).unwrap();
+
+        assert!(!certs.join(HOST_BUNDLE_FILE).exists(), "host bundle removed");
+        assert!(!certs.join(CORP_FILE).exists(), "corp bundle removed");
+        assert!(certs.is_dir(), "certs/ is left in place");
+        assert_eq!(fs::read(certs.join("notes.txt")).unwrap(), b"user file");
+        assert_eq!(fs::read(&source).unwrap(), sample_bundle(), "source untouched");
+    }
+
+    #[test]
+    fn forget_bundle_empties_the_cache_fragment() {
+        // Removing corp.pem is what forces the rebuild that actually drops the
+        // certs from the image / activation, so the cache key must change.
+        let env = tempfile::tempdir().unwrap();
+        let report = cert::parse_bundle(sample_bundle()).unwrap();
+        materialize_bundles(&report, env.path()).unwrap();
+        let before = fs::read(env.path().join("certs/corp.pem")).unwrap();
+        assert!(!before.is_empty());
+        forget_bundle_in(env.path()).unwrap();
+        assert!(fs::read(env.path().join("certs/corp.pem")).is_err());
+    }
+
+    #[test]
+    fn forget_bundle_is_idempotent_when_nothing_is_materialized() {
+        // No certs dir at all: removing an absent bundle is a no-op, not an error.
+        let env = tempfile::tempdir().unwrap();
+        assert!(forget_bundle_in(env.path()).is_ok());
+        assert!(forget_bundle_in(env.path()).is_ok());
     }
 
     #[test]

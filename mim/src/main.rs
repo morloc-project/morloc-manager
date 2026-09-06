@@ -422,7 +422,16 @@ Examples:
   mim modify --env myenv --mount-home ~/morloc-homes/myenv
   mim modify --env myenv --conda-packages-file tools.conda
   mim modify --env myenv --system-packages-file tools.apt
-  mim modify --env myenv --lang py@3.13")]
+  mim modify --env myenv --lang py@3.13
+
+Every setting that can be added can also be taken away. `--no-<flag>` clears
+what the corresponding flag set:
+  mim modify --env myenv --no-lang              # unpin every language
+  mim modify --env myenv --no-conda-packages-file   # drop the conda extras
+  mim modify --env myenv --no-cert-bundle       # stop trusting the corporate CA
+  mim modify --env myenv --no-mount-home        # back to the env-owned home
+  mim modify --env myenv --no-modules-file extra.txt   # drop one pin file
+  mim modify --env myenv --unset-default        # stop being the default")]
     Modify {
         /// Environment to modify (default: the default environment)
         #[arg(long)]
@@ -431,22 +440,40 @@ Examples:
         /// comma-separated). Triggers a rebuild at the current morloc version.
         #[arg(long)]
         lang: Vec<String>,
+        /// Drop every pinned language, leaving the environment with no baseline
+        /// toolchain (languages are then provisioned on demand at `morloc make`).
+        /// Triggers a rebuild.
+        #[arg(long = "no-lang", conflicts_with = "lang")]
+        no_lang: bool,
         /// Replace the env's apt package list with the contents of this file, one
         /// package per line (`#` comments and blank lines ignored). Container
         /// backend only. Triggers a rebuild. To change packages, edit the file
         /// and re-apply.
         #[arg(long = "system-packages-file")]
         system_packages_file: Option<String>,
+        /// Empty the env's apt package list. Container backend only. Triggers a
+        /// rebuild.
+        #[arg(long = "no-system-packages-file", conflicts_with = "system_packages_file")]
+        no_system_packages_file: bool,
         /// Replace the env's conda package list with the contents of this file,
         /// one match-spec per line (`#` comments and blank lines ignored), e.g.
         /// `jq` or `hyperfine>=1.18`. Any backend. Triggers a rebuild.
         #[arg(long = "conda-packages-file")]
         conda_packages_file: Option<String>,
+        /// Empty the env's conda package list, re-solving the world without the
+        /// extras. Any backend. Triggers a rebuild.
+        #[arg(long = "no-conda-packages-file", conflicts_with = "conda_packages_file")]
+        no_conda_packages_file: bool,
         /// Deposit a morloc-module pin file (`name hash` per line) into the
         /// environment. The compiler resolves imports against it on demand; no
         /// rebuild, no install. Repeatable.
         #[arg(long = "modules-file")]
         modules_file: Vec<String>,
+        /// Remove a deposited module-pin file by name (as shown by `mim info`),
+        /// e.g. `stdlib.txt`. Repeatable. Modules pinned only by that file fall
+        /// back to resolving at latest. No rebuild.
+        #[arg(long = "no-modules-file", value_name = "NAME")]
+        no_modules_file: Vec<String>,
         /// Directory of dotfiles to copy into the environment's home
         /// (.bashrc, .vimrc, .config/...). Overwrites like `cp -rf`;
         /// docker/podman only. No rebuild.
@@ -458,11 +485,21 @@ Examples:
         /// only. No rebuild.
         #[arg(long = "mount-home", conflicts_with = "dotfiles")]
         mount_home: Option<String>,
+        /// Stop bind-mounting a host home; the environment goes back to its own
+        /// home. The host directory is left exactly as it is. Docker/podman only.
+        /// No rebuild.
+        #[arg(long = "no-mount-home", conflicts_with = "mount_home")]
+        no_mount_home: bool,
         /// Replace the corporate CA bundle trusted by this environment (host
         /// path to a PEM/DER file). Re-validates the certificates and triggers a
         /// rebuild so the new CA is applied. Use after the corporate CA rotates.
         #[arg(long = "cert-bundle")]
         cert_bundle: Option<String>,
+        /// Stop trusting a corporate CA: drop the environment's copies of the
+        /// bundle and rebuild without them. The source bundle on your system is
+        /// never touched. Triggers a rebuild.
+        #[arg(long = "no-cert-bundle", conflicts_with = "cert_bundle")]
+        no_cert_bundle: bool,
         /// Switch the container base image (`heavy` = ubuntu:24.04, `light` =
         /// debian:bookworm-slim) and rebuild. Container backends only.
         #[arg(long, value_enum)]
@@ -472,8 +509,13 @@ Examples:
         /// system-scope env; add --system to set the machine-wide default. No rebuild.
         #[arg(long = "set-default")]
         set_default: bool,
-        /// With --set-default, write the machine-wide (system) default instead of
-        /// your personal one (requires root).
+        /// Stop this environment being the default, leaving no personal default
+        /// set (add --system to clear the machine-wide one). Commands then need an
+        /// explicit --env. No rebuild.
+        #[arg(long = "unset-default", conflicts_with = "set_default")]
+        unset_default: bool,
+        /// With --set-default / --unset-default, write the machine-wide (system)
+        /// default instead of your personal one (requires root).
         #[arg(long)]
         system: bool,
     },
@@ -1920,6 +1962,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let languages = info_languages(&dep_ctx);
                 let pinned_langs = dep_ctx.pinned_languages().unwrap_or_default();
                 let installed = dep_ctx.installed_program_names().unwrap_or_default();
+                let module_pins = deposited_snapshot_names(&data_dir);
                 // The actual solved world from pixi.lock (host-side for every
                 // backend). Empty if the env has not been solved yet.
                 let platform = morloc_deps::platform::conda_platform();
@@ -1968,6 +2011,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         system_packages: Vec<String>,
                         #[serde(skip_serializing_if = "Vec::is_empty")]
                         conda_packages: Vec<String>,
+                        /// Deposited module-pin files, by name. These are the
+                        /// names `modify --no-modules-file` accepts.
+                        #[serde(skip_serializing_if = "Vec::is_empty")]
+                        module_pins: Vec<String>,
                         packages: Vec<pixi::LockedPackage>,
                     }
                     // Container-only image/recipe detail (includes the engine flags,
@@ -2002,6 +2049,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     struct LocalRuntimeInfo {
                         source: String,
                     }
+                    /// The corporate CA bundle this env trusts, if any: the host
+                    /// SOURCE path (mim reads it and never owns it) plus the
+                    /// fingerprints materialized from it.
+                    #[derive(serde::Serialize)]
+                    struct CertInfo {
+                        source: String,
+                        fingerprints: Vec<String>,
+                    }
                     #[derive(serde::Serialize)]
                     struct InfoDetail {
                         name: String,
@@ -2018,6 +2073,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         folders: Folders,
                         environment: std::collections::BTreeMap<String, String>,
                         dependencies: Deps,
+                        #[serde(skip_serializing_if = "Option::is_none")]
+                        cert_bundle: Option<CertInfo>,
                         #[serde(skip_serializing_if = "Option::is_none")]
                         container: Option<Container>,
                     }
@@ -2075,8 +2132,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                             installed,
                             system_packages: ec.system_packages.clone(),
                             conda_packages: ec.conda_packages.clone(),
+                            module_pins: module_pins.clone(),
                             packages: locked,
                         },
+                        cert_bundle: ec.cert_bundle.as_ref().map(|src| CertInfo {
+                            source: src.clone(),
+                            fingerprints: ec.cert_fingerprints.clone(),
+                        }),
                         container,
                     };
                     println!("{}", serde_json::to_string_pretty(&output).unwrap());
@@ -2105,6 +2167,15 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         "Status:    {}",
                         if materialized { "materialized" } else { "not materialized (run `update`)" }
                     );
+                    // The CA bundle is shown as its host SOURCE path: mim reads
+                    // that file and materializes copies under the data dir, but
+                    // never owns or modifies the source.
+                    if let Some(ref src) = ec.cert_bundle {
+                        println!(
+                            "CA bundle: {src}  ({} certificate(s), source not owned by mim)",
+                            ec.cert_fingerprints.len()
+                        );
+                    }
 
                     println!();
                     println!("Folders (host):");
@@ -2168,6 +2239,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     }
                     if !ec.conda_packages.is_empty() {
                         println!("  Conda:      {}", ec.conda_packages.join(" "));
+                    }
+                    // Deposited module-pin files, by the name `modify
+                    // --no-modules-file` takes.
+                    if !module_pins.is_empty() {
+                        println!("  Pin files:  {}", module_pins.join(", "));
                     }
 
                     // Container image + recipe detail (docker/podman/apptainer only).
@@ -2386,49 +2462,75 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         Cmd::Modify {
             env,
             lang,
+            no_lang,
             system_packages_file,
+            no_system_packages_file,
             conda_packages_file,
+            no_conda_packages_file,
             modules_file,
+            no_modules_file,
             dotfiles,
             mount_home,
+            no_mount_home,
             cert_bundle,
+            no_cert_bundle,
             base,
             set_default,
+            unset_default,
             system,
         } => {
             // ---- Argument validation (no filesystem) ----
-            if system && !set_default {
+            if system && !(set_default || unset_default) {
                 return Err(ManagerError::EnvError(
-                    "--system applies only to --set-default (the machine-wide default); \
-                     an environment's scope is fixed when it is created".to_string(),
+                    "--system applies only to --set-default / --unset-default (the \
+                     machine-wide default); an environment's scope is fixed when it is \
+                     created".to_string(),
                 ));
             }
             // Read the package files up front so a bad path aborts before any side
-            // effect. `None` = flag not passed = leave that list unchanged; `Some`
-            // replaces the stored list for that source.
-            let system_from_file =
-                system_packages_file.as_deref().map(read_package_file).transpose()?;
-            let conda_from_file =
-                conda_packages_file.as_deref().map(read_package_file).transpose()?;
+            // effect. `None` = neither flag passed = leave that list unchanged;
+            // `Some` replaces the stored list for that source, and the `--no-` form
+            // replaces it with the empty list.
+            let system_from_file = match (&system_packages_file, no_system_packages_file) {
+                (Some(path), _) => Some(read_package_file(path)?),
+                (None, true) => Some(Vec::new()),
+                (None, false) => None,
+            };
+            let conda_from_file = match (&conda_packages_file, no_conda_packages_file) {
+                (Some(path), _) => Some(read_package_file(path)?),
+                (None, true) => Some(Vec::new()),
+                (None, false) => None,
+            };
             // Module-pin snapshots are deposited (not solved / not a rebuild);
             // read them up front so a bad path aborts before any side effect.
             let module_snapshots = read_snapshot_files(&modules_file)?;
+            // Removals name a deposited file, not a host path; reject a path-shaped
+            // argument here rather than letting it escape the snapshots directory.
+            validate_snapshot_removals(&no_modules_file)?;
             // apt is container-only; conda works on every backend, so the native
             // rejection below keys on apt alone.
             let touches_apt = system_from_file.is_some();
             let touches_packages = touches_apt || conda_from_file.is_some();
-            let will_rebuild =
-                !lang.is_empty() || touches_packages || cert_bundle.is_some() || base.is_some();
+            let will_rebuild = !lang.is_empty()
+                || no_lang
+                || touches_packages
+                || cert_bundle.is_some()
+                || no_cert_bundle
+                || base.is_some();
             if !set_default
+                && !unset_default
                 && !will_rebuild
                 && dotfiles.is_none()
                 && mount_home.is_none()
+                && !no_mount_home
                 && module_snapshots.is_empty()
+                && no_modules_file.is_empty()
             {
                 return Err(ManagerError::EnvError(
-                    "nothing to modify: pass --set-default, --dotfiles, --mount-home, \
-                     --lang, --cert-bundle, --base, --system-packages-file, \
-                     --conda-packages-file, or --modules-file".to_string(),
+                    "nothing to modify: pass --set-default, --unset-default, --dotfiles, \
+                     --mount-home, --lang, --cert-bundle, --base, --system-packages-file, \
+                     --conda-packages-file, or --modules-file (each of which has a \
+                     --no-<flag> form that clears it)".to_string(),
                 ));
             }
 
@@ -2439,12 +2541,19 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // Only apt packages are container-only; conda packages land in the
             // pixi solve, which the native backend has too.
             if touches_apt && ec.backend.is_native() {
-                return Err(ManagerError::EnvError(
-                    "--system-packages-file applies only to container backends; the \
-                     native backend has no image to bake packages into. Use \
-                     --conda-packages-file for utilities on conda-forge."
-                        .to_string(),
-                ));
+                // Rejected in both directions: a native env's apt list is always
+                // empty, so clearing it would buy a guaranteed no-op at the price
+                // of a full rebuild.
+                let flag = if no_system_packages_file {
+                    "--no-system-packages-file"
+                } else {
+                    "--system-packages-file"
+                };
+                return Err(ManagerError::EnvError(format!(
+                    "{flag} applies only to container backends; the native backend has \
+                     no image to bake packages into. Use --conda-packages-file for \
+                     utilities on conda-forge."
+                )));
             }
             if base.is_some() && ec.backend.is_native() {
                 return Err(base_not_supported());
@@ -2454,9 +2563,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 // native runs against your real home and apptainer mounts host $HOME.
                 return Err(dotfiles_not_supported());
             }
-            // `none` clears the mount and returns the env to its own home; any
-            // other value is resolved (and created) before any side effect runs.
+            // `--no-mount-home` (and the `none` value `--mount-home` accepts)
+            // clears the mount and returns the env to its own home; any other
+            // value is resolved (and created) before any side effect runs.
             let mount_home_change: Option<Option<String>> = match &mount_home {
+                None if no_mount_home => {
+                    if !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
+                        return Err(mount_home_not_supported());
+                    }
+                    Some(None)
+                }
                 None => None,
                 Some(raw) if raw.trim().eq_ignore_ascii_case("none") || raw.trim().is_empty() => {
                     if !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
@@ -2489,28 +2605,61 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                      can be the machine-wide default. Omit --system to set your personal default."
                 )));
             }
+            // Clearing a default only ever clears THIS environment's: refuse when
+            // the recorded default names someone else, rather than silently
+            // dropping a default the user did not mean to touch.
+            if unset_default {
+                let write_scope = if system { Scope::System } else { Scope::Local };
+                let recorded = cfg::read_config::<Config>(&cfg::config_path(write_scope))
+                    .ok()
+                    .and_then(|c| c.default_env);
+                match recorded.as_deref() {
+                    Some(n) if n == env_name => {}
+                    Some(other) => {
+                        let which = if system { "system" } else { "personal" };
+                        return Err(ManagerError::EnvError(format!(
+                            "environment '{env_name}' is not your {which} default \
+                             ('{other}' is); --unset-default clears only this \
+                             environment's default status."
+                        )));
+                    }
+                    None => {
+                        let which = if system { "system" } else { "personal" };
+                        return Err(ManagerError::EnvError(format!(
+                            "no {which} default environment is set, so there is nothing \
+                             for --unset-default to clear."
+                        )));
+                    }
+                }
+            }
             // Any write into a system-scope env's own data/config (dotfiles copy,
-            // package/lang edits + rebuild) needs root. A personal (local)
-            // set-default does not, and is handled in its own block below.
+            // package/lang edits + rebuild, pin-file removal) needs root. A
+            // personal (local) set-default does not, and is handled in its own
+            // block below.
             if env_scope == Scope::System
-                && (will_rebuild || dotfiles.is_some() || mount_home_change.is_some())
+                && (will_rebuild
+                    || dotfiles.is_some()
+                    || mount_home_change.is_some()
+                    || !no_modules_file.is_empty())
             {
                 check_system_write_access()?;
             }
             // Cert bundle: preflight + materialize up front so an invalid bundle
             // aborts here -- before set-default / dotfiles run -- honoring the
             // validate-before-side-effect contract. Snapshot the prior cert files
-            // first so a later rebuild failure can restore them exactly.
-            let cert_snapshot =
-                cert_bundle.as_ref().map(|_| cert::snapshot_certs(env_scope, &env_name));
+            // first so a later rebuild failure can restore them exactly. The
+            // snapshot restores absence as well as content, so it covers the
+            // removal path too.
+            let cert_snapshot = (cert_bundle.is_some() || no_cert_bundle)
+                .then(|| cert::snapshot_certs(env_scope, &env_name));
             let cert_prepared = match &cert_bundle {
                 Some(src) => cert::prepare_for_env(env_scope, &env_name, Some(src))?,
                 None => None,
             };
 
             // ---- Side effects (all inputs validated) ----
-            // 1. set-default (pure metadata, no rebuild): personal (local) by
-            //    default, machine-wide with --system (root).
+            // 1. set-default / unset-default (pure metadata, no rebuild): personal
+            //    (local) by default, machine-wide with --system (root).
             if set_default {
                 let write_scope = if system { Scope::System } else { Scope::Local };
                 if system {
@@ -2521,6 +2670,27 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     eprintln!("Set '{env_name}' as the system default environment.");
                 } else {
                     eprintln!("Set '{env_name}' as your default environment.");
+                }
+            }
+            if unset_default {
+                let write_scope = if system { Scope::System } else { Scope::Local };
+                if system {
+                    check_system_write_access()?;
+                }
+                environment::clear_default_environment(write_scope)?;
+                if system {
+                    eprintln!("'{env_name}' is no longer the system default environment.");
+                } else {
+                    eprintln!("'{env_name}' is no longer your default environment.");
+                }
+                // A personal default shadows the system one, so clearing it hands
+                // the answer back to the system config rather than leaving none.
+                // Say which, so "unset" is never mistaken for "no default now".
+                match environment::effective_default_env_name() {
+                    Some(fallback) => eprintln!(
+                        "Commands with no --env now use '{fallback}' (the system default)."
+                    ),
+                    None => eprintln!("Commands now need an explicit --env."),
                 }
             }
 
@@ -2547,6 +2717,24 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
 
             // 2b. module-pin snapshots: deposit for on-demand resolution; no
             //     rebuild, no install (the compiler pulls modules at build time).
+            //     Removals run FIRST so re-depositing a file under a name being
+            //     removed in the same command is an update, not a delete.
+            if !no_modules_file.is_empty() {
+                let data_dir = cfg::env_data_dir(env_scope, &env_name);
+                let unpinned = remove_snapshot_files(&data_dir, &no_modules_file)?;
+                eprintln!(
+                    "Removed {} module snapshot file(s) from '{env_name}'.",
+                    no_modules_file.len()
+                );
+                if !unpinned.is_empty() {
+                    eprintln!(
+                        "Warning: {} module(s) are no longer pinned and will resolve at \
+                         latest: {}",
+                        unpinned.len(),
+                        unpinned.join(", ")
+                    );
+                }
+            }
             if !module_snapshots.is_empty() {
                 let data_dir = cfg::env_data_dir(env_scope, &env_name);
                 deposit_snapshot_files(&data_dir, &module_snapshots)?;
@@ -2582,9 +2770,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 }
                 // Apply the CA bundle materialized during validation. Its new
                 // certs change the solve/image cache key, so the rebuild re-runs.
-                let cert_changed = cert_prepared.is_some();
+                let cert_changed = cert_prepared.is_some() || no_cert_bundle;
                 if let Some(p) = cert_prepared {
                     p.apply_to(&mut ec);
+                }
+                // Drop a CA bundle: forget the source and delete only the two
+                // files mim itself materialized. The recorded source path is a
+                // host file (often under /etc) that mim never owned, so it is
+                // never followed or removed. Nothing is un-installed in place --
+                // the rebuild below simply does not put the certs back: the
+                // container image is rendered without the COPY / ENV, and the
+                // native activation is recaptured with no cert vars.
+                if no_cert_bundle {
+                    cert::forget_bundle(env_scope, &env_name)?;
+                    ec.cert_bundle = None;
+                    ec.cert_fingerprints = Vec::new();
                 }
                 // Switch the container base image; rematerialize_env reads it back.
                 if let Some(b) = base {
@@ -2595,7 +2795,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if touches_packages || cert_changed || base.is_some() {
                     cfg::write_env_config(env_scope, &env_name, &ec)?;
                 }
-                if !lang.is_empty() {
+                // `--no-lang` writes the empty pin set: a legal state in which the
+                // env keeps no baseline toolchain and languages are provisioned on
+                // demand at `morloc make`.
+                if !lang.is_empty() || no_lang {
                     let pins = parse_lang_pins(&lang);
                     cfg::write_env_inputs(env_scope, &env_name, &EnvInputs { lang_pins: pins })?;
                 }
@@ -4511,6 +4714,88 @@ fn validate_snapshot_set(env_dir: &std::path::Path, files: &[(String, String)]) 
         }
     }
     Ok(())
+}
+
+/// The module-pin files deposited in an environment, by name, sorted. These are
+/// the names `--no-modules-file` accepts; `mim info` lists them so removal is not
+/// a guess.
+fn deposited_snapshot_names(env_dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = match std::fs::read_dir(env_dir.join("snapshots")) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    names
+}
+
+/// Reject a `--no-modules-file` argument that is not a plain deposited filename.
+/// The value names a file mim itself wrote into `snapshots/`, so anything with a
+/// path separator or a `..` component is a mistake (most likely the host path the
+/// file was deposited FROM) and must never be joined onto the snapshots dir.
+fn validate_snapshot_removals(names: &[String]) -> Result<()> {
+    for name in names {
+        let bad = name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || std::path::Path::new(name).components().count() != 1
+            || name == "."
+            || name == "..";
+        if bad {
+            return Err(ManagerError::EnvError(format!(
+                "--no-modules-file takes the NAME of a deposited pin file, not a path: \
+                 '{name}'. Run `mim info <env>` to see the deposited names."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Remove deposited module-pin files by name and report the modules that lose
+/// their last pin as a result. A name that is not deposited is a hard error, so a
+/// typo is reported rather than silently doing nothing.
+///
+/// Removal can only ever shrink the pin set, so it cannot create the cross-file
+/// hash conflict `validate_snapshot_set` guards against -- but it can leave a
+/// module unpinned (resolving at latest), which the returned names let the caller
+/// warn about.
+fn remove_snapshot_files(env_dir: &std::path::Path, names: &[String]) -> Result<Vec<String>> {
+    use std::collections::BTreeSet;
+    let dir = env_dir.join("snapshots");
+    let mut removed_pins: BTreeSet<String> = BTreeSet::new();
+    for name in names {
+        let path = dir.join(name);
+        if !path.is_file() {
+            return Err(ManagerError::EnvError(format!(
+                "environment has no deposited pin file named '{name}'. Run \
+                 `mim info <env>` to see the deposited names."
+            )));
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            removed_pins.extend(parse_snapshot_pins(&content).into_iter().map(|(m, _)| m));
+        }
+        std::fs::remove_file(&path).map_err(|e| {
+            ManagerError::EnvError(format!("cannot remove {}: {e}", path.display()))
+        })?;
+    }
+    // A module still named by a surviving file keeps its pin, so subtract what
+    // remains rather than reporting everything the removed files mentioned.
+    let mut surviving: BTreeSet<String> = BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(e.path()) {
+                surviving.extend(parse_snapshot_pins(&content).into_iter().map(|(m, _)| m));
+            }
+        }
+    }
+    Ok(removed_pins.difference(&surviving).cloned().collect())
 }
 
 fn deposit_snapshot_files(env_dir: &std::path::Path, files: &[(String, String)]) -> Result<()> {
@@ -8660,25 +8945,135 @@ mod tests {
     }
 
     #[test]
+    fn modify_parses_every_negation() {
+        let cli = Cli::try_parse_from([
+            "mim", "modify", "--env", "e",
+            "--no-lang",
+            "--no-system-packages-file",
+            "--no-conda-packages-file",
+            "--no-modules-file", "extra.txt",
+            "--no-mount-home",
+            "--no-cert-bundle",
+        ])
+        .expect("modify should parse the negations");
+        match cli.command {
+            Some(Cmd::Modify {
+                no_lang,
+                no_system_packages_file,
+                no_conda_packages_file,
+                no_modules_file,
+                no_mount_home,
+                no_cert_bundle,
+                ..
+            }) => {
+                assert!(no_lang);
+                assert!(no_system_packages_file);
+                assert!(no_conda_packages_file);
+                assert_eq!(no_modules_file, vec!["extra.txt".to_string()]);
+                assert!(no_mount_home);
+                assert!(no_cert_bundle);
+            }
+            _ => panic!("expected Cmd::Modify"),
+        }
+    }
+
+    #[test]
+    fn modify_unset_default_parses_and_takes_system() {
+        let cli = Cli::try_parse_from(["mim", "modify", "--env", "e", "--unset-default"])
+            .expect("modify --unset-default should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Modify { unset_default: true, system: false, .. })
+        ));
+        let cli =
+            Cli::try_parse_from(["mim", "modify", "--env", "e", "--unset-default", "--system"])
+                .expect("modify --unset-default --system should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Modify { unset_default: true, system: true, .. })
+        ));
+    }
+
+    #[test]
+    fn modify_rejects_a_flag_and_its_negation_together() {
+        // Asking to both set and clear a setting is a contradiction, caught at
+        // parse time rather than resolved by argument order.
+        let contradictions: Vec<Vec<&str>> = vec![
+            vec!["--lang", "py", "--no-lang"],
+            vec!["--system-packages-file", "a.apt", "--no-system-packages-file"],
+            vec!["--conda-packages-file", "a.conda", "--no-conda-packages-file"],
+            vec!["--mount-home", "/tmp/h", "--no-mount-home"],
+            vec!["--cert-bundle", "/tmp/ca.pem", "--no-cert-bundle"],
+            vec!["--set-default", "--unset-default"],
+        ];
+        for args in contradictions {
+            let mut argv = vec!["mim", "modify", "--env", "e"];
+            argv.extend(args.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "should reject: {}",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn modify_no_modules_file_is_repeatable() {
+        let cli = Cli::try_parse_from([
+            "mim", "modify", "--env", "e",
+            "--no-modules-file", "a.txt",
+            "--no-modules-file", "b.txt",
+        ])
+        .expect("--no-modules-file should repeat");
+        match cli.command {
+            Some(Cmd::Modify { no_modules_file, .. }) => {
+                assert_eq!(no_modules_file, vec!["a.txt".to_string(), "b.txt".to_string()]);
+            }
+            _ => panic!("expected Cmd::Modify"),
+        }
+    }
+
+    #[test]
     fn setup_subcommand_removed() {
         assert!(Cli::try_parse_from(["mim", "setup", "--engine", "podman"]).is_err());
     }
 
-    // The two `modify` guards below fire before any environment/filesystem
-    // access, so they can be exercised straight through `dispatch`.
-    fn modify_cmd(set_default: bool, system: bool, dotfiles: Option<String>) -> Cmd {
+    // The `modify` guards below fire before any environment/filesystem access,
+    // so they can be exercised straight through `dispatch`.
+    #[derive(Default)]
+    struct ModifyFlags {
+        set_default: bool,
+        unset_default: bool,
+        system: bool,
+        dotfiles: Option<String>,
+        no_lang: bool,
+        no_system_packages_file: bool,
+        no_conda_packages_file: bool,
+        no_mount_home: bool,
+        no_cert_bundle: bool,
+        no_modules_file: Vec<String>,
+    }
+
+    fn modify_cmd(f: ModifyFlags) -> Cmd {
         Cmd::Modify {
             env: Some("e".to_string()),
             lang: Vec::new(),
+            no_lang: f.no_lang,
             system_packages_file: None,
+            no_system_packages_file: f.no_system_packages_file,
             conda_packages_file: None,
+            no_conda_packages_file: f.no_conda_packages_file,
             modules_file: Vec::new(),
-            dotfiles,
+            no_modules_file: f.no_modules_file,
+            dotfiles: f.dotfiles,
             mount_home: None,
+            no_mount_home: f.no_mount_home,
             cert_bundle: None,
+            no_cert_bundle: f.no_cert_bundle,
             base: None,
-            set_default,
-            system,
+            set_default: f.set_default,
+            unset_default: f.unset_default,
+            system: f.system,
         }
     }
 
@@ -8717,6 +9112,72 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!leftover_tmp, "temporary files should be renamed away");
+    }
+
+    #[test]
+    fn remove_snapshot_files_deletes_named_files_and_reports_unpinned() {
+        let dir = tempfile::tempdir().unwrap();
+        deposit_snapshot_files(
+            dir.path(),
+            &[
+                ("stdlib.txt".to_string(), "root-py abc123\nmath-py def456\n".to_string()),
+                ("extra.txt".to_string(), "math-py def456\nweena/foo 999aaa\n".to_string()),
+            ],
+        )
+        .unwrap();
+
+        let unpinned =
+            remove_snapshot_files(dir.path(), &["extra.txt".to_string()]).unwrap();
+        let snap = dir.path().join("snapshots");
+        assert!(!snap.join("extra.txt").exists(), "named file removed");
+        assert!(snap.join("stdlib.txt").is_file(), "unnamed file untouched");
+        // math-py is still pinned by stdlib.txt, so only weena/foo comes loose.
+        assert_eq!(unpinned, vec!["weena/foo".to_string()]);
+    }
+
+    #[test]
+    fn remove_snapshot_files_rejects_an_undeposited_name() {
+        let dir = tempfile::tempdir().unwrap();
+        deposit_snapshot_files(dir.path(), &[("stdlib.txt".to_string(), "a b\n".to_string())])
+            .unwrap();
+        // A typo must be reported, not silently do nothing.
+        let err = remove_snapshot_files(dir.path(), &["stdlb.txt".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("no deposited pin file named"), "got: {err}");
+        // ...and nothing is removed on the way to the error.
+        assert!(dir.path().join("snapshots/stdlib.txt").is_file());
+    }
+
+    #[test]
+    fn remove_snapshot_files_rejects_paths_not_names() {
+        // The argument names a deposited file, so anything that could escape the
+        // snapshots directory is refused before it is ever joined onto a path.
+        for bad in ["../env.yaml", "a/b.txt", "/etc/passwd", "..", ".", ""] {
+            let err = validate_snapshot_removals(&[bad.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("takes the NAME of a deposited pin file"),
+                "should reject {bad:?}; got: {err}"
+            );
+        }
+        assert!(validate_snapshot_removals(&["stdlib.txt".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn deposited_snapshot_names_lists_sorted_and_skips_dotfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(deposited_snapshot_names(dir.path()).is_empty(), "no snapshots dir");
+        deposit_snapshot_files(
+            dir.path(),
+            &[
+                ("zeta.txt".to_string(), "a b\n".to_string()),
+                ("alpha.txt".to_string(), "c d\n".to_string()),
+            ],
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("snapshots/.hidden.tmp"), "x").unwrap();
+        assert_eq!(
+            deposited_snapshot_names(dir.path()),
+            vec!["alpha.txt".to_string(), "zeta.txt".to_string()]
+        );
     }
 
     #[test]
@@ -8794,15 +9255,69 @@ mod tests {
     }
 
     #[test]
-    fn modify_system_requires_set_default() {
-        let err = dispatch(false, false, modify_cmd(false, true, None)).unwrap_err();
-        assert!(err.to_string().contains("--system applies only to --set-default"), "got: {err}");
+    fn modify_system_requires_a_default_flag() {
+        let err = dispatch(
+            false,
+            false,
+            modify_cmd(ModifyFlags { system: true, ..Default::default() }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--system applies only to --set-default / --unset-default"),
+            "got: {err}"
+        );
+        // --system is legal with either direction; both get past this guard and
+        // fail later on the (nonexistent) environment instead.
+        for f in [
+            ModifyFlags { system: true, set_default: true, ..Default::default() },
+            ModifyFlags { system: true, unset_default: true, ..Default::default() },
+        ] {
+            let err = dispatch(false, false, modify_cmd(f)).unwrap_err();
+            assert!(
+                !err.to_string().contains("--system applies only"),
+                "--system should be accepted alongside a default flag; got: {err}"
+            );
+        }
     }
 
     #[test]
     fn modify_requires_at_least_one_change() {
-        let err = dispatch(false, false, modify_cmd(false, false, None)).unwrap_err();
+        let err = dispatch(false, false, modify_cmd(ModifyFlags::default())).unwrap_err();
         assert!(err.to_string().contains("nothing to modify"), "got: {err}");
+    }
+
+    #[test]
+    fn modify_negations_each_count_as_a_change() {
+        // Every `--no-` form must satisfy the "nothing to modify" guard on its
+        // own, or the flag is unreachable without pairing it with another edit.
+        let cases: Vec<(&str, ModifyFlags)> = vec![
+            ("--no-lang", ModifyFlags { no_lang: true, ..Default::default() }),
+            (
+                "--no-system-packages-file",
+                ModifyFlags { no_system_packages_file: true, ..Default::default() },
+            ),
+            (
+                "--no-conda-packages-file",
+                ModifyFlags { no_conda_packages_file: true, ..Default::default() },
+            ),
+            ("--no-mount-home", ModifyFlags { no_mount_home: true, ..Default::default() }),
+            ("--no-cert-bundle", ModifyFlags { no_cert_bundle: true, ..Default::default() }),
+            (
+                "--no-modules-file",
+                ModifyFlags {
+                    no_modules_file: vec!["stdlib.txt".to_string()],
+                    ..Default::default()
+                },
+            ),
+            ("--unset-default", ModifyFlags { unset_default: true, ..Default::default() }),
+        ];
+        for (flag, f) in cases {
+            let err = dispatch(false, false, modify_cmd(f)).unwrap_err();
+            assert!(
+                !err.to_string().contains("nothing to modify"),
+                "{flag} alone should be a change; got: {err}"
+            );
+        }
     }
 
     #[test]
