@@ -132,6 +132,18 @@ pub fn generate_deploy_dockerfile(input: &DeployDockerfileInput) -> String {
     out.push_str(&format!("ENV MORLOC_HOME={mh}\n"));
     out.push_str(&format!("ENV MORLOC_STATE={state}\n\n"));
 
+    // The base image points $HOME at a directory under the state root, which in
+    // a pliable environment the state mount supplies. Nothing mounts it here, and
+    // the frozen environment's own home is dotfiles and caches rather than
+    // anything a deployment needs, so an empty writable one is created instead.
+    // Pool processes touch $HOME (a matplotlib config, an R temp dir) and a
+    // dangling one fails them at the point of first use. World-writable because
+    // the image does not know what user it will be run as.
+    out.push_str("# A writable HOME, which the base image points into the state root\n");
+    out.push_str(&format!(
+        "RUN mkdir -p {state}/home && chmod 1777 {state}/home\n\n"
+    ));
+
     if input.healthcheck {
         out.push_str("# Liveness for container orchestrators\n");
         out.push_str(&format!(
@@ -628,6 +640,16 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         assert!(full.contains("COPY fdb/ /opt/morloc-state/fdb/"), "{full}");
         assert!(full.contains("COPY modules/ /opt/morloc-state/modules/"), "{full}");
         assert!(!full.contains("COPY src/"), "{full}");
+    }
+
+    #[test]
+    fn a_deployment_image_has_a_writable_home() {
+        // The base image makes $HOME a path under the state root. In a pliable
+        // environment the state mount supplies it; here nothing does, and a
+        // dangling HOME fails any pool that touches it.
+        let df = deploy(&SERVE_CMD, &[], false);
+        assert!(df.contains("mkdir -p /opt/morloc-state/home"), "{df}");
+        assert!(df.contains("chmod 1777 /opt/morloc-state/home"), "{df}");
     }
 
     #[test]
