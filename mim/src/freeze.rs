@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -8,26 +7,64 @@ use crate::config;
 use crate::error::{ManagerError, Result};
 use crate::types::*;
 
-pub fn freeze_from_dir(
+/// Parts of an environment a deployment artifact cannot do without.
+const REQUIRED_PARTS: [&str; 4] = ["runtime", "exe", "pixi/pixi.toml", "pixi/pixi.lock"];
+
+/// Parts that travel when the environment has them. Module sources and the
+/// install prefix for local native dependencies are on a pool's search path,
+/// so they are not merely nice to have -- they are absent only when the
+/// environment never had them.
+const OPTIONAL_STATE: [&str; 3] = ["fdb", "src", "modules"];
+
+/// Port the deployment image's router listens on. A fixed, documented port is
+/// what makes `docker run -p <host>:8080 <image>` work without reading the
+/// image; the host side is the operator's to choose.
+pub const DEPLOY_HTTP_PORT: u16 = 8080;
+
+/// What an environment declared it serves, or `None` when it declared nothing.
+/// An environment that exposed nothing still freezes: the image is then a
+/// command line rather than a server, which is a real use and better than
+/// inventing a default command that would publish whatever was installed.
+fn spec_from_exposure(ex: &ExposureConfig) -> Option<crate::ServeSpec> {
+    if ex.is_empty() {
+        return None;
+    }
+    Some(crate::ServeSpec::new(
+        ex.mcp.clone(),
+        ex.api.clone(),
+        ex.eval.as_ref().map(|e| e.allow.join(",")),
+    ))
+}
+
+/// Build a self-contained deployment image from an environment.
+///
+/// The image is the environment with its mounted halves baked in: the runtime
+/// copied, the toolchain reinstalled from the environment's own lock, the
+/// programs and the module sources behind them, and the exposed set compiled
+/// into the default command. Nothing is left in the working directory, because
+/// the artifact is a tag in the engine's image store -- moved by pushing it to
+/// a registry, by `save_to`, or by rebuilding it.
+///
+/// The base is the environment's own image and cannot be anything else: it
+/// carries pixi to install the toolchain, the activation wrapper every process
+/// goes through, and the compiler a sandboxed eval forks.
+#[allow(clippy::too_many_arguments)]
+pub fn freeze_environment(
     scope: Scope,
     env_name: &str,
     ver: Version,
     engine: ContainerEngine,
-    image: &str,
+    env_image: &str,
     v_data_dir: &str,
-    output_dir: &str,
+    tag: &str,
+    save_to: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
-    fs::create_dir_all(output_dir)
-        .map_err(|e| ManagerError::FreezeError(format!("Failed to create output dir: {e}")))?;
-
     if !Path::new(v_data_dir).is_dir() {
         return Err(ManagerError::FreezeError(format!(
             "Data directory does not exist: {v_data_dir}"
         )));
     }
-
-    // Validate programs exist before writing any files
     let modules = scan_modules(&format!("{v_data_dir}/fdb"));
     let programs = scan_programs(&format!("{v_data_dir}/exe"));
     if programs.is_empty() {
@@ -36,101 +73,167 @@ pub fn freeze_from_dir(
         ));
     }
 
-    // Validate programs work before freezing, in the environment as it actually
-    // runs: the runtime and the toolchain are mounts, not image layers, so a
-    // validation without them probes an empty directory.
+    // Validate the programs in the environment as it actually runs: the runtime
+    // and the toolchain are mounts, not image layers, so a validation without
+    // them probes an empty directory.
     let (bind_mounts, volumes) = crate::base_mounts(v_data_dir);
-    crate::serve::validate_programs(engine, image, &programs, bind_mounts, volumes, verbose)?;
+    crate::serve::validate_programs(engine, env_image, &programs, bind_mounts, volumes, verbose)?;
 
-    eprintln!("Freezing installed state from {v_data_dir}...");
-    let tar_path = Path::new(output_dir).join("state.tar.gz");
-    let tar_path = tar_path.to_string_lossy();
-    let tar_dirs = frozen_paths(Path::new(v_data_dir))?;
-
-    // Pre-flight: verify all files are readable before invoking tar
-    for dir in &tar_dirs {
-        check_readable_recursive(&Path::new(v_data_dir).join(dir))?;
+    let paths = frozen_paths(Path::new(v_data_dir))?;
+    for rel in &paths {
+        check_readable_recursive(&Path::new(v_data_dir).join(rel))?;
     }
 
-    let tar_status = Command::new("tar")
-        .args(["-czf", &tar_path, "-C", v_data_dir])
-        .args(&tar_dirs)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| ManagerError::FreezeError(format!("tar failed: {e}")))?;
+    // A build context holding exactly what travels. The environment directory
+    // cannot be handed to the engine as-is: it also holds caches, logs, a build
+    // context of its own and the environment's home, all of which would be sent
+    // to the daemon and baked into a layer.
+    let context = Path::new(v_data_dir).join(FREEZE_CONTEXT_SUBDIR);
+    let _ = fs::remove_dir_all(&context);
+    fs::create_dir_all(&context)
+        .map_err(|e| ManagerError::FreezeError(format!("cannot create the build context: {e}")))?;
+    eprintln!("Staging the environment into a build context...");
+    for rel in &paths {
+        stage_into_context(Path::new(v_data_dir), &context, rel)?;
+    }
 
-    if !tar_status.success() {
-        return Err(ManagerError::FreezeError(
-            "tar failed (see error output above)".to_string()
+    let exposure = config::read_exposure(scope, env_name).unwrap_or_default();
+    let cmd = match spec_from_exposure(&exposure) {
+        Some(spec) => crate::build_router_command(
+            crate::serve::CONTAINER_MORLOC_STATE,
+            DEPLOY_HTTP_PORT,
+            "0.0.0.0",
+            &spec,
+            false,
+        ),
+        None => Vec::new(),
+    };
+    let optional_state: Vec<String> = paths
+        .iter()
+        .filter(|p| OPTIONAL_STATE.contains(&p.as_str()))
+        .cloned()
+        .collect();
+    let labels = deploy_labels(env_name, &ver, &programs, &modules, &exposure);
+
+    let dockerfile = context.join("Dockerfile");
+    let text = crate::dockerfile::generate_deploy_dockerfile(
+        &crate::dockerfile::DeployDockerfileInput {
+            base_image: env_image,
+            cmd: &cmd,
+            optional_state: &optional_state,
+            http_port: DEPLOY_HTTP_PORT,
+            // Podman's OCI output format drops HEALTHCHECK and warns.
+            healthcheck: engine == ContainerEngine::Docker,
+            labels: &labels,
+        },
+    );
+    fs::write(&dockerfile, &text)
+        .map_err(|e| ManagerError::FreezeError(format!("cannot write the Dockerfile: {e}")))?;
+
+    eprintln!("Building the deployment image {tag}...");
+    let cfg = crate::container::BuildConfig {
+        dockerfile: dockerfile.to_string_lossy().to_string(),
+        context: context.to_string_lossy().to_string(),
+        tag: tag.to_string(),
+        build_args: Vec::new(),
+        extra_flags: Vec::new(),
+    };
+    let status = crate::container::container_build_visible(engine, &cfg);
+    // The context is large (the runtime alone is around a hundred megabytes) and
+    // is worth nothing once the image exists, so it goes whether or not the
+    // build succeeded.
+    let _ = fs::remove_dir_all(&context);
+    if !status.success() {
+        return Err(ManagerError::FreezeError(format!(
+            "the deployment image build failed (see the output above). The environment \
+             itself is untouched; nothing was frozen into '{tag}'."
+        )));
+    }
+
+    eprintln!("Built {tag}");
+    if let Some(path) = save_to {
+        eprintln!("Saving {tag} to {path}...");
+        crate::container::save_image(engine, tag, path)
+            .map_err(|e| ManagerError::FreezeError(format!("could not save {tag}: {e}")))?;
+        eprintln!("Wrote {path} (load it elsewhere with `{} load -i {path}`)", engine.name());
+    }
+    Ok(())
+}
+
+/// Where a freeze stages its build context, under the environment's own data
+/// dir so it shares a filesystem with what it copies and never crosses a mount.
+const FREEZE_CONTEXT_SUBDIR: &str = "freeze-build";
+
+/// Copy one frozen path into the build context, preserving its shape. A file
+/// keeps its parent directory, so `pixi/pixi.lock` lands at `pixi/pixi.lock`
+/// and the generated `COPY pixi/ ...` finds it.
+fn stage_into_context(root: &Path, context: &Path, rel: &str) -> Result<()> {
+    let from = root.join(rel);
+    let to = context.join(rel);
+    if from.is_dir() {
+        return crate::provision::copy_dir_excluding(&from, &to, &[], false)
+            .map_err(|e| ManagerError::FreezeError(format!("cannot stage {rel}: {e}")));
+    }
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| ManagerError::FreezeError(format!("cannot stage {rel}: {e}")))?;
+    }
+    fs::copy(&from, &to)
+        .map_err(|e| ManagerError::FreezeError(format!("cannot stage {rel}: {e}")))?;
+    Ok(())
+}
+
+/// What the image says about itself.
+///
+/// A frozen image leaves the manager's world entirely: nothing tracks it, and
+/// whoever meets it next may have neither the environment it came from nor any
+/// record of what went into it. So its provenance travels inside it, where
+/// `docker inspect` will find it, rather than in a file beside it that can be
+/// separated from it.
+fn deploy_labels(
+    env_name: &str,
+    ver: &Version,
+    programs: &[ProgramEntry],
+    modules: &[ModuleEntry],
+    exposure: &ExposureConfig,
+) -> Vec<(String, String)> {
+    let join = |xs: Vec<String>| xs.join(",");
+    let mut labels = vec![
+        (
+            "org.opencontainers.image.created".to_string(),
+            Utc::now().to_rfc3339(),
+        ),
+        (
+            "org.opencontainers.image.version".to_string(),
+            ver.show(),
+        ),
+        (
+            "org.opencontainers.image.title".to_string(),
+            format!("morloc {env_name}"),
+        ),
+        ("morloc.environment".to_string(), env_name.to_string()),
+        ("morloc.version".to_string(), ver.show()),
+        (
+            "morloc.programs".to_string(),
+            join(programs.iter().map(|p| p.name.clone()).collect()),
+        ),
+    ];
+    if !modules.is_empty() {
+        labels.push((
+            "morloc.modules".to_string(),
+            join(modules.iter().map(|m| m.name.clone()).collect()),
         ));
     }
-    eprintln!("Created {tar_path}");
-    let now = Utc::now();
-
-    // The image a deployment image will be built on: the environment's OWN
-    // image, not the generic base underneath it. That image carries pixi (to
-    // install the toolchain from the lock this artifact holds), the activation
-    // wrapper every container process goes through, and the morloc compiler a
-    // sandboxed eval forks; a deployment image is that image with the
-    // environment's mounted halves baked in.
-    let (base_img, env_layer) = {
-        let env_scope = config::find_env_scope(env_name).unwrap_or(scope);
-        match config::read_env_config(env_scope, env_name) {
-            Ok(ec) => {
-                let base = ec.active_image().to_string();
-                // Capture env layer info if there's a Dockerfile
-                let layer = if ec.dockerfile.is_some() {
-                    let df_path = config::env_dockerfile_path(env_scope, env_name);
-                    if df_path.exists() {
-                        let df_contents = fs::read_to_string(&df_path).unwrap_or_default();
-                        let content_hash = ec.content_hash.unwrap_or_default();
-                        // Use the tagged image reference (not digest) so that
-                        // unfreeze can resolve it locally without network access.
-                        // Digest references like localhost/morloc-env@sha256:...
-                        // cause BuildKit to attempt HTTPS to localhost.
-                        let image_tag = ec.built_image.clone();
-                        Some(FrozenEnvLayer {
-                            name: env_name.to_string(),
-                            dockerfile: df_contents,
-                            content_hash,
-                            image_tag,
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                (base, layer)
-            }
-            Err(_) => ("unknown".to_string(), None),
-        }
-    };
-
-    // What this environment exposes travels with it: a deployment image serves
-    // the declared set, not whatever programs happen to be installed. An
-    // environment that exposes nothing still freezes -- the image is then a
-    // command line rather than a server.
-    let exposure = config::read_exposure(scope, env_name).unwrap_or_default();
-
-    let manifest = FreezeManifest {
-        morloc_version: ver,
-        frozen_at: now,
-        modules,
-        programs,
-        base_image: base_img,
-        env_layer,
-        exposure,
-        env_vars: Vec::new(),
-    };
-    let manifest_path = Path::new(output_dir).join("freeze-manifest.json");
-    let manifest_path = manifest_path.to_string_lossy();
-    write_freeze_manifest(&manifest_path, &manifest)?;
-    eprintln!("Wrote {manifest_path}");
-    eprintln!("Frozen state written to {output_dir}");
-    Ok(())
+    if !exposure.mcp.is_empty() {
+        labels.push(("morloc.mcp".to_string(), join(exposure.mcp.clone())));
+    }
+    if !exposure.api.is_empty() {
+        labels.push(("morloc.api".to_string(), join(exposure.api.clone())));
+    }
+    if let Some(eval) = &exposure.eval {
+        labels.push(("morloc.eval".to_string(), join(eval.allow.clone())));
+    }
+    labels
 }
 
 /// The parts of an environment a deployment artifact carries, as paths relative
@@ -153,12 +256,9 @@ pub fn freeze_from_dir(
 /// its image build several steps later on a `COPY` of a path that was never
 /// written, and gave no hint that the environment was the problem.
 pub(crate) fn frozen_paths(v_data_dir: &Path) -> Result<Vec<String>> {
-    const REQUIRED: [&str; 4] = ["runtime", "exe", "pixi/pixi.toml", "pixi/pixi.lock"];
-    const OPTIONAL: [&str; 3] = ["fdb", "src", "modules"];
-
     let mut missing: Vec<&str> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
-    for rel in REQUIRED {
+    for rel in REQUIRED_PARTS {
         if v_data_dir.join(rel).exists() {
             paths.push(rel.to_string());
         } else {
@@ -175,27 +275,12 @@ pub(crate) fn frozen_paths(v_data_dir: &Path) -> Result<Vec<String>> {
         )));
     }
     paths.extend(
-        OPTIONAL
+        OPTIONAL_STATE
             .iter()
             .filter(|rel| v_data_dir.join(rel).exists())
             .map(|rel| rel.to_string()),
     );
     Ok(paths)
-}
-
-pub fn write_freeze_manifest(path: &str, manifest: &FreezeManifest) -> Result<()> {
-    let json = serde_json::to_vec(manifest)
-        .map_err(|e| ManagerError::FreezeError(format!("JSON encode failed: {e}")))?;
-    fs::write(path, json)
-        .map_err(|e| ManagerError::FreezeError(format!("Write failed: {e}")))?;
-    Ok(())
-}
-
-pub fn read_freeze_manifest(path: &str) -> Result<FreezeManifest> {
-    let bytes =
-        fs::read(path).map_err(|e| ManagerError::FreezeError(format!("Read failed: {e}")))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| ManagerError::FreezeError(format!("Invalid manifest: {e}")))
 }
 
 // ======================================================================
@@ -341,6 +426,73 @@ mod tests {
     }
 
     const WHOLE: [&str; 4] = ["runtime", "exe", "pixi/pixi.toml", "pixi/pixi.lock"];
+
+    #[test]
+    fn a_deployment_image_serves_the_declared_set() {
+        let ex = ExposureConfig {
+            mcp: vec!["dna".to_string()],
+            api: vec!["util".to_string()],
+            eval: None,
+        };
+        let spec = spec_from_exposure(&ex).expect("a spec");
+        let cmd = crate::build_router_command(
+            crate::serve::CONTAINER_MORLOC_STATE,
+            DEPLOY_HTTP_PORT,
+            "0.0.0.0",
+            &spec,
+            false,
+        );
+        assert!(cmd.windows(2).any(|w| w == ["--mcp", "dna"]), "{cmd:?}");
+        assert!(cmd.windows(2).any(|w| w == ["--api", "util"]), "{cmd:?}");
+        // A container's loopback is its own, so a published port only reaches a
+        // service bound to all interfaces.
+        assert!(cmd.windows(2).any(|w| w == ["--http-host", "0.0.0.0"]), "{cmd:?}");
+        // And nothing waives authentication on that bind: the nexus refuses to
+        // start until the operator supplies a token or overrides the command.
+        assert!(!cmd.iter().any(|a| a == "--allow-no-auth"), "{cmd:?}");
+    }
+
+    #[test]
+    fn an_environment_that_exposed_nothing_gets_no_default_command() {
+        assert!(spec_from_exposure(&ExposureConfig::default()).is_none());
+    }
+
+    #[test]
+    fn labels_say_what_the_image_holds() {
+        // The image leaves the manager's world, so whoever meets it next may
+        // have neither the environment nor any record of what went in.
+        let programs = vec![ProgramEntry {
+            name: "dna".to_string(),
+            commands: vec!["revcomp".to_string()],
+        }];
+        let modules = vec![ModuleEntry {
+            name: "root-py".to_string(),
+            version: None,
+            sha256: "abc".to_string(),
+            morloc_version: None,
+            built_with_morloc: None,
+        }];
+        let ex = ExposureConfig {
+            mcp: vec!["dna".to_string()],
+            api: Vec::new(),
+            eval: Some(EvalExposure { allow: vec!["dna".to_string()] }),
+        };
+        let labels = deploy_labels("dev", &Version::new(0, 101, 0), &programs, &modules, &ex);
+        let get = |k: &str| {
+            labels
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("morloc.environment").as_deref(), Some("dev"));
+        assert_eq!(get("morloc.programs").as_deref(), Some("dna"));
+        assert_eq!(get("morloc.modules").as_deref(), Some("root-py"));
+        assert_eq!(get("morloc.mcp").as_deref(), Some("dna"));
+        assert_eq!(get("morloc.eval").as_deref(), Some("dna"));
+        // An adapter nothing was exposed on is absent rather than empty.
+        assert_eq!(get("morloc.api"), None);
+        assert!(get("org.opencontainers.image.version").is_some());
+    }
 
     #[test]
     fn a_whole_environment_carries_its_runtime_and_its_lock() {

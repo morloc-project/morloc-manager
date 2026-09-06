@@ -612,47 +612,6 @@ impl FlagConfig {
     }
 }
 
-// ======================================================================
-// Freeze manifest
-// ======================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FreezeManifest {
-    pub morloc_version: Version,
-    pub frozen_at: chrono::DateTime<chrono::Utc>,
-    pub modules: Vec<ModuleEntry>,
-    pub programs: Vec<ProgramEntry>,
-    /// The environment's own image, which a deployment image is built on. Not
-    /// the generic base underneath it: the deployment image needs pixi to
-    /// install the toolchain from this artifact's lock, the activation wrapper,
-    /// and the compiler a sandboxed eval forks -- all of which the environment
-    /// image has and a bare base does not.
-    pub base_image: String,
-    pub env_layer: Option<FrozenEnvLayer>,
-    /// What the frozen environment exposed, and how. A deployment image serves
-    /// exactly this, so the artifact carries the intent rather than rediscovering
-    /// it from whatever happens to be installed. Empty means the image has no
-    /// default command and is a command line only.
-    #[serde(default)]
-    pub exposure: ExposureConfig,
-    /// Deprecated: previously held expected env var names. Retained for backward
-    /// compatibility when reading older freeze manifests.
-    #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
-    pub env_vars: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrozenEnvLayer {
-    pub name: String,
-    pub dockerfile: String,
-    pub content_hash: String,
-    /// Container image tag (e.g. localhost/morloc-env:0.79.2-dnd).
-    /// Named image_tag because it stores a mutable tag, not a content-addressed digest.
-    #[serde(alias = "image_digest")]
-    pub image_tag: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleEntry {
     pub name: String,

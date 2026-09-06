@@ -91,8 +91,7 @@ fn build_help_template() -> String {
   {b}logs{r}       Stream logs from a running serve container
 
 {bu}Deployment{r}
-  {b}freeze{r}     Export installed state as a frozen artifact
-  {b}unfreeze{r}   Build a portable serve image from frozen state
+  {b}freeze{r}     Freeze an environment into a deployment image
 
 {bu}Options{r}
 {{options}}"
@@ -609,49 +608,30 @@ Examples:
         #[arg(short, long)]
         follow: bool,
     },
-    /// Export installed state as a frozen artifact
+    /// Freeze the environment into a self-contained deployment image
     #[command(display_order = 23)]
     #[command(after_help = "\
 Examples:
   mim freeze
-  mim freeze --env myenv
-  mim freeze -o ./my-freeze
+  mim freeze --tag dna-service:v1
+  mim freeze --tag dna-service:v1 --save ./dna-service-v1.tar
+
+The image serves the exposed set and runs the same programs from a command
+line. It is left in the engine's image store; move it with a registry push,
+with --save, or by rebuilding it.
 
 Requires at least one program compiled with 'morloc make --install'.")]
     Freeze {
         /// Environment to freeze (default: the default environment)
         #[arg(long)]
         env: Option<String>,
-        /// Output directory (default: ./morloc-freeze)
+        /// Image tag to build (default: morloc-<env>:<morloc version>)
         #[arg(short, long)]
-        output: Option<String>,
-        /// Overwrite existing output directory
+        tag: Option<String>,
+        /// Also write the image to a tarball, for a machine with no registry
+        /// between it and this one. Load it there with `docker load -i <path>`.
         #[arg(long)]
-        force: bool,
-    },
-    /// Build a serve image from frozen state
-    #[command(display_order = 24)]
-    #[command(after_help = "\
-Examples:
-  mim unfreeze --from ./morloc-freeze/state.tar.gz -t myservice:v1
-  mim unfreeze --from ./state.tar.gz -t svc:v1 --engine docker")]
-    Unfreeze {
-        /// Path to state.tar.gz from freeze
-        #[arg(long)]
-        from: String,
-        /// Image tag
-        #[arg(short, long)]
-        tag: String,
-        /// Base image override
-        #[arg(long)]
-        base: Option<String>,
-        /// Container engine override (default: configured engine).
-        /// Images frozen with engine-specific flags may not work with a different engine.
-        #[arg(long, value_enum)]
-        engine: Option<EngineArg>,
-        /// Rebuild image even if it already exists locally
-        #[arg(long)]
-        rebuild: bool,
+        save: Option<String>,
     },
     /// Evaluate a morloc expression against a running serve container
     #[command(display_order = 25)]
@@ -2932,17 +2912,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             Ok(())
         }
         // ---- freeze ----
-        Cmd::Freeze { env, output, force } => {
-            let output_dir = output.as_deref().unwrap_or("./morloc-freeze");
-            // Protect against silently overwriting a previous freeze
-            let existing_tar = std::path::Path::new(output_dir).join("state.tar.gz");
-            if existing_tar.exists() && !force {
-                return Err(ManagerError::FreezeError(format!(
-                    "Output directory already contains a freeze: {}\n  \
-                     Use --force to overwrite, or specify a different -o path.",
-                    existing_tar.display()
-                )));
-            }
+        Cmd::Freeze { env, tag, save } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
             if ec.is_dev() {
                 return Err(ManagerError::EnvError(format!(
@@ -3000,68 +2970,19 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             };
             let data_dir = cfg::env_data_dir(env_scope, &env_name);
             let image = ec.active_image().to_string();
-            let result = freeze::freeze_from_dir(env_scope, &env_name, ver.clone(), engine, &image, &data_dir.to_string_lossy(), output_dir, verbose);
+            // A tag that says what it is and does not collide with the
+            // environment image it is built on.
+            let tag = tag.unwrap_or_else(|| format!("morloc-{env_name}:{}", ver.show()));
+            let result = freeze::freeze_environment(
+                env_scope, &env_name, ver.clone(), engine, &image,
+                &data_dir.to_string_lossy(), &tag, save.as_deref(), verbose,
+            );
             if result.is_ok() && ec.morloc_version.as_ref() != Some(&ver) {
                 let mut updated = ec.clone();
                 updated.morloc_version = Some(ver);
                 let _ = cfg::write_env_config(env_scope, &env_name, &updated);
             }
             result
-        }
-
-        // ---- unfreeze ----
-        Cmd::Unfreeze { from, tag, base, engine: engine_override, rebuild } => {
-            let from = {
-                let p = std::path::Path::new(&from);
-                if p.is_dir() {
-                    let tar = p.join("state.tar.gz");
-                    if tar.is_file() {
-                        tar.to_string_lossy().to_string()
-                    } else {
-                        return Err(ManagerError::UnfreezeError(format!(
-                            "Directory '{}' does not contain state.tar.gz. \
-                             Pass the path to state.tar.gz directly, or the directory containing it.",
-                            from
-                        )));
-                    }
-                } else if p.is_file() {
-                    from
-                } else {
-                    return Err(ManagerError::UnfreezeError(format!(
-                        "Input not found: {from}. \
-                         Pass the path to state.tar.gz or the directory containing it."
-                    )));
-                }
-            };
-            // Read version and engine from the freeze manifest so unfreeze
-            // works on deployment machines with no morloc environments.
-            let tarball_dir = std::path::Path::new(&from)
-                .parent()
-                .unwrap_or(std::path::Path::new("."));
-            let manifest_path = tarball_dir.join("freeze-manifest.json");
-            let manifest = freeze::read_freeze_manifest(&manifest_path.to_string_lossy())
-                .map_err(|_| ManagerError::UnfreezeError(format!(
-                    "Cannot read freeze manifest at {}. Ensure state.tar.gz and freeze-manifest.json are in the same directory.",
-                    manifest_path.display()
-                )))?;
-            if matches!(engine_override, Some(EngineArg::None)) {
-                return Err(ManagerError::UnfreezeError(
-                    "unfreezing to the native backend is not yet supported; unfreeze to a \
-                     container engine (--engine podman) or omit --engine".to_string(),
-                ));
-            }
-            let engine = match engine_override {
-                Some(arg) => arg.into(),
-                None => {
-                    let e = ensure_engine()?;
-                    eprintln!(
-                        "Note: using {} engine from global config. Override with --engine if needed.",
-                        e.name()
-                    );
-                    e
-                }
-            };
-            serve::build_serve_image(engine, verbose, &from, &tag, manifest.morloc_version, base.as_deref(), rebuild, &manifest.programs)
         }
 
         // ---- start ----
@@ -10260,75 +10181,6 @@ mod tests {
         assert_eq!(ec2.shm_size, "1g");
         assert_eq!(ec2.morloc_version, Some(Version::new(0, 67, 0)));
     }
-
-    #[test]
-    fn freeze_manifest_json_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fm.json");
-        let fm = FreezeManifest {
-            morloc_version: Version::new(0, 67, 0),
-            frozen_at: chrono::Utc::now(),
-            modules: vec![ModuleEntry {
-                name: "math".to_string(),
-                version: Some("0.3.0".to_string()),
-                sha256: "abc123".to_string(),
-                morloc_version: None,
-                built_with_morloc: None,
-            }],
-            programs: vec![ProgramEntry {
-                name: "svc".to_string(),
-                commands: vec!["hello".to_string(), "compute".to_string()],
-            }],
-            base_image: "localhost/morloc-env:latest".to_string(),
-            env_layer: Some(FrozenEnvLayer {
-                name: "ml".to_string(),
-                dockerfile: "FROM scratch".to_string(),
-                content_hash: "abc".to_string(),
-                image_tag: None,
-            }),
-            exposure: ExposureConfig {
-                mcp: vec!["svc".to_string()],
-                api: Vec::new(),
-                eval: None,
-            },
-            env_vars: Vec::new(),
-        };
-        cfg::write_config(&path, &fm).unwrap();
-        let fm2: FreezeManifest = cfg::read_config(&path).unwrap();
-        assert_eq!(fm2.morloc_version, Version::new(0, 67, 0));
-        assert_eq!(fm2.modules.len(), 1);
-        assert_eq!(fm2.programs.len(), 1);
-        assert_eq!(fm2.programs[0].commands, vec!["hello", "compute"]);
-        // The exposed set travels with the artifact: a deployment image serves
-        // what the environment declared, not what happened to be installed.
-        assert_eq!(fm2.exposure.mcp, vec!["svc"]);
-        assert!(fm2.exposure.api.is_empty());
-        // env_vars is no longer written but can still be read from old manifests
-        assert!(fm2.env_vars.is_empty());
-    }
-
-    #[test]
-    fn freeze_manifest_reads_legacy_env_vars() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.json");
-        // Version (de)serializes as a string via its Display/FromStr impls.
-        // env_vars survives for backward-compat with old manifests that
-        // wrote the field; new code skips it on write.
-        let json = r#"{
-            "morloc_version": "0.67.0",
-            "frozen_at": "2025-01-01T00:00:00Z",
-            "modules": [],
-            "programs": [],
-            "base_image": "morloc-full:0.67.0",
-            "env_layer": null,
-            "env_vars": ["API_KEY", "DB_URL"]
-        }"#;
-        std::fs::write(&path, json).unwrap();
-        let fm: FreezeManifest = cfg::read_config(&path).unwrap();
-        assert_eq!(fm.env_vars, vec!["API_KEY", "DB_URL"]);
-    }
-
-    // ---- FlagConfig tests ----
 
     #[test]
     fn flag_config_default_is_all_empty() {

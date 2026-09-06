@@ -197,18 +197,6 @@ pub fn container_run_passthrough(
         .unwrap_or_else(|_| std::process::exit(1))
 }
 
-pub fn container_build(engine: ContainerEngine, cfg: &BuildConfig) -> (ExitStatus, String, String) {
-    let exe = engine_executable(engine);
-    let args = build_build_args(cfg);
-    run_process(exe, &args)
-}
-
-pub fn container_pull(engine: ContainerEngine, image: &str) -> (ExitStatus, String, String) {
-    let exe = engine_executable(engine);
-    let args = pull_argv(engine, image, None);
-    run_process(exe, &args)
-}
-
 /// Build a container image with all output (stdout+stderr) redirected to stderr.
 /// Use for IO () commands where stdout must stay clean.
 pub fn container_build_visible(engine: ContainerEngine, cfg: &BuildConfig) -> ExitStatus {
@@ -219,30 +207,6 @@ pub fn container_build_visible(engine: ContainerEngine, cfg: &BuildConfig) -> Ex
 
 
 
-/// Build the argv for `pull`. For OCI engines this is `pull <image>`. For
-/// Apptainer it is `pull <output.sif> docker://<image>` (the `docker://`
-/// scheme triggers OCI conversion).
-fn pull_argv(engine: ContainerEngine, image: &str, target_path: Option<&str>) -> Vec<String> {
-    match argstyle(engine) {
-        ArgStyle::Oci => vec!["pull".to_string(), image.to_string()],
-        ArgStyle::Apptainer => {
-            let mut args = vec!["pull".to_string()];
-            if let Some(path) = target_path {
-                args.push(path.to_string());
-            }
-            // Treat any caller-supplied scheme (docker://, oras://, library://,
-            // docker-daemon://, oci-archive://) as-is. Otherwise default to
-            // docker:// so a bare OCI ref like ghcr.io/foo/bar:tag works.
-            let normalized = if image.contains("://") {
-                image.to_string()
-            } else {
-                format!("docker://{image}")
-            };
-            args.push(normalized);
-            args
-        }
-    }
-}
 
 pub fn image_exists_locally(engine: ContainerEngine, image: &str) -> bool {
     match argstyle(engine) {
@@ -360,6 +324,33 @@ pub fn volume_remove(engine: ContainerEngine, name: &str) -> ExitStatus {
             code
         }
         ArgStyle::Apptainer => no_op_exit_status(),
+    }
+}
+
+/// Write an image to a tarball with the engine's own `save`, so an artifact can
+/// cross to a machine with no registry between them. The result is what
+/// `docker load` / `podman load` reads back: every layer, including the base.
+pub fn save_image(engine: ContainerEngine, tag: &str, path: &str) -> Result<(), String> {
+    match argstyle(engine) {
+        ArgStyle::Oci => {
+            let exe = engine_executable(engine);
+            let (status, _, stderr) = run_process(
+                exe,
+                &[
+                    "save".to_string(),
+                    "-o".to_string(),
+                    path.to_string(),
+                    tag.to_string(),
+                ],
+            );
+            if status.success() {
+                Ok(())
+            } else {
+                Err(stderr.trim().to_string())
+            }
+        }
+        // Apptainer images are already files; there is nothing to export.
+        ArgStyle::Apptainer => Err("apptainer has no image store to save from".to_string()),
     }
 }
 
