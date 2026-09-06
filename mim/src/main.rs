@@ -3361,6 +3361,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     "--install".to_string(), src.clone(),
                 ]
             };
+            let installed_before = installed_program_names(&cfg::env_data_dir(scope, &env_name));
             runner::run_in_env(
                 Some((env_name.clone(), scope, ec)),
                 runner::RunRequest {
@@ -3373,6 +3374,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     slurm_bridge: false,
                 },
             )?;
+            report_newly_installed(
+                &installed_before,
+                &installed_program_names(&cfg::env_data_dir(scope, &env_name)),
+            );
 
             // 4. Provision Python local deps now that the program is built. For each
             //    program built this run that declares py locals: resolve its spec
@@ -7132,6 +7137,44 @@ fn eval_against_serve(
     Ok(())
 }
 
+/// The programs installed in an environment, by name, read from the program
+/// database. Directory names only: this notices what a build added, and says
+/// nothing about whether what it added is sound.
+fn installed_program_names(data_dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(data_dir.join("exe")) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                names.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    names
+}
+
+/// Report what a build newly installed, and the one command that makes it
+/// reachable.
+///
+/// A program is named after its `module` declaration, not the file it was built
+/// from, so the name to expose is not the name the user just typed. Saying it
+/// here removes the step where they have to go and look. Silent when a build
+/// only rebuilt what was already installed, which is most of them.
+fn report_newly_installed(
+    before: &std::collections::BTreeSet<String>,
+    after: &std::collections::BTreeSet<String>,
+) {
+    let new: Vec<&String> = after.difference(before).collect();
+    if new.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = new.iter().map(|n| n.as_str()).collect();
+    eprintln!("Installed: {}", names.join(", "));
+    eprintln!("Expose to serve:");
+    for n in &names {
+        eprintln!("  mim expose add {n} --as mcp,api");
+    }
+}
+
 /// Refuse to launch against an environment whose mounted halves were never
 /// materialized.
 ///
@@ -7940,9 +7983,21 @@ fn resolve_serve_spec(
     } else {
         let ex = cfg::read_exposure(scope, name)?;
         if ex.is_empty() {
+            // Name what could be exposed. A program is named after its module
+            // declaration rather than its source file, so the reader of this
+            // message does not necessarily know what to type.
+            let installed = installed_program_names(&cfg::env_data_dir(scope, name));
+            let candidates = if installed.is_empty() {
+                "  Nothing is installed yet either: mim install <src>.loc".to_string()
+            } else {
+                installed
+                    .iter()
+                    .map(|p| format!("    mim expose add {p} --as mcp,api"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
             return Err(ManagerError::EnvError(format!(
-                "Nothing is exposed in '{name}'. Expose a module first:\n    \
-                 mim expose add <module> --as mcp\n  \
+                "Nothing is exposed in '{name}'. Expose a module first:\n{candidates}\n  \
                  (or 'start --mcp <module>' for a one-off)."
             )));
         }
@@ -8984,6 +9039,29 @@ mod tests {
             token_required,
             handle: None,
         }
+    }
+
+    #[test]
+    fn an_install_reports_what_it_added_by_module_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("exe");
+        std::fs::create_dir_all(exe.join("dna")).unwrap();
+        let before = installed_program_names(dir.path());
+        assert_eq!(before.iter().map(String::as_str).collect::<Vec<_>>(), ["dna"]);
+
+        // A second program appears; a rebuild of the first does not.
+        std::fs::create_dir_all(exe.join("util")).unwrap();
+        let after = installed_program_names(dir.path());
+        let new: Vec<&str> = after.difference(&before).map(String::as_str).collect();
+        assert_eq!(new, ["util"]);
+    }
+
+    #[test]
+    fn an_environment_with_no_program_database_lists_nothing() {
+        // A fresh environment, or one whose programs were never built: the
+        // absence is not an error, it is an empty set.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(installed_program_names(dir.path()).is_empty());
     }
 
     #[test]
