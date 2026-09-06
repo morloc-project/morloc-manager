@@ -14,6 +14,13 @@ use crate::types::ContainerEngine;
 pub struct RunConfig {
     pub image: String,
     pub bind_mounts: Vec<(String, String)>,
+    /// Engine-managed volumes as `(volume name, container path)`. Unlike a bind
+    /// mount these live in the engine's own storage, so their filesystem is the
+    /// engine's rather than the host's -- on macOS that is the Linux filesystem
+    /// inside the engine VM, which preserves letter case and is not reached
+    /// through a file-sharing layer. Applied by the OCI engines only; Apptainer
+    /// has no equivalent and leaves the underlying bind mount showing through.
+    pub volumes: Vec<(String, String)>,
     pub ports: Vec<(u16, u16)>,
     /// Host interface to publish ports on (`docker -p <host>:H:C`). `None`
     /// binds all interfaces (0.0.0.0); `Some("127.0.0.1")` restricts to
@@ -41,6 +48,7 @@ impl RunConfig {
         Self {
             image: image.to_string(),
             bind_mounts: Vec::new(),
+            volumes: Vec::new(),
             ports: Vec::new(),
             publish_host: None,
             network: None,
@@ -338,6 +346,23 @@ pub fn container_exists(engine: ContainerEngine, name: &str) -> bool {
     }
 }
 
+/// Remove an engine-managed volume. Quiet and best-effort: a volume that was
+/// never created (an environment removed before it was ever materialized) is not
+/// an error. Apptainer has no volumes, so this is a no-op there.
+pub fn volume_remove(engine: ContainerEngine, name: &str) -> ExitStatus {
+    match argstyle(engine) {
+        ArgStyle::Oci => {
+            let exe = engine_executable(engine);
+            let (code, _, _) = run_process_quiet(
+                exe,
+                &["volume".to_string(), "rm".to_string(), "-f".to_string(), name.to_string()],
+            );
+            code
+        }
+        ArgStyle::Apptainer => no_op_exit_status(),
+    }
+}
+
 pub fn remove_image(engine: ContainerEngine, tag: &str) -> bool {
     match argstyle(engine) {
         ArgStyle::Oci => {
@@ -422,6 +447,14 @@ fn build_oci_run_args(
     for (host, container) in &cfg.bind_mounts {
         args.push("-v".to_string());
         args.push(format!("{host}:{container}{}", cfg.selinux_suffix));
+    }
+    // After the bind mounts, so a volume whose target nests inside one is applied
+    // over it. Both engines order mounts by destination depth regardless, but
+    // emitting them in this order keeps the command line readable. No SELinux
+    // suffix: relabelling applies to host paths, not engine-managed storage.
+    for (volume, container) in &cfg.volumes {
+        args.push("-v".to_string());
+        args.push(format!("{volume}:{container}"));
     }
     if let Some(ref net) = cfg.network {
         args.push("--network".to_string());

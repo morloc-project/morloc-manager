@@ -23,7 +23,7 @@ mod types;
 // The dependency-resolution kernel (envspec/pixi/constraint/langsupport) lives in
 // the shared `morloc-deps` crate; re-export it so existing `crate::<mod>` paths
 // resolve unchanged.
-pub(crate) use morloc_deps::{constraint, envspec, envstore, langsupport, layout, pixi};
+pub(crate) use morloc_deps::{casefold, constraint, envspec, envstore, langsupport, layout, pixi};
 
 use std::collections::HashSet;
 use std::fs;
@@ -4391,6 +4391,10 @@ fn materialize_native_env(
     let ssl_cert = cert::host_bundle_if_present(scope, name);
     eprintln!("Solving native toolchain with pixi (this may take a few minutes)...");
     pixi::solve(&pixi_dir, &pixi_bin, ssl_cert.as_deref(), fhs)?;
+    // A filesystem that folds letter case (the macOS default) merges conda files
+    // whose names differ only in case, leaving a header holding another header's
+    // contents. Refuse the prefix before anything is compiled against it.
+    casefold::check_pixi_dir(&pixi_dir)?;
     let mut activation = pixi::capture_activation(&pixi_dir, &pixi_bin, ssl_cert.as_deref(), fhs)?;
     // Persist the CA env vars into the env's run environment so a later
     // `morloc make` (its uv/pip and any runtime egress) also trusts the CA.
@@ -7031,15 +7035,75 @@ fn persist_env_dockerfile(scope: Scope, name: &str, df_text: &str) {
     let _ = std::fs::write(&df_doc, df_text);
 }
 
-/// The bind mounts every materialize/run of a container env shares: the env state
-/// dir, its pixi env (`/env`), and MORLOC_HOME. The dev materialize appends its
-/// source/build/dev-bin mounts on top. One source of truth for the base layout.
-fn base_bind_mounts(v_data_dir: &str) -> Vec<(String, String)> {
-    vec![
+/// The mounts every materialize/run of a container env shares, as
+/// `(bind mounts, engine volumes)`: the env state dir, its pixi project
+/// (`/env`), MORLOC_HOME, and the volumes holding the solved conda prefix and
+/// the shared package cache. The dev materialize appends its source/build/dev-bin
+/// mounts on top. One source of truth for the base layout, so no run can be
+/// given the pixi project without the prefix that belongs to it.
+///
+/// The prefix is a volume rather than a bind mount because it is a Linux tree
+/// that only in-container processes execute, and because a host share need not
+/// be able to hold it: conda ships files whose names differ only in case, which
+/// a case-folding host filesystem (the macOS default) silently merges. The
+/// manifest and lock stay on the bind mount beside it -- the host solves the
+/// environment and reads the lock back.
+fn base_mounts(v_data_dir: &str) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let binds = vec![
         (v_data_dir.to_string(), serve::CONTAINER_MORLOC_STATE.to_string()),
         (format!("{v_data_dir}/pixi"), serve::CONTAINER_PIXI_DIR.to_string()),
         (format!("{v_data_dir}/runtime"), serve::CONTAINER_MORLOC_HOME.to_string()),
-    ]
+    ];
+    let volumes = vec![
+        (
+            serve::prefix_volume(std::path::Path::new(v_data_dir)),
+            format!("{}/.pixi", serve::CONTAINER_PIXI_DIR),
+        ),
+        (
+            serve::PIXI_CACHE_VOLUME.to_string(),
+            serve::CONTAINER_PIXI_CACHE.to_string(),
+        ),
+    ];
+    (binds, volumes)
+}
+
+/// The shell run against a freshly installed prefix, before anything is built
+/// against it.
+///
+/// It does two things the host cannot do for a container environment, because
+/// the prefix is on an engine volume the host cannot read. First it refuses a
+/// prefix whose filesystem folds letter case: conda ships files whose names
+/// differ only in case (the Linux kernel headers alone ship eight such pairs
+/// with different contents), and such a filesystem merges them into one file
+/// holding the wrong bytes -- a toolchain that is not what the lockfile
+/// describes, with nothing to show for it at build time. Then it mirrors the
+/// `conda-meta` records onto the bind-mounted project dir, which is how the host
+/// reads back what was installed (`morloc_deps::abi::meta_dir`).
+///
+/// Written as shell rather than a `mim` subcommand because a dev environment
+/// materializes before any mim agent is staged into its image.
+fn prefix_postinstall_script() -> String {
+    let prefix = format!("{}/.pixi/envs/default", serve::CONTAINER_PIXI_DIR);
+    let pixi_dir = serve::CONTAINER_PIXI_DIR;
+    let mirror = morloc_deps::abi::CONDA_META_MIRROR;
+    format!(
+        r#"probe="{prefix}/.mim-case-probe-A"
+touch "$probe"
+if [ -e "{prefix}/.mim-case-probe-a" ]; then
+  rm -f "$probe"
+  echo "the conda prefix was installed on a filesystem that folds letter case, which" >&2
+  echo "merges conda files whose names differ only in case into one file holding the" >&2
+  echo "wrong contents. This is the container engine's storage, not the host's: check" >&2
+  echo "that the engine's data root is on a case-sensitive filesystem." >&2
+  exit 1
+fi
+rm -f "$probe"
+rm -rf "{pixi_dir}/{mirror}.new"
+cp -a "{prefix}/conda-meta" "{pixi_dir}/{mirror}.new"
+rm -rf "{pixi_dir}/{mirror}"
+mv "{pixi_dir}/{mirror}.new" "{pixi_dir}/{mirror}"
+"#
+    )
 }
 
 /// Solve the pixi env + build the morloc runtime shims INSIDE a container,
@@ -7058,6 +7122,7 @@ fn materialize_container_env(
     // env skips that: the developer builds the runtime (via `morloc init`) from the
     // mounted source, so provisioning stops at the pixi env.
     let mut script = format!("set -e\n{pixi} install --locked\n", pixi = serve::CONTAINER_PIXI_BIN);
+    script.push_str(&prefix_postinstall_script());
     if build_runtime {
         script.push_str(&serve::conda_activate_lines().join("\n"));
         // Strict conda: build shims against ONLY the activated conda prefix's tools
@@ -7068,9 +7133,11 @@ fn materialize_container_env(
             envagent::ENV_STRICT_CONDA
         ));
     }
+    let (bind_mounts, volumes) = base_mounts(&v_data_dir);
     let cfg = crate::container::RunConfig {
         image: image.to_string(),
-        bind_mounts: base_bind_mounts(&v_data_dir),
+        bind_mounts,
+        volumes,
         ports: Vec::new(),
         publish_host: None,
         network: None,
@@ -8258,7 +8325,7 @@ fn run_with_config(
     // (exe/fdb/modules) is the third mount at MORLOC_STATE. All three are
     // host-owned, hence writable under the keep-id-mapped host UID (no chmod).
     // A pliable container env must be MATERIALIZED before it can run: `/env` (the
-    // conda toolchain) and MORLOC_HOME (the morloc runtime shims) are host-mounted
+    // conda toolchain) and MORLOC_HOME (the morloc runtime shims) are mounted
     // from `<env>/pixi` and `<env>/runtime`, populated by materialize at env setup.
     // If a mount source is absent (an env created with --no-init, or a materialize
     // that never completed), mounting it would shadow the image with an empty dir
@@ -8266,7 +8333,16 @@ fn run_with_config(
     // is an INPUT to every process (including a manual `morloc init`), so it is
     // always required; MORLOC_HOME is the OUTPUT init writes, so it may be empty
     // during an is_init run.
-    let pixi_src = std::path::Path::new(v_data_dir).join("pixi");
+    //
+    // The toolchain is checked through its record mirror rather than the project
+    // dir: the solved prefix is an engine volume, so the project dir holds a
+    // manifest from the moment one is rendered, whereas materialize writes the
+    // mirror only once the prefix is installed. An environment provisioned before
+    // the prefix moved off the host has no mirror and is correctly reported here,
+    // since its prefix is no longer where its container will look for one.
+    let pixi_src = std::path::Path::new(v_data_dir)
+        .join("pixi")
+        .join(morloc_deps::abi::CONDA_META_MIRROR);
     let runtime_src = std::path::Path::new(v_data_dir).join("runtime");
     let mut required: Vec<(&std::path::Path, &str)> =
         vec![(pixi_src.as_path(), "conda toolchain (/env)")];
@@ -8290,11 +8366,7 @@ fn run_with_config(
     }
 
     let mh = serve::CONTAINER_MORLOC_HOME;
-    let base_mounts = vec![
-        (v_data_dir.to_string(), serve::CONTAINER_MORLOC_STATE.to_string()),
-        (format!("{v_data_dir}/pixi"), serve::CONTAINER_PIXI_DIR.to_string()),
-        (format!("{v_data_dir}/runtime"), mh.to_string()),
-    ];
+    let (base_binds, base_volumes) = base_mounts(v_data_dir);
     let work_mount = if is_init {
         Vec::new()
     } else {
@@ -8318,7 +8390,7 @@ fn run_with_config(
     };
     // A configured host home shadows the env-owned `<data_dir>/home` for this run.
     let home_mount = serve::home_mount(mount_home)?;
-    let all_mounts: Vec<(String, String)> = base_mounts
+    let all_mounts: Vec<(String, String)> = base_binds
         .into_iter()
         .chain(work_mount)
         .chain(bridge_mount)
@@ -8434,6 +8506,7 @@ fn run_with_config(
     let cfg = RunConfig {
         image: image.to_string(),
         bind_mounts: all_mounts,
+        volumes: base_volumes,
         env: env_vars,
         interactive: shell,
         shm_size: Some(shm_size.to_string()),
@@ -8768,6 +8841,91 @@ mod tests {
     use super::*;
     use crate::container::{build_build_args, build_run_args, engine_executable, engine_specific_run_flags, BuildConfig};
     use clap::Parser;
+
+    #[test]
+    fn the_prefix_volume_covers_the_pixi_project_it_belongs_to() {
+        let (binds, volumes) = base_mounts("/data/environments/latest");
+        // The project dir is a bind mount, so the host keeps writing pixi.toml
+        // and reading pixi.lock.
+        assert!(binds
+            .iter()
+            .any(|(h, c)| h == "/data/environments/latest/pixi" && c == serve::CONTAINER_PIXI_DIR));
+        // The solved prefix is a volume mounted over `.pixi` inside it, so the
+        // manifest stays on the host and the prefix does not.
+        let prefix_target = format!("{}/.pixi", serve::CONTAINER_PIXI_DIR);
+        let (vol, _) = volumes
+            .iter()
+            .find(|(_, c)| *c == prefix_target)
+            .expect("the prefix volume must cover the project's .pixi");
+        assert_eq!(*vol, serve::prefix_volume(std::path::Path::new("/data/environments/latest")));
+        // No bind mount may cover the same place, or it would shadow the volume.
+        assert!(!binds.iter().any(|(_, c)| *c == prefix_target));
+    }
+
+    #[test]
+    fn volumes_render_for_the_oci_engines_and_are_dropped_by_apptainer() {
+        let (bind_mounts, volumes) = base_mounts("/data/environments/latest");
+        let cfg = RunConfig {
+            bind_mounts,
+            volumes,
+            command: Some(vec!["true".to_string()]),
+            ..RunConfig::new("img:1")
+        };
+        let docker = build_run_args(ContainerEngine::Docker, &[], &cfg).join(" ");
+        let vol = serve::prefix_volume(std::path::Path::new("/data/environments/latest"));
+        assert!(docker.contains(&format!("{vol}:{}/.pixi", serve::CONTAINER_PIXI_DIR)), "{docker}");
+        assert!(
+            docker.contains(&format!(
+                "{}:{}",
+                serve::PIXI_CACHE_VOLUME,
+                serve::CONTAINER_PIXI_CACHE
+            )),
+            "{docker}"
+        );
+        // Apptainer has no volumes; the bind mount underneath shows through, which
+        // is correct on the Linux-only filesystems it runs on.
+        let apptainer = build_run_args(ContainerEngine::Apptainer, &[], &cfg).join(" ");
+        assert!(!apptainer.contains(&vol), "{apptainer}");
+        assert!(apptainer.contains("/data/environments/latest/pixi"), "{apptainer}");
+    }
+
+    #[test]
+    fn the_package_cache_is_shared_and_off_the_state_mount() {
+        let (_, a) = base_mounts("/data/environments/latest");
+        let (_, b) = base_mounts("/data/environments/other");
+        let cache_of = |v: &Vec<(String, String)>| {
+            v.iter()
+                .find(|(_, c)| c == serve::CONTAINER_PIXI_CACHE)
+                .expect("a cache volume")
+                .0
+                .clone()
+        };
+        // Conda packages are content-addressed, so environments share one cache.
+        assert_eq!(cache_of(&a), cache_of(&b));
+        // And it must not sit under the state mount, which is host-backed.
+        assert!(!serve::CONTAINER_PIXI_CACHE.starts_with(serve::CONTAINER_MORLOC_STATE));
+        assert!(serve::oci_base_env(serve::CONTAINER_MORLOC_HOME)
+            .contains(&("PIXI_CACHE_DIR".to_string(), serve::CONTAINER_PIXI_CACHE.to_string())));
+    }
+
+    #[test]
+    fn the_postinstall_step_refuses_a_case_folding_prefix_and_mirrors_the_records() {
+        let script = prefix_postinstall_script();
+        let prefix = format!("{}/.pixi/envs/default", serve::CONTAINER_PIXI_DIR);
+        // Probes the prefix itself, under both spellings, and exits on a fold.
+        assert!(script.contains(&format!("{prefix}/.mim-case-probe-A")), "{script}");
+        assert!(script.contains(&format!("{prefix}/.mim-case-probe-a")), "{script}");
+        assert!(script.contains("exit 1"), "{script}");
+        // Leaves the records where a host reading this environment looks.
+        assert!(
+            script.contains(&format!(
+                "{}/{}",
+                serve::CONTAINER_PIXI_DIR,
+                morloc_deps::abi::CONDA_META_MIRROR
+            )),
+            "{script}"
+        );
+    }
 
     #[test]
     fn merge_lang_pins_keeps_pins_and_adds_bare() {

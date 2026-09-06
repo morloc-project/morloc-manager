@@ -12,6 +12,8 @@ use crate::container::{
 use crate::error::{ManagerError, Result};
 use crate::types::*;
 
+use sha2::Digest;
+
 pub fn build_serve_image(
     engine: ContainerEngine,
     verbose: bool,
@@ -727,6 +729,45 @@ pub const CONTAINER_PIXI_DIR: &str = "/env";
 /// The pixi binary inside the image (PIXI_HOME=/opt/pixi; not on the run PATH).
 pub const CONTAINER_PIXI_BIN: &str = "/opt/pixi/bin/pixi";
 
+/// In-container mount point for the conda package cache, pointed at by
+/// `PIXI_CACHE_DIR` and backed by [`PIXI_CACHE_VOLUME`].
+///
+/// It is deliberately not under the state mount. Package payloads are unpacked
+/// here byte for byte, case-colliding names included, and then copied into the
+/// prefix; on a host share that folds letter case one file of every such pair is
+/// lost during unpacking, and the copy into the prefix then fails on a source
+/// that is no longer there.
+pub const CONTAINER_PIXI_CACHE: &str = "/opt/morloc-pixi-cache";
+
+/// The engine volume backing [`CONTAINER_PIXI_CACHE`]. Conda packages are
+/// content-addressed, so one cache serves every environment on the machine; it
+/// is not per-environment and removing an environment does not remove it.
+pub const PIXI_CACHE_VOLUME: &str = "morloc-pixi-cache";
+
+/// The engine volume holding an environment's solved conda prefix, mounted over
+/// `<CONTAINER_PIXI_DIR>/.pixi`.
+///
+/// Only the prefix moves off the host. `pixi.toml` and `pixi.lock` stay on the
+/// bind mount beside it, because the host solves the environment (with the
+/// host's CA bundle) and reads the lock back; the prefix itself is a Linux tree
+/// that only in-container processes ever execute.
+///
+/// The name carries the environment's directory name so `volume ls` is readable,
+/// plus a digest of its full path so two environments cannot share a volume --
+/// environment names may contain characters a volume name may not, and are
+/// unique only within a scope.
+pub fn prefix_volume(env_dir: &Path) -> String {
+    let path = env_dir.to_string_lossy();
+    let readable: String = env_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect();
+    format!("morloc-env-{readable}-{:.8x}-pixi", sha2::Sha256::digest(path.as_bytes()))
+}
+
 /// Dev environments only: the ghcup bin dir baked into the dev image
 /// (`GHCUP_INSTALL_BASE_PREFIX=/opt`), holding `ghcup`/`stack`. Placed on the run
 /// PATH so an interactive dev shell can build the compiler, not just run it. On a
@@ -773,6 +814,8 @@ pub fn oci_base_env(mh: &str) -> Vec<(String, String)> {
         ("MORLOC_STATE".to_string(), CONTAINER_MORLOC_STATE.to_string()),
         ("HOME".to_string(), CONTAINER_HOME.to_string()),
         ("PATH".to_string(), container_path(mh)),
+        // Off the state mount: see CONTAINER_PIXI_CACHE.
+        ("PIXI_CACHE_DIR".to_string(), CONTAINER_PIXI_CACHE.to_string()),
         // A UTF-8 locale (C.UTF-8 is built into the base image's glibc) so the
         // compiler and programs can emit non-ASCII to stdout; under the default C
         // locale that fails with "commitBuffer: invalid argument".
@@ -1167,6 +1210,34 @@ pub fn dump_err_files(logs_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_volume_names_are_engine_legal_and_readable() {
+        let name = prefix_volume(Path::new("/home/z/.local/share/morloc/environments/latest"));
+        assert!(name.starts_with("morloc-env-latest-"), "{name}");
+        assert!(name.ends_with("-pixi"), "{name}");
+        // docker/podman accept [a-zA-Z0-9][a-zA-Z0-9_.-]*
+        let mut chars = name.chars();
+        assert!(chars.next().unwrap().is_ascii_alphanumeric());
+        assert!(chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'));
+    }
+
+    #[test]
+    fn prefix_volume_is_stable_and_per_environment() {
+        let a = Path::new("/data/environments/latest");
+        let b = Path::new("/data/other-scope/environments/latest");
+        assert_eq!(prefix_volume(a), prefix_volume(a));
+        // Same directory name under a different root: the digest keeps the two
+        // environments from sharing one prefix.
+        assert_ne!(prefix_volume(a), prefix_volume(b));
+    }
+
+    #[test]
+    fn a_volume_name_survives_an_environment_name_a_volume_may_not_hold() {
+        // Environment names allow any Unicode alphanumeric; volume names do not.
+        let name = prefix_volume(Path::new("/data/environments/pruebas-nino"));
+        assert!(name.is_ascii(), "{name}");
+    }
 
     // A previous whole-output `.trim()` stripped the trailing tab from the last
     // `ps` line, so the last host-network container (empty Ports) split into two

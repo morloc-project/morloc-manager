@@ -122,6 +122,14 @@ pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &
                 container::remove_image(engine, img);
             }
         }
+
+        // The solved conda prefix lives in an engine volume rather than under the
+        // env data dir, so deleting the directory tree below would leave it
+        // behind -- gigabytes with nothing left to reference them.
+        let _ = container::volume_remove(
+            engine,
+            &serve::prefix_volume(&config::env_data_dir(scope, name)),
+        );
     }
 
     // Remove config directory

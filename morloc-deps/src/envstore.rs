@@ -384,9 +384,9 @@ impl EnvContext {
     /// morloc bans) is NOT pinned -- pinning it would fold an unsatisfiable interval
     /// into every later solve. See `abi::abi_lock_spec`.
     pub fn record_abi_lock(&self, morloc_version: &str, support: &LangSupport) -> Result<()> {
-        let prefix = crate::abi::conda_prefix(&self.pixi_dir());
+        let meta = crate::abi::meta_dir(&self.pixi_dir());
         let windows = support.runtime_windows();
-        match crate::abi::abi_lock_spec(&prefix, morloc_version, &windows) {
+        match crate::abi::abi_lock_spec(&meta, morloc_version, &windows) {
             Some(spec) => {
                 let json = serde_json::to_string(&spec)
                     .map_err(|e| DepsError::Env(format!("cannot serialize abi lock: {e}")))?;
@@ -543,6 +543,14 @@ impl EnvContext {
             crate::pixi::solve(&pixi_dir, inputs.pixi_bin, None, None)?;
             true
         };
+        // Keep the host-readable record mirror in step with the prefix that was
+        // just installed, so a host reading this environment does not describe a
+        // world it has moved on from.
+        let _ = crate::abi::refresh_conda_meta_mirror(&prefix, &pixi_dir);
+        // The world just changed, so a package new to this env may ship paths that
+        // a case-folding filesystem cannot keep apart. Checked before the
+        // activation is cached, so a refused prefix leaves no usable state.
+        crate::casefold::check_pixi_dir(&pixi_dir)?;
         let activation =
             crate::pixi::capture_activation(&pixi_dir, inputs.pixi_bin, None, None)?;
         write_activation_cache(&cache_path, &activation);

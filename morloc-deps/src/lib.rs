@@ -8,6 +8,7 @@
 
 pub mod abi;
 pub mod ambient;
+pub mod casefold;
 pub mod cert;
 pub mod constraint;
 // envspec/langsupport deserialize the compiler's JSON contracts in full; not

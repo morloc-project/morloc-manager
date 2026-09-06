@@ -202,6 +202,19 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     out.push_str(&format!("ENV PATH=\"{runtime_bin}:${{PATH}}\"\n"));
     out.push('\n');
 
+    // Mount points for the engine volumes carrying the solved conda prefix and the
+    // shared package cache. They must exist in the image and be writable by a
+    // non-root user: an engine initializes a fresh volume from the image directory
+    // underneath it, ownership and mode included, and every container runs as the
+    // host UID rather than root, which no `chown` here can know. Same reasoning as
+    // the Rust source tree above.
+    let prefix_mount = format!("{}/.pixi", crate::serve::CONTAINER_PIXI_DIR);
+    let cache_mount = crate::serve::CONTAINER_PIXI_CACHE;
+    out.push_str("# Mount points for the conda prefix + package cache volumes\n");
+    out.push_str(&format!(
+        "RUN mkdir -p {prefix_mount} {cache_mount} && chmod 1777 {prefix_mount} {cache_mount}\n\n"
+    ));
+
     if input.dev {
         // Bake the Haskell toolchain (ghcup + stack) into the dev image, so
         // `stack`/`ghc` are on PATH in an interactive dev shell -- a dev env is a
@@ -417,6 +430,9 @@ RUN chmod -R a+rwX /opt/morloc-runtime/rust
 ENV MORLOC_RUST_DIR=/opt/morloc-runtime/rust
 ENV PATH=\"/opt/morloc-runtime:${PATH}\"
 
+# Mount points for the conda prefix + package cache volumes
+RUN mkdir -p /env/.pixi /opt/morloc-pixi-cache && chmod 1777 /env/.pixi /opt/morloc-pixi-cache
+
 # Toolchain PATH (the conda env is mounted at /env at run time)
 ENV PATH=\"/env/.pixi/envs/default/bin:${PATH}\"
 
@@ -430,6 +446,29 @@ RUN printf '%s\\n' '#!/bin/bash' 'if [ -f /usr/local/lib/morloc-nss-wrapper.so ]
 ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
 ";
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn volume_mount_points_exist_and_are_writable_without_root() {
+        // An engine seeds a fresh volume from the image directory beneath it,
+        // ownership and mode included. Every container runs as the host UID, whose
+        // value the image cannot know, so these must be group/other-writable or the
+        // first `pixi install` dies on EACCES.
+        for dev in [false, true] {
+            let df = generate_dockerfile(&DockerfileInput {
+                base_image: "debian:bookworm-slim",
+                pixi_version: "0.76.2",
+                morloc_home: "/opt/morloc",
+                extras: &BuildExtras::default(),
+                lang_installs: &[],
+                dev,
+                cert_file: None,
+            });
+            assert!(
+                df.contains("mkdir -p /env/.pixi /opt/morloc-pixi-cache && chmod 1777"),
+                "dev={dev}: {df}"
+            );
+        }
     }
 
     #[test]
