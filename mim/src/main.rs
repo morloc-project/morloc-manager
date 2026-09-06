@@ -664,13 +664,17 @@ Examples:
         /// Expression to evaluate
         #[arg(allow_hyphen_values = true)]
         expr: String,
-        /// Environment whose serve container to evaluate against
+        /// Environment whose serve to evaluate against
         /// (default: the default environment)
         #[arg(long)]
         env: Option<String>,
-        /// Port of the serve container (default: 8080)
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
+        /// Port of the serve (default: the port the running serve reported)
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Bearer token, when the serve requires one
+        /// (default: $MORLOC_MCP_TOKEN)
+        #[arg(long)]
+        auth_token: Option<String>,
     },
     /// Build and install a module into an environment
     #[command(display_order = 4)]
@@ -3277,46 +3281,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         }
 
         // ---- eval ----
-        Cmd::Eval { expr, env, port } => {
-            // When --env is given, validate that env's server is running. Eval
-            // itself is a backend-neutral HTTP client (it connects over --port);
-            // this pre-flight check must be backend-neutral too, or it would
-            // wrongly reject a live native serve.
-            if let Some(env_arg) = env {
-                let (env_name, scope, ec) = resolve_env_or_default(Some(env_arg))?;
-                if !env_serve_alive(scope, &env_name, &ec) {
-                    return Err(ManagerError::EnvError(format!(
-                        "No server running for '{env_name}'. Start with: mim start --env {env_name}"
-                    )));
-                }
+        Cmd::Eval { expr, env, port, auth_token } => {
+            let (env_name, scope, ec) = resolve_env_or_default(env)?;
+            // Backend-neutral: eval is an HTTP client, and a native serve is as
+            // valid a target as a container one.
+            if !env_serve_alive(scope, &env_name, &ec) {
+                return Err(ManagerError::EnvError(format!(
+                    "No server running for '{env_name}'. Start with: mim start --env {env_name}"
+                )));
             }
-            use std::io::{Read as IoRead, Write as IoWrite};
-            let body = format!("{{\"expr\":{}}}", serde_json::to_string(&expr).unwrap_or_default());
-            let request = format!(
-                "POST /eval HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(), body
-            );
-            let addr = format!("127.0.0.1:{port}");
-            let mut stream = std::net::TcpStream::connect(&addr).map_err(|e| {
-                ManagerError::EnvError(format!(
-                    "Cannot connect to serve container on {addr}: {e}\n  Is a serve container running? Start with: mim start"
-                ))
-            })?;
-            stream.write_all(request.as_bytes()).map_err(|e| {
-                ManagerError::EnvError(format!("Failed to send request: {e}"))
-            })?;
-            let mut response = String::new();
-            stream.read_to_string(&mut response).map_err(|e| {
-                ManagerError::EnvError(format!("Failed to read response: {e}"))
-            })?;
-            // Extract body from HTTP response (after \r\n\r\n)
-            if let Some(pos) = response.find("\r\n\r\n") {
-                let body = &response[pos + 4..];
-                println!("{body}");
-            } else {
-                println!("{response}");
-            }
-            Ok(())
+            let rt = cfg::read_serve_runtime(scope, &env_name);
+            eval_against_serve(&env_name, &expr, port, auth_token, rt.as_ref())
         }
 
         // ---- install ----
@@ -7067,6 +7042,94 @@ fn base_mounts(v_data_dir: &str) -> (Vec<(String, String)>, Vec<(String, String)
     (binds, volumes)
 }
 
+/// The HTTP request `mim eval` sends. Kept separate from the socket work so the
+/// wire shape is testable: an `Authorization` header appears exactly when a
+/// token was resolved, and the body is the expression as JSON.
+fn eval_request(expr: &str, token: Option<&str>) -> String {
+    let body = format!(
+        "{{\"expr\":{}}}",
+        serde_json::to_string(expr).unwrap_or_default()
+    );
+    let auth = match token {
+        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        None => String::new(),
+    };
+    format!(
+        "POST /eval HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         {auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The port to reach a serve on: the one asked for, else the one the serve
+/// reported when it started.
+///
+/// A serve picks its own port, so a fixed default would connect to whatever else
+/// happens to be listening -- or to nothing, and then report that no serve is
+/// running while one is.
+fn resolve_eval_port(env_name: &str, port: Option<u16>, rt: Option<&ServeRuntime>) -> Result<u16> {
+    port.or_else(|| rt.map(|r| r.port)).ok_or_else(|| {
+        ManagerError::EnvError(format!(
+            "the serve for '{env_name}' did not record a port. Name one with --port."
+        ))
+    })
+}
+
+/// Evaluate an expression against a running serve.
+///
+/// The port and the token come from the serve itself wherever possible. A serve
+/// picks its own port, so a fixed default would connect to whatever else happens
+/// to be listening -- or to nothing, and report that no serve is running while
+/// one is. The token is not recorded (a secret does not belong in a state file),
+/// but whether one is required is, which is enough to say so before the request
+/// comes back as an opaque 401.
+fn eval_against_serve(
+    env_name: &str,
+    expr: &str,
+    port: Option<u16>,
+    auth_token: Option<String>,
+    rt: Option<&ServeRuntime>,
+) -> Result<()> {
+    use std::io::{Read as IoRead, Write as IoWrite};
+
+    let port = resolve_eval_port(env_name, port, rt)?;
+    let token = auth_token
+        .or_else(|| std::env::var("MORLOC_MCP_TOKEN").ok().filter(|s| !s.is_empty()));
+    if token.is_none() && rt.map(|r| r.token_required).unwrap_or(false) {
+        return Err(ManagerError::EnvError(format!(
+            "the serve for '{env_name}' requires a bearer token. Supply it with \
+             --auth-token, or set MORLOC_MCP_TOKEN."
+        )));
+    }
+
+    let addr = format!("127.0.0.1:{port}");
+    let mut stream = std::net::TcpStream::connect(&addr).map_err(|e| {
+        ManagerError::EnvError(format!(
+            "cannot reach the serve for '{env_name}' on {addr}: {e}\n  \
+             Check `mim status`, or start one with `mim start --env {env_name}`."
+        ))
+    })?;
+    stream
+        .write_all(eval_request(expr, token.as_deref()).as_bytes())
+        .map_err(|e| ManagerError::EnvError(format!("failed to send the request: {e}")))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| ManagerError::EnvError(format!("failed to read the response: {e}")))?;
+
+    if response.starts_with("HTTP/1.1 401") {
+        return Err(ManagerError::EnvError(format!(
+            "the serve for '{env_name}' rejected the token. Supply the one `mim start` \
+             printed with --auth-token, or set MORLOC_MCP_TOKEN."
+        )));
+    }
+    match response.find("\r\n\r\n") {
+        Some(pos) => println!("{}", &response[pos + 4..]),
+        None => println!("{response}"),
+    }
+    Ok(())
+}
+
 /// Refuse to launch against an environment whose mounted halves were never
 /// materialized.
 ///
@@ -8897,6 +8960,56 @@ mod tests {
         let apptainer = build_run_args(ContainerEngine::Apptainer, &[], &cfg).join(" ");
         assert!(!apptainer.contains(&vol), "{apptainer}");
         assert!(apptainer.contains("/data/environments/latest/pixi"), "{apptainer}");
+    }
+
+    fn serve_record(port: u16, token_required: bool) -> ServeRuntime {
+        ServeRuntime {
+            mcp: vec!["dna".to_string()],
+            api: Vec::new(),
+            eval: true,
+            host: "127.0.0.1".to_string(),
+            port,
+            token_required,
+            handle: None,
+        }
+    }
+
+    #[test]
+    fn eval_carries_a_token_only_when_it_has_one() {
+        let bare = eval_request("add 1 2", None);
+        assert!(!bare.contains("Authorization"), "{bare}");
+        assert!(bare.contains(r#"{"expr":"add 1 2"}"#), "{bare}");
+
+        let authed = eval_request("add 1 2", Some("s3cret"));
+        assert!(authed.contains("Authorization: Bearer s3cret"), "{authed}");
+        // The body is unchanged by the header, and the length still describes it.
+        assert!(authed.contains(r#"{"expr":"add 1 2"}"#), "{authed}");
+        assert!(authed.contains("Content-Length: 18"), "{authed}");
+    }
+
+    #[test]
+    fn eval_says_a_token_is_needed_before_asking_for_a_401() {
+        // The serve records THAT a token is required, never the token itself.
+        let rt = serve_record(9090, true);
+        let err = eval_against_serve("dev", "add 1 2", None, None, Some(&rt))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires a bearer token"), "{err}");
+        assert!(err.contains("MORLOC_MCP_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn eval_reaches_for_the_port_the_serve_reported() {
+        // A serve picks its own port. Defaulting to a fixed one connects to
+        // whatever else is listening, or to nothing, and then reports that no
+        // serve is running while one is.
+        let rt = serve_record(9090, false);
+        assert_eq!(resolve_eval_port("dev", None, Some(&rt)).unwrap(), 9090);
+        // An explicit port still wins.
+        assert_eq!(resolve_eval_port("dev", Some(7000), Some(&rt)).unwrap(), 7000);
+        // With neither, say so rather than guessing.
+        let err = resolve_eval_port("dev", None, None).unwrap_err().to_string();
+        assert!(err.contains("--port"), "{err}");
     }
 
     #[test]
