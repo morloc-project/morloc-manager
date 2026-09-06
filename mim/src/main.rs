@@ -83,7 +83,7 @@ fn build_help_template() -> String {
 
 {bu}Serving{r}
   {b}install{r}    Build and install a module into an environment
-  {b}expose{r}     Choose which installed modules are served (MCP/API/eval)
+  {b}view{r}       Choose which installed modules are served (MCP/API/eval)
   {b}start{r}      Serve an environment over the network
   {b}eval{r}       Evaluate a morloc expression against a serve container
   {b}status{r}     List running serve containers
@@ -540,7 +540,7 @@ Examples:
         env: Option<String>,
         /// Ad-hoc: serve just this one installed module over MCP, ignoring the
         /// exposed set. Default (no --mcp) serves the environment's exposed
-        /// set (managed with `mim expose`).
+        /// views (managed with `mim view`).
         #[arg(long, value_name = "PROGRAM")]
         mcp: Option<String>,
         /// Bearer token required on HTTP requests. Falls back to the
@@ -717,14 +717,22 @@ Demos are extracted into examples-<tag>-<version>/ in the current directory.")]
     #[command(display_order = 23)]
     #[command(after_help = "\
 Examples:
-  mim expose add dna --as mcp
-  mim expose add util --as mcp,api
-  mim expose eval --allow dna,stats
-  mim expose list
-  mim expose rm dna")]
-    Expose {
+  mim view                          # show this environment's views
+  mim view add dna --as mcp
+  mim view add util --as mcp,api
+  mim view eval --allow dna,stats
+  mim view rm dna
+
+A view is what an adapter shows of an environment: the MCP view and the API
+view are independent sets. Installing a module makes it importable; adding it
+to a view makes it callable over the network. `mim start` serves the views.")]
+    View {
         #[command(subcommand)]
-        action: ExposeAction,
+        action: Option<ViewAction>,
+        /// Environment to show (default: the default environment). Only used
+        /// when no subcommand is given.
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Report environment paths for build tooling (no building is done)
     #[command(display_order = 9)]
@@ -793,19 +801,19 @@ enum EnvAction {
 }
 
 #[derive(Subcommand)]
-enum ExposeAction {
-    /// Add a module to the exposure set over one or more protocols
+enum ViewAction {
+    /// Add a module to one or more views
     Add {
         /// Installed module name
         module: String,
-        /// Protocols to expose over (comma-separated: mcp, api)
+        /// Adapters to appear in (comma-separated: mcp, api)
         #[arg(long = "as", value_enum, value_delimiter = ',', required = true)]
         protocols: Vec<Protocol>,
         /// Environment (default: the default environment)
         #[arg(long)]
         env: Option<String>,
     },
-    /// Remove a module from all exposure sets
+    /// Remove a module from every view
     Rm {
         /// Module name
         module: String,
@@ -813,7 +821,7 @@ enum ExposeAction {
         #[arg(long)]
         env: Option<String>,
     },
-    /// Show what is exposed
+    /// Show this environment's views
     List {
         /// Environment (default: the default environment)
         #[arg(long)]
@@ -821,8 +829,10 @@ enum ExposeAction {
     },
     /// Enable (or update) the eval capability with a sandbox allow-list
     Eval {
-        /// Modules eval may import (comma-separated). Independent of the exposed
-        /// sets. Omit for an empty allow-list; use --off to disable eval.
+        /// Modules eval may import (comma-separated). Independent of the views:
+        /// eval composes generic code a fixed set of tools cannot express, and
+        /// may need a module that is not itself callable. Omit for an empty
+        /// allow-list; use --off to disable eval.
         #[arg(long, value_delimiter = ',')]
         allow: Vec<String>,
         /// Disable the eval capability
@@ -3356,10 +3366,19 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         }
 
         // ---- expose ----
-        Cmd::Expose { action } => match action {
-            ExposeAction::Add { module, protocols, env } => {
+        // Bare `mim view` shows the views. The word promises a look at something,
+        // and the other `view` in this toolchain (`morloc-nexus view`) has
+        // already taught that reading, so the two agree rather than compete.
+        Cmd::View { action: None, env } => {
+            let (env_name, scope, _ec) = resolve_env_or_default(env)?;
+            let views = cfg::read_views(scope, &env_name)?;
+            print_views(&env_name, &views, json);
+            Ok(())
+        }
+        Cmd::View { action: Some(action), .. } => match action {
+            ViewAction::Add { module, protocols, env } => {
                 let (env_name, scope, ec) = resolve_env_or_default(env)?;
-                // Exposure is a view of an INSTALLED program; catch typos early.
+                // A view shows an INSTALLED program; catch typos early.
                 let launcher =
                     cfg::env_program_launcher(&ec, cfg::env_data_dir(scope, &env_name), &module);
                 if !launcher.exists() {
@@ -3369,50 +3388,51 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         launcher.display()
                     )));
                 }
-                let mut ex = cfg::read_exposure(scope, &env_name)?;
-                ex.add(&module, &protocols);
-                cfg::write_exposure(scope, &env_name, &ex)?;
+                let mut views = cfg::read_views(scope, &env_name)?;
+                views.add(&module, &protocols);
+                cfg::write_views(scope, &env_name, &views)?;
                 let protos: Vec<&str> = protocols.iter().map(|p| p.as_str()).collect();
                 eprintln!(
-                    "Exposed '{module}' over {} in '{env_name}'. Run 'mim start' to serve.",
-                    protos.join(", ")
+                    "'{module}' is now in the {} view of '{env_name}'. Run 'mim start' to serve.",
+                    protos.join(" and ")
                 );
                 Ok(())
             }
-            ExposeAction::Rm { module, env } => {
+            ViewAction::Rm { module, env } => {
                 let (env_name, scope, _ec) = resolve_env_or_default(env)?;
-                let mut ex = cfg::read_exposure(scope, &env_name)?;
-                if ex.remove(&module) {
-                    cfg::write_exposure(scope, &env_name, &ex)?;
-                    eprintln!("Unexposed '{module}' in '{env_name}'. Run 'mim start' to apply.");
+                let mut views = cfg::read_views(scope, &env_name)?;
+                if views.remove(&module) {
+                    cfg::write_views(scope, &env_name, &views)?;
+                    eprintln!("Removed '{module}' from the views of '{env_name}'. \
+                               Run 'mim start' to apply.");
                 } else {
-                    eprintln!("'{module}' was not exposed in '{env_name}'.");
+                    eprintln!("'{module}' was not in any view of '{env_name}'.");
                 }
                 Ok(())
             }
-            ExposeAction::List { env } => {
+            ViewAction::List { env } => {
                 let (env_name, scope, _ec) = resolve_env_or_default(env)?;
-                let ex = cfg::read_exposure(scope, &env_name)?;
-                print_exposure(&env_name, &ex, json);
+                let views = cfg::read_views(scope, &env_name)?;
+                print_views(&env_name, &views, json);
                 Ok(())
             }
-            ExposeAction::Eval { allow, off, env } => {
+            ViewAction::Eval { allow, off, env } => {
                 let (env_name, scope, _ec) = resolve_env_or_default(env)?;
-                let mut ex = cfg::read_exposure(scope, &env_name)?;
+                let mut views = cfg::read_views(scope, &env_name)?;
                 if off {
-                    ex.eval = None;
+                    views.eval = None;
                     eprintln!("Disabled eval in '{env_name}'.");
                 } else if allow.is_empty() {
-                    ex.eval = Some(EvalExposure { allow: Vec::new() });
+                    views.eval = Some(EvalCapability { allow: Vec::new() });
                     eprintln!(
                         "Enabled eval in '{env_name}' with an EMPTY allow-list \
                          (eval can import nothing; add modules with --allow)."
                     );
                 } else {
-                    ex.eval = Some(EvalExposure { allow: allow.clone() });
+                    views.eval = Some(EvalCapability { allow: allow.clone() });
                     eprintln!("Enabled eval in '{env_name}', allow-list: {}.", allow.join(", "));
                 }
-                cfg::write_exposure(scope, &env_name, &ex)?;
+                cfg::write_views(scope, &env_name, &views)?;
                 Ok(())
             }
         },
@@ -7096,9 +7116,9 @@ fn report_newly_installed(
     }
     let names: Vec<&str> = new.iter().map(|n| n.as_str()).collect();
     eprintln!("Installed: {}", names.join(", "));
-    eprintln!("Expose to serve:");
+    eprintln!("Add to a view to serve:");
     for n in &names {
-        eprintln!("  mim expose add {n} --as mcp,api");
+        eprintln!("  mim view add {n} --as mcp,api");
     }
 }
 
@@ -7908,7 +7928,7 @@ fn resolve_serve_spec(
         ensure_program_installed(ec, scope, name, program)?;
         Ok(ServeSpec { mcp: vec![program.clone()], api: Vec::new(), eval_allow: None })
     } else {
-        let ex = cfg::read_exposure(scope, name)?;
+        let ex = cfg::read_views(scope, name)?;
         if ex.is_empty() {
             // Name what could be exposed. A program is named after its module
             // declaration rather than its source file, so the reader of this
@@ -7919,16 +7939,17 @@ fn resolve_serve_spec(
             } else {
                 installed
                     .iter()
-                    .map(|p| format!("    mim expose add {p} --as mcp,api"))
+                    .map(|p| format!("    mim view add {p} --as mcp,api"))
                     .collect::<Vec<_>>()
                     .join("\n")
             };
             return Err(ManagerError::EnvError(format!(
-                "Nothing is exposed in '{name}'. Expose a module first:\n{candidates}\n  \
+                "'{name}' presents no views, so there is nothing to serve. \
+                 Add a module to one:\n{candidates}\n  \
                  (or 'start --mcp <module>' for a one-off)."
             )));
         }
-        for m in ex.exposed_modules() {
+        for m in ex.viewed_modules() {
             ensure_program_installed(ec, scope, name, &m)?;
         }
         let eval_allow = ex.eval.as_ref().map(|e| e.allow.join(","));
@@ -8864,32 +8885,47 @@ pub(crate) fn build_router_command(
 
 /// Print an environment's exposure set (modules with their protocols, and the
 /// eval capability). Under --json, pure JSON on stdout.
-fn print_exposure(env: &str, ex: &ExposureConfig, json: bool) {
+fn print_views(env: &str, views: &ViewSet, json: bool) {
     if json {
         let v = serde_json::json!({
             "environment": env,
-            "mcp": ex.mcp,
-            "api": ex.api,
-            "eval": ex.eval.as_ref().map(|e| serde_json::json!({ "allow": e.allow })),
+            "mcp": views.mcp,
+            "api": views.api,
+            "eval": views.eval.as_ref().map(|e| serde_json::json!({ "allow": e.allow })),
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return;
     }
-    if ex.is_empty() {
-        println!("Nothing exposed in '{env}'. Add with: mim expose add <module> --as mcp");
+    if views.is_empty() {
+        // Name what could go in one: a program is named after its module
+        // declaration rather than its source file, so the reader may not know
+        // what to type.
+        println!("'{env}' presents no views.");
+        let installed = installed_program_names(&cfg::env_data_dir(
+            cfg::find_env_scope(env).unwrap_or(Scope::Local),
+            env,
+        ));
+        if installed.is_empty() {
+            println!("  Nothing is installed yet: mim install <src>.loc");
+        } else {
+            println!("  Add one with:");
+            for p in installed {
+                println!("    mim view add {p} --as mcp,api");
+            }
+        }
         return;
     }
-    println!("Exposed in '{env}':");
-    for m in ex.exposed_modules() {
-        let protos: Vec<&str> = ex.protocols_of(&m).iter().map(|p| p.as_str()).collect();
+    println!("Views of '{env}':");
+    for m in views.viewed_modules() {
+        let protos: Vec<&str> = views.protocols_of(&m).iter().map(|p| p.as_str()).collect();
         println!("  {m}  [{}]", protos.join(", "));
     }
-    match &ex.eval {
+    match &views.eval {
         Some(e) if e.allow.is_empty() => println!("  eval  [enabled; empty allow-list]"),
         Some(e) => println!("  eval  [enabled; allow: {}]", e.allow.join(", ")),
         None => {}
     }
-    println!("\nRun 'mim start' to serve this set.");
+    println!("\nRun 'mim start' to serve these views.");
 }
 
 /// Print a client `mcpServers` config entry (HTTP transport) as PURE JSON on

@@ -196,9 +196,17 @@ pub fn env_data_dir(scope: Scope, name: &str) -> PathBuf {
 }
 
 /// Path to an environment's exposure config (which modules are served, and how).
-/// Lives beside env.yaml; declarative intent, edited by `expose`, realized by
+/// Lives beside env.yaml; declarative intent, edited by `view`, realized by
 /// `start`. Not mounted into the container.
-pub fn env_expose_path(scope: Scope, name: &str) -> PathBuf {
+pub fn env_views_path(scope: Scope, name: &str) -> PathBuf {
+    env_config_dir(scope, name).join("views.yaml")
+}
+
+/// The name this file had before views were called views. Read when the current
+/// one is absent, so an environment declared under the old name keeps working
+/// and is migrated on the next write rather than silently losing its set --
+/// which would surface as `start` reporting that nothing is served.
+fn env_views_path_legacy(scope: Scope, name: &str) -> PathBuf {
     env_config_dir(scope, name).join("expose.yaml")
 }
 
@@ -455,20 +463,26 @@ pub fn write_env_inputs(scope: Scope, name: &str, inputs: &EnvInputs) -> Result<
     write_config(&env_inputs_path(scope, name), inputs)
 }
 
-/// Read an environment's exposure config. An absent file means nothing is
-/// exposed yet (the default), not an error.
-pub fn read_exposure(scope: Scope, name: &str) -> Result<ExposureConfig> {
-    let path = env_expose_path(scope, name);
+/// Read an environment's views. An absent file means the environment presents
+/// no views yet (the default), not an error.
+pub fn read_views(scope: Scope, name: &str) -> Result<ViewSet> {
+    let path = env_views_path(scope, name);
     if path.is_file() {
-        read_yaml_config(&path)
-    } else {
-        Ok(ExposureConfig::default())
+        return read_yaml_config(&path);
     }
+    let legacy = env_views_path_legacy(scope, name);
+    if legacy.is_file() {
+        return read_yaml_config(&legacy);
+    }
+    Ok(ViewSet::default())
 }
 
-/// Write an environment's exposure config to expose.yaml (atomic, locked).
-pub fn write_exposure(scope: Scope, name: &str, ex: &ExposureConfig) -> Result<()> {
-    write_yaml_config(&env_expose_path(scope, name), ex)
+/// Write an environment's views (atomic, locked), removing the file's former
+/// name so the next read has one answer rather than two that can disagree.
+pub fn write_views(scope: Scope, name: &str, views: &ViewSet) -> Result<()> {
+    write_yaml_config(&env_views_path(scope, name), views)?;
+    let _ = fs::remove_file(env_views_path_legacy(scope, name));
+    Ok(())
 }
 
 // ======================================================================
@@ -639,6 +653,25 @@ mod tests {
             Vec::new(),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn views_declared_under_the_old_file_name_are_still_read() {
+        // Renaming the file must not silently lose a declared set: that would
+        // surface as `start` reporting nothing to serve, with the declaration
+        // sitting on disk under a name nothing reads any more.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("environments").join("dev");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("expose.yaml"), "mcp:\n- dna\n").unwrap();
+
+        let legacy: ViewSet = read_yaml_config(&dir.join("expose.yaml")).unwrap();
+        assert_eq!(legacy.mcp, vec!["dna"]);
+        // And the current name wins when both exist, so a migrated environment
+        // reads its new file rather than a stale copy of the old one.
+        std::fs::write(dir.join("views.yaml"), "mcp:\n- util\n").unwrap();
+        let current: ViewSet = read_yaml_config(&dir.join("views.yaml")).unwrap();
+        assert_eq!(current.mcp, vec!["util"]);
     }
 
     #[test]

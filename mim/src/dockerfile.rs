@@ -178,7 +178,7 @@ pub fn generate_deploy_dockerfile(input: &DeployDockerfileInput) -> String {
     }
 
     if input.cmd.is_empty() {
-        out.push_str("# Nothing was exposed, so this image is a command line:\n");
+        out.push_str("# The environment presents no views, so this image is a command line:\n");
         out.push_str("#   docker run <image> <program> <args>\n");
         out.push_str(&format!("ENTRYPOINT [\"{ACTIVATE_WRAPPER}\"]\n"));
         return out;
@@ -652,7 +652,7 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
     }
 
     #[test]
-    fn an_environment_that_exposed_nothing_yields_a_command_line_image() {
+    fn an_environment_with_no_views_yields_a_command_line_image() {
         // Freezing for distribution as a command line is a real use, and an
         // image with no exposed set must not invent one: a default command that
         // served whatever was installed would publish it by accident.

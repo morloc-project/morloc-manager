@@ -25,7 +25,7 @@ pub const DEPLOY_HTTP_PORT: u16 = 8080;
 /// An environment that exposed nothing still freezes: the image is then a
 /// command line rather than a server, which is a real use and better than
 /// inventing a default command that would publish whatever was installed.
-fn spec_from_exposure(ex: &ExposureConfig) -> Option<crate::ServeSpec> {
+fn spec_from_exposure(ex: &ViewSet) -> Option<crate::ServeSpec> {
     if ex.is_empty() {
         return None;
     }
@@ -97,7 +97,7 @@ pub fn freeze_environment(
         stage_into_context(Path::new(v_data_dir), &context, rel)?;
     }
 
-    let exposure = config::read_exposure(scope, env_name).unwrap_or_default();
+    let exposure = config::read_views(scope, env_name).unwrap_or_default();
     let cmd = deploy_command(&exposure);
     let optional_state: Vec<String> = paths
         .iter()
@@ -166,7 +166,7 @@ pub fn freeze_environment(
 /// caller writes rather than the functions the author exported, and that one
 /// call can rebuild a pool. An operator who wants it open sets
 /// MORLOC_EVAL_ALLOW_NO_AUTH.
-fn deploy_command(exposure: &ExposureConfig) -> Vec<String> {
+fn deploy_command(exposure: &ViewSet) -> Vec<String> {
     match spec_from_exposure(exposure) {
         Some(spec) => crate::build_router_command(
             crate::serve::CONTAINER_MORLOC_STATE,
@@ -215,7 +215,7 @@ fn deploy_labels(
     ver: &Version,
     programs: &[ProgramEntry],
     modules: &[ModuleEntry],
-    exposure: &ExposureConfig,
+    exposure: &ViewSet,
 ) -> Vec<(String, String)> {
     let join = |xs: Vec<String>| xs.join(",");
     let mut labels = vec![
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn a_deployment_image_serves_the_declared_set() {
-        let ex = ExposureConfig {
+        let ex = ViewSet {
             mcp: vec!["dna".to_string()],
             api: vec!["util".to_string()],
             eval: None,
@@ -470,9 +470,9 @@ mod tests {
     }
 
     #[test]
-    fn an_environment_that_exposed_nothing_gets_no_default_command() {
-        assert!(spec_from_exposure(&ExposureConfig::default()).is_none());
-        assert!(deploy_command(&ExposureConfig::default()).is_empty());
+    fn an_environment_with_no_views_gets_no_default_command() {
+        assert!(spec_from_exposure(&ViewSet::default()).is_none());
+        assert!(deploy_command(&ViewSet::default()).is_empty());
     }
 
     #[test]
@@ -490,10 +490,10 @@ mod tests {
             morloc_version: None,
             built_with_morloc: None,
         }];
-        let ex = ExposureConfig {
+        let ex = ViewSet {
             mcp: vec!["dna".to_string()],
             api: Vec::new(),
-            eval: Some(EvalExposure { allow: vec!["dna".to_string()] }),
+            eval: Some(EvalCapability { allow: vec!["dna".to_string()] }),
         };
         let labels = deploy_labels("dev", &Version::new(0, 101, 0), &programs, &modules, &ex);
         let get = |k: &str| {
