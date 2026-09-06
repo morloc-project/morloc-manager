@@ -2713,6 +2713,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             {
                 check_system_write_access()?;
             }
+            // `modify` rebuilds at the environment's CURRENT version, so a rebuild
+            // needs one to exist. Resolve it here, before the first side effect.
+            // The rollback below covers only a failed `rematerialize_env`, so a
+            // check that returned early after the certificates were re-materialized
+            // or the new settings persisted would leave the environment holding
+            // state that was never built -- and every later operation, including
+            // the in-env agent's make-time solve, would start from it.
+            let rebuild_version = will_rebuild
+                .then(|| require_current_version(&ec, &env_name))
+                .transpose()?;
+
             // Cert bundle: preflight + materialize up front so an invalid bundle
             // aborts here -- before set-default / dotfiles run -- honoring the
             // validate-before-side-effect contract. Snapshot the prior cert files
@@ -2836,7 +2847,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    breaks the build (e.g. a typo) is never left stored to re-break
             //    every later operation. (`new` needs no rollback: it persists only
             //    after a successful build.)
-            if will_rebuild {
+            if let Some(keep) = rebuild_version {
                 let prev_ec = ec.clone();
                 let prev_inputs = cfg::read_env_inputs(env_scope, &env_name);
                 // Snapshot the requirements-store artifacts the rebuild's prime step
@@ -2889,7 +2900,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 }
 
                 // Rebuild at the CURRENT morloc version; `modify` never moves it.
-                let keep = require_current_version(&ec, &env_name)?;
                 match rematerialize_env(env_scope, &env_name, &[], Some(keep), verbose) {
                     Ok(()) => {
                         report_rematerialized(ec.backend.is_native(), &env_name);
