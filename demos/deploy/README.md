@@ -87,8 +87,8 @@ you build is baked into a layer, so you can keep changing it.
 ```console
 $ mim install main.loc
 Installed: dna
-Expose to serve:
-  mim expose add dna --as mcp,api
+Add to a view to serve:
+  mim view add dna --as mcp,api
 ```
 
 `mim shell` and `mim run -- ...` reach the same environment for anything else.
@@ -97,13 +97,19 @@ tells you the name to use next.
 
 ## 3. Declare what is reachable
 
+A *view* is what an adapter shows of the environment. The MCP view and the API
+view are independent sets.
+
 ```console
-$ mim expose add dna --as mcp,api
-$ mim expose eval --allow dna
+$ mim view                      # show the views
+$ mim view add dna --as mcp,api
+$ mim view eval --allow dna
 ```
 
-Installing a program does not expose it. This writes the declared set to
-`expose.yaml`; nothing is served until you ask. `expose eval` turns on the
+Installing a program makes it importable; adding it to a view makes it callable
+over the network. The two are independent, so a program can be installed and
+unreachable, which is the default. This writes the declared intent to
+`views.yaml`; nothing is served until you ask. `view eval` turns on the
 sandboxed eval capability, with an allow-list of the modules an expression may
 import.
 
@@ -117,7 +123,8 @@ $ mim logs -f
 $ mim stop
 ```
 
-This is the iteration loop. Reinstall, re-expose, restart. The environment is
+This is the iteration loop. Reinstall, change the views, restart. The
+environment is
 still mounted, so a rebuild is a rebuild and not an image build.
 
 ## 5. Freeze
@@ -128,8 +135,8 @@ $ mim freeze --tag dna-service:v1
 
 This builds a self-contained image: the environment's own image, plus the
 runtime copied in, plus the conda toolchain installed from the environment's
-lock, plus the programs and the module sources behind them, with the exposed
-set compiled into the default command.
+lock, plus the programs and the module sources behind them, with the declared
+views compiled into the default command.
 
 ## 6. Share it
 
@@ -211,12 +218,12 @@ every layer including the base, and `docker load` restores it anywhere.
 
 ## What this should exercise
 
-- The environment is pliable: install, rebuild and re-expose without an image
-  build.
+- The environment is pliable: install, rebuild and change the views without an
+  image build.
 - A frozen image runs with nothing mounted, on a machine that has never seen
   the environment.
-- It serves the declared set and only that. A module you installed but did not
-  expose is not reachable.
+- It serves the declared views and only those. A module you installed but did
+  not add to a view is not reachable.
 - It is a command line and a server from the same declarations.
 - `/eval` compiles a new program out of the installed ones inside the image,
   which is why the compiler, the Rust sources and the conda toolchain stay in
