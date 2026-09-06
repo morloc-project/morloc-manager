@@ -162,9 +162,27 @@ without a token so an orchestrator can probe it.
 
 The service binds every interface inside the container, because a container's
 loopback belongs to the container and a published port never reaches
-`127.0.0.1` in there. It therefore refuses to start without a bearer token.
-Set `MORLOC_MCP_TOKEN`, or override the command with `--allow-no-auth` if you
-mean to serve openly.
+`127.0.0.1` in there. Whether anything can actually reach it is your decision,
+made outside the container: publish to loopback with
+`-p 127.0.0.1:8080:8080`, keep it on an internal network, or put a gateway in
+front. The image cannot see that decision and does not try to second-guess it,
+so it serves without a token and says so once at startup.
+
+Eval is the exception. It runs expressions the caller writes rather than the
+functions you exported, and one call can rebuild a pool, so it asks for a token
+even where the rest of the endpoint does not:
+
+```console
+$ docker run -e MORLOC_MCP_TOKEN=$TOK -p 8080:8080 dna-service:v1
+
+$ docker run -e MORLOC_EVAL_ALLOW_NO_AUTH=1 -p 8080:8080 dna-service:v1
+```
+
+The first serves eval to holders of the token. The second waives the
+requirement, for an operator whose gateway already gates it. Without either,
+eval is locked: it is not advertised in the tool list, discovery reports it as
+not callable, and a direct request is refused with the reason. Everything else
+serves normally.
 
 ## Where mim stops
 
@@ -203,6 +221,8 @@ every layer including the base, and `docker load` restores it anywhere.
 - `/eval` compiles a new program out of the installed ones inside the image,
   which is why the compiler, the Rust sources and the conda toolchain stay in
   it rather than being trimmed for size.
+- Eval is locked until a token or an explicit waiver is given, and a locked
+  eval is not advertised rather than advertised and refusing.
 - A missing piece is named. Freezing an environment that was never provisioned
   fails saying what it lacks, rather than producing an artifact with holes.
 
