@@ -275,9 +275,15 @@ pub fn serve_environment(
     cfg.publish_host = publish_host.map(str::to_string);
     cfg.network = network.map(str::to_string);
     let mh = CONTAINER_MORLOC_HOME;
-    // Mount the host env dir at MORLOC_STATE (mutable), NOT over MORLOC_HOME (the
-    // baked runtime), so the runtime is never shadowed.
-    cfg.bind_mounts = vec![(data_dir.to_string(), CONTAINER_MORLOC_STATE.to_string())];
+    // A served pliable environment needs the same three-way mount the run path
+    // uses. The image carries neither the morloc runtime nor the conda toolchain
+    // -- `morloc init` builds the runtime into `<env>/runtime` and pixi solves the
+    // toolchain into its own volume, both after the image is built -- so serving
+    // with only the state mount leaves the container without `morloc-nexus` on
+    // PATH and without an interpreter for any pool.
+    let (binds, volumes) = crate::base_mounts(data_dir);
+    cfg.bind_mounts = binds;
+    cfg.volumes = volumes;
     // A host-mounted home shadows the env-owned one for served daemons too, so a
     // program reading `~/.config` sees the same home as `mim shell`.
     cfg.bind_mounts.extend(home_mount(mount_home)?);
@@ -990,8 +996,14 @@ fn serve_apptainer_instance(
 
     let exe = engine_executable(ContainerEngine::Apptainer);
     let mut argv: Vec<String> = vec!["instance".to_string(), "start".to_string()];
-    argv.push("--bind".to_string());
-    argv.push(format!("{data_dir}:{CONTAINER_MORLOC_STATE}"));
+    // The same three-way mount the OCI path uses. Apptainer has no volumes, so
+    // the conda prefix comes straight from the host dir under `<env>/pixi`, which
+    // is where it lives on the Linux-only filesystems Apptainer runs on.
+    let (binds, _volumes) = crate::base_mounts(data_dir);
+    for (src, dest) in binds {
+        argv.push("--bind".to_string());
+        argv.push(format!("{src}:{dest}"));
+    }
     argv.push("--env".to_string());
     argv.push(format!("PATH={}", container_path(mh)));
     argv.push("--env".to_string());

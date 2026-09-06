@@ -7067,6 +7067,48 @@ fn base_mounts(v_data_dir: &str) -> (Vec<(String, String)>, Vec<(String, String)
     (binds, volumes)
 }
 
+/// Refuse to launch against an environment whose mounted halves were never
+/// materialized.
+///
+/// A pliable container env is an image plus three host-side pieces: mutable
+/// state, the morloc runtime (MORLOC_HOME), and the conda toolchain (`/env`).
+/// Mounting a source that does not exist shadows the image with an empty
+/// directory, and the process then fails somewhere deep with no hint of the
+/// cause; refusing here names the missing half instead.
+///
+/// The toolchain is checked through its record mirror rather than the project
+/// dir, because the solved prefix is an engine volume: the project dir holds a
+/// manifest from the moment one is rendered, whereas materialize writes the
+/// mirror only once the prefix is installed. An environment provisioned before
+/// the prefix moved off the host has no mirror and is correctly reported here,
+/// since its prefix is no longer where its container will look for one.
+///
+/// `runtime_may_be_empty` covers the two launches that legitimately precede a
+/// runtime: `morloc init` itself, which is what writes it, and a dev env, whose
+/// developer builds it from mounted source.
+fn require_materialized(v_data_dir: &str, runtime_may_be_empty: bool) -> Result<()> {
+    let root = std::path::Path::new(v_data_dir);
+    let pixi_src = root.join("pixi").join(morloc_deps::abi::CONDA_META_MIRROR);
+    let runtime_src = root.join("runtime");
+    let mut required: Vec<(&std::path::Path, &str)> =
+        vec![(pixi_src.as_path(), "conda toolchain (/env)")];
+    if !runtime_may_be_empty {
+        required.push((runtime_src.as_path(), "morloc runtime (MORLOC_HOME)"));
+    }
+    for (src, what) in required {
+        let populated = std::fs::read_dir(src).map(|mut d| d.next().is_some()).unwrap_or(false);
+        if !populated {
+            return Err(ManagerError::EnvError(format!(
+                "environment at '{v_data_dir}' is not materialized: its {what} is missing \
+                 at '{}'. Provision it first with 'mim update --env <env>', or recreate \
+                 the environment without --no-init.",
+                src.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The shell run against a freshly installed prefix, before anything is built
 /// against it.
 ///
@@ -8028,6 +8070,11 @@ pub(crate) fn container_serve(
     let mut extra_flags = cfg::read_flag_config(env.scope, env_name)?.materialize(Phase::Start, engine);
     extra_flags.extend(req.engine_args.iter().cloned());
 
+    // Serving mounts the runtime and the toolchain, so a half-provisioned
+    // environment must be refused here rather than starting a container that
+    // shadows the image with empty directories.
+    require_materialized(&data_dir.to_string_lossy(), false)?;
+
     serve::serve_environment(
         engine, req.verbose, &image, &data_dir.to_string_lossy(), &container_name,
         &[(req.host_port, req.container_port)], plan.publish_host.as_deref(), plan.network.as_deref(),
@@ -8318,52 +8365,7 @@ fn run_with_config(
         }
     }
 
-    // Pliable container: the pixi env (/env) and the morloc runtime shims
-    // (MORLOC_HOME) are host-mounted MUTABLE dirs -- materialized at env setup
-    // into `<env_dir>/pixi` and `<env_dir>/runtime` -- so an in-container
-    // `morloc make` can install package deps in place. Mutable state
-    // (exe/fdb/modules) is the third mount at MORLOC_STATE. All three are
-    // host-owned, hence writable under the keep-id-mapped host UID (no chmod).
-    // A pliable container env must be MATERIALIZED before it can run: `/env` (the
-    // conda toolchain) and MORLOC_HOME (the morloc runtime shims) are mounted
-    // from `<env>/pixi` and `<env>/runtime`, populated by materialize at env setup.
-    // If a mount source is absent (an env created with --no-init, or a materialize
-    // that never completed), mounting it would shadow the image with an empty dir
-    // and the runtime would break with a cryptic error; fail early instead. `/env`
-    // is an INPUT to every process (including a manual `morloc init`), so it is
-    // always required; MORLOC_HOME is the OUTPUT init writes, so it may be empty
-    // during an is_init run.
-    //
-    // The toolchain is checked through its record mirror rather than the project
-    // dir: the solved prefix is an engine volume, so the project dir holds a
-    // manifest from the moment one is rendered, whereas materialize writes the
-    // mirror only once the prefix is installed. An environment provisioned before
-    // the prefix moved off the host has no mirror and is correctly reported here,
-    // since its prefix is no longer where its container will look for one.
-    let pixi_src = std::path::Path::new(v_data_dir)
-        .join("pixi")
-        .join(morloc_deps::abi::CONDA_META_MIRROR);
-    let runtime_src = std::path::Path::new(v_data_dir).join("runtime");
-    let mut required: Vec<(&std::path::Path, &str)> =
-        vec![(pixi_src.as_path(), "conda toolchain (/env)")];
-    // A dev env's runtime (MORLOC_HOME) is BUILT from the mounted source by the
-    // developer (`morloc init`), so it starts empty by design -- only the conda
-    // toolchain is manager-materialized. Non-dev envs bake the runtime at setup,
-    // so a missing one there is a real half-provisioned state.
-    if !is_init && !is_dev {
-        required.push((runtime_src.as_path(), "morloc runtime (MORLOC_HOME)"));
-    }
-    for (src, what) in required {
-        let populated = std::fs::read_dir(src).map(|mut d| d.next().is_some()).unwrap_or(false);
-        if !populated {
-            return Err(ManagerError::EnvError(format!(
-                "environment at '{v_data_dir}' is not materialized: its {what} is missing \
-                 at '{}'. Provision it first with 'mim update --env <env>', or recreate \
-                 the environment without --no-init.",
-                src.display()
-            )));
-        }
-    }
+    require_materialized(v_data_dir, is_init || is_dev)?;
 
     let mh = serve::CONTAINER_MORLOC_HOME;
     let (base_binds, base_volumes) = base_mounts(v_data_dir);
@@ -8887,6 +8889,30 @@ mod tests {
         let apptainer = build_run_args(ContainerEngine::Apptainer, &[], &cfg).join(" ");
         assert!(!apptainer.contains(&vol), "{apptainer}");
         assert!(apptainer.contains("/data/environments/latest/pixi"), "{apptainer}");
+    }
+
+    #[test]
+    fn every_mounted_path_entry_is_actually_mounted() {
+        // `container_path` advertises where the runtime and the conda toolchain
+        // live. Neither is in the image -- `morloc init` writes the runtime after
+        // the image is built, and pixi solves the toolchain into its own volume --
+        // so a launch path that omits either mount leaves a dead PATH entry and a
+        // container with no `morloc-nexus` and no interpreter. Serving did exactly
+        // that.
+        let (binds, volumes) = base_mounts("/data/environments/latest");
+        let path = serve::container_path(serve::CONTAINER_MORLOC_HOME);
+        let provided: Vec<&str> = binds
+            .iter()
+            .chain(volumes.iter())
+            .map(|(_, dest)| dest.as_str())
+            .collect();
+        for root in [serve::CONTAINER_MORLOC_HOME, serve::CONTAINER_PIXI_DIR] {
+            assert!(path.contains(root), "{root} is not on PATH: {path}");
+            assert!(
+                provided.iter().any(|dest| *dest == root),
+                "{root} is on PATH but nothing mounts it: {provided:?}"
+            );
+        }
     }
 
     #[test]
