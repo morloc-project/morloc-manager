@@ -545,8 +545,17 @@ impl EnvContext {
         };
         // Keep the host-readable record mirror in step with the prefix that was
         // just installed, so a host reading this environment does not describe a
-        // world it has moved on from.
-        let _ = crate::abi::refresh_conda_meta_mirror(&prefix, &pixi_dir);
+        // world it has moved on from. A failure here leaves the prefix correct and
+        // only its description behind, which is not worth failing a build over, but
+        // it is worth saying: the stale copy is what the host would then report.
+        if let Err(e) = crate::abi::refresh_conda_meta_mirror(&prefix, &pixi_dir) {
+            eprintln!(
+                "Warning: the environment was installed, but its host-readable record \
+                 copy could not be updated ({e}). Until the next successful install, \
+                 tools reading this environment from outside it describe the previous \
+                 set of packages."
+            );
+        }
         // The world just changed, so a package new to this env may ship paths that
         // a case-folding filesystem cannot keep apart. Checked before the
         // activation is cached, so a refused prefix leaves no usable state.

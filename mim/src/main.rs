@@ -7157,6 +7157,43 @@ fn older_layout_error(v_data_dir: &str, pixi_dir: &std::path::Path) -> Option<Ma
     )))
 }
 
+/// Retire a conda prefix that an older mim solved onto the host.
+///
+/// A container's prefix is an engine volume now, so a tree at the host path is a
+/// previous layout's: nothing runs it, it holds several gigabytes, and a host
+/// reading this environment finds its records before the mirror -- real records
+/// win over a mirror, and a leftover tree still looks real -- and so reports the
+/// toolchain the environment replaced rather than the one it now runs. That is
+/// the pin every later make-time solve is gated on, and it is silent.
+///
+/// The records go first and their loss is fatal to the update: while they are
+/// readable the environment describes itself wrongly, which is worse than
+/// stopping. Reclaiming the rest is only disk, so it is reported and not fatal.
+fn retire_host_prefix(pixi_dir: &std::path::Path) -> Result<()> {
+    let prefix = morloc_deps::abi::conda_prefix(pixi_dir);
+    let meta = prefix.join("conda-meta");
+    if !is_populated(&meta) {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&meta).map_err(|e| {
+        ManagerError::EnvError(format!(
+            "the conda prefix an older mim left at '{}' cannot be removed ({e}). While              it is there this environment reports the toolchain it replaced rather than              the one it now runs, so the update stops here: remove that directory and              run it again.",
+            prefix.display()
+        ))
+    })?;
+    match std::fs::remove_dir_all(&prefix) {
+        Ok(()) => eprintln!(
+            "Removed the conda prefix an older mim left on the host at '{}'.",
+            prefix.display()
+        ),
+        Err(e) => eprintln!(
+            "Warning: the conda prefix an older mim left at '{}' is inert but could not              be reclaimed ({e}). It can be deleted by hand.",
+            prefix.display()
+        ),
+    }
+    Ok(())
+}
+
 /// Refuse to launch against an environment whose mounted halves were never
 /// materialized.
 ///
@@ -7300,6 +7337,14 @@ fn materialize_container_env(
             "environment materialization ({what}) failed:\n{}",
             stderr.trim()
         )));
+    }
+    // The volume holds this environment's prefix now, so anything at the host path
+    // belongs to the layout it was provisioned into before. Conditional on the
+    // mirror the postinstall step writes: with no mirror there would be nothing
+    // left to read the environment through.
+    let pixi_dir = env_dir.join("pixi");
+    if is_populated(&pixi_dir.join(morloc_deps::abi::CONDA_META_MIRROR)) {
+        retire_host_prefix(&pixi_dir)?;
     }
     Ok(())
 }
@@ -9226,6 +9271,37 @@ mod tests {
         let err = require_materialized(&root.to_string_lossy(), false).unwrap_err().to_string();
         assert!(err.contains("not materialized"), "{err}");
         assert!(!err.contains("older mim"), "{err}");
+    }
+
+    #[test]
+    fn retiring_the_host_prefix_leaves_the_mirror_as_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let pixi = dir.path().join("pixi");
+        // A materialized environment whose previous layout is still lying around:
+        // records in the volume's mirror, and an older prefix at the host path.
+        let prefix = morloc_deps::abi::conda_prefix(&pixi);
+        std::fs::create_dir_all(prefix.join("conda-meta")).unwrap();
+        std::fs::write(prefix.join("conda-meta").join("python-3.13.1-h1.json"), "{}").unwrap();
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        let mirror = pixi.join(morloc_deps::abi::CONDA_META_MIRROR);
+        std::fs::create_dir_all(&mirror).unwrap();
+        std::fs::write(mirror.join("python-3.14.0-h2.json"), "{}").unwrap();
+
+        // Records that are really there win, so until the leftover goes it is what
+        // this environment gets described by.
+        assert_eq!(morloc_deps::abi::meta_dir(&pixi), prefix.join("conda-meta"));
+        retire_host_prefix(&pixi).unwrap();
+        assert_eq!(morloc_deps::abi::meta_dir(&pixi), mirror);
+        assert!(!prefix.exists(), "the whole tree goes, not just its records");
+    }
+
+    #[test]
+    fn retiring_is_silent_when_no_prefix_was_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let pixi = dir.path().join("pixi");
+        std::fs::create_dir_all(&pixi).unwrap();
+        // Every materialize after the first one lands here.
+        retire_host_prefix(&pixi).unwrap();
     }
 
     #[test]
