@@ -31,24 +31,79 @@ use crate::envspec::{EnvSpec, LangReq};
 const ABI_PACKAGES: &[(&str, &str)] = &[("python", "py"), ("r-base", "r")];
 
 /// The solved conda prefix under a pixi project dir. Both backends solve into the
-/// `default` environment, and the container bind-mounts its `/env` from this same
-/// host dir, so one derivation serves native and container alike.
+/// `default` environment, so one derivation serves native and container alike.
+/// For an OCI container environment the prefix is an engine volume mounted here,
+/// which means the path exists in the container but is an empty shadow on the
+/// host -- read its records through [`meta_dir`], not through this.
 pub fn conda_prefix(pixi_dir: &Path) -> PathBuf {
     pixi_dir.join(".pixi").join("envs").join("default")
 }
 
-/// Read the installed versions of the ABI-relevant packages from a solved conda
-/// prefix's `conda-meta/`. Each installed package leaves a
-/// `<name>-<version>-<build>.json` record carrying its name and version. Absent
-/// packages (a language the env does not use) are simply not returned; an
-/// unreadable prefix yields an empty map (best-effort, never fatal).
-/// Walk a solved prefix's `conda-meta/`, deserializing each `<pkg>.json` record to
-/// `T` and handing it to `f`. Best-effort: an unreadable prefix or a malformed
-/// record is skipped, never fatal. The one home for the conda-meta directory walk,
-/// shared by the ABI-version and installed-binaries probes so the boilerplate lives
-/// once.
-fn for_each_conda_meta<T: serde::de::DeserializeOwned>(conda_prefix: &Path, mut f: impl FnMut(T)) {
-    let entries = match std::fs::read_dir(conda_prefix.join("conda-meta")) {
+/// Name of the host-readable mirror of a prefix's `conda-meta`, kept beside the
+/// pixi manifest. See [`meta_dir`].
+pub const CONDA_META_MIRROR: &str = ".conda-meta";
+
+/// The directory holding a prefix's `conda-meta` records, as reachable from
+/// here.
+///
+/// The prefix's own records win whenever this process can see them, which is
+/// always for a native environment and for anything running inside a container.
+/// A host looking at an OCI container environment cannot: the prefix is an
+/// engine volume and the path is an empty shadow, so it falls back to the mirror
+/// materialization leaves beside the pixi manifest. Preferring the real records
+/// means a mirror can never shadow the truth, only stand in for it.
+pub fn meta_dir(pixi_dir: &Path) -> PathBuf {
+    let real = conda_prefix(pixi_dir).join("conda-meta");
+    if has_records(&real) {
+        return real;
+    }
+    pixi_dir.join(CONDA_META_MIRROR)
+}
+
+/// Whether a directory holds at least one conda record. Distinguishes a solved
+/// prefix from the empty mount point an engine leaves on the host under one.
+fn has_records(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                e.path().extension().and_then(|x| x.to_str()) == Some("json")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Refresh an existing host-readable mirror of `conda_prefix`'s records, so a
+/// host reading [`meta_dir`] never sees a world the prefix has moved on from.
+///
+/// Creating the mirror belongs to materialization, which is the step that knows
+/// the prefix is not on the host; this only keeps an existing one in step. A
+/// native environment therefore never pays to copy records nothing would read.
+/// The replacement goes through a staging directory, so an interrupted refresh
+/// cannot leave a half-written mirror behind.
+pub fn refresh_conda_meta_mirror(conda_prefix: &Path, pixi_dir: &Path) -> std::io::Result<()> {
+    let dest = pixi_dir.join(CONDA_META_MIRROR);
+    if !dest.is_dir() {
+        return Ok(());
+    }
+    let staging = pixi_dir.join(format!("{CONDA_META_MIRROR}.new"));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+    for entry in std::fs::read_dir(conda_prefix.join("conda-meta"))?.flatten() {
+        if entry.path().extension().and_then(|x| x.to_str()) == Some("json") {
+            std::fs::copy(entry.path(), staging.join(entry.file_name()))?;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::rename(&staging, &dest)
+}
+
+/// Walk a directory of `conda-meta` records (see [`meta_dir`]), deserializing
+/// each `<pkg>.json` to `T` and handing it to `f`. Best-effort: an unreadable
+/// directory or a malformed record is skipped, never fatal. The one home for the
+/// conda-meta directory walk, shared by the ABI-version, installed-binaries and
+/// case-fold probes so the boilerplate lives once.
+pub(crate) fn for_each_conda_meta<T: serde::de::DeserializeOwned>(meta_dir: &Path, mut f: impl FnMut(T)) {
+    let entries = match std::fs::read_dir(meta_dir) {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -63,14 +118,18 @@ fn for_each_conda_meta<T: serde::de::DeserializeOwned>(conda_prefix: &Path, mut 
     }
 }
 
-fn abi_versions(conda_prefix: &Path) -> BTreeMap<String, String> {
+/// The installed versions of the ABI-relevant packages. Each installed package
+/// leaves a `<name>-<version>-<build>.json` record carrying its name and
+/// version. Absent packages (a language the env does not use) are simply not
+/// returned; unreadable records yield an empty map (best-effort, never fatal).
+fn abi_versions(meta_dir: &Path) -> BTreeMap<String, String> {
     #[derive(Deserialize)]
     struct Meta {
         name: String,
         version: String,
     }
     let mut found = BTreeMap::new();
-    for_each_conda_meta(conda_prefix, |m: Meta| {
+    for_each_conda_meta(meta_dir, |m: Meta| {
         if ABI_PACKAGES.iter().any(|(pkg, _)| *pkg == m.name) {
             found.insert(m.name, m.version);
         }
@@ -84,13 +143,12 @@ fn abi_versions(conda_prefix: &Path) -> BTreeMap<String, String> {
 /// `name` field, not the filename). Scans `conda-meta/` ONCE for the whole set -- a
 /// caller probing many extras pays one directory walk, not one per package. Paths
 /// are relative so a caller can join the HOST conda prefix (native `ldd`) or the
-/// in-container prefix (container `ldd`) as appropriate; `conda_prefix`'s
-/// `conda-meta/` is always read host-side (for a container env, `<env>/pixi/...` is
-/// the bind-mount source). An absent package is omitted from the map; a present
-/// library-only extra maps to an empty vec. Unlike morloc's own dlopen-shims (which
-/// report false "not found"s outside their load context), a normal conda CLI tool
-/// resolves cleanly under `ldd`, so this is a sound probe.
-pub fn package_binaries(conda_prefix: &Path, packages: &[String]) -> BTreeMap<String, Vec<String>> {
+/// in-container prefix (container `ldd`) as appropriate; the records themselves
+/// are always read from [`meta_dir`]. An absent package is omitted from the map;
+/// a present library-only extra maps to an empty vec. Unlike morloc's own
+/// dlopen-shims (which report false "not found"s outside their load context), a
+/// normal conda CLI tool resolves cleanly under `ldd`, so this is a sound probe.
+pub fn package_binaries(meta_dir: &Path, packages: &[String]) -> BTreeMap<String, Vec<String>> {
     #[derive(Deserialize)]
     struct Meta {
         name: String,
@@ -99,7 +157,7 @@ pub fn package_binaries(conda_prefix: &Path, packages: &[String]) -> BTreeMap<St
     }
     let wanted: BTreeSet<&str> = packages.iter().map(String::as_str).collect();
     let mut out = BTreeMap::new();
-    for_each_conda_meta(conda_prefix, |meta: Meta| {
+    for_each_conda_meta(meta_dir, |meta: Meta| {
         if wanted.contains(meta.name.as_str()) {
             let bins = meta
                 .files
@@ -151,11 +209,11 @@ fn minor_pin(version: &str) -> Option<String> {
 /// every later solve (`>=3.10,<3.14` AND `>=3.14,<3.15`); skipping it lets the
 /// solve proceed and lets a re-provision clear the spurious lock.
 pub fn abi_lock_spec(
-    conda_prefix: &Path,
+    meta_dir: &Path,
     morloc_version: &str,
     windows: &BTreeMap<String, String>,
 ) -> Option<EnvSpec> {
-    let versions = abi_versions(conda_prefix);
+    let versions = abi_versions(meta_dir);
     let langs: Vec<LangReq> = ABI_PACKAGES
         .iter()
         .filter_map(|(pkg, lang)| {
@@ -199,8 +257,7 @@ mod tests {
     #[test]
     fn package_binaries_reads_bin_files_by_name() {
         let tmp = tempfile::tempdir().unwrap();
-        let prefix = tmp.path();
-        let dir = prefix.join("conda-meta");
+        let dir = tmp.path().join("conda-meta");
         std::fs::create_dir_all(&dir).unwrap();
         // neovim installs a bin/ tool plus a lib and a share file; only bin/ is a
         // loadability target. Matched on the record `name`, not the filename.
@@ -218,7 +275,7 @@ mod tests {
         // One scan resolves the whole set. Prefix-RELATIVE bin paths; only bin/
         // entries (not the lib/share files).
         let got = package_binaries(
-            prefix,
+            &dir,
             &["neovim".into(), "ripgrep".into(), "nvim".into(), "absent".into()],
         );
         assert_eq!(got.get("neovim"), Some(&vec!["bin/nvim".to_string()]));
@@ -227,6 +284,58 @@ mod tests {
         // `neovim`), and `absent` is not installed -- neither appears in the map.
         assert_eq!(got.get("nvim"), None);
         assert_eq!(got.get("absent"), None);
+    }
+
+    #[test]
+    fn the_prefix_records_win_over_a_mirror() {
+        // A mirror stands in for records this process cannot see; it must never
+        // shadow records it can, or a stale copy would outrank the truth.
+        let tmp = tempfile::tempdir().unwrap();
+        let pixi_dir = tmp.path();
+        write_meta(&conda_prefix(pixi_dir).join("conda-meta"), "python", "3.12.5");
+        std::fs::create_dir_all(pixi_dir.join(CONDA_META_MIRROR)).unwrap();
+        write_meta(&pixi_dir.join(CONDA_META_MIRROR), "python", "3.11.0");
+        assert_eq!(meta_dir(pixi_dir), conda_prefix(pixi_dir).join("conda-meta"));
+    }
+
+    #[test]
+    fn an_empty_prefix_mount_point_falls_back_to_the_mirror() {
+        // What a host sees of a container environment: the prefix path exists as
+        // the engine's mount point but holds nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let pixi_dir = tmp.path();
+        std::fs::create_dir_all(conda_prefix(pixi_dir).join("conda-meta")).unwrap();
+        write_meta(&pixi_dir.join(CONDA_META_MIRROR), "python", "3.12.5");
+        assert_eq!(meta_dir(pixi_dir), pixi_dir.join(CONDA_META_MIRROR));
+        assert_eq!(
+            abi_versions(&meta_dir(pixi_dir)).get("python"),
+            Some(&"3.12.5".to_string())
+        );
+    }
+
+    #[test]
+    fn the_mirror_is_refreshed_but_never_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pixi_dir = tmp.path();
+        let prefix = conda_prefix(pixi_dir);
+        write_meta(&prefix.join("conda-meta"), "python", "3.12.5");
+
+        // No mirror yet: a native environment reads the prefix directly and must
+        // not be made to copy records nothing will read.
+        refresh_conda_meta_mirror(&prefix, pixi_dir).unwrap();
+        assert!(!pixi_dir.join(CONDA_META_MIRROR).is_dir());
+
+        // Once materialization has established one, it is brought up to date.
+        std::fs::create_dir_all(pixi_dir.join(CONDA_META_MIRROR)).unwrap();
+        write_meta(&pixi_dir.join(CONDA_META_MIRROR), "python", "3.11.0");
+        refresh_conda_meta_mirror(&prefix, pixi_dir).unwrap();
+        let mirrored: Vec<String> = std::fs::read_dir(pixi_dir.join(CONDA_META_MIRROR))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(mirrored, vec!["python-3.12.5-0.json".to_string()]);
+        assert!(!pixi_dir.join(format!("{CONDA_META_MIRROR}.new")).exists());
     }
 
     #[test]
@@ -246,10 +355,9 @@ mod tests {
         assert!(unresolved_libs("\tlibc.so.6 => /usr/lib/libc.so.6 (0x0)\n").is_empty());
     }
 
-    /// Write a minimal `conda-meta/<name>-<ver>-<build>.json` record.
-    fn write_meta(prefix: &Path, name: &str, version: &str) {
-        let dir = prefix.join("conda-meta");
-        std::fs::create_dir_all(&dir).unwrap();
+    /// Write a minimal `<name>-<ver>-<build>.json` record into a conda-meta dir.
+    fn write_meta(dir: &Path, name: &str, version: &str) {
+        std::fs::create_dir_all(dir).unwrap();
         std::fs::write(
             dir.join(format!("{name}-{version}-0.json")),
             format!(r#"{{"name":"{name}","version":"{version}"}}"#),

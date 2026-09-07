@@ -5,6 +5,7 @@ mod container;
 mod demos;
 mod doctor;
 mod dockerfile;
+mod dotfiles;
 mod envagent;
 mod environment;
 mod error;
@@ -22,7 +23,7 @@ mod types;
 // The dependency-resolution kernel (envspec/pixi/constraint/langsupport) lives in
 // the shared `morloc-deps` crate; re-export it so existing `crate::<mod>` paths
 // resolve unchanged.
-pub(crate) use morloc_deps::{constraint, envspec, envstore, langsupport, layout, pixi};
+pub(crate) use morloc_deps::{casefold, constraint, envspec, envstore, langsupport, layout, pixi};
 
 use std::collections::HashSet;
 use std::fs;
@@ -82,7 +83,7 @@ fn build_help_template() -> String {
 
 {bu}Serving{r}
   {b}install{r}    Build and install a module into an environment
-  {b}expose{r}     Choose which installed modules are served (MCP/API/eval)
+  {b}view{r}       Choose which installed modules are served (MCP/API/eval)
   {b}start{r}      Serve an environment over the network
   {b}eval{r}       Evaluate a morloc expression against a serve container
   {b}status{r}     List running serve containers
@@ -90,8 +91,7 @@ fn build_help_template() -> String {
   {b}logs{r}       Stream logs from a running serve container
 
 {bu}Deployment{r}
-  {b}freeze{r}     Export installed state as a frozen artifact
-  {b}unfreeze{r}   Build a portable serve image from frozen state
+  {b}freeze{r}     Freeze an environment into a deployment image
 
 {bu}Options{r}
 {{options}}"
@@ -422,7 +422,17 @@ Examples:
   mim modify --env myenv --mount-home ~/morloc-homes/myenv
   mim modify --env myenv --conda-packages-file tools.conda
   mim modify --env myenv --system-packages-file tools.apt
-  mim modify --env myenv --lang py@3.13")]
+  mim modify --env myenv --lang py@3.13
+
+Every setting that can be added can also be taken away. `--no-<flag>` clears
+what the corresponding flag set:
+  mim modify --env myenv --no-lang              # unpin every language
+  mim modify --env myenv --no-conda-packages-file   # drop the conda extras
+  mim modify --env myenv --no-cert-bundle       # stop trusting the corporate CA
+  mim modify --env myenv --no-mount-home        # back to the env-owned home
+  mim modify --env myenv --no-dotfiles          # take the copied dotfiles back
+  mim modify --env myenv --no-modules-file extra.txt   # drop one pin file
+  mim modify --env myenv --unset-default        # stop being the default")]
     Modify {
         /// Environment to modify (default: the default environment)
         #[arg(long)]
@@ -431,38 +441,71 @@ Examples:
         /// comma-separated). Triggers a rebuild at the current morloc version.
         #[arg(long)]
         lang: Vec<String>,
+        /// Drop every pinned language, leaving the environment with no baseline
+        /// toolchain (languages are then provisioned on demand at `morloc make`).
+        /// Triggers a rebuild.
+        #[arg(long = "no-lang", conflicts_with = "lang")]
+        no_lang: bool,
         /// Replace the env's apt package list with the contents of this file, one
         /// package per line (`#` comments and blank lines ignored). Container
         /// backend only. Triggers a rebuild. To change packages, edit the file
         /// and re-apply.
         #[arg(long = "system-packages-file")]
         system_packages_file: Option<String>,
+        /// Empty the env's apt package list. Container backend only. Triggers a
+        /// rebuild.
+        #[arg(long = "no-system-packages-file", conflicts_with = "system_packages_file")]
+        no_system_packages_file: bool,
         /// Replace the env's conda package list with the contents of this file,
         /// one match-spec per line (`#` comments and blank lines ignored), e.g.
         /// `jq` or `hyperfine>=1.18`. Any backend. Triggers a rebuild.
         #[arg(long = "conda-packages-file")]
         conda_packages_file: Option<String>,
+        /// Empty the env's conda package list, re-solving the world without the
+        /// extras. Any backend. Triggers a rebuild.
+        #[arg(long = "no-conda-packages-file", conflicts_with = "conda_packages_file")]
+        no_conda_packages_file: bool,
         /// Deposit a morloc-module pin file (`name hash` per line) into the
         /// environment. The compiler resolves imports against it on demand; no
         /// rebuild, no install. Repeatable.
         #[arg(long = "modules-file")]
         modules_file: Vec<String>,
+        /// Remove a deposited module-pin file by name (as shown by `mim info`),
+        /// e.g. `stdlib.txt`. Repeatable. Modules pinned only by that file fall
+        /// back to resolving at latest. No rebuild.
+        #[arg(long = "no-modules-file", value_name = "NAME")]
+        no_modules_file: Vec<String>,
         /// Directory of dotfiles to copy into the environment's home
-        /// (.bashrc, .vimrc, .config/...). Overwrites like `cp -rf`;
-        /// docker/podman only. No rebuild.
+        /// (.bashrc, .vimrc, .config/...). Overwrites like `cp -rf`, and
+        /// replaces any previous set; docker/podman only. No rebuild.
         #[arg(long)]
         dotfiles: Option<String>,
+        /// Take back the copied dotfiles: remove the files still identical to
+        /// what was copied in, and keep (reporting) any edited since.
+        /// Docker/podman only. No rebuild.
+        #[arg(long = "no-dotfiles", conflicts_with = "dotfiles")]
+        no_dotfiles: bool,
         /// Host directory to bind-mount as the environment's $HOME (created if
-        /// absent), or `none` to go back to the env-owned home. The host
-        /// directory itself is never copied, moved or deleted. Docker/podman
+        /// absent). The host directory itself is never copied, moved or deleted.
+        /// Use --no-mount-home to go back to the env-owned home. Docker/podman
         /// only. No rebuild.
         #[arg(long = "mount-home", conflicts_with = "dotfiles")]
         mount_home: Option<String>,
+        /// Stop bind-mounting a host home; the environment goes back to its own
+        /// home. The host directory is left exactly as it is. Docker/podman only.
+        /// No rebuild.
+        #[arg(long = "no-mount-home", conflicts_with = "mount_home")]
+        no_mount_home: bool,
         /// Replace the corporate CA bundle trusted by this environment (host
         /// path to a PEM/DER file). Re-validates the certificates and triggers a
         /// rebuild so the new CA is applied. Use after the corporate CA rotates.
         #[arg(long = "cert-bundle")]
         cert_bundle: Option<String>,
+        /// Stop trusting a corporate CA: drop the environment's copies of the
+        /// bundle and rebuild without them. The source bundle on your system is
+        /// never touched. Triggers a rebuild.
+        #[arg(long = "no-cert-bundle", conflicts_with = "cert_bundle")]
+        no_cert_bundle: bool,
         /// Switch the container base image (`heavy` = ubuntu:24.04, `light` =
         /// debian:bookworm-slim) and rebuild. Container backends only.
         #[arg(long, value_enum)]
@@ -472,8 +515,13 @@ Examples:
         /// system-scope env; add --system to set the machine-wide default. No rebuild.
         #[arg(long = "set-default")]
         set_default: bool,
-        /// With --set-default, write the machine-wide (system) default instead of
-        /// your personal one (requires root).
+        /// Stop this environment being the default, leaving no personal default
+        /// set (add --system to clear the machine-wide one). Commands then need an
+        /// explicit --env. No rebuild.
+        #[arg(long = "unset-default", conflicts_with = "set_default")]
+        unset_default: bool,
+        /// With --set-default / --unset-default, write the machine-wide (system)
+        /// default instead of your personal one (requires root).
         #[arg(long)]
         system: bool,
     },
@@ -492,7 +540,7 @@ Examples:
         env: Option<String>,
         /// Ad-hoc: serve just this one installed module over MCP, ignoring the
         /// exposed set. Default (no --mcp) serves the environment's exposed
-        /// set (managed with `mim expose`).
+        /// views (managed with `mim view`).
         #[arg(long, value_name = "PROGRAM")]
         mcp: Option<String>,
         /// Bearer token required on HTTP requests. Falls back to the
@@ -517,6 +565,12 @@ Examples:
         /// engine's network. Only use on a host you fully trust.
         #[arg(long = "unsafe")]
         unsafe_serve: bool,
+        /// Serve eval without a bearer token even off-box. Eval asks for one
+        /// because it runs expressions the caller writes rather than the
+        /// functions you exported, and a single call can rebuild a pool. It is
+        /// already waived for a host-confined endpoint.
+        #[arg(long)]
+        eval_allow_no_auth: bool,
         /// Port mapping HOST:CONTAINER (default: 8080:8080, or 9000:9000 with --mcp)
         #[arg(short, long, value_parser = parse_port)]
         port: Vec<(u16, u16)>,
@@ -560,49 +614,30 @@ Examples:
         #[arg(short, long)]
         follow: bool,
     },
-    /// Export installed state as a frozen artifact
+    /// Freeze the environment into a self-contained deployment image
     #[command(display_order = 23)]
     #[command(after_help = "\
 Examples:
   mim freeze
-  mim freeze --env myenv
-  mim freeze -o ./my-freeze
+  mim freeze --tag dna-service:v1
+  mim freeze --tag dna-service:v1 --save ./dna-service-v1.tar
+
+The image serves the exposed set and runs the same programs from a command
+line. It is left in the engine's image store; move it with a registry push,
+with --save, or by rebuilding it.
 
 Requires at least one program compiled with 'morloc make --install'.")]
     Freeze {
         /// Environment to freeze (default: the default environment)
         #[arg(long)]
         env: Option<String>,
-        /// Output directory (default: ./morloc-freeze)
+        /// Image tag to build (default: morloc-<env>:<morloc version>)
         #[arg(short, long)]
-        output: Option<String>,
-        /// Overwrite existing output directory
+        tag: Option<String>,
+        /// Also write the image to a tarball, for a machine with no registry
+        /// between it and this one. Load it there with `docker load -i <path>`.
         #[arg(long)]
-        force: bool,
-    },
-    /// Build a serve image from frozen state
-    #[command(display_order = 24)]
-    #[command(after_help = "\
-Examples:
-  mim unfreeze --from ./morloc-freeze/state.tar.gz -t myservice:v1
-  mim unfreeze --from ./state.tar.gz -t svc:v1 --engine docker")]
-    Unfreeze {
-        /// Path to state.tar.gz from freeze
-        #[arg(long)]
-        from: String,
-        /// Image tag
-        #[arg(short, long)]
-        tag: String,
-        /// Base image override
-        #[arg(long)]
-        base: Option<String>,
-        /// Container engine override (default: configured engine).
-        /// Images frozen with engine-specific flags may not work with a different engine.
-        #[arg(long, value_enum)]
-        engine: Option<EngineArg>,
-        /// Rebuild image even if it already exists locally
-        #[arg(long)]
-        rebuild: bool,
+        save: Option<String>,
     },
     /// Evaluate a morloc expression against a running serve container
     #[command(display_order = 25)]
@@ -615,13 +650,17 @@ Examples:
         /// Expression to evaluate
         #[arg(allow_hyphen_values = true)]
         expr: String,
-        /// Environment whose serve container to evaluate against
+        /// Environment whose serve to evaluate against
         /// (default: the default environment)
         #[arg(long)]
         env: Option<String>,
-        /// Port of the serve container (default: 8080)
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
+        /// Port of the serve (default: the port the running serve reported)
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Bearer token, when the serve requires one
+        /// (default: $MORLOC_MCP_TOKEN)
+        #[arg(long)]
+        auth_token: Option<String>,
     },
     /// Build and install a module into an environment
     #[command(display_order = 4)]
@@ -678,14 +717,22 @@ Demos are extracted into examples-<tag>-<version>/ in the current directory.")]
     #[command(display_order = 23)]
     #[command(after_help = "\
 Examples:
-  mim expose add dna --as mcp
-  mim expose add util --as mcp,api
-  mim expose eval --allow dna,stats
-  mim expose list
-  mim expose rm dna")]
-    Expose {
+  mim view                          # show this environment's views
+  mim view add dna --as mcp
+  mim view add util --as mcp,api
+  mim view eval --allow dna,stats
+  mim view rm dna
+
+A view is what an adapter shows of an environment: the MCP view and the API
+view are independent sets. Installing a module makes it importable; adding it
+to a view makes it callable over the network. `mim start` serves the views.")]
+    View {
         #[command(subcommand)]
-        action: ExposeAction,
+        action: Option<ViewAction>,
+        /// Environment to show (default: the default environment). Only used
+        /// when no subcommand is given.
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Report environment paths for build tooling (no building is done)
     #[command(display_order = 9)]
@@ -754,19 +801,19 @@ enum EnvAction {
 }
 
 #[derive(Subcommand)]
-enum ExposeAction {
-    /// Add a module to the exposure set over one or more protocols
+enum ViewAction {
+    /// Add a module to one or more views
     Add {
         /// Installed module name
         module: String,
-        /// Protocols to expose over (comma-separated: mcp, api)
+        /// Adapters to appear in (comma-separated: mcp, api)
         #[arg(long = "as", value_enum, value_delimiter = ',', required = true)]
         protocols: Vec<Protocol>,
         /// Environment (default: the default environment)
         #[arg(long)]
         env: Option<String>,
     },
-    /// Remove a module from all exposure sets
+    /// Remove a module from every view
     Rm {
         /// Module name
         module: String,
@@ -774,7 +821,7 @@ enum ExposeAction {
         #[arg(long)]
         env: Option<String>,
     },
-    /// Show what is exposed
+    /// Show this environment's views
     List {
         /// Environment (default: the default environment)
         #[arg(long)]
@@ -782,8 +829,10 @@ enum ExposeAction {
     },
     /// Enable (or update) the eval capability with a sandbox allow-list
     Eval {
-        /// Modules eval may import (comma-separated). Independent of the exposed
-        /// sets. Omit for an empty allow-list; use --off to disable eval.
+        /// Modules eval may import (comma-separated). Independent of the views:
+        /// eval composes generic code a fixed set of tools cannot express, and
+        /// may need a module that is not itself callable. Omit for an empty
+        /// allow-list; use --off to disable eval.
         #[arg(long, value_delimiter = ',')]
         allow: Vec<String>,
         /// Disable the eval capability
@@ -1920,6 +1969,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let languages = info_languages(&dep_ctx);
                 let pinned_langs = dep_ctx.pinned_languages().unwrap_or_default();
                 let installed = dep_ctx.installed_program_names().unwrap_or_default();
+                let module_pins = deposited_snapshot_names(&data_dir);
+                // The recorded dotfiles copy, if any. Reported so `--no-dotfiles`
+                // names state the user can see first.
+                let dotfiles_manifest = dotfiles::read_manifest(&data_dir);
                 // The actual solved world from pixi.lock (host-side for every
                 // backend). Empty if the env has not been solved yet.
                 let platform = morloc_deps::platform::conda_platform();
@@ -1968,6 +2021,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         system_packages: Vec<String>,
                         #[serde(skip_serializing_if = "Vec::is_empty")]
                         conda_packages: Vec<String>,
+                        /// Deposited module-pin files, by name. These are the
+                        /// names `modify --no-modules-file` accepts.
+                        #[serde(skip_serializing_if = "Vec::is_empty")]
+                        module_pins: Vec<String>,
                         packages: Vec<pixi::LockedPackage>,
                     }
                     // Container-only image/recipe detail (includes the engine flags,
@@ -2002,6 +2059,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     struct LocalRuntimeInfo {
                         source: String,
                     }
+                    /// The corporate CA bundle this env trusts, if any: the host
+                    /// SOURCE path (mim reads it and never owns it) plus the
+                    /// fingerprints materialized from it.
+                    #[derive(serde::Serialize)]
+                    struct CertInfo {
+                        source: String,
+                        fingerprints: Vec<String>,
+                    }
+                    /// The dotfiles copied into this env's home: where they came
+                    /// from and how many files the copy still accounts for.
+                    #[derive(serde::Serialize)]
+                    struct DotfilesInfo {
+                        source: String,
+                        files: usize,
+                    }
                     #[derive(serde::Serialize)]
                     struct InfoDetail {
                         name: String,
@@ -2018,6 +2090,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         folders: Folders,
                         environment: std::collections::BTreeMap<String, String>,
                         dependencies: Deps,
+                        #[serde(skip_serializing_if = "Option::is_none")]
+                        cert_bundle: Option<CertInfo>,
+                        #[serde(skip_serializing_if = "Option::is_none")]
+                        dotfiles: Option<DotfilesInfo>,
                         #[serde(skip_serializing_if = "Option::is_none")]
                         container: Option<Container>,
                     }
@@ -2075,8 +2151,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                             installed,
                             system_packages: ec.system_packages.clone(),
                             conda_packages: ec.conda_packages.clone(),
+                            module_pins: module_pins.clone(),
                             packages: locked,
                         },
+                        cert_bundle: ec.cert_bundle.as_ref().map(|src| CertInfo {
+                            source: src.clone(),
+                            fingerprints: ec.cert_fingerprints.clone(),
+                        }),
+                        dotfiles: dotfiles_manifest.as_ref().map(|m| DotfilesInfo {
+                            source: m.source.clone(),
+                            files: m.files.len(),
+                        }),
                         container,
                     };
                     println!("{}", serde_json::to_string_pretty(&output).unwrap());
@@ -2105,6 +2190,22 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         "Status:    {}",
                         if materialized { "materialized" } else { "not materialized (run `update`)" }
                     );
+                    // The CA bundle is shown as its host SOURCE path: mim reads
+                    // that file and materializes copies under the data dir, but
+                    // never owns or modifies the source.
+                    if let Some(ref src) = ec.cert_bundle {
+                        println!(
+                            "CA bundle: {src}  ({} certificate(s), source not owned by mim)",
+                            ec.cert_fingerprints.len()
+                        );
+                    }
+                    if let Some(ref m) = dotfiles_manifest {
+                        println!(
+                            "Dotfiles:  {}  ({} file(s); `modify --no-dotfiles` takes them back)",
+                            m.source,
+                            m.files.len()
+                        );
+                    }
 
                     println!();
                     println!("Folders (host):");
@@ -2168,6 +2269,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     }
                     if !ec.conda_packages.is_empty() {
                         println!("  Conda:      {}", ec.conda_packages.join(" "));
+                    }
+                    // Deposited module-pin files, by the name `modify
+                    // --no-modules-file` takes.
+                    if !module_pins.is_empty() {
+                        println!("  Pin files:  {}", module_pins.join(", "));
                     }
 
                     // Container image + recipe detail (docker/podman/apptainer only).
@@ -2386,49 +2492,77 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         Cmd::Modify {
             env,
             lang,
+            no_lang,
             system_packages_file,
+            no_system_packages_file,
             conda_packages_file,
+            no_conda_packages_file,
             modules_file,
+            no_modules_file,
             dotfiles,
+            no_dotfiles,
             mount_home,
+            no_mount_home,
             cert_bundle,
+            no_cert_bundle,
             base,
             set_default,
+            unset_default,
             system,
         } => {
             // ---- Argument validation (no filesystem) ----
-            if system && !set_default {
+            if system && !(set_default || unset_default) {
                 return Err(ManagerError::EnvError(
-                    "--system applies only to --set-default (the machine-wide default); \
-                     an environment's scope is fixed when it is created".to_string(),
+                    "--system applies only to --set-default / --unset-default (the \
+                     machine-wide default); an environment's scope is fixed when it is \
+                     created".to_string(),
                 ));
             }
             // Read the package files up front so a bad path aborts before any side
-            // effect. `None` = flag not passed = leave that list unchanged; `Some`
-            // replaces the stored list for that source.
-            let system_from_file =
-                system_packages_file.as_deref().map(read_package_file).transpose()?;
-            let conda_from_file =
-                conda_packages_file.as_deref().map(read_package_file).transpose()?;
+            // effect. `None` = neither flag passed = leave that list unchanged;
+            // `Some` replaces the stored list for that source, and the `--no-` form
+            // replaces it with the empty list.
+            let system_from_file = match (&system_packages_file, no_system_packages_file) {
+                (Some(path), _) => Some(read_package_file(path)?),
+                (None, true) => Some(Vec::new()),
+                (None, false) => None,
+            };
+            let conda_from_file = match (&conda_packages_file, no_conda_packages_file) {
+                (Some(path), _) => Some(read_package_file(path)?),
+                (None, true) => Some(Vec::new()),
+                (None, false) => None,
+            };
             // Module-pin snapshots are deposited (not solved / not a rebuild);
             // read them up front so a bad path aborts before any side effect.
             let module_snapshots = read_snapshot_files(&modules_file)?;
+            // Removals name a deposited file, not a host path; reject a path-shaped
+            // argument here rather than letting it escape the snapshots directory.
+            validate_snapshot_removals(&no_modules_file)?;
             // apt is container-only; conda works on every backend, so the native
             // rejection below keys on apt alone.
             let touches_apt = system_from_file.is_some();
             let touches_packages = touches_apt || conda_from_file.is_some();
-            let will_rebuild =
-                !lang.is_empty() || touches_packages || cert_bundle.is_some() || base.is_some();
+            let will_rebuild = !lang.is_empty()
+                || no_lang
+                || touches_packages
+                || cert_bundle.is_some()
+                || no_cert_bundle
+                || base.is_some();
             if !set_default
+                && !unset_default
                 && !will_rebuild
                 && dotfiles.is_none()
+                && !no_dotfiles
                 && mount_home.is_none()
+                && !no_mount_home
                 && module_snapshots.is_empty()
+                && no_modules_file.is_empty()
             {
                 return Err(ManagerError::EnvError(
-                    "nothing to modify: pass --set-default, --dotfiles, --mount-home, \
-                     --lang, --cert-bundle, --base, --system-packages-file, \
-                     --conda-packages-file, or --modules-file".to_string(),
+                    "nothing to modify: pass --set-default, --unset-default, --dotfiles, \
+                     --mount-home, --lang, --cert-bundle, --base, --system-packages-file, \
+                     --conda-packages-file, or --modules-file (each of which has a \
+                     --no-<flag> form that clears it)".to_string(),
                 ));
             }
 
@@ -2439,31 +2573,45 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // Only apt packages are container-only; conda packages land in the
             // pixi solve, which the native backend has too.
             if touches_apt && ec.backend.is_native() {
-                return Err(ManagerError::EnvError(
-                    "--system-packages-file applies only to container backends; the \
-                     native backend has no image to bake packages into. Use \
-                     --conda-packages-file for utilities on conda-forge."
-                        .to_string(),
-                ));
+                // Rejected in both directions: a native env's apt list is always
+                // empty, so clearing it would buy a guaranteed no-op at the price
+                // of a full rebuild.
+                let flag = if no_system_packages_file {
+                    "--no-system-packages-file"
+                } else {
+                    "--system-packages-file"
+                };
+                return Err(ManagerError::EnvError(format!(
+                    "{flag} applies only to container backends; the native backend has \
+                     no image to bake packages into. Use --conda-packages-file for \
+                     utilities on conda-forge."
+                )));
             }
             if base.is_some() && ec.backend.is_native() {
                 return Err(base_not_supported());
             }
-            if dotfiles.is_some() && !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
+            if (dotfiles.is_some() || no_dotfiles)
+                && !ec.backend.container_engine().is_some_and(|e| e.is_oci())
+            {
                 // Same rule as `new`: dotfiles land in a docker/podman env home;
                 // native runs against your real home and apptainer mounts host $HOME.
+                // Removal is gated identically -- there is no such home to take
+                // files back out of.
                 return Err(dotfiles_not_supported());
             }
-            // `none` clears the mount and returns the env to its own home; any
-            // other value is resolved (and created) before any side effect runs.
+            // `--no-mount-home` clears the mount and returns the env to its own
+            // home; a value is a path, resolved (and created) before any side
+            // effect runs. Every value is taken as a path -- there is no word
+            // that means "no mount", since any such word would be a directory
+            // name someone could legitimately choose.
             let mount_home_change: Option<Option<String>> = match &mount_home {
-                None => None,
-                Some(raw) if raw.trim().eq_ignore_ascii_case("none") || raw.trim().is_empty() => {
+                None if no_mount_home => {
                     if !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
                         return Err(mount_home_not_supported());
                     }
                     Some(None)
                 }
+                None => None,
                 Some(raw) => Some(Some(resolve_mount_home(
                     raw,
                     ec.backend.container_engine(),
@@ -2479,7 +2627,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 return Err(ManagerError::EnvError(format!(
                     "environment '{env_name}' mounts a host home ({}); --dotfiles would \
                      overwrite files in it. Edit that directory directly, or clear the \
-                     mount with --mount-home none.",
+                     mount with --no-mount-home.",
                     ec.mount_home.as_deref().unwrap_or_default()
                 )));
             }
@@ -2489,28 +2637,109 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                      can be the machine-wide default. Omit --system to set your personal default."
                 )));
             }
+            // A removal that removes nothing is a misunderstanding worth naming:
+            // left alone it reports success at undoing something that was never
+            // set.
+            let nothing_to_remove = |what: &str, fix: &str| {
+                Err(ManagerError::EnvError(format!(
+                    "environment '{env_name}' has no {what}, so there is nothing to \
+                     remove. {fix}"
+                )))
+            };
+            if no_lang && cfg::read_env_inputs(env_scope, &env_name).lang_pins.is_empty() {
+                return nothing_to_remove(
+                    "pinned languages",
+                    "Its languages are already provisioned on demand at `morloc make`.",
+                );
+            }
+            if no_system_packages_file && ec.system_packages.is_empty() {
+                return nothing_to_remove("apt packages", "Its apt package list is already empty.");
+            }
+            if no_conda_packages_file && ec.conda_packages.is_empty() {
+                return nothing_to_remove(
+                    "conda packages",
+                    "Its conda package list is already empty.",
+                );
+            }
+            if no_cert_bundle && ec.cert_bundle.is_none() {
+                return nothing_to_remove(
+                    "corporate CA bundle configured",
+                    "It already trusts only the public roots.",
+                );
+            }
+            if no_mount_home && ec.mount_home.is_none() {
+                return nothing_to_remove(
+                    "host home mounted",
+                    "It already uses its own home.",
+                );
+            }
+            // Clearing a default only ever clears THIS environment's: refuse when
+            // the recorded default names someone else, rather than silently
+            // dropping a default the user did not mean to touch.
+            if unset_default {
+                let write_scope = if system { Scope::System } else { Scope::Local };
+                let recorded = cfg::read_config::<Config>(&cfg::config_path(write_scope))
+                    .ok()
+                    .and_then(|c| c.default_env);
+                match recorded.as_deref() {
+                    Some(n) if n == env_name => {}
+                    Some(other) => {
+                        let which = if system { "system" } else { "personal" };
+                        return Err(ManagerError::EnvError(format!(
+                            "environment '{env_name}' is not your {which} default \
+                             ('{other}' is); --unset-default clears only this \
+                             environment's default status."
+                        )));
+                    }
+                    None => {
+                        let which = if system { "system" } else { "personal" };
+                        return Err(ManagerError::EnvError(format!(
+                            "no {which} default environment is set, so there is nothing \
+                             for --unset-default to clear."
+                        )));
+                    }
+                }
+            }
             // Any write into a system-scope env's own data/config (dotfiles copy,
-            // package/lang edits + rebuild) needs root. A personal (local)
-            // set-default does not, and is handled in its own block below.
+            // package/lang edits + rebuild, pin-file removal) needs root. A
+            // personal (local) set-default does not, and is handled in its own
+            // block below.
             if env_scope == Scope::System
-                && (will_rebuild || dotfiles.is_some() || mount_home_change.is_some())
+                && (will_rebuild
+                    || dotfiles.is_some()
+                    || no_dotfiles
+                    || mount_home_change.is_some()
+                    || !no_modules_file.is_empty())
             {
                 check_system_write_access()?;
             }
+            // `modify` rebuilds at the environment's CURRENT version, so a rebuild
+            // needs one to exist. Resolve it here, before the first side effect.
+            // The rollback below covers only a failed `rematerialize_env`, so a
+            // check that returned early after the certificates were re-materialized
+            // or the new settings persisted would leave the environment holding
+            // state that was never built -- and every later operation, including
+            // the in-env agent's make-time solve, would start from it.
+            let rebuild_version = will_rebuild
+                .then(|| require_current_version(&ec, &env_name))
+                .transpose()?;
+
             // Cert bundle: preflight + materialize up front so an invalid bundle
             // aborts here -- before set-default / dotfiles run -- honoring the
             // validate-before-side-effect contract. Snapshot the prior cert files
-            // first so a later rebuild failure can restore them exactly.
-            let cert_snapshot =
-                cert_bundle.as_ref().map(|_| cert::snapshot_certs(env_scope, &env_name));
+            // first so a later rebuild failure can restore them exactly. The
+            // snapshot restores absence as well as content, so it covers the
+            // removal path too.
+            let cert_snapshot = (cert_bundle.is_some() || no_cert_bundle)
+                .then(|| cert::snapshot_certs(env_scope, &env_name));
             let cert_prepared = match &cert_bundle {
                 Some(src) => cert::prepare_for_env(env_scope, &env_name, Some(src))?,
                 None => None,
             };
 
             // ---- Side effects (all inputs validated) ----
-            // 1. set-default (pure metadata, no rebuild): personal (local) by
-            //    default, machine-wide with --system (root).
+            // 1. set-default / unset-default (pure metadata, no rebuild): personal
+            //    (local) by default, machine-wide with --system (root).
             if set_default {
                 let write_scope = if system { Scope::System } else { Scope::Local };
                 if system {
@@ -2523,12 +2752,49 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     eprintln!("Set '{env_name}' as your default environment.");
                 }
             }
+            if unset_default {
+                let write_scope = if system { Scope::System } else { Scope::Local };
+                if system {
+                    check_system_write_access()?;
+                }
+                environment::clear_default_environment(write_scope)?;
+                if system {
+                    eprintln!("'{env_name}' is no longer the system default environment.");
+                } else {
+                    eprintln!("'{env_name}' is no longer your default environment.");
+                }
+                // A personal default shadows the system one, so clearing it hands
+                // the answer back to the system config rather than leaving none.
+                // Say which, so "unset" is never mistaken for "no default now".
+                match environment::effective_default_env_name() {
+                    Some(fallback) => eprintln!(
+                        "Commands with no --env now use '{fallback}' (the system default)."
+                    ),
+                    None => eprintln!("Commands now need an explicit --env."),
+                }
+            }
 
-            // 2. dotfiles: copy into the mounted home; no rebuild.
+            // 2. dotfiles: copy into (or retract from) the env-owned home; no
+            //    rebuild. Removal takes back only files still byte-identical to
+            //    what was copied, so anything edited in the env stays the user's.
             if let Some(src) = &dotfiles {
                 let data_dir = cfg::env_data_dir(env_scope, &env_name);
                 apply_dotfiles(ec.backend.container_engine(), &data_dir, src)?;
-                eprintln!("Copied dotfiles into '{env_name}'.");
+            }
+            if no_dotfiles {
+                let data_dir = cfg::env_data_dir(env_scope, &env_name);
+                let report = dotfiles::forget(&data_dir)?;
+                eprintln!(
+                    "Removed {} dotfile(s) copied from {} out of '{env_name}'.",
+                    report.removed, report.source
+                );
+                if !report.kept.is_empty() {
+                    eprintln!(
+                        "Kept {} file(s) edited since they were copied: {}",
+                        report.kept.len(),
+                        report.kept.join(", ")
+                    );
+                }
             }
 
             // 2a. mounted home: pure metadata (the mount happens at run time), so
@@ -2547,6 +2813,24 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
 
             // 2b. module-pin snapshots: deposit for on-demand resolution; no
             //     rebuild, no install (the compiler pulls modules at build time).
+            //     Removals run FIRST so re-depositing a file under a name being
+            //     removed in the same command is an update, not a delete.
+            if !no_modules_file.is_empty() {
+                let data_dir = cfg::env_data_dir(env_scope, &env_name);
+                let unpinned = remove_snapshot_files(&data_dir, &no_modules_file)?;
+                eprintln!(
+                    "Removed {} module snapshot file(s) from '{env_name}'.",
+                    no_modules_file.len()
+                );
+                if !unpinned.is_empty() {
+                    eprintln!(
+                        "Warning: {} module(s) are no longer pinned and will resolve at \
+                         latest: {}",
+                        unpinned.len(),
+                        unpinned.join(", ")
+                    );
+                }
+            }
             if !module_snapshots.is_empty() {
                 let data_dir = cfg::env_data_dir(env_scope, &env_name);
                 deposit_snapshot_files(&data_dir, &module_snapshots)?;
@@ -2563,7 +2847,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    breaks the build (e.g. a typo) is never left stored to re-break
             //    every later operation. (`new` needs no rollback: it persists only
             //    after a successful build.)
-            if will_rebuild {
+            if let Some(keep) = rebuild_version {
                 let prev_ec = ec.clone();
                 let prev_inputs = cfg::read_env_inputs(env_scope, &env_name);
                 // Snapshot the requirements-store artifacts the rebuild's prime step
@@ -2582,9 +2866,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 }
                 // Apply the CA bundle materialized during validation. Its new
                 // certs change the solve/image cache key, so the rebuild re-runs.
-                let cert_changed = cert_prepared.is_some();
+                let cert_changed = cert_prepared.is_some() || no_cert_bundle;
                 if let Some(p) = cert_prepared {
                     p.apply_to(&mut ec);
+                }
+                // Drop a CA bundle: forget the source and delete only the two
+                // files mim itself materialized. The recorded source path is a
+                // host file (often under /etc) that mim never owned, so it is
+                // never followed or removed. Nothing is un-installed in place --
+                // the rebuild below simply does not put the certs back: the
+                // container image is rendered without the COPY / ENV, and the
+                // native activation is recaptured with no cert vars.
+                if no_cert_bundle {
+                    cert::forget_bundle(env_scope, &env_name)?;
+                    ec.cert_bundle = None;
+                    ec.cert_fingerprints = Vec::new();
                 }
                 // Switch the container base image; rematerialize_env reads it back.
                 if let Some(b) = base {
@@ -2595,13 +2891,15 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if touches_packages || cert_changed || base.is_some() {
                     cfg::write_env_config(env_scope, &env_name, &ec)?;
                 }
-                if !lang.is_empty() {
+                // `--no-lang` writes the empty pin set: a legal state in which the
+                // env keeps no baseline toolchain and languages are provisioned on
+                // demand at `morloc make`.
+                if !lang.is_empty() || no_lang {
                     let pins = parse_lang_pins(&lang);
                     cfg::write_env_inputs(env_scope, &env_name, &EnvInputs { lang_pins: pins })?;
                 }
 
                 // Rebuild at the CURRENT morloc version; `modify` never moves it.
-                let keep = require_current_version(&ec, &env_name)?;
                 match rematerialize_env(env_scope, &env_name, &[], Some(keep), verbose) {
                     Ok(()) => {
                         report_rematerialized(ec.backend.is_native(), &env_name);
@@ -2630,17 +2928,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             Ok(())
         }
         // ---- freeze ----
-        Cmd::Freeze { env, output, force } => {
-            let output_dir = output.as_deref().unwrap_or("./morloc-freeze");
-            // Protect against silently overwriting a previous freeze
-            let existing_tar = std::path::Path::new(output_dir).join("state.tar.gz");
-            if existing_tar.exists() && !force {
-                return Err(ManagerError::FreezeError(format!(
-                    "Output directory already contains a freeze: {}\n  \
-                     Use --force to overwrite, or specify a different -o path.",
-                    existing_tar.display()
-                )));
-            }
+        Cmd::Freeze { env, tag, save } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
             if ec.is_dev() {
                 return Err(ManagerError::EnvError(format!(
@@ -2698,7 +2986,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             };
             let data_dir = cfg::env_data_dir(env_scope, &env_name);
             let image = ec.active_image().to_string();
-            let result = freeze::freeze_from_dir(env_scope, &env_name, ver.clone(), engine, &image, &data_dir.to_string_lossy(), output_dir, verbose);
+            // A tag that says what it is and does not collide with the
+            // environment image it is built on.
+            let tag = tag.unwrap_or_else(|| format!("morloc-{env_name}:{}", ver.show()));
+            let result = freeze::freeze_environment(
+                env_scope, &env_name, ver.clone(), engine, &image,
+                &data_dir.to_string_lossy(), &tag, save.as_deref(), verbose,
+            );
             if result.is_ok() && ec.morloc_version.as_ref() != Some(&ver) {
                 let mut updated = ec.clone();
                 updated.morloc_version = Some(ver);
@@ -2707,63 +3001,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             result
         }
 
-        // ---- unfreeze ----
-        Cmd::Unfreeze { from, tag, base, engine: engine_override, rebuild } => {
-            let from = {
-                let p = std::path::Path::new(&from);
-                if p.is_dir() {
-                    let tar = p.join("state.tar.gz");
-                    if tar.is_file() {
-                        tar.to_string_lossy().to_string()
-                    } else {
-                        return Err(ManagerError::UnfreezeError(format!(
-                            "Directory '{}' does not contain state.tar.gz. \
-                             Pass the path to state.tar.gz directly, or the directory containing it.",
-                            from
-                        )));
-                    }
-                } else if p.is_file() {
-                    from
-                } else {
-                    return Err(ManagerError::UnfreezeError(format!(
-                        "Input not found: {from}. \
-                         Pass the path to state.tar.gz or the directory containing it."
-                    )));
-                }
-            };
-            // Read version and engine from the freeze manifest so unfreeze
-            // works on deployment machines with no morloc environments.
-            let tarball_dir = std::path::Path::new(&from)
-                .parent()
-                .unwrap_or(std::path::Path::new("."));
-            let manifest_path = tarball_dir.join("freeze-manifest.json");
-            let manifest = freeze::read_freeze_manifest(&manifest_path.to_string_lossy())
-                .map_err(|_| ManagerError::UnfreezeError(format!(
-                    "Cannot read freeze manifest at {}. Ensure state.tar.gz and freeze-manifest.json are in the same directory.",
-                    manifest_path.display()
-                )))?;
-            if matches!(engine_override, Some(EngineArg::None)) {
-                return Err(ManagerError::UnfreezeError(
-                    "unfreezing to the native backend is not yet supported; unfreeze to a \
-                     container engine (--engine podman) or omit --engine".to_string(),
-                ));
-            }
-            let engine = match engine_override {
-                Some(arg) => arg.into(),
-                None => {
-                    let e = ensure_engine()?;
-                    eprintln!(
-                        "Note: using {} engine from global config. Override with --engine if needed.",
-                        e.name()
-                    );
-                    e
-                }
-            };
-            serve::build_serve_image(engine, verbose, &from, &tag, manifest.morloc_version, base.as_deref(), rebuild, &manifest.programs)
-        }
-
         // ---- start ----
-        Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, port, env_vars, env_file, engine_arg, force } => {
+        Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, eval_allow_no_auth, port, env_vars, env_file, engine_arg, force } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
             if ec.is_dev() {
                 return Err(ManagerError::EnvError(format!(
@@ -2812,7 +3051,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // Backend-neutral orchestration: WHAT to serve (a --mcp one-off or the
             // exposed set) + the port. One listener serves both adapters; MCP
             // defaults to 9000, API-only to 8080, auto-picking a free port.
-            let spec = resolve_serve_spec(env_scope, &env_name, &mcp)?;
+            let spec = resolve_serve_spec(&ec, env_scope, &env_name, &mcp)?;
             let eval_on = spec.eval_allow.is_some();
             let serves_mcp = !spec.mcp.is_empty() || eval_on;
             let serves_api = !spec.api.is_empty() || eval_on;
@@ -2834,7 +3073,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let req = ServeRequest {
                 spec, host_port, container_port, user_env,
                 expose, allow_plaintext, allow_no_auth, unsafe_serve,
-                engine_args: engine_arg, token, verbose,
+                eval_allow_no_auth, engine_args: engine_arg, token, verbose,
             };
             let env = runner::ResolvedEnv { name: env_name.clone(), scope: env_scope, ec };
             let ServeOutcome { handle, url_host, token: eff_token } =
@@ -2979,46 +3218,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         }
 
         // ---- eval ----
-        Cmd::Eval { expr, env, port } => {
-            // When --env is given, validate that env's server is running. Eval
-            // itself is a backend-neutral HTTP client (it connects over --port);
-            // this pre-flight check must be backend-neutral too, or it would
-            // wrongly reject a live native serve.
-            if let Some(env_arg) = env {
-                let (env_name, scope, ec) = resolve_env_or_default(Some(env_arg))?;
-                if !env_serve_alive(scope, &env_name, &ec) {
-                    return Err(ManagerError::EnvError(format!(
-                        "No server running for '{env_name}'. Start with: mim start --env {env_name}"
-                    )));
-                }
+        Cmd::Eval { expr, env, port, auth_token } => {
+            let (env_name, scope, ec) = resolve_env_or_default(env)?;
+            // Backend-neutral: eval is an HTTP client, and a native serve is as
+            // valid a target as a container one.
+            if !env_serve_alive(scope, &env_name, &ec) {
+                return Err(ManagerError::EnvError(format!(
+                    "No server running for '{env_name}'. Start with: mim start --env {env_name}"
+                )));
             }
-            use std::io::{Read as IoRead, Write as IoWrite};
-            let body = format!("{{\"expr\":{}}}", serde_json::to_string(&expr).unwrap_or_default());
-            let request = format!(
-                "POST /eval HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(), body
-            );
-            let addr = format!("127.0.0.1:{port}");
-            let mut stream = std::net::TcpStream::connect(&addr).map_err(|e| {
-                ManagerError::EnvError(format!(
-                    "Cannot connect to serve container on {addr}: {e}\n  Is a serve container running? Start with: mim start"
-                ))
-            })?;
-            stream.write_all(request.as_bytes()).map_err(|e| {
-                ManagerError::EnvError(format!("Failed to send request: {e}"))
-            })?;
-            let mut response = String::new();
-            stream.read_to_string(&mut response).map_err(|e| {
-                ManagerError::EnvError(format!("Failed to read response: {e}"))
-            })?;
-            // Extract body from HTTP response (after \r\n\r\n)
-            if let Some(pos) = response.find("\r\n\r\n") {
-                let body = &response[pos + 4..];
-                println!("{body}");
-            } else {
-                println!("{response}");
-            }
-            Ok(())
+            let rt = cfg::read_serve_runtime(scope, &env_name);
+            eval_against_serve(&env_name, &expr, port, auth_token, rt.as_ref())
         }
 
         // ---- install ----
@@ -3088,6 +3298,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     "--install".to_string(), src.clone(),
                 ]
             };
+            let installed_before = installed_program_names(&cfg::env_data_dir(scope, &env_name));
             runner::run_in_env(
                 Some((env_name.clone(), scope, ec)),
                 runner::RunRequest {
@@ -3100,6 +3311,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     slurm_bridge: false,
                 },
             )?;
+            report_newly_installed(
+                &installed_before,
+                &installed_program_names(&cfg::env_data_dir(scope, &env_name)),
+            );
 
             // 4. Provision Python local deps now that the program is built. For each
             //    program built this run that declares py locals: resolve its spec
@@ -3151,61 +3366,73 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         }
 
         // ---- expose ----
-        Cmd::Expose { action } => match action {
-            ExposeAction::Add { module, protocols, env } => {
-                let (env_name, scope, _ec) = resolve_env_or_default(env)?;
-                // Exposure is a view of an INSTALLED program; catch typos early.
-                let launcher = cfg::env_data_dir(scope, &env_name).join("bin").join(&module);
+        // Bare `mim view` shows the views. The word promises a look at something,
+        // and the other `view` in this toolchain (`morloc-nexus view`) has
+        // already taught that reading, so the two agree rather than compete.
+        Cmd::View { action: None, env } => {
+            let (env_name, scope, _ec) = resolve_env_or_default(env)?;
+            let views = cfg::read_views(scope, &env_name)?;
+            print_views(&env_name, &views, json);
+            Ok(())
+        }
+        Cmd::View { action: Some(action), .. } => match action {
+            ViewAction::Add { module, protocols, env } => {
+                let (env_name, scope, ec) = resolve_env_or_default(env)?;
+                // A view shows an INSTALLED program; catch typos early.
+                let launcher =
+                    cfg::env_program_launcher(&ec, cfg::env_data_dir(scope, &env_name), &module);
                 if !launcher.exists() {
                     return Err(ManagerError::EnvError(format!(
                         "Module '{module}' is not installed in environment '{env_name}' \
-                         (no bin/{module}).\n  Install it first: mim install <src>.loc"
+                         (no launcher at {}).\n  Install it first: mim install <src>.loc",
+                        launcher.display()
                     )));
                 }
-                let mut ex = cfg::read_exposure(scope, &env_name)?;
-                ex.add(&module, &protocols);
-                cfg::write_exposure(scope, &env_name, &ex)?;
+                let mut views = cfg::read_views(scope, &env_name)?;
+                views.add(&module, &protocols);
+                cfg::write_views(scope, &env_name, &views)?;
                 let protos: Vec<&str> = protocols.iter().map(|p| p.as_str()).collect();
                 eprintln!(
-                    "Exposed '{module}' over {} in '{env_name}'. Run 'mim start' to serve.",
-                    protos.join(", ")
+                    "'{module}' is now in the {} view of '{env_name}'. Run 'mim start' to serve.",
+                    protos.join(" and ")
                 );
                 Ok(())
             }
-            ExposeAction::Rm { module, env } => {
+            ViewAction::Rm { module, env } => {
                 let (env_name, scope, _ec) = resolve_env_or_default(env)?;
-                let mut ex = cfg::read_exposure(scope, &env_name)?;
-                if ex.remove(&module) {
-                    cfg::write_exposure(scope, &env_name, &ex)?;
-                    eprintln!("Unexposed '{module}' in '{env_name}'. Run 'mim start' to apply.");
+                let mut views = cfg::read_views(scope, &env_name)?;
+                if views.remove(&module) {
+                    cfg::write_views(scope, &env_name, &views)?;
+                    eprintln!("Removed '{module}' from the views of '{env_name}'. \
+                               Run 'mim start' to apply.");
                 } else {
-                    eprintln!("'{module}' was not exposed in '{env_name}'.");
+                    eprintln!("'{module}' was not in any view of '{env_name}'.");
                 }
                 Ok(())
             }
-            ExposeAction::List { env } => {
+            ViewAction::List { env } => {
                 let (env_name, scope, _ec) = resolve_env_or_default(env)?;
-                let ex = cfg::read_exposure(scope, &env_name)?;
-                print_exposure(&env_name, &ex, json);
+                let views = cfg::read_views(scope, &env_name)?;
+                print_views(&env_name, &views, json);
                 Ok(())
             }
-            ExposeAction::Eval { allow, off, env } => {
+            ViewAction::Eval { allow, off, env } => {
                 let (env_name, scope, _ec) = resolve_env_or_default(env)?;
-                let mut ex = cfg::read_exposure(scope, &env_name)?;
+                let mut views = cfg::read_views(scope, &env_name)?;
                 if off {
-                    ex.eval = None;
+                    views.eval = None;
                     eprintln!("Disabled eval in '{env_name}'.");
                 } else if allow.is_empty() {
-                    ex.eval = Some(EvalExposure { allow: Vec::new() });
+                    views.eval = Some(EvalCapability { allow: Vec::new() });
                     eprintln!(
                         "Enabled eval in '{env_name}' with an EMPTY allow-list \
                          (eval can import nothing; add modules with --allow)."
                     );
                 } else {
-                    ex.eval = Some(EvalExposure { allow: allow.clone() });
+                    views.eval = Some(EvalCapability { allow: allow.clone() });
                     eprintln!("Enabled eval in '{env_name}', allow-list: {}.", allow.join(", "));
                 }
-                cfg::write_exposure(scope, &env_name, &ex)?;
+                cfg::write_views(scope, &env_name, &views)?;
                 Ok(())
             }
         },
@@ -3387,7 +3614,10 @@ fn find_running_serve_container() -> Result<(String, ContainerEngine)> {
 // ======================================================================
 
 /// Apply a captured activation env-map to a `Command` (the inherited environ
-/// stays in place; callers add their own overrides afterwards).
+/// stays in place; callers add their own overrides afterwards). Callers pair
+/// this with `morloc_deps::ambient::scrub` -- via `native_command`, or directly
+/// -- so the map is applied over an environment with no other conda activation
+/// in it, matching the clean-shell case the map was captured for.
 pub(crate) fn apply_activation(cmd: &mut Command, env: &[(String, String)]) {
     for (k, v) in env {
         cmd.env(k, v);
@@ -4090,6 +4320,10 @@ fn materialize_native_env(
     let ssl_cert = cert::host_bundle_if_present(scope, name);
     eprintln!("Solving native toolchain with pixi (this may take a few minutes)...");
     pixi::solve(&pixi_dir, &pixi_bin, ssl_cert.as_deref(), fhs)?;
+    // A filesystem that folds letter case (the macOS default) merges conda files
+    // whose names differ only in case, leaving a header holding another header's
+    // contents. Refuse the prefix before anything is compiled against it.
+    casefold::check_pixi_dir(&pixi_dir)?;
     let mut activation = pixi::capture_activation(&pixi_dir, &pixi_bin, ssl_cert.as_deref(), fhs)?;
     // Persist the CA env vars into the env's run environment so a later
     // `morloc make` (its uv/pip and any runtime egress) also trusts the CA.
@@ -4513,6 +4747,88 @@ fn validate_snapshot_set(env_dir: &std::path::Path, files: &[(String, String)]) 
     Ok(())
 }
 
+/// The module-pin files deposited in an environment, by name, sorted. These are
+/// the names `--no-modules-file` accepts; `mim info` lists them so removal is not
+/// a guess.
+fn deposited_snapshot_names(env_dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = match std::fs::read_dir(env_dir.join("snapshots")) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    names
+}
+
+/// Reject a `--no-modules-file` argument that is not a plain deposited filename.
+/// The value names a file mim itself wrote into `snapshots/`, so anything with a
+/// path separator or a `..` component is a mistake (most likely the host path the
+/// file was deposited FROM) and must never be joined onto the snapshots dir.
+fn validate_snapshot_removals(names: &[String]) -> Result<()> {
+    for name in names {
+        let bad = name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || std::path::Path::new(name).components().count() != 1
+            || name == "."
+            || name == "..";
+        if bad {
+            return Err(ManagerError::EnvError(format!(
+                "--no-modules-file takes the NAME of a deposited pin file, not a path: \
+                 '{name}'. Run `mim info <env>` to see the deposited names."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Remove deposited module-pin files by name and report the modules that lose
+/// their last pin as a result. A name that is not deposited is a hard error, so a
+/// typo is reported rather than silently doing nothing.
+///
+/// Removal can only ever shrink the pin set, so it cannot create the cross-file
+/// hash conflict `validate_snapshot_set` guards against -- but it can leave a
+/// module unpinned (resolving at latest), which the returned names let the caller
+/// warn about.
+fn remove_snapshot_files(env_dir: &std::path::Path, names: &[String]) -> Result<Vec<String>> {
+    use std::collections::BTreeSet;
+    let dir = env_dir.join("snapshots");
+    let mut removed_pins: BTreeSet<String> = BTreeSet::new();
+    for name in names {
+        let path = dir.join(name);
+        if !path.is_file() {
+            return Err(ManagerError::EnvError(format!(
+                "environment has no deposited pin file named '{name}'. Run \
+                 `mim info <env>` to see the deposited names."
+            )));
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            removed_pins.extend(parse_snapshot_pins(&content).into_iter().map(|(m, _)| m));
+        }
+        std::fs::remove_file(&path).map_err(|e| {
+            ManagerError::EnvError(format!("cannot remove {}: {e}", path.display()))
+        })?;
+    }
+    // A module still named by a surviving file keeps its pin, so subtract what
+    // remains rather than reporting everything the removed files mentioned.
+    let mut surviving: BTreeSet<String> = BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(e.path()) {
+                surviving.extend(parse_snapshot_pins(&content).into_iter().map(|(m, _)| m));
+            }
+        }
+    }
+    Ok(removed_pins.difference(&surviving).cloned().collect())
+}
+
 fn deposit_snapshot_files(env_dir: &std::path::Path, files: &[(String, String)]) -> Result<()> {
     if files.is_empty() {
         return Ok(());
@@ -4605,10 +4921,10 @@ fn eprintln_columns(items: &[String]) {
     }
 }
 
-/// Prompt for an optional package-file path (interactive `new`); blank / "none"
-/// yields an empty list, otherwise the file is read, parsed, and its contents
-/// echoed in columns as immediate feedback. A bad path is reported and
-/// re-prompted rather than aborting the session.
+/// Prompt for an optional package-file path (interactive `new`); a blank line
+/// yields an empty list, otherwise the answer is taken as a path -- the file is
+/// read, parsed, and its contents echoed in columns as immediate feedback. A bad
+/// path is reported and re-prompted rather than aborting the session.
 fn prompt_package_file(label: &str) -> prompt::Result<Vec<String>> {
     let help = "path to a file with one package per line";
     let mut rejected: Option<String> = None;
@@ -4622,7 +4938,9 @@ fn prompt_package_file(label: &str) -> prompt::Result<Vec<String>> {
             None => prompt::path(label, help)?,
         };
         let ans = ans.trim().to_string();
-        if ans.is_empty() || ans.eq_ignore_ascii_case("none") {
+        // Blank is the only skip: every other answer is a path, so a file really
+        // named `none` is reachable.
+        if ans.is_empty() {
             return Ok(Vec::new());
         }
         // Expand ~ like every other path prompt, so a hand-typed ~/pkgs.txt works.
@@ -4902,6 +5220,16 @@ fn resolve_mount_home(
     if !matches!(engine, Some(e) if e.is_oci()) {
         return Err(mount_home_not_supported());
     }
+    // An empty path names no directory. `create_dir_all("")` succeeds without
+    // creating anything, so without this the caller would be told the empty
+    // string is not a directory, having just been told it was created.
+    if raw.trim().is_empty() {
+        return Err(ManagerError::EnvError(
+            "--mount-home was given an empty path; pass a directory, or omit the \
+             flag. `mim modify --no-mount-home` clears an existing mount."
+                .to_string(),
+        ));
+    }
     let expanded = expand_tilde(raw);
     // Created rather than rejected: a fresh persistent home is the common case,
     // and the mount would otherwise materialize it root-owned inside the engine.
@@ -5063,10 +5391,10 @@ fn stage_dev_agent(scope: Scope, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Prompt for an optional dotfiles directory to seed the environment's home.
-/// Empty / "none" means no dotfiles. A given path (with ~ expanded) is checked
-/// for existence and re-prompted on error. `current` (when re-editing) is
-/// pre-filled so a bare Enter keeps it. Docker/podman only.
+/// Prompt for an optional dotfiles directory to seed the environment's home. A
+/// blank line means no dotfiles; every other answer is a path (with ~ expanded),
+/// checked for existence and re-prompted on error. `current` (when re-editing)
+/// is pre-filled so a bare Enter keeps it. Docker/podman only.
 fn interactive_choose_dotfiles(current: Option<&str>) -> prompt::Result<Option<String>> {
     let msg = "Dotfiles directory (blank for none)";
     let help = "copied into the env home";
@@ -5080,7 +5408,9 @@ fn interactive_choose_dotfiles(current: Option<&str>) -> prompt::Result<Option<S
             None => prompt::path(msg, help)?,
         };
         let choice = choice.trim().to_string();
-        if choice.is_empty() || choice.eq_ignore_ascii_case("none") {
+        // Blank is the only skip: every other answer is a path, so a dotfiles
+        // profile directory really named `none` is reachable.
+        if choice.is_empty() {
             return Ok(None);
         }
         let expanded = expand_tilde(&choice);
@@ -5137,7 +5467,9 @@ fn interactive_choose_dotfiles(current: Option<&str>) -> prompt::Result<Option<S
 }
 
 /// Prompt for an optional host directory to bind-mount as the environment's
-/// `$HOME`. Empty / "none" means the env owns its home. The path may not exist
+/// `$HOME`. A blank line means the env owns its home; every other answer is
+/// taken as a path, so a directory really named `none` is reachable. The path
+/// may not exist
 /// yet (it is created when the plan is applied), so only its parent is checked
 /// here; the full validation lives in `resolve_mount_home`. The answer is made
 /// absolute before it is returned -- it is recorded in the setup file and later
@@ -5155,7 +5487,7 @@ fn interactive_choose_mount_home(current: Option<&str>) -> prompt::Result<Option
             None => prompt::path(msg, help)?,
         };
         let choice = choice.trim().to_string();
-        if choice.is_empty() || choice.eq_ignore_ascii_case("none") {
+        if choice.is_empty() {
             return Ok(None);
         }
         let expanded = absolutize(&expand_tilde(&choice));
@@ -6096,8 +6428,20 @@ fn native_capture_env(scope: Scope, name: &str, args: &[String]) -> Result<Strin
     })?;
     let data_dir = cfg::env_data_dir(scope, name);
     let (program, rest) = args.split_first().ok_or(ManagerError::NoCommand)?;
-    let mut cmd = Command::new(program);
-    cmd.args(rest);
+    let rest_os: Vec<std::ffi::OsString> =
+        rest.iter().map(std::ffi::OsString::from).collect();
+    // The captured program is a conda/glibc ELF (`morloc envspec`), so on NixOS it
+    // needs the env's FHS sandbox for its loader exactly as `run` does -- outside
+    // it the capture fails while every other native path works. Preserve the
+    // caller's cwd: the envspec target is a cwd-relative source path.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| data_dir.clone());
+    let mut cmd = native_command(
+        runtime.fhs_wrapper.as_deref(),
+        std::path::Path::new(program),
+        &rest_os,
+        &cwd,
+        activation_path(&runtime.activation_env),
+    );
     apply_activation(&mut cmd, &runtime.activation_env);
     cmd.env("MORLOC_HOME", data_dir.to_string_lossy().to_string());
     let out = cmd
@@ -6620,15 +6964,324 @@ fn persist_env_dockerfile(scope: Scope, name: &str, df_text: &str) {
     let _ = std::fs::write(&df_doc, df_text);
 }
 
-/// The bind mounts every materialize/run of a container env shares: the env state
-/// dir, its pixi env (`/env`), and MORLOC_HOME. The dev materialize appends its
-/// source/build/dev-bin mounts on top. One source of truth for the base layout.
-fn base_bind_mounts(v_data_dir: &str) -> Vec<(String, String)> {
-    vec![
+/// The mounts every materialize/run of a container env shares, as
+/// `(bind mounts, engine volumes)`: the env state dir, its pixi project
+/// (`/env`), MORLOC_HOME, and the volumes holding the solved conda prefix and
+/// the shared package cache. The dev materialize appends its source/build/dev-bin
+/// mounts on top. One source of truth for the base layout, so no run can be
+/// given the pixi project without the prefix that belongs to it.
+///
+/// The prefix is a volume rather than a bind mount because it is a Linux tree
+/// that only in-container processes execute, and because a host share need not
+/// be able to hold it: conda ships files whose names differ only in case, which
+/// a case-folding host filesystem (the macOS default) silently merges. The
+/// manifest and lock stay on the bind mount beside it -- the host solves the
+/// environment and reads the lock back.
+fn base_mounts(v_data_dir: &str) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let binds = vec![
         (v_data_dir.to_string(), serve::CONTAINER_MORLOC_STATE.to_string()),
         (format!("{v_data_dir}/pixi"), serve::CONTAINER_PIXI_DIR.to_string()),
         (format!("{v_data_dir}/runtime"), serve::CONTAINER_MORLOC_HOME.to_string()),
-    ]
+    ];
+    let volumes = vec![
+        (
+            serve::prefix_volume(std::path::Path::new(v_data_dir)),
+            format!("{}/.pixi", serve::CONTAINER_PIXI_DIR),
+        ),
+        (
+            serve::PIXI_CACHE_VOLUME.to_string(),
+            serve::CONTAINER_PIXI_CACHE.to_string(),
+        ),
+    ];
+    (binds, volumes)
+}
+
+/// The HTTP request `mim eval` sends. Kept separate from the socket work so the
+/// wire shape is testable: an `Authorization` header appears exactly when a
+/// token was resolved, and the body is the expression as JSON.
+fn eval_request(expr: &str, token: Option<&str>) -> String {
+    let body = format!(
+        "{{\"expr\":{}}}",
+        serde_json::to_string(expr).unwrap_or_default()
+    );
+    let auth = match token {
+        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        None => String::new(),
+    };
+    format!(
+        "POST /eval HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         {auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The port to reach a serve on: the one asked for, else the one the serve
+/// reported when it started.
+///
+/// A serve picks its own port, so a fixed default would connect to whatever else
+/// happens to be listening -- or to nothing, and then report that no serve is
+/// running while one is.
+fn resolve_eval_port(env_name: &str, port: Option<u16>, rt: Option<&ServeRuntime>) -> Result<u16> {
+    port.or_else(|| rt.map(|r| r.port)).ok_or_else(|| {
+        ManagerError::EnvError(format!(
+            "the serve for '{env_name}' did not record a port. Name one with --port."
+        ))
+    })
+}
+
+/// Evaluate an expression against a running serve.
+///
+/// The port and the token come from the serve itself wherever possible. A serve
+/// picks its own port, so a fixed default would connect to whatever else happens
+/// to be listening -- or to nothing, and report that no serve is running while
+/// one is. The token is not recorded (a secret does not belong in a state file),
+/// but whether one is required is, which is enough to say so before the request
+/// comes back as an opaque 401.
+fn eval_against_serve(
+    env_name: &str,
+    expr: &str,
+    port: Option<u16>,
+    auth_token: Option<String>,
+    rt: Option<&ServeRuntime>,
+) -> Result<()> {
+    use std::io::{Read as IoRead, Write as IoWrite};
+
+    let port = resolve_eval_port(env_name, port, rt)?;
+    let token = auth_token
+        .or_else(|| std::env::var("MORLOC_MCP_TOKEN").ok().filter(|s| !s.is_empty()));
+    if token.is_none() && rt.map(|r| r.token_required).unwrap_or(false) {
+        return Err(ManagerError::EnvError(format!(
+            "the serve for '{env_name}' requires a bearer token. Supply it with \
+             --auth-token, or set MORLOC_MCP_TOKEN."
+        )));
+    }
+
+    let addr = format!("127.0.0.1:{port}");
+    let mut stream = std::net::TcpStream::connect(&addr).map_err(|e| {
+        ManagerError::EnvError(format!(
+            "cannot reach the serve for '{env_name}' on {addr}: {e}\n  \
+             Check `mim status`, or start one with `mim start --env {env_name}`."
+        ))
+    })?;
+    stream
+        .write_all(eval_request(expr, token.as_deref()).as_bytes())
+        .map_err(|e| ManagerError::EnvError(format!("failed to send the request: {e}")))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| ManagerError::EnvError(format!("failed to read the response: {e}")))?;
+
+    if response.starts_with("HTTP/1.1 401") {
+        return Err(ManagerError::EnvError(format!(
+            "the serve for '{env_name}' rejected the token. Supply the one `mim start` \
+             printed with --auth-token, or set MORLOC_MCP_TOKEN."
+        )));
+    }
+    match response.find("\r\n\r\n") {
+        Some(pos) => println!("{}", &response[pos + 4..]),
+        None => println!("{response}"),
+    }
+    Ok(())
+}
+
+/// The programs installed in an environment, by name, read from the program
+/// database. Directory names only: this notices what a build added, and says
+/// nothing about whether what it added is sound.
+fn installed_program_names(data_dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(data_dir.join("exe")) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                names.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    names
+}
+
+/// Report what a build newly installed, and the one command that makes it
+/// reachable.
+///
+/// A program is named after its `module` declaration, not the file it was built
+/// from, so the name to expose is not the name the user just typed. Saying it
+/// here removes the step where they have to go and look. Silent when a build
+/// only rebuilt what was already installed, which is most of them.
+fn report_newly_installed(
+    before: &std::collections::BTreeSet<String>,
+    after: &std::collections::BTreeSet<String>,
+) {
+    let new: Vec<&String> = after.difference(before).collect();
+    if new.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = new.iter().map(|n| n.as_str()).collect();
+    eprintln!("Installed: {}", names.join(", "));
+    eprintln!("Add to a view to serve:");
+    for n in &names {
+        eprintln!("  mim view add {n} --as mcp,api");
+    }
+}
+
+/// Whether a mounted half was actually populated. An empty directory is the
+/// shadow that an unmounted or never-installed half leaves behind, which is
+/// exactly what must not be mistaken for a provisioned one.
+fn is_populated(p: &std::path::Path) -> bool {
+    std::fs::read_dir(p).map(|mut d| d.next().is_some()).unwrap_or(false)
+}
+
+/// The refusal for an environment whose conda prefix is still on the host,
+/// where an older mim kept it and this one no longer looks. Such an environment
+/// is provisioned, just into a layout that is no longer read, so it needs a
+/// re-provision rather than the first one it never had.
+///
+/// `None` when no prefix is there, which is an environment that genuinely was
+/// never provisioned.
+fn older_layout_error(v_data_dir: &str, pixi_dir: &std::path::Path) -> Option<ManagerError> {
+    let prefix = morloc_deps::abi::conda_prefix(pixi_dir);
+    if !is_populated(&prefix.join("conda-meta")) {
+        return None;
+    }
+    let env_name = std::path::Path::new(v_data_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "<env>".to_string());
+    Some(ManagerError::EnvError(format!(
+        "environment at '{v_data_dir}' was provisioned by an older mim than the one \
+         running, and the two disagree about where its conda toolchain lives: the older \
+         mim solved it onto the host at '{}', while this one keeps it in a container \
+         volume, which for this environment is empty. Nothing is damaged; the toolchain \
+         has to be installed again for the current layout:\n  mim update --env {env_name}\n\
+         That reinstalls it from the environment's existing lock, after which the prefix \
+         left on the host is unused and can be deleted.",
+        prefix.display()
+    )))
+}
+
+/// Retire a conda prefix that an older mim solved onto the host.
+///
+/// A container's prefix is an engine volume now, so a tree at the host path is a
+/// previous layout's: nothing runs it, it holds several gigabytes, and a host
+/// reading this environment finds its records before the mirror -- real records
+/// win over a mirror, and a leftover tree still looks real -- and so reports the
+/// toolchain the environment replaced rather than the one it now runs. That is
+/// the pin every later make-time solve is gated on, and it is silent.
+///
+/// The records go first and their loss is fatal to the update: while they are
+/// readable the environment describes itself wrongly, which is worse than
+/// stopping. Reclaiming the rest is only disk, so it is reported and not fatal.
+fn retire_host_prefix(pixi_dir: &std::path::Path) -> Result<()> {
+    let prefix = morloc_deps::abi::conda_prefix(pixi_dir);
+    let meta = prefix.join("conda-meta");
+    if !is_populated(&meta) {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&meta).map_err(|e| {
+        ManagerError::EnvError(format!(
+            "the conda prefix an older mim left at '{}' cannot be removed ({e}). While              it is there this environment reports the toolchain it replaced rather than              the one it now runs, so the update stops here: remove that directory and              run it again.",
+            prefix.display()
+        ))
+    })?;
+    match std::fs::remove_dir_all(&prefix) {
+        Ok(()) => eprintln!(
+            "Removed the conda prefix an older mim left on the host at '{}'.",
+            prefix.display()
+        ),
+        Err(e) => eprintln!(
+            "Warning: the conda prefix an older mim left at '{}' is inert but could not              be reclaimed ({e}). It can be deleted by hand.",
+            prefix.display()
+        ),
+    }
+    Ok(())
+}
+
+/// Refuse to launch against an environment whose mounted halves were never
+/// materialized.
+///
+/// A pliable container env is an image plus three host-side pieces: mutable
+/// state, the morloc runtime (MORLOC_HOME), and the conda toolchain (`/env`).
+/// Mounting a source that does not exist shadows the image with an empty
+/// directory, and the process then fails somewhere deep with no hint of the
+/// cause; refusing here names the missing half instead.
+///
+/// The toolchain is checked through its record mirror rather than the project
+/// dir, because the solved prefix is an engine volume: the project dir holds a
+/// manifest from the moment one is rendered, whereas materialize writes the
+/// mirror only once the prefix is installed.
+///
+/// An environment provisioned before the prefix moved off the host has no
+/// mirror, and is refused here for a different reason than a missing install:
+/// it holds a solved prefix, just at a path this mim no longer mounts, so it
+/// gets a refusal that names the layout change rather than one that sends its
+/// owner looking for an install that failed.
+///
+/// `runtime_may_be_empty` covers the two launches that legitimately precede a
+/// runtime: `morloc init` itself, which is what writes it, and a dev env, whose
+/// developer builds it from mounted source.
+fn require_materialized(v_data_dir: &str, runtime_may_be_empty: bool) -> Result<()> {
+    let root = std::path::Path::new(v_data_dir);
+    let pixi_dir = root.join("pixi");
+    let pixi_src = pixi_dir.join(morloc_deps::abi::CONDA_META_MIRROR);
+    if !is_populated(&pixi_src) {
+        if let Some(err) = older_layout_error(v_data_dir, &pixi_dir) {
+            return Err(err);
+        }
+    }
+    let runtime_src = root.join("runtime");
+    let mut required: Vec<(&std::path::Path, &str)> =
+        vec![(pixi_src.as_path(), "conda toolchain (/env)")];
+    if !runtime_may_be_empty {
+        required.push((runtime_src.as_path(), "morloc runtime (MORLOC_HOME)"));
+    }
+    for (src, what) in required {
+        if !is_populated(src) {
+            return Err(ManagerError::EnvError(format!(
+                "environment at '{v_data_dir}' is not materialized: its {what} is missing \
+                 at '{}'. Provision it first with 'mim update --env <env>', or recreate \
+                 the environment without --no-init.",
+                src.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The shell run against a freshly installed prefix, before anything is built
+/// against it.
+///
+/// It does two things the host cannot do for a container environment, because
+/// the prefix is on an engine volume the host cannot read. First it refuses a
+/// prefix whose filesystem folds letter case: conda ships files whose names
+/// differ only in case (the Linux kernel headers alone ship eight such pairs
+/// with different contents), and such a filesystem merges them into one file
+/// holding the wrong bytes -- a toolchain that is not what the lockfile
+/// describes, with nothing to show for it at build time. Then it mirrors the
+/// `conda-meta` records onto the bind-mounted project dir, which is how the host
+/// reads back what was installed (`morloc_deps::abi::meta_dir`).
+///
+/// Written as shell rather than a `mim` subcommand because a dev environment
+/// materializes before any mim agent is staged into its image.
+fn prefix_postinstall_script() -> String {
+    let prefix = format!("{}/.pixi/envs/default", serve::CONTAINER_PIXI_DIR);
+    let pixi_dir = serve::CONTAINER_PIXI_DIR;
+    let mirror = morloc_deps::abi::CONDA_META_MIRROR;
+    format!(
+        r#"probe="{prefix}/.mim-case-probe-A"
+touch "$probe"
+if [ -e "{prefix}/.mim-case-probe-a" ]; then
+  rm -f "$probe"
+  echo "the conda prefix was installed on a filesystem that folds letter case, which" >&2
+  echo "merges conda files whose names differ only in case into one file holding the" >&2
+  echo "wrong contents. This is the container engine's storage, not the host's: check" >&2
+  echo "that the engine's data root is on a case-sensitive filesystem." >&2
+  exit 1
+fi
+rm -f "$probe"
+rm -rf "{pixi_dir}/{mirror}.new"
+cp -a "{prefix}/conda-meta" "{pixi_dir}/{mirror}.new"
+rm -rf "{pixi_dir}/{mirror}"
+mv "{pixi_dir}/{mirror}.new" "{pixi_dir}/{mirror}"
+"#
+    )
 }
 
 /// Solve the pixi env + build the morloc runtime shims INSIDE a container,
@@ -6647,6 +7300,7 @@ fn materialize_container_env(
     // env skips that: the developer builds the runtime (via `morloc init`) from the
     // mounted source, so provisioning stops at the pixi env.
     let mut script = format!("set -e\n{pixi} install --locked\n", pixi = serve::CONTAINER_PIXI_BIN);
+    script.push_str(&prefix_postinstall_script());
     if build_runtime {
         script.push_str(&serve::conda_activate_lines().join("\n"));
         // Strict conda: build shims against ONLY the activated conda prefix's tools
@@ -6657,9 +7311,11 @@ fn materialize_container_env(
             envagent::ENV_STRICT_CONDA
         ));
     }
+    let (bind_mounts, volumes) = base_mounts(&v_data_dir);
     let cfg = crate::container::RunConfig {
         image: image.to_string(),
-        bind_mounts: base_bind_mounts(&v_data_dir),
+        bind_mounts,
+        volumes,
         ports: Vec::new(),
         publish_host: None,
         network: None,
@@ -6681,6 +7337,14 @@ fn materialize_container_env(
             "environment materialization ({what}) failed:\n{}",
             stderr.trim()
         )));
+    }
+    // The volume holds this environment's prefix now, so anything at the host path
+    // belongs to the layout it was provisioned into before. Conditional on the
+    // mirror the postinstall step writes: with no mirror there would be nothing
+    // left to read the environment through.
+    let pixi_dir = env_dir.join("pixi");
+    if is_populated(&pixi_dir.join(morloc_deps::abi::CONDA_META_MIRROR)) {
+        retire_host_prefix(&pixi_dir)?;
     }
     Ok(())
 }
@@ -6858,16 +7522,11 @@ fn build_dev_container_image(
     Ok(image_tag)
 }
 
-/// The single rejection for `--dotfiles` on a non-OCI backend: apptainer mounts
-/// the host `$HOME` and native uses the real host home, so neither consults the
-/// env-owned home this flag populates. Both the `new` native guard and
-/// `apply_dotfiles` return this so the message has one source of truth.
+/// The single rejection for `--dotfiles` on a non-OCI backend. Lives in the
+/// dotfiles module with the code that enforces it; re-exported here because the
+/// `new` guards reject before they ever reach a copy.
 fn dotfiles_not_supported() -> ManagerError {
-    ManagerError::EnvError(
-        "--dotfiles applies only to docker/podman environments; apptainer \
-         inherits the host $HOME and the native backend uses your real home"
-            .to_string(),
-    )
+    dotfiles::not_supported()
 }
 
 /// Rejection for `--dev` with a non-OCI backend (native or apptainer): a dev env's
@@ -6891,27 +7550,14 @@ fn dev_is_local_scope_only() -> ManagerError {
 }
 
 /// Copy a user dotfiles directory into the environment's home (`<data_dir>/home`,
-/// the docker/podman shell `$HOME`), overwriting like `cp -rf`. Rejected on
-/// apptainer and native (see `dotfiles_not_supported`).
+/// the docker/podman shell `$HOME`), recording what was written so it can be
+/// removed again. Rejected on apptainer and native (see `dotfiles_not_supported`).
 fn apply_dotfiles(
     engine: Option<ContainerEngine>,
     data_dir: &std::path::Path,
-    dotfiles: &str,
+    src: &str,
 ) -> Result<()> {
-    if !matches!(engine, Some(e) if e.is_oci()) {
-        return Err(dotfiles_not_supported());
-    }
-    let src = std::path::Path::new(dotfiles);
-    if !src.is_dir() {
-        return Err(ManagerError::EnvError(format!(
-            "--dotfiles path is not a directory: {}",
-            src.display()
-        )));
-    }
-    let home = cfg::ensure_env_home(data_dir);
-    provision::copy_dir_excluding(src, &home, &[], false)?;
-    eprintln!("Copied dotfiles from {} into {}", src.display(), home.display());
-    Ok(())
+    dotfiles::apply(engine, data_dir, src)
 }
 
 /// Filename of the morloc-owned rcfile that tags an interactive `shell`
@@ -7361,21 +8007,39 @@ fn native_running_serves() -> Vec<serve::ServeContainerInfo> {
 /// Resolve WHAT to serve: a `--mcp <program>` one-off, or the environment's
 /// exposed set (expose.yaml). Ensures each program is installed. Shared by the
 /// container and native start paths.
-fn resolve_serve_spec(scope: Scope, name: &str, mcp: &Option<String>) -> Result<ServeSpec> {
+fn resolve_serve_spec(
+    ec: &EnvironmentConfig,
+    scope: Scope,
+    name: &str,
+    mcp: &Option<String>,
+) -> Result<ServeSpec> {
     if let Some(program) = mcp {
-        ensure_program_installed(scope, name, program)?;
+        ensure_program_installed(ec, scope, name, program)?;
         Ok(ServeSpec { mcp: vec![program.clone()], api: Vec::new(), eval_allow: None })
     } else {
-        let ex = cfg::read_exposure(scope, name)?;
+        let ex = cfg::read_views(scope, name)?;
         if ex.is_empty() {
+            // Name what could be exposed. A program is named after its module
+            // declaration rather than its source file, so the reader of this
+            // message does not necessarily know what to type.
+            let installed = installed_program_names(&cfg::env_data_dir(scope, name));
+            let candidates = if installed.is_empty() {
+                "  Nothing is installed yet either: mim install <src>.loc".to_string()
+            } else {
+                installed
+                    .iter()
+                    .map(|p| format!("    mim view add {p} --as mcp,api"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
             return Err(ManagerError::EnvError(format!(
-                "Nothing is exposed in '{name}'. Expose a module first:\n    \
-                 mim expose add <module> --as mcp\n  \
+                "'{name}' presents no views, so there is nothing to serve. \
+                 Add a module to one:\n{candidates}\n  \
                  (or 'start --mcp <module>' for a one-off)."
             )));
         }
-        for m in ex.exposed_modules() {
-            ensure_program_installed(scope, name, &m)?;
+        for m in ex.viewed_modules() {
+            ensure_program_installed(ec, scope, name, &m)?;
         }
         let eval_allow = ex.eval.as_ref().map(|e| e.allow.join(","));
         Ok(ServeSpec { mcp: ex.mcp.clone(), api: ex.api.clone(), eval_allow })
@@ -7419,7 +8083,12 @@ fn native_serve(
 
     let data_dir = cfg::env_data_dir(scope, env_name);
     let mh = data_dir.to_string_lossy().to_string();
-    let command = build_router_command(&mh, host_port, http_host, spec, need_allow_no_auth);
+    // A native serve shares the host's network namespace, so the bind address
+    // really does say who can reach it: loopback is host-confined and eval needs
+    // no token there.
+    let command = build_router_command(
+        &mh, host_port, http_host, spec, need_allow_no_auth, !expose,
+    );
 
     // The stored activation env-map puts the env's bin (morloc-nexus) + conda
     // toolchain on PATH; its absence means the env was never materialized.
@@ -7557,7 +8226,7 @@ pub(crate) fn container_serve(
     let plan = serve_plan(
         engine, &req.spec, req.container_port, req.host_port,
         req.expose, req.allow_plaintext, req.allow_no_auth, req.unsafe_serve,
-        cfg!(target_os = "linux"), req.token.clone(),
+        req.eval_allow_no_auth, cfg!(target_os = "linux"), req.token.clone(),
     )?;
     let mut user_env = req.user_env.clone();
     let mut mcp_token: Option<String> = None;
@@ -7567,6 +8236,11 @@ pub(crate) fn container_serve(
     }
     let mut extra_flags = cfg::read_flag_config(env.scope, env_name)?.materialize(Phase::Start, engine);
     extra_flags.extend(req.engine_args.iter().cloned());
+
+    // Serving mounts the runtime and the toolchain, so a half-provisioned
+    // environment must be refused here rather than starting a container that
+    // shadows the image with empty directories.
+    require_materialized(&data_dir.to_string_lossy(), false)?;
 
     serve::serve_environment(
         engine, req.verbose, &image, &data_dir.to_string_lossy(), &container_name,
@@ -7858,50 +8532,10 @@ fn run_with_config(
         }
     }
 
-    // Pliable container: the pixi env (/env) and the morloc runtime shims
-    // (MORLOC_HOME) are host-mounted MUTABLE dirs -- materialized at env setup
-    // into `<env_dir>/pixi` and `<env_dir>/runtime` -- so an in-container
-    // `morloc make` can install package deps in place. Mutable state
-    // (exe/fdb/modules) is the third mount at MORLOC_STATE. All three are
-    // host-owned, hence writable under the keep-id-mapped host UID (no chmod).
-    // A pliable container env must be MATERIALIZED before it can run: `/env` (the
-    // conda toolchain) and MORLOC_HOME (the morloc runtime shims) are host-mounted
-    // from `<env>/pixi` and `<env>/runtime`, populated by materialize at env setup.
-    // If a mount source is absent (an env created with --no-init, or a materialize
-    // that never completed), mounting it would shadow the image with an empty dir
-    // and the runtime would break with a cryptic error; fail early instead. `/env`
-    // is an INPUT to every process (including a manual `morloc init`), so it is
-    // always required; MORLOC_HOME is the OUTPUT init writes, so it may be empty
-    // during an is_init run.
-    let pixi_src = std::path::Path::new(v_data_dir).join("pixi");
-    let runtime_src = std::path::Path::new(v_data_dir).join("runtime");
-    let mut required: Vec<(&std::path::Path, &str)> =
-        vec![(pixi_src.as_path(), "conda toolchain (/env)")];
-    // A dev env's runtime (MORLOC_HOME) is BUILT from the mounted source by the
-    // developer (`morloc init`), so it starts empty by design -- only the conda
-    // toolchain is manager-materialized. Non-dev envs bake the runtime at setup,
-    // so a missing one there is a real half-provisioned state.
-    if !is_init && !is_dev {
-        required.push((runtime_src.as_path(), "morloc runtime (MORLOC_HOME)"));
-    }
-    for (src, what) in required {
-        let populated = std::fs::read_dir(src).map(|mut d| d.next().is_some()).unwrap_or(false);
-        if !populated {
-            return Err(ManagerError::EnvError(format!(
-                "environment at '{v_data_dir}' is not materialized: its {what} is missing \
-                 at '{}'. Provision it first with 'mim update --env <env>', or recreate \
-                 the environment without --no-init.",
-                src.display()
-            )));
-        }
-    }
+    require_materialized(v_data_dir, is_init || is_dev)?;
 
     let mh = serve::CONTAINER_MORLOC_HOME;
-    let base_mounts = vec![
-        (v_data_dir.to_string(), serve::CONTAINER_MORLOC_STATE.to_string()),
-        (format!("{v_data_dir}/pixi"), serve::CONTAINER_PIXI_DIR.to_string()),
-        (format!("{v_data_dir}/runtime"), mh.to_string()),
-    ];
+    let (base_binds, base_volumes) = base_mounts(v_data_dir);
     let work_mount = if is_init {
         Vec::new()
     } else {
@@ -7925,7 +8559,7 @@ fn run_with_config(
     };
     // A configured host home shadows the env-owned `<data_dir>/home` for this run.
     let home_mount = serve::home_mount(mount_home)?;
-    let all_mounts: Vec<(String, String)> = base_mounts
+    let all_mounts: Vec<(String, String)> = base_binds
         .into_iter()
         .chain(work_mount)
         .chain(bridge_mount)
@@ -8041,6 +8675,7 @@ fn run_with_config(
     let cfg = RunConfig {
         image: image.to_string(),
         bind_mounts: all_mounts,
+        volumes: base_volumes,
         env: env_vars,
         interactive: shell,
         shm_size: Some(shm_size.to_string()),
@@ -8073,16 +8708,21 @@ fn run_with_config(
 /// (the `-o` name); the launcher's exec line carries the real manifest path,
 /// so the nexus resolves it. (The build dir under exe/ is keyed on the source
 /// basename, not the program name, so it is not a reliable lookup key.)
-fn ensure_program_installed(env_scope: Scope, env_name: &str, program: &str) -> Result<()> {
-    let host_launcher = cfg::env_data_dir(env_scope, env_name)
-        .join("bin")
-        .join(program);
-    if !host_launcher.exists() {
+fn ensure_program_installed(
+    ec: &EnvironmentConfig,
+    env_scope: Scope,
+    env_name: &str,
+    program: &str,
+) -> Result<()> {
+    let launcher =
+        cfg::env_program_launcher(ec, cfg::env_data_dir(env_scope, env_name), program);
+    if !launcher.exists() {
         return Err(ManagerError::EnvError(format!(
             "Program '{program}' is not installed in environment '{env_name}' \
-             (looked for bin/{program}).\n  Install it with: \
+             (looked for {}).\n  Install it with: \
              mim install <file>.loc  (the program is named after its \
-             module, so serve it as '{program}' only if that is the module name)."
+             module, so serve it as '{program}' only if that is the module name).",
+            launcher.display()
         )));
     }
     Ok(())
@@ -8131,11 +8771,23 @@ pub(crate) struct ServeSpec {
     eval_allow: Option<String>,
 }
 
+impl ServeSpec {
+    /// A spec from an exposed set: the modules answering on each adapter, and
+    /// the eval allow-list as the comma-separated form the nexus takes.
+    pub(crate) fn new(mcp: Vec<String>, api: Vec<String>, eval_allow: Option<String>) -> Self {
+        ServeSpec { mcp, api, eval_allow }
+    }
+}
+
 /// Everything a backend needs to launch a serve, after the neutral orchestration
 /// (spec resolution, port pick, env, token) has run in the `start` handler. The
 /// backend impl differs only in how it launches + tracks the process.
 pub(crate) struct ServeRequest {
     pub spec: ServeSpec,
+    /// Serve eval without a bearer token even where this endpoint is reachable
+    /// off the host. Eval is otherwise waived only when the endpoint is
+    /// host-confined; see `serve_plan`.
+    pub eval_allow_no_auth: bool,
     pub host_port: u16,
     pub container_port: u16,
     pub user_env: Vec<(String, String)>,
@@ -8183,6 +8835,7 @@ fn serve_plan(
     allow_plaintext: bool,
     allow_no_auth: bool,
     unsafe_serve: bool,
+    eval_allow_no_auth: bool,
     // Whether docker/podman can bind the host's loopback via the shared netns
     // (true on a Linux manager; false on a VM-backed engine). The production
     // caller passes `cfg!(target_os = "linux")`; kept a parameter so both the
@@ -8249,6 +8902,12 @@ fn serve_plan(
 
     // The nexus refuses a non-loopback bind with no token unless --allow-no-auth.
     let need_allow_no_auth = http_host == "0.0.0.0" && token.is_none();
+    // Eval's token requirement is waived where this endpoint cannot be reached
+    // from off the host: local development is the case eval exists for, and a
+    // token there is ceremony against a caller who is already the operator.
+    // Exposing off-box keeps the requirement, since that is the case where an
+    // expensive, caller-written computation is reachable by someone else.
+    let waive_eval_auth = eval_allow_no_auth || !expose;
     // Container: programs are installed under the mounted MORLOC_STATE, not the
     // baked MORLOC_HOME (mh), so point the router's --fdb at the state root.
     let command = build_router_command(
@@ -8257,6 +8916,7 @@ fn serve_plan(
         &http_host,
         spec,
         need_allow_no_auth,
+        waive_eval_auth,
     );
     Ok(ServePlan { command, network, publish_host, token, unsafe_unconfined })
 }
@@ -8266,7 +8926,7 @@ fn serve_plan(
 /// installed programs); the nexus listens on `http_host:bind_port`.
 /// `need_allow_no_auth` is set when a non-loopback bind has no token (the nexus
 /// otherwise refuses it).
-fn build_router_command(
+pub(crate) fn build_router_command(
     // The exe/fdb tree lives under MORLOC_STATE, not MORLOC_HOME. Native: state
     // == home == data_dir. Container: state is the mounted /opt/morloc-state,
     // NOT the baked /opt/morloc, so the router must scan the mounted dir or it
@@ -8276,6 +8936,7 @@ fn build_router_command(
     http_host: &str,
     spec: &ServeSpec,
     need_allow_no_auth: bool,
+    eval_allow_no_auth: bool,
 ) -> Vec<String> {
     let mut command = vec![
         "morloc-nexus".to_string(),
@@ -8300,37 +8961,60 @@ fn build_router_command(
     if need_allow_no_auth {
         command.push("--allow-no-auth".to_string());
     }
+    // Eval asks for a bearer token even where the rest of the endpoint does not:
+    // it runs expressions the caller writes rather than the functions the author
+    // declared, and rebuilding a pool for one costs seconds to tens of seconds.
+    // Waived only where the endpoint is host-confined, or where the operator
+    // asked for it.
+    if eval_allow_no_auth {
+        command.push("--eval-allow-no-auth".to_string());
+    }
     command
 }
 
 /// Print an environment's exposure set (modules with their protocols, and the
 /// eval capability). Under --json, pure JSON on stdout.
-fn print_exposure(env: &str, ex: &ExposureConfig, json: bool) {
+fn print_views(env: &str, views: &ViewSet, json: bool) {
     if json {
         let v = serde_json::json!({
             "environment": env,
-            "mcp": ex.mcp,
-            "api": ex.api,
-            "eval": ex.eval.as_ref().map(|e| serde_json::json!({ "allow": e.allow })),
+            "mcp": views.mcp,
+            "api": views.api,
+            "eval": views.eval.as_ref().map(|e| serde_json::json!({ "allow": e.allow })),
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return;
     }
-    if ex.is_empty() {
-        println!("Nothing exposed in '{env}'. Add with: mim expose add <module> --as mcp");
+    if views.is_empty() {
+        // Name what could go in one: a program is named after its module
+        // declaration rather than its source file, so the reader may not know
+        // what to type.
+        println!("'{env}' presents no views.");
+        let installed = installed_program_names(&cfg::env_data_dir(
+            cfg::find_env_scope(env).unwrap_or(Scope::Local),
+            env,
+        ));
+        if installed.is_empty() {
+            println!("  Nothing is installed yet: mim install <src>.loc");
+        } else {
+            println!("  Add one with:");
+            for p in installed {
+                println!("    mim view add {p} --as mcp,api");
+            }
+        }
         return;
     }
-    println!("Exposed in '{env}':");
-    for m in ex.exposed_modules() {
-        let protos: Vec<&str> = ex.protocols_of(&m).iter().map(|p| p.as_str()).collect();
+    println!("Views of '{env}':");
+    for m in views.viewed_modules() {
+        let protos: Vec<&str> = views.protocols_of(&m).iter().map(|p| p.as_str()).collect();
         println!("  {m}  [{}]", protos.join(", "));
     }
-    match &ex.eval {
+    match &views.eval {
         Some(e) if e.allow.is_empty() => println!("  eval  [enabled; empty allow-list]"),
         Some(e) => println!("  eval  [enabled; allow: {}]", e.allow.join(", ")),
         None => {}
     }
-    println!("\nRun 'mim start' to serve this set.");
+    println!("\nRun 'mim start' to serve these views.");
 }
 
 /// Print a client `mcpServers` config entry (HTTP transport) as PURE JSON on
@@ -8375,6 +9059,250 @@ mod tests {
     use super::*;
     use crate::container::{build_build_args, build_run_args, engine_executable, engine_specific_run_flags, BuildConfig};
     use clap::Parser;
+
+    #[test]
+    fn the_prefix_volume_covers_the_pixi_project_it_belongs_to() {
+        let (binds, volumes) = base_mounts("/data/environments/latest");
+        // The project dir is a bind mount, so the host keeps writing pixi.toml
+        // and reading pixi.lock.
+        assert!(binds
+            .iter()
+            .any(|(h, c)| h == "/data/environments/latest/pixi" && c == serve::CONTAINER_PIXI_DIR));
+        // The solved prefix is a volume mounted over `.pixi` inside it, so the
+        // manifest stays on the host and the prefix does not.
+        let prefix_target = format!("{}/.pixi", serve::CONTAINER_PIXI_DIR);
+        let (vol, _) = volumes
+            .iter()
+            .find(|(_, c)| *c == prefix_target)
+            .expect("the prefix volume must cover the project's .pixi");
+        assert_eq!(*vol, serve::prefix_volume(std::path::Path::new("/data/environments/latest")));
+        // No bind mount may cover the same place, or it would shadow the volume.
+        assert!(!binds.iter().any(|(_, c)| *c == prefix_target));
+    }
+
+    #[test]
+    fn volumes_render_for_the_oci_engines_and_are_dropped_by_apptainer() {
+        let (bind_mounts, volumes) = base_mounts("/data/environments/latest");
+        let cfg = RunConfig {
+            bind_mounts,
+            volumes,
+            command: Some(vec!["true".to_string()]),
+            ..RunConfig::new("img:1")
+        };
+        let docker = build_run_args(ContainerEngine::Docker, &[], &cfg).join(" ");
+        let vol = serve::prefix_volume(std::path::Path::new("/data/environments/latest"));
+        assert!(docker.contains(&format!("{vol}:{}/.pixi", serve::CONTAINER_PIXI_DIR)), "{docker}");
+        assert!(
+            docker.contains(&format!(
+                "{}:{}",
+                serve::PIXI_CACHE_VOLUME,
+                serve::CONTAINER_PIXI_CACHE
+            )),
+            "{docker}"
+        );
+        // Apptainer has no volumes; the bind mount underneath shows through, which
+        // is correct on the Linux-only filesystems it runs on.
+        let apptainer = build_run_args(ContainerEngine::Apptainer, &[], &cfg).join(" ");
+        assert!(!apptainer.contains(&vol), "{apptainer}");
+        assert!(apptainer.contains("/data/environments/latest/pixi"), "{apptainer}");
+    }
+
+    fn serve_record(port: u16, token_required: bool) -> ServeRuntime {
+        ServeRuntime {
+            mcp: vec!["dna".to_string()],
+            api: Vec::new(),
+            eval: true,
+            host: "127.0.0.1".to_string(),
+            port,
+            token_required,
+            handle: None,
+        }
+    }
+
+    #[test]
+    fn an_install_reports_what_it_added_by_module_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("exe");
+        std::fs::create_dir_all(exe.join("dna")).unwrap();
+        let before = installed_program_names(dir.path());
+        assert_eq!(before.iter().map(String::as_str).collect::<Vec<_>>(), ["dna"]);
+
+        // A second program appears; a rebuild of the first does not.
+        std::fs::create_dir_all(exe.join("util")).unwrap();
+        let after = installed_program_names(dir.path());
+        let new: Vec<&str> = after.difference(&before).map(String::as_str).collect();
+        assert_eq!(new, ["util"]);
+    }
+
+    #[test]
+    fn an_environment_with_no_program_database_lists_nothing() {
+        // A fresh environment, or one whose programs were never built: the
+        // absence is not an error, it is an empty set.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(installed_program_names(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn eval_carries_a_token_only_when_it_has_one() {
+        let bare = eval_request("add 1 2", None);
+        assert!(!bare.contains("Authorization"), "{bare}");
+        assert!(bare.contains(r#"{"expr":"add 1 2"}"#), "{bare}");
+
+        let authed = eval_request("add 1 2", Some("s3cret"));
+        assert!(authed.contains("Authorization: Bearer s3cret"), "{authed}");
+        // The body is unchanged by the header, and the length still describes it.
+        assert!(authed.contains(r#"{"expr":"add 1 2"}"#), "{authed}");
+        assert!(authed.contains("Content-Length: 18"), "{authed}");
+    }
+
+    #[test]
+    fn eval_says_a_token_is_needed_before_asking_for_a_401() {
+        // The serve records THAT a token is required, never the token itself.
+        let rt = serve_record(9090, true);
+        let err = eval_against_serve("dev", "add 1 2", None, None, Some(&rt))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires a bearer token"), "{err}");
+        assert!(err.contains("MORLOC_MCP_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn eval_reaches_for_the_port_the_serve_reported() {
+        // A serve picks its own port. Defaulting to a fixed one connects to
+        // whatever else is listening, or to nothing, and then reports that no
+        // serve is running while one is.
+        let rt = serve_record(9090, false);
+        assert_eq!(resolve_eval_port("dev", None, Some(&rt)).unwrap(), 9090);
+        // An explicit port still wins.
+        assert_eq!(resolve_eval_port("dev", Some(7000), Some(&rt)).unwrap(), 7000);
+        // With neither, say so rather than guessing.
+        let err = resolve_eval_port("dev", None, None).unwrap_err().to_string();
+        assert!(err.contains("--port"), "{err}");
+    }
+
+    #[test]
+    fn every_mounted_path_entry_is_actually_mounted() {
+        // `container_path` advertises where the runtime and the conda toolchain
+        // live. Neither is in the image -- `morloc init` writes the runtime after
+        // the image is built, and pixi solves the toolchain into its own volume --
+        // so a launch path that omits either mount leaves a dead PATH entry and a
+        // container with no `morloc-nexus` and no interpreter. Serving did exactly
+        // that.
+        let (binds, volumes) = base_mounts("/data/environments/latest");
+        let path = serve::container_path(serve::CONTAINER_MORLOC_HOME);
+        let provided: Vec<&str> = binds
+            .iter()
+            .chain(volumes.iter())
+            .map(|(_, dest)| dest.as_str())
+            .collect();
+        for root in [serve::CONTAINER_MORLOC_HOME, serve::CONTAINER_PIXI_DIR] {
+            assert!(path.contains(root), "{root} is not on PATH: {path}");
+            assert!(
+                provided.iter().any(|dest| *dest == root),
+                "{root} is on PATH but nothing mounts it: {provided:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_package_cache_is_shared_and_off_the_state_mount() {
+        let (_, a) = base_mounts("/data/environments/latest");
+        let (_, b) = base_mounts("/data/environments/other");
+        let cache_of = |v: &Vec<(String, String)>| {
+            v.iter()
+                .find(|(_, c)| c == serve::CONTAINER_PIXI_CACHE)
+                .expect("a cache volume")
+                .0
+                .clone()
+        };
+        // Conda packages are content-addressed, so environments share one cache.
+        assert_eq!(cache_of(&a), cache_of(&b));
+        // And it must not sit under the state mount, which is host-backed.
+        assert!(!serve::CONTAINER_PIXI_CACHE.starts_with(serve::CONTAINER_MORLOC_STATE));
+        assert!(serve::oci_base_env(serve::CONTAINER_MORLOC_HOME)
+            .contains(&("PIXI_CACHE_DIR".to_string(), serve::CONTAINER_PIXI_CACHE.to_string())));
+    }
+
+    #[test]
+    fn the_postinstall_step_refuses_a_case_folding_prefix_and_mirrors_the_records() {
+        let script = prefix_postinstall_script();
+        let prefix = format!("{}/.pixi/envs/default", serve::CONTAINER_PIXI_DIR);
+        // Probes the prefix itself, under both spellings, and exits on a fold.
+        assert!(script.contains(&format!("{prefix}/.mim-case-probe-A")), "{script}");
+        assert!(script.contains(&format!("{prefix}/.mim-case-probe-a")), "{script}");
+        assert!(script.contains("exit 1"), "{script}");
+        // Leaves the records where a host reading this environment looks.
+        assert!(
+            script.contains(&format!(
+                "{}/{}",
+                serve::CONTAINER_PIXI_DIR,
+                morloc_deps::abi::CONDA_META_MIRROR
+            )),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn a_prefix_left_on_the_host_is_reported_as_an_older_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("k");
+        // What an environment provisioned before the prefix moved looks like:
+        // a solved prefix on the host, and no record mirror beside the manifest.
+        let prefix = morloc_deps::abi::conda_prefix(&root.join("pixi")).join("conda-meta");
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::fs::write(prefix.join("python-3.13.1-h1234.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join("runtime").join("bin")).unwrap();
+
+        let err = require_materialized(&root.to_string_lossy(), false).unwrap_err().to_string();
+        assert!(err.contains("provisioned by an older mim"), "{err}");
+        assert!(err.contains("mim update --env k"), "{err}");
+        assert!(err.contains(&prefix.parent().unwrap().display().to_string()), "{err}");
+        // The generic wording sends the user hunting for an install that failed.
+        assert!(!err.contains("not materialized"), "{err}");
+    }
+
+    #[test]
+    fn an_environment_that_was_never_provisioned_still_reports_that() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("k");
+        std::fs::create_dir_all(root.join("pixi")).unwrap();
+        std::fs::create_dir_all(root.join("runtime").join("bin")).unwrap();
+
+        let err = require_materialized(&root.to_string_lossy(), false).unwrap_err().to_string();
+        assert!(err.contains("not materialized"), "{err}");
+        assert!(!err.contains("older mim"), "{err}");
+    }
+
+    #[test]
+    fn retiring_the_host_prefix_leaves_the_mirror_as_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let pixi = dir.path().join("pixi");
+        // A materialized environment whose previous layout is still lying around:
+        // records in the volume's mirror, and an older prefix at the host path.
+        let prefix = morloc_deps::abi::conda_prefix(&pixi);
+        std::fs::create_dir_all(prefix.join("conda-meta")).unwrap();
+        std::fs::write(prefix.join("conda-meta").join("python-3.13.1-h1.json"), "{}").unwrap();
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        let mirror = pixi.join(morloc_deps::abi::CONDA_META_MIRROR);
+        std::fs::create_dir_all(&mirror).unwrap();
+        std::fs::write(mirror.join("python-3.14.0-h2.json"), "{}").unwrap();
+
+        // Records that are really there win, so until the leftover goes it is what
+        // this environment gets described by.
+        assert_eq!(morloc_deps::abi::meta_dir(&pixi), prefix.join("conda-meta"));
+        retire_host_prefix(&pixi).unwrap();
+        assert_eq!(morloc_deps::abi::meta_dir(&pixi), mirror);
+        assert!(!prefix.exists(), "the whole tree goes, not just its records");
+    }
+
+    #[test]
+    fn retiring_is_silent_when_no_prefix_was_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let pixi = dir.path().join("pixi");
+        std::fs::create_dir_all(&pixi).unwrap();
+        // Every materialize after the first one lands here.
+        retire_host_prefix(&pixi).unwrap();
+    }
 
     #[test]
     fn merge_lang_pins_keeps_pins_and_adds_bare() {
@@ -8660,25 +9588,141 @@ mod tests {
     }
 
     #[test]
+    fn modify_parses_every_negation() {
+        let cli = Cli::try_parse_from([
+            "mim", "modify", "--env", "e",
+            "--no-lang",
+            "--no-system-packages-file",
+            "--no-conda-packages-file",
+            "--no-modules-file", "extra.txt",
+            "--no-dotfiles",
+            "--no-mount-home",
+            "--no-cert-bundle",
+        ])
+        .expect("modify should parse the negations");
+        match cli.command {
+            Some(Cmd::Modify {
+                no_lang,
+                no_system_packages_file,
+                no_conda_packages_file,
+                no_modules_file,
+                no_dotfiles,
+                no_mount_home,
+                no_cert_bundle,
+                ..
+            }) => {
+                assert!(no_lang);
+                assert!(no_system_packages_file);
+                assert!(no_conda_packages_file);
+                assert_eq!(no_modules_file, vec!["extra.txt".to_string()]);
+                assert!(no_dotfiles);
+                assert!(no_mount_home);
+                assert!(no_cert_bundle);
+            }
+            _ => panic!("expected Cmd::Modify"),
+        }
+    }
+
+    #[test]
+    fn modify_unset_default_parses_and_takes_system() {
+        let cli = Cli::try_parse_from(["mim", "modify", "--env", "e", "--unset-default"])
+            .expect("modify --unset-default should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Modify { unset_default: true, system: false, .. })
+        ));
+        let cli =
+            Cli::try_parse_from(["mim", "modify", "--env", "e", "--unset-default", "--system"])
+                .expect("modify --unset-default --system should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Modify { unset_default: true, system: true, .. })
+        ));
+    }
+
+    #[test]
+    fn modify_rejects_a_flag_and_its_negation_together() {
+        // Asking to both set and clear a setting is a contradiction, caught at
+        // parse time rather than resolved by argument order.
+        let contradictions: Vec<Vec<&str>> = vec![
+            vec!["--lang", "py", "--no-lang"],
+            vec!["--system-packages-file", "a.apt", "--no-system-packages-file"],
+            vec!["--conda-packages-file", "a.conda", "--no-conda-packages-file"],
+            vec!["--dotfiles", "/tmp/d", "--no-dotfiles"],
+            vec!["--mount-home", "/tmp/h", "--no-mount-home"],
+            vec!["--cert-bundle", "/tmp/ca.pem", "--no-cert-bundle"],
+            vec!["--set-default", "--unset-default"],
+        ];
+        for args in contradictions {
+            let mut argv = vec!["mim", "modify", "--env", "e"];
+            argv.extend(args.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "should reject: {}",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn modify_no_modules_file_is_repeatable() {
+        let cli = Cli::try_parse_from([
+            "mim", "modify", "--env", "e",
+            "--no-modules-file", "a.txt",
+            "--no-modules-file", "b.txt",
+        ])
+        .expect("--no-modules-file should repeat");
+        match cli.command {
+            Some(Cmd::Modify { no_modules_file, .. }) => {
+                assert_eq!(no_modules_file, vec!["a.txt".to_string(), "b.txt".to_string()]);
+            }
+            _ => panic!("expected Cmd::Modify"),
+        }
+    }
+
+    #[test]
     fn setup_subcommand_removed() {
         assert!(Cli::try_parse_from(["mim", "setup", "--engine", "podman"]).is_err());
     }
 
-    // The two `modify` guards below fire before any environment/filesystem
-    // access, so they can be exercised straight through `dispatch`.
-    fn modify_cmd(set_default: bool, system: bool, dotfiles: Option<String>) -> Cmd {
+    // The `modify` guards below fire before any environment/filesystem access,
+    // so they can be exercised straight through `dispatch`.
+    #[derive(Default)]
+    struct ModifyFlags {
+        set_default: bool,
+        unset_default: bool,
+        system: bool,
+        dotfiles: Option<String>,
+        no_dotfiles: bool,
+        no_lang: bool,
+        no_system_packages_file: bool,
+        no_conda_packages_file: bool,
+        no_mount_home: bool,
+        no_cert_bundle: bool,
+        no_modules_file: Vec<String>,
+    }
+
+    fn modify_cmd(f: ModifyFlags) -> Cmd {
         Cmd::Modify {
             env: Some("e".to_string()),
             lang: Vec::new(),
+            no_lang: f.no_lang,
             system_packages_file: None,
+            no_system_packages_file: f.no_system_packages_file,
             conda_packages_file: None,
+            no_conda_packages_file: f.no_conda_packages_file,
             modules_file: Vec::new(),
-            dotfiles,
+            no_modules_file: f.no_modules_file,
+            dotfiles: f.dotfiles,
+            no_dotfiles: f.no_dotfiles,
             mount_home: None,
+            no_mount_home: f.no_mount_home,
             cert_bundle: None,
+            no_cert_bundle: f.no_cert_bundle,
             base: None,
-            set_default,
-            system,
+            set_default: f.set_default,
+            unset_default: f.unset_default,
+            system: f.system,
         }
     }
 
@@ -8717,6 +9761,72 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!leftover_tmp, "temporary files should be renamed away");
+    }
+
+    #[test]
+    fn remove_snapshot_files_deletes_named_files_and_reports_unpinned() {
+        let dir = tempfile::tempdir().unwrap();
+        deposit_snapshot_files(
+            dir.path(),
+            &[
+                ("stdlib.txt".to_string(), "root-py abc123\nmath-py def456\n".to_string()),
+                ("extra.txt".to_string(), "math-py def456\nweena/foo 999aaa\n".to_string()),
+            ],
+        )
+        .unwrap();
+
+        let unpinned =
+            remove_snapshot_files(dir.path(), &["extra.txt".to_string()]).unwrap();
+        let snap = dir.path().join("snapshots");
+        assert!(!snap.join("extra.txt").exists(), "named file removed");
+        assert!(snap.join("stdlib.txt").is_file(), "unnamed file untouched");
+        // math-py is still pinned by stdlib.txt, so only weena/foo comes loose.
+        assert_eq!(unpinned, vec!["weena/foo".to_string()]);
+    }
+
+    #[test]
+    fn remove_snapshot_files_rejects_an_undeposited_name() {
+        let dir = tempfile::tempdir().unwrap();
+        deposit_snapshot_files(dir.path(), &[("stdlib.txt".to_string(), "a b\n".to_string())])
+            .unwrap();
+        // A typo must be reported, not silently do nothing.
+        let err = remove_snapshot_files(dir.path(), &["stdlb.txt".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("no deposited pin file named"), "got: {err}");
+        // ...and nothing is removed on the way to the error.
+        assert!(dir.path().join("snapshots/stdlib.txt").is_file());
+    }
+
+    #[test]
+    fn remove_snapshot_files_rejects_paths_not_names() {
+        // The argument names a deposited file, so anything that could escape the
+        // snapshots directory is refused before it is ever joined onto a path.
+        for bad in ["../env.yaml", "a/b.txt", "/etc/passwd", "..", ".", ""] {
+            let err = validate_snapshot_removals(&[bad.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("takes the NAME of a deposited pin file"),
+                "should reject {bad:?}; got: {err}"
+            );
+        }
+        assert!(validate_snapshot_removals(&["stdlib.txt".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn deposited_snapshot_names_lists_sorted_and_skips_dotfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(deposited_snapshot_names(dir.path()).is_empty(), "no snapshots dir");
+        deposit_snapshot_files(
+            dir.path(),
+            &[
+                ("zeta.txt".to_string(), "a b\n".to_string()),
+                ("alpha.txt".to_string(), "c d\n".to_string()),
+            ],
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("snapshots/.hidden.tmp"), "x").unwrap();
+        assert_eq!(
+            deposited_snapshot_names(dir.path()),
+            vec!["alpha.txt".to_string(), "zeta.txt".to_string()]
+        );
     }
 
     #[test]
@@ -8794,15 +9904,70 @@ mod tests {
     }
 
     #[test]
-    fn modify_system_requires_set_default() {
-        let err = dispatch(false, false, modify_cmd(false, true, None)).unwrap_err();
-        assert!(err.to_string().contains("--system applies only to --set-default"), "got: {err}");
+    fn modify_system_requires_a_default_flag() {
+        let err = dispatch(
+            false,
+            false,
+            modify_cmd(ModifyFlags { system: true, ..Default::default() }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--system applies only to --set-default / --unset-default"),
+            "got: {err}"
+        );
+        // --system is legal with either direction; both get past this guard and
+        // fail later on the (nonexistent) environment instead.
+        for f in [
+            ModifyFlags { system: true, set_default: true, ..Default::default() },
+            ModifyFlags { system: true, unset_default: true, ..Default::default() },
+        ] {
+            let err = dispatch(false, false, modify_cmd(f)).unwrap_err();
+            assert!(
+                !err.to_string().contains("--system applies only"),
+                "--system should be accepted alongside a default flag; got: {err}"
+            );
+        }
     }
 
     #[test]
     fn modify_requires_at_least_one_change() {
-        let err = dispatch(false, false, modify_cmd(false, false, None)).unwrap_err();
+        let err = dispatch(false, false, modify_cmd(ModifyFlags::default())).unwrap_err();
         assert!(err.to_string().contains("nothing to modify"), "got: {err}");
+    }
+
+    #[test]
+    fn modify_negations_each_count_as_a_change() {
+        // Every `--no-` form must satisfy the "nothing to modify" guard on its
+        // own, or the flag is unreachable without pairing it with another edit.
+        let cases: Vec<(&str, ModifyFlags)> = vec![
+            ("--no-lang", ModifyFlags { no_lang: true, ..Default::default() }),
+            (
+                "--no-system-packages-file",
+                ModifyFlags { no_system_packages_file: true, ..Default::default() },
+            ),
+            (
+                "--no-conda-packages-file",
+                ModifyFlags { no_conda_packages_file: true, ..Default::default() },
+            ),
+            ("--no-dotfiles", ModifyFlags { no_dotfiles: true, ..Default::default() }),
+            ("--no-mount-home", ModifyFlags { no_mount_home: true, ..Default::default() }),
+            ("--no-cert-bundle", ModifyFlags { no_cert_bundle: true, ..Default::default() }),
+            (
+                "--no-modules-file",
+                ModifyFlags {
+                    no_modules_file: vec!["stdlib.txt".to_string()],
+                    ..Default::default()
+                },
+            ),
+            ("--unset-default", ModifyFlags { unset_default: true, ..Default::default() }),
+        ];
+        for (flag, f) in cases {
+            let err = dispatch(false, false, modify_cmd(f)).unwrap_err();
+            assert!(
+                !err.to_string().contains("nothing to modify"),
+                "{flag} alone should be a change; got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -8928,8 +10093,40 @@ mod tests {
         };
         serve_plan(
             engine, &spec, 9000, 9000,
-            expose, plaintext, noauth, unsafe_serve, host_net, tok.map(str::to_string),
+            expose, plaintext, noauth, unsafe_serve, false, host_net, tok.map(str::to_string),
         )
+    }
+
+    #[test]
+    fn eval_needs_no_token_on_a_host_confined_endpoint() {
+        // Local development is what eval exists for, and the caller there is
+        // already the operator, so a token would be ceremony.
+        let p = plan(ContainerEngine::Docker, false, false, false, false, true, None).unwrap();
+        assert!(p.command.iter().any(|a| a == "--eval-allow-no-auth"), "{:?}", p.command);
+    }
+
+    #[test]
+    fn eval_keeps_its_token_off_box() {
+        // Reachable by someone else, and one call can rebuild a pool: this is the
+        // case the requirement exists for.
+        let p = plan(ContainerEngine::Docker, true, true, false, false, true, Some("t")).unwrap();
+        assert!(!p.command.iter().any(|a| a == "--eval-allow-no-auth"), "{:?}", p.command);
+    }
+
+    #[test]
+    fn an_operator_can_waive_eval_auth_off_box() {
+        // The documented way out, for someone whose gateway already gates it.
+        let spec = ServeSpec {
+            mcp: vec!["dna".to_string()],
+            api: Vec::new(),
+            eval_allow: Some("dna".to_string()),
+        };
+        let p = serve_plan(
+            ContainerEngine::Docker, &spec, 9000, 9000,
+            true, true, false, false, true, true, Some("t".to_string()),
+        )
+        .unwrap();
+        assert!(p.command.iter().any(|a| a == "--eval-allow-no-auth"), "{:?}", p.command);
     }
 
     #[test]
@@ -9007,7 +10204,7 @@ mod tests {
         };
         let p = serve_plan(
             ContainerEngine::Docker, &spec, 9000, 9000,
-            false, false, false, false, true, None,
+            false, false, false, false, false, true, None,
         ).unwrap();
         // The front-end is the `router` mode, not the single-program `mcp` mode.
         assert_eq!(p.command.first().map(String::as_str), Some("morloc-nexus"));
@@ -9235,66 +10432,6 @@ mod tests {
         assert_eq!(ec2.shm_size, "1g");
         assert_eq!(ec2.morloc_version, Some(Version::new(0, 67, 0)));
     }
-
-    #[test]
-    fn freeze_manifest_json_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fm.json");
-        let fm = FreezeManifest {
-            morloc_version: Version::new(0, 67, 0),
-            frozen_at: chrono::Utc::now(),
-            modules: vec![ModuleEntry {
-                name: "math".to_string(),
-                version: Some("0.3.0".to_string()),
-                sha256: "abc123".to_string(),
-                morloc_version: None,
-                built_with_morloc: None,
-            }],
-            programs: vec![ProgramEntry {
-                name: "svc".to_string(),
-                commands: vec!["hello".to_string(), "compute".to_string()],
-            }],
-            base_image: "morloc-full:0.67.0".to_string(),
-            env_layer: Some(FrozenEnvLayer {
-                name: "ml".to_string(),
-                dockerfile: "FROM scratch".to_string(),
-                content_hash: "abc".to_string(),
-                image_tag: None,
-            }),
-            env_vars: Vec::new(),
-        };
-        cfg::write_config(&path, &fm).unwrap();
-        let fm2: FreezeManifest = cfg::read_config(&path).unwrap();
-        assert_eq!(fm2.morloc_version, Version::new(0, 67, 0));
-        assert_eq!(fm2.modules.len(), 1);
-        assert_eq!(fm2.programs.len(), 1);
-        assert_eq!(fm2.programs[0].commands, vec!["hello", "compute"]);
-        // env_vars is no longer written but can still be read from old manifests
-        assert!(fm2.env_vars.is_empty());
-    }
-
-    #[test]
-    fn freeze_manifest_reads_legacy_env_vars() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.json");
-        // Version (de)serializes as a string via its Display/FromStr impls.
-        // env_vars survives for backward-compat with old manifests that
-        // wrote the field; new code skips it on write.
-        let json = r#"{
-            "morloc_version": "0.67.0",
-            "frozen_at": "2025-01-01T00:00:00Z",
-            "modules": [],
-            "programs": [],
-            "base_image": "morloc-full:0.67.0",
-            "env_layer": null,
-            "env_vars": ["API_KEY", "DB_URL"]
-        }"#;
-        std::fs::write(&path, json).unwrap();
-        let fm: FreezeManifest = cfg::read_config(&path).unwrap();
-        assert_eq!(fm.env_vars, vec!["API_KEY", "DB_URL"]);
-    }
-
-    // ---- FlagConfig tests ----
 
     #[test]
     fn flag_config_default_is_all_empty() {
@@ -9808,6 +10945,39 @@ run:
         .unwrap();
         assert!(target.is_dir(), "the host home is created, not rejected");
         assert_eq!(got, std::fs::canonicalize(&target).unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_mount_home_treats_none_as_an_ordinary_directory_name() {
+        // There is no word that means "no mount": every value is a path, so a
+        // directory genuinely named `none` is reachable. Clearing a mount is
+        // `--no-mount-home` and nothing else.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("none");
+        let data_dir = tmp.path().join("data");
+        let got = resolve_mount_home(
+            target.to_str().unwrap(),
+            Some(ContainerEngine::Podman),
+            Scope::Local,
+            &data_dir,
+        )
+        .unwrap();
+        assert!(target.is_dir(), "a directory named `none` is created like any other");
+        assert_eq!(got, std::fs::canonicalize(&target).unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_mount_home_rejects_an_empty_path() {
+        // The empty string once meant "clear the mount"; now that clearing has
+        // its own flag, it names nothing and must say so.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        for raw in ["", "   "] {
+            let err =
+                resolve_mount_home(raw, Some(ContainerEngine::Podman), Scope::Local, &data_dir)
+                    .unwrap_err();
+            assert!(err.to_string().contains("empty path"), "got: {err}");
+        }
     }
 
     #[test]

@@ -5,212 +5,13 @@ use std::thread;
 use std::time::Duration;
 
 use crate::container::{
-    container_build, container_pull, container_run, container_run_quiet, container_stop,
-    container_remove, engine_executable, exit_code_to_int, image_exists_locally,
-    BuildConfig, RunConfig,
+    container_run, container_run_quiet, container_stop, container_remove, engine_executable,
+    exit_code_to_int, RunConfig,
 };
 use crate::error::{ManagerError, Result};
 use crate::types::*;
 
-pub fn build_serve_image(
-    engine: ContainerEngine,
-    verbose: bool,
-    state_tarball: &str,
-    tag: &str,
-    ver: Version,
-    base_override: Option<&str>,
-    rebuild: bool,
-    programs: &[ProgramEntry],
-) -> Result<()> {
-    if matches!(engine, ContainerEngine::Apptainer) {
-        // The Apptainer unfreeze path is not yet implemented end-to-end --
-        // the OCI builder available on the freeze host may not be available
-        // on a deployment host. Produce a clear error here instead of
-        // silently falling into a docker/podman code path that will fail
-        // later with a confusing message.
-        return Err(ManagerError::UnfreezeError(format!(
-            "Apptainer unfreeze is not yet implemented in this build. The frozen \
-             state at '{state_tarball}' is engine-agnostic and can be unfrozen \
-             under --engine docker or --engine podman; or rebuild from the env's \
-             .def recipe with `apptainer build {tag}.sif ...`. Track support in \
-             the SLURM-prep roadmap."
-        )));
-    }
-    if !Path::new(state_tarball).exists() {
-        return Err(ManagerError::UnfreezeError(format!(
-            "Tarball not found: {state_tarball}"
-        )));
-    }
-
-    if !rebuild && image_exists_locally(engine, tag) {
-        eprintln!("Image '{tag}' already exists locally; skipping build (use --rebuild to force)");
-        return Ok(());
-    }
-
-    let tarball_dir = Path::new(state_tarball)
-        .parent()
-        .unwrap_or(Path::new("."));
-    let manifest_path = tarball_dir.join("freeze-manifest.json");
-    let m_manifest = if manifest_path.exists() {
-        crate::freeze::read_freeze_manifest(&manifest_path.to_string_lossy()).ok()
-    } else {
-        None
-    };
-
-    let base_image = match base_override {
-        Some(b) => b.to_string(),
-        None => resolve_base_from_manifest(engine, m_manifest.as_ref(), ver),
-    };
-
-    eprintln!("Using base image: {base_image}");
-    if !image_exists_locally(engine, &base_image) {
-        let exe = engine_executable(engine);
-        if verbose {
-            eprintln!("[mim] {exe} pull {base_image}");
-        }
-        let (pull_status, _, pull_err) = container_pull(engine, &base_image);
-        if !pull_status.success() {
-            return Err(ManagerError::EngineError {
-                engine,
-                code: exit_code_to_int(pull_status),
-                stderr: pull_err,
-            });
-        }
-    }
-
-    let context_dir = tarball_dir.join("serve-build");
-    fs::create_dir_all(&context_dir)
-        .map_err(|e| ManagerError::UnfreezeError(format!("mkdir failed: {e}")))?;
-
-    eprintln!("Extracting frozen state...");
-    let tar_status = Command::new("tar")
-        .args(["-xzf", state_tarball, "-C", &context_dir.to_string_lossy()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| ManagerError::UnfreezeError(format!("tar extract failed: {e}")))?;
-    if !tar_status.success() {
-        return Err(ManagerError::UnfreezeError(
-            "tar extract failed (see error output above)".to_string()
-        ));
-    }
-
-    // No manifest rewriting is needed: pool exec paths are relative to each
-    // manifest.json's own directory, so the copied exe/<name>/ trees resolve
-    // correctly inside the container with no host-path leakage.
-
-    let dockerfile_path = context_dir.join("Dockerfile");
-    let has_exe = context_dir.join("exe").is_dir()
-        && fs::read_dir(context_dir.join("exe"))
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-    let has_opt = context_dir.join("opt").is_dir()
-        && fs::read_dir(context_dir.join("opt"))
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-    let has_src = context_dir.join("src").is_dir()
-        && fs::read_dir(context_dir.join("src"))
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-    let mh = CONTAINER_MORLOC_HOME;
-    let exe_line = if has_exe {
-        format!("COPY exe/ {mh}/exe/\n")
-    } else {
-        String::new()
-    };
-    let opt_line = if has_opt {
-        format!("COPY opt/ {mh}/opt/\n")
-    } else {
-        String::new()
-    };
-    let src_line = if has_src {
-        format!("COPY src/ {mh}/src/\n")
-    } else {
-        String::new()
-    };
-    // Podman's OCI format drops HEALTHCHECK; omit it to avoid warnings.
-    let healthcheck = if engine == ContainerEngine::Docker {
-        "# Health check for container orchestrators\n\
-         HEALTHCHECK --interval=30s --timeout=5s --retries=3 \\\n\
-           CMD curl -sf http://localhost:8080/health || exit 1\n\
-         \n"
-            .to_string()
-    } else {
-        String::new()
-    };
-    // The frozen deploy image serves every installed program over both
-    // adapters. `--program <name>` (both MCP and API) is baked in explicitly
-    // for each program in the frozen state.
-    let program_flags: String = programs
-        .iter()
-        .map(|p| format!("\"--program\", \"{}\", \\\n                     ", p.name))
-        .collect();
-    let dockerfile_content = format!(
-        "# Auto-generated by mim serve-image\n\
-         FROM {base_image}\n\
-         \n\
-         # Ensure morloc binaries are on PATH\n\
-         ENV PATH=\"{mh}/bin:${{PATH}}\"\n\
-         \n\
-         # Morloc home for pool path resolution\n\
-         ENV MORLOC_HOME=\"{mh}\"\n\
-         \n\
-         # Copy frozen morloc state (modules, manifests, binaries, pools)\n\
-         COPY lib/ {mh}/lib/\n\
-         COPY fdb/ {mh}/fdb/\n\
-         COPY bin/ {mh}/bin/\n\
-         {exe_line}\
-         {opt_line}\
-         {src_line}\
-         RUN chmod -R a+rX {mh}\n\
-         \n\
-         {healthcheck}\
-         # Entrypoint: serve every installed program over both adapters.\n\
-         ENTRYPOINT [\"morloc-nexus\", \"router\", \\\n\
-                     {program_flags}\"--fdb\", \"{mh}/exe\", \\\n\
-                     \"--http-port\", \"8080\"]\n"
-    );
-    fs::write(&dockerfile_path, &dockerfile_content)
-        .map_err(|e| ManagerError::UnfreezeError(format!("Write Dockerfile failed: {e}")))?;
-
-    eprintln!("Building serve image {tag} (base: {base_image})...");
-    let build_cfg = BuildConfig {
-        dockerfile: dockerfile_path.to_string_lossy().to_string(),
-        context: context_dir.to_string_lossy().to_string(),
-        tag: tag.to_string(),
-        build_args: Vec::new(),
-        // Serve-image builds are short-lived bootstrap recipes generated
-        // by mim itself; no user-supplied build flags apply.
-        extra_flags: Vec::new(),
-    };
-    if verbose {
-        let exe = engine_executable(engine);
-        eprintln!(
-            "[mim] {exe} build -f {} -t {tag} {}",
-            build_cfg.dockerfile, build_cfg.context
-        );
-    }
-    let (status, _, build_err) = container_build(engine, &build_cfg);
-    if !status.success() {
-        return Err(ManagerError::EngineError {
-            engine,
-            code: exit_code_to_int(status),
-            stderr: build_err,
-        });
-    }
-    eprintln!("Built serve image: {tag}");
-
-    // Validate programs work inside the built image
-    validate_programs(engine, tag, programs, Vec::new(), verbose)?;
-
-    // Clean up the temporary build context
-    if let Err(e) = fs::remove_dir_all(&context_dir) {
-        eprintln!("Warning: failed to clean up {}: {e}", context_dir.display());
-    }
-
-    Ok(())
-}
+use sha2::Digest;
 
 /// Serve an environment by bind-mounting its data directory into the container.
 pub fn serve_environment(
@@ -273,9 +74,15 @@ pub fn serve_environment(
     cfg.publish_host = publish_host.map(str::to_string);
     cfg.network = network.map(str::to_string);
     let mh = CONTAINER_MORLOC_HOME;
-    // Mount the host env dir at MORLOC_STATE (mutable), NOT over MORLOC_HOME (the
-    // baked runtime), so the runtime is never shadowed.
-    cfg.bind_mounts = vec![(data_dir.to_string(), CONTAINER_MORLOC_STATE.to_string())];
+    // A served pliable environment needs the same three-way mount the run path
+    // uses. The image carries neither the morloc runtime nor the conda toolchain
+    // -- `morloc init` builds the runtime into `<env>/runtime` and pixi solves the
+    // toolchain into its own volume, both after the image is built -- so serving
+    // with only the state mount leaves the container without `morloc-nexus` on
+    // PATH and without an interpreter for any pool.
+    let (binds, volumes) = crate::base_mounts(data_dir);
+    cfg.bind_mounts = binds;
+    cfg.volumes = volumes;
     // A host-mounted home shadows the env-owned one for served daemons too, so a
     // program reading `~/.config` sees the same home as `mim shell`.
     cfg.bind_mounts.extend(home_mount(mount_home)?);
@@ -586,6 +393,7 @@ pub fn validate_programs(
     image: &str,
     programs: &[ProgramEntry],
     bind_mounts: Vec<(String, String)>,
+    volumes: Vec<(String, String)>,
     verbose: bool,
 ) -> Result<()> {
     if programs.is_empty() {
@@ -601,6 +409,7 @@ pub fn validate_programs(
         }
         let cfg = RunConfig {
             bind_mounts: bind_mounts.clone(),
+            volumes: volumes.clone(),
             command: Some(vec![exe_path, "--help".to_string()]),
             env: vec![
                 ("MORLOC_HOME".to_string(), CONTAINER_MORLOC_HOME.to_string()),
@@ -727,6 +536,45 @@ pub const CONTAINER_PIXI_DIR: &str = "/env";
 /// The pixi binary inside the image (PIXI_HOME=/opt/pixi; not on the run PATH).
 pub const CONTAINER_PIXI_BIN: &str = "/opt/pixi/bin/pixi";
 
+/// In-container mount point for the conda package cache, pointed at by
+/// `PIXI_CACHE_DIR` and backed by [`PIXI_CACHE_VOLUME`].
+///
+/// It is deliberately not under the state mount. Package payloads are unpacked
+/// here byte for byte, case-colliding names included, and then copied into the
+/// prefix; on a host share that folds letter case one file of every such pair is
+/// lost during unpacking, and the copy into the prefix then fails on a source
+/// that is no longer there.
+pub const CONTAINER_PIXI_CACHE: &str = "/opt/morloc-pixi-cache";
+
+/// The engine volume backing [`CONTAINER_PIXI_CACHE`]. Conda packages are
+/// content-addressed, so one cache serves every environment on the machine; it
+/// is not per-environment and removing an environment does not remove it.
+pub const PIXI_CACHE_VOLUME: &str = "morloc-pixi-cache";
+
+/// The engine volume holding an environment's solved conda prefix, mounted over
+/// `<CONTAINER_PIXI_DIR>/.pixi`.
+///
+/// Only the prefix moves off the host. `pixi.toml` and `pixi.lock` stay on the
+/// bind mount beside it, because the host solves the environment (with the
+/// host's CA bundle) and reads the lock back; the prefix itself is a Linux tree
+/// that only in-container processes ever execute.
+///
+/// The name carries the environment's directory name so `volume ls` is readable,
+/// plus a digest of its full path so two environments cannot share a volume --
+/// environment names may contain characters a volume name may not, and are
+/// unique only within a scope.
+pub fn prefix_volume(env_dir: &Path) -> String {
+    let path = env_dir.to_string_lossy();
+    let readable: String = env_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect();
+    format!("morloc-env-{readable}-{:.8x}-pixi", sha2::Sha256::digest(path.as_bytes()))
+}
+
 /// Dev environments only: the ghcup bin dir baked into the dev image
 /// (`GHCUP_INSTALL_BASE_PREFIX=/opt`), holding `ghcup`/`stack`. Placed on the run
 /// PATH so an interactive dev shell can build the compiler, not just run it. On a
@@ -773,6 +621,8 @@ pub fn oci_base_env(mh: &str) -> Vec<(String, String)> {
         ("MORLOC_STATE".to_string(), CONTAINER_MORLOC_STATE.to_string()),
         ("HOME".to_string(), CONTAINER_HOME.to_string()),
         ("PATH".to_string(), container_path(mh)),
+        // Off the state mount: see CONTAINER_PIXI_CACHE.
+        ("PIXI_CACHE_DIR".to_string(), CONTAINER_PIXI_CACHE.to_string()),
         // A UTF-8 locale (C.UTF-8 is built into the base image's glibc) so the
         // compiler and programs can emit non-ASCII to stdout; under the default C
         // locale that fails with "commitBuffer: invalid argument".
@@ -796,105 +646,6 @@ pub fn oci_managed_markers() -> Vec<(String, String)> {
         ("MORLOC_PIXI".to_string(), CONTAINER_PIXI_BIN.to_string()),
         ("MORLOC_PIXI_DIR".to_string(), CONTAINER_PIXI_DIR.to_string()),
     ]
-}
-
-// ======================================================================
-// Manifest and image resolution
-// ======================================================================
-
-fn resolve_base_from_manifest(
-    engine: ContainerEngine,
-    m_manifest: Option<&FreezeManifest>,
-    ver: Version,
-) -> String {
-    let ghcr_fallback = format!(
-        "ghcr.io/morloc-project/morloc/morloc-full:{}",
-        ver.show()
-    );
-    let Some(fm) = m_manifest else {
-        return ghcr_fallback;
-    };
-
-    // Resolve the effective base image: use manifest's base_image if it exists
-    // locally, otherwise fall back to the GHCR image. The manifest may record a
-    // locally-retagged image (e.g. localhost/morloc:0.69.0) that won't exist on
-    // other machines.
-    let effective_base = if image_exists_locally(engine, &fm.base_image) {
-        fm.base_image.clone()
-    } else {
-        eprintln!(
-            "Base image '{}' not found locally, trying GHCR fallback...",
-            fm.base_image
-        );
-        ghcr_fallback
-    };
-
-    match &fm.env_layer {
-        None => effective_base,
-        Some(fel) => {
-            // Fast path: env image tag exists locally
-            if let Some(ref tag) = fel.image_tag {
-                let exe = engine_executable(engine);
-                let check = Command::new(exe)
-                    .args(["image", "inspect", tag])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                if check.map(|s| s.success()).unwrap_or(false) {
-                    return tag.clone();
-                }
-            }
-            // Rebuild env layer from stored Dockerfile using effective base
-            rebuild_env_image(engine, &effective_base, fm, fel)
-        }
-    }
-}
-
-fn rebuild_env_image(
-    engine: ContainerEngine,
-    effective_base: &str,
-    fm: &FreezeManifest,
-    fel: &FrozenEnvLayer,
-) -> String {
-    let env_tag = format!(
-        "localhost/morloc-env:{}-{}",
-        fm.morloc_version.show(),
-        fel.name
-    );
-    let exe = engine_executable(engine);
-    // Check if tagged image exists locally
-    let check = Command::new(exe)
-        .args(["image", "inspect", &env_tag])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    if check.map(|s| s.success()).unwrap_or(false) {
-        return env_tag;
-    }
-
-    eprintln!("Building deployment image (environment layer: {})", fel.name);
-    let build_dir = "/tmp/morloc-env-rebuild";
-    let _ = fs::create_dir_all(build_dir);
-    let df_path = format!("{build_dir}/Dockerfile");
-    let _ = fs::write(&df_path, &fel.dockerfile);
-    let build_cfg = BuildConfig {
-        dockerfile: df_path,
-        context: build_dir.to_string(),
-        tag: env_tag.clone(),
-        build_args: vec![("CONTAINER_BASE".to_string(), effective_base.to_string())],
-        // Deployment-image rebuild during unfreeze is mim's own
-        // bootstrap step; no user flag-file applies here.
-        extra_flags: Vec::new(),
-    };
-    let (status, _, build_err) = container_build(engine, &build_cfg);
-    if status.success() {
-        env_tag
-    } else {
-        eprintln!(
-            "Warning: env rebuild failed, falling back to base image: {build_err}"
-        );
-        effective_base.to_string()
-    }
 }
 
 // ======================================================================
@@ -947,8 +698,14 @@ fn serve_apptainer_instance(
 
     let exe = engine_executable(ContainerEngine::Apptainer);
     let mut argv: Vec<String> = vec!["instance".to_string(), "start".to_string()];
-    argv.push("--bind".to_string());
-    argv.push(format!("{data_dir}:{CONTAINER_MORLOC_STATE}"));
+    // The same three-way mount the OCI path uses. Apptainer has no volumes, so
+    // the conda prefix comes straight from the host dir under `<env>/pixi`, which
+    // is where it lives on the Linux-only filesystems Apptainer runs on.
+    let (binds, _volumes) = crate::base_mounts(data_dir);
+    for (src, dest) in binds {
+        argv.push("--bind".to_string());
+        argv.push(format!("{src}:{dest}"));
+    }
     argv.push("--env".to_string());
     argv.push(format!("PATH={}", container_path(mh)));
     argv.push("--env".to_string());
@@ -1167,6 +924,34 @@ pub fn dump_err_files(logs_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_volume_names_are_engine_legal_and_readable() {
+        let name = prefix_volume(Path::new("/home/z/.local/share/morloc/environments/latest"));
+        assert!(name.starts_with("morloc-env-latest-"), "{name}");
+        assert!(name.ends_with("-pixi"), "{name}");
+        // docker/podman accept [a-zA-Z0-9][a-zA-Z0-9_.-]*
+        let mut chars = name.chars();
+        assert!(chars.next().unwrap().is_ascii_alphanumeric());
+        assert!(chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'));
+    }
+
+    #[test]
+    fn prefix_volume_is_stable_and_per_environment() {
+        let a = Path::new("/data/environments/latest");
+        let b = Path::new("/data/other-scope/environments/latest");
+        assert_eq!(prefix_volume(a), prefix_volume(a));
+        // Same directory name under a different root: the digest keeps the two
+        // environments from sharing one prefix.
+        assert_ne!(prefix_volume(a), prefix_volume(b));
+    }
+
+    #[test]
+    fn a_volume_name_survives_an_environment_name_a_volume_may_not_hold() {
+        // Environment names allow any Unicode alphanumeric; volume names do not.
+        let name = prefix_volume(Path::new("/data/environments/pruebas-nino"));
+        assert!(name.is_ascii(), "{name}");
+    }
 
     // A previous whole-output `.trim()` stripped the trailing tab from the last
     // `ps` line, so the last host-network container (empty Ports) split into two

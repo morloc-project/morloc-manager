@@ -213,6 +213,7 @@ fn build_new_language_shims(activation: &[(String, String)], home: &Path) -> Res
     let morloc = std::env::var("MORLOC_BIN").unwrap_or_else(|_| "morloc".to_string());
     let mut cmd = Command::new(&morloc);
     cmd.arg("init");
+    morloc_deps::ambient::scrub(&mut cmd);
     crate::apply_activation(&mut cmd, activation);
     cmd.env("MORLOC_HOME", home);
     cmd.env(ENV_INIT_INCREMENTAL, "1");

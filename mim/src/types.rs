@@ -612,36 +612,6 @@ impl FlagConfig {
     }
 }
 
-// ======================================================================
-// Freeze manifest
-// ======================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FreezeManifest {
-    pub morloc_version: Version,
-    pub frozen_at: chrono::DateTime<chrono::Utc>,
-    pub modules: Vec<ModuleEntry>,
-    pub programs: Vec<ProgramEntry>,
-    pub base_image: String,
-    pub env_layer: Option<FrozenEnvLayer>,
-    /// Deprecated: previously held expected env var names. Retained for backward
-    /// compatibility when reading older freeze manifests.
-    #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
-    pub env_vars: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrozenEnvLayer {
-    pub name: String,
-    pub dockerfile: String,
-    pub content_hash: String,
-    /// Container image tag (e.g. localhost/morloc-env:0.79.2-dnd).
-    /// Named image_tag because it stores a mutable tag, not a content-addressed digest.
-    #[serde(alias = "image_digest")]
-    pub image_tag: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleEntry {
     pub name: String,
@@ -690,32 +660,36 @@ impl Protocol {
 /// module sets (eval composes generic code a fixed tool surface cannot express,
 /// and may need to import modules that are not themselves exposed as tools).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EvalExposure {
+pub struct EvalCapability {
     /// Modules eval may import (sandbox allow-list). Empty = eval can import
     /// nothing (harmless but useless).
     #[serde(default)]
     pub allow: Vec<String>,
 }
 
-/// Declarative record of what an environment exposes and how. Lives at
-/// `<config>/environments/<name>/expose.yaml`, edited by `expose` and realized
-/// by `start`. Separate from `EnvironmentConfig` (build/image config): install
-/// makes a module importable; expose declares which modules are served, over
-/// which protocol.
+/// The views an environment presents: which installed modules answer on which
+/// adapter, plus the eval capability. Lives at
+/// `<config>/environments/<name>/views.yaml`, edited by `view` and realized by
+/// `start`.
+///
+/// Separate from `EnvironmentConfig` (build/image config): installing a module
+/// makes it importable, and adding it to a view makes it callable over a
+/// network adapter. The two are independent, so a program can be installed and
+/// unreachable, which is the default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExposureConfig {
-    /// Modules exposed over MCP (each contributes `<module>__<command>` tools).
+pub struct ViewSet {
+    /// Modules in the MCP view (each contributes `<module>__<command>` tools).
     #[serde(default)]
     pub mcp: Vec<String>,
-    /// Modules exposed over the HTTP JSON API.
+    /// Modules in the HTTP JSON API view.
     #[serde(default)]
     pub api: Vec<String>,
     /// The eval capability. `None` = off (the default).
     #[serde(default)]
-    pub eval: Option<EvalExposure>,
+    pub eval: Option<EvalCapability>,
 }
 
-impl ExposureConfig {
+impl ViewSet {
     pub fn is_empty(&self) -> bool {
         self.mcp.is_empty() && self.api.is_empty() && self.eval.is_none()
     }
@@ -746,7 +720,7 @@ impl ExposureConfig {
         before != self.mcp.len() + self.api.len()
     }
 
-    /// The protocols a given module is exposed over (for display).
+    /// The adapters a given module answers on (for display).
     pub fn protocols_of(&self, module: &str) -> Vec<Protocol> {
         let mut ps = Vec::new();
         if self.mcp.iter().any(|m| m == module) {
@@ -758,13 +732,13 @@ impl ExposureConfig {
         ps
     }
 
-    /// Every module exposed over any protocol (deduped, sorted).
-    pub fn exposed_modules(&self) -> Vec<String> {
+    /// Every module in any view (deduped, sorted).
+    pub fn viewed_modules(&self) -> Vec<String> {
         sorted_union(&self.mcp, &self.api)
     }
 }
 
-/// Sorted, deduped union of two module lists. Shared by `ExposureConfig` and
+/// Sorted, deduped union of two module lists. Shared by `ViewSet` and
 /// `ServeRuntime` so "the set of modules across both adapters" has one spelling.
 fn sorted_union(a: &[String], b: &[String]) -> Vec<String> {
     let mut all: Vec<String> = a.iter().chain(b.iter()).cloned().collect();
@@ -774,7 +748,7 @@ fn sorted_union(a: &[String], b: &[String]) -> Vec<String> {
 }
 
 /// Runtime record of what a serve container is ACTUALLY serving, written by
-/// `start` and read by `status`. Distinct from `ExposureConfig` (declared
+/// `start` and read by `status`. Distinct from `ViewSet` (declared
 /// intent): this reflects the live invocation, including the resolved host/port
 /// and whether a token is required.
 /// Host-side materialization record for a native (no-container) environment.
@@ -880,7 +854,7 @@ mod exposure_tests {
 
     #[test]
     fn add_is_idempotent_and_per_protocol() {
-        let mut ex = ExposureConfig::default();
+        let mut ex = ViewSet::default();
         ex.add("dna", &[Protocol::Mcp]);
         ex.add("dna", &[Protocol::Mcp]); // idempotent
         ex.add("align", &[Protocol::Api]);
@@ -891,7 +865,7 @@ mod exposure_tests {
 
     #[test]
     fn remove_clears_all_sets() {
-        let mut ex = ExposureConfig::default();
+        let mut ex = ViewSet::default();
         ex.add("util", &[Protocol::Mcp, Protocol::Api]);
         assert!(ex.remove("util"));
         assert!(ex.mcp.is_empty() && ex.api.is_empty());
@@ -900,7 +874,7 @@ mod exposure_tests {
 
     #[test]
     fn protocols_of_reports_both() {
-        let mut ex = ExposureConfig::default();
+        let mut ex = ViewSet::default();
         ex.add("util", &[Protocol::Mcp, Protocol::Api]);
         ex.add("dna", &[Protocol::Mcp]);
         assert_eq!(ex.protocols_of("util"), vec![Protocol::Mcp, Protocol::Api]);
@@ -909,12 +883,12 @@ mod exposure_tests {
     }
 
     #[test]
-    fn eval_is_independent_of_exposed_sets() {
-        let mut ex = ExposureConfig::default();
+    fn eval_is_independent_of_the_views() {
+        let mut ex = ViewSet::default();
         ex.add("dna", &[Protocol::Mcp]);
-        ex.eval = Some(EvalExposure { allow: vec!["dna".into(), "stats".into()] });
+        ex.eval = Some(EvalCapability { allow: vec!["dna".into(), "stats".into()] });
         // eval may allow a module (stats) that is NOT in any exposed set.
-        assert!(!ex.exposed_modules().contains(&"stats".to_string()));
+        assert!(!ex.viewed_modules().contains(&"stats".to_string()));
         assert_eq!(ex.eval.as_ref().unwrap().allow, vec!["dna".to_string(), "stats".to_string()]);
     }
 
@@ -943,12 +917,12 @@ mod exposure_tests {
 
     #[test]
     fn yaml_round_trip() {
-        let mut ex = ExposureConfig::default();
+        let mut ex = ViewSet::default();
         ex.add("dna", &[Protocol::Mcp]);
         ex.add("align", &[Protocol::Api]);
-        ex.eval = Some(EvalExposure { allow: vec!["dna".into()] });
+        ex.eval = Some(EvalCapability { allow: vec!["dna".into()] });
         let yaml = serde_yaml::to_string(&ex).unwrap();
-        let back: ExposureConfig = serde_yaml::from_str(&yaml).unwrap();
+        let back: ViewSet = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(ex, back);
     }
 }

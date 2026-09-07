@@ -655,13 +655,13 @@ pub(crate) struct ExtraLoadability {
 }
 
 /// Probe each requested conda extra's binaries for unresolved shared libraries.
-/// `conda_prefix` locates the host-side `conda-meta/` (to map extra -> `bin/*`); the
-/// `ldd` closure runs `ldd` on a prefix-relative binary path in the RIGHT context
+/// `meta_dir` holds the `conda-meta` records (to map extra -> `bin/*`); the `ldd`
+/// closure runs `ldd` on a prefix-relative binary path in the RIGHT context
 /// (native activation, or in-container) and returns its stdout, or `None` if the
 /// binary was not a real ELF probe (empty output). Unlike morloc's own dlopen-shims,
 /// a normal conda CLI tool `ldd`s cleanly, so an unresolved lib is a real broken or
 /// mismatched package (the nvim/libunibilium class).
-fn probe_extras<F>(conda_prefix: &Path, extras: &[String], ldd: F) -> Vec<ExtraLoadability>
+fn probe_extras<F>(meta_dir: &Path, extras: &[String], ldd: F) -> Vec<ExtraLoadability>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -675,7 +675,7 @@ where
             name.rsplit("::").next().unwrap_or(name).to_string()
         })
         .collect();
-    let bins_by_pkg = morloc_deps::abi::package_binaries(conda_prefix, &names);
+    let bins_by_pkg = morloc_deps::abi::package_binaries(meta_dir, &names);
     let mut findings = Vec::new();
     for (name, bins) in &bins_by_pkg {
         let mut unresolved: Vec<String> = Vec::new();
@@ -703,7 +703,7 @@ pub(crate) fn probe_extras_native(
     rt: &NativeRuntime,
 ) -> Vec<ExtraLoadability> {
     let prefix = morloc_deps::abi::conda_prefix(pixi_dir);
-    probe_extras(&prefix, &ec.conda_packages, |rel| {
+    probe_extras(&morloc_deps::abi::meta_dir(pixi_dir), &ec.conda_packages, |rel| {
         let bin = prefix.join(rel);
         let path = bin.to_str()?;
         let out = run_with_activation(rt, "ldd", &[path])?;
@@ -716,10 +716,12 @@ pub(crate) fn probe_extras_native(
 }
 
 /// Container loadability probe: `ldd` each extra binary INSIDE the image, where its
-/// shared libraries live. `conda-meta/` is read host-side (the bind-mount source);
-/// the binary is probed at its in-container path (activated by the entrypoint; it
-/// also self-resolves via `$ORIGIN/../lib`). One `ldd` run per binary keeps the
-/// parse trivial. Apptainer is skipped here (its `exec` bypasses the runscript, so
+/// shared libraries live. The records are read host-side from the mirror the
+/// environment's materialization leaves beside its pixi manifest, since the
+/// prefix itself is an engine volume; the binary is probed at its in-container
+/// path with that volume mounted (activated by the entrypoint; it also
+/// self-resolves via `$ORIGIN/../lib`). One `ldd` run per binary keeps the parse
+/// trivial. Apptainer is skipped here (its `exec` bypasses the runscript, so
 /// `activate.d` never runs -> false "not found"); the skip lives with the probe so
 /// no caller can forget it.
 pub(crate) fn probe_extras_container(
@@ -731,17 +733,22 @@ pub(crate) fn probe_extras_container(
         return Vec::new();
     }
     let image = ec.active_image();
-    let host_prefix = morloc_deps::abi::conda_prefix(&data_dir.join("pixi"));
+    let pixi_dir = data_dir.join("pixi");
     let container_prefix = format!("{}/.pixi/envs/default", crate::serve::CONTAINER_PIXI_DIR);
     let bind_mounts = vec![(
-        data_dir.join("pixi").to_string_lossy().to_string(),
+        pixi_dir.to_string_lossy().to_string(),
         crate::serve::CONTAINER_PIXI_DIR.to_string(),
     )];
-    probe_extras(&host_prefix, &ec.conda_packages, |rel| {
+    let volumes = vec![(
+        crate::serve::prefix_volume(data_dir),
+        format!("{}/.pixi", crate::serve::CONTAINER_PIXI_DIR),
+    )];
+    probe_extras(&morloc_deps::abi::meta_dir(&pixi_dir), &ec.conda_packages, |rel| {
         let in_container = format!("{container_prefix}/{rel}");
         let cfg = RunConfig {
             command: Some(vec!["ldd".to_string(), in_container]),
             bind_mounts: bind_mounts.clone(),
+            volumes: volumes.clone(),
             ..RunConfig::new(image)
         };
         let (status, stdout, _) = container_run_quiet(engine, &cfg);

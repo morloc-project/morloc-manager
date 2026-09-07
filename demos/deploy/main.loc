@@ -1,0 +1,13 @@
+--' Operations on DNA sequences
+module dna (revcomp)
+
+import root-py
+
+source Py from "dna.py" ("revcomp")
+
+--' Reverse complement a DNA sequence
+revcomp ::
+  --' A DNA sequence over the alphabet ACGT
+  Str ->
+  --' Its reverse complement
+  Str

@@ -979,6 +979,14 @@ pub fn capture_activation(
         None => Command::new("bash"),
     };
     cmd.arg("-c").arg(&script).stdin(Stdio::null());
+    // Capture this environment's activation ALONE. A conda/pixi environment
+    // active in the user's shell would otherwise seed the base environment, and
+    // conda's activate.d scripts read what they find there -- appending to
+    // $CFLAGS/$LDFLAGS (mixing two conda worlds' include/library paths into
+    // every morloc build) and honoring an inherited $CONDA_BUILD_SYSROOT instead
+    // of computing this platform's, which on macOS makes the clang activation
+    // abort before it exports $CC.
+    crate::ambient::scrub(&mut cmd);
     apply_cert_env(&mut cmd, ssl_cert_file);
     let out = cmd
         .output()
@@ -1002,7 +1010,47 @@ pub fn capture_activation(
                 .to_string(),
         ));
     }
-    Ok(activation_delta(&parse_env0(base_text), activated))
+    let delta = activation_delta(&parse_env0(base_text), activated);
+    require_compiler_vars(&delta, &String::from_utf8_lossy(&out.stderr))?;
+    Ok(delta)
+}
+
+/// Fail the capture when the environment's conda toolchain activation exported
+/// no C/C++ compiler. `c-compiler`/`cxx-compiler` are core to every morloc
+/// environment and conda ships their binaries under target-prefixed names
+/// (`x86_64-conda-linux-gnu-gcc`, `arm64-apple-darwin20.0.0-clang`), never as a
+/// bare `gcc` on PATH -- `$CC`/`$CXX` are the only handle on them. Without those
+/// the environment cannot build libmorloc, the nexus, or any pool, and the
+/// failure otherwise surfaces much later as the compiler resolving a HOST
+/// `/usr/bin/gcc` and reporting an incoherent toolchain, which names the wrong
+/// cause. conda's activation scripts write their diagnosis to stderr and return
+/// non-zero WITHOUT failing the sourcing shell, so that output is the real error
+/// and is reproduced here.
+fn require_compiler_vars(delta: &[(String, String)], diagnostics: &str) -> Result<()> {
+    let missing: Vec<String> = ["CC", "CXX"]
+        .into_iter()
+        .filter(|k| {
+            !delta
+                .iter()
+                .any(|(key, value)| key == k && !value.trim().is_empty())
+        })
+        .map(|k| format!("${k}"))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let diagnostics = diagnostics.trim();
+    let detail = if diagnostics.is_empty() {
+        "The activation scripts produced no output.".to_string()
+    } else {
+        format!("Output from the environment's activation scripts:\n{diagnostics}")
+    };
+    Err(DepsError::Env(format!(
+        "the environment's conda toolchain activation exported no {}. morloc builds \
+         its runtime and every pool with the compiler the environment names there, so \
+         the environment is not usable without it.\n{detail}",
+        missing.join(" or "),
+    )))
 }
 
 /// The activation delta: entries the activated environment ADDED or CHANGED
@@ -1615,6 +1663,41 @@ environments:
         assert!(has("CONDA_PREFIX"), "CONDA_PREFIX always kept");
         // an unrelated var equal to base and unrelated to the prefix is dropped
         assert!(!has("PYTHONHASHSEED"), "unrelated unchanged var dropped");
+    }
+
+    #[test]
+    fn capture_requires_a_compiler_and_reports_the_activation_error() {
+        let delta = vec![
+            ("PATH".to_string(), "/env/bin:/usr/bin".to_string()),
+            ("CONDA_PREFIX".to_string(), "/env".to_string()),
+        ];
+        let err = require_compiler_vars(&delta, "ERROR: the macOS SDK was not found")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("$CC or $CXX"), "names both vars: {err}");
+        // The activation's own diagnosis is the real cause, so it must reach the
+        // user rather than being replaced by a downstream symptom.
+        assert!(err.contains("the macOS SDK was not found"), "{err}");
+    }
+
+    #[test]
+    fn capture_accepts_a_delta_carrying_a_compiler() {
+        let delta = vec![
+            ("CC".to_string(), "arm64-apple-darwin20.0.0-clang".to_string()),
+            ("CXX".to_string(), "arm64-apple-darwin20.0.0-clang++".to_string()),
+        ];
+        assert!(require_compiler_vars(&delta, "").is_ok());
+    }
+
+    #[test]
+    fn capture_rejects_an_empty_compiler_var() {
+        let delta = vec![
+            ("CC".to_string(), "  ".to_string()),
+            ("CXX".to_string(), "clang++".to_string()),
+        ];
+        let err = require_compiler_vars(&delta, "").unwrap_err().to_string();
+        assert!(err.contains("$CC"), "{err}");
+        assert!(!err.contains("$CXX"), "{err}");
     }
 
     #[test]

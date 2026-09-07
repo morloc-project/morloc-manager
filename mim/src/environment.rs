@@ -122,6 +122,14 @@ pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &
                 container::remove_image(engine, img);
             }
         }
+
+        // The solved conda prefix lives in an engine volume rather than under the
+        // env data dir, so deleting the directory tree below would leave it
+        // behind -- gigabytes with nothing left to reference them.
+        let _ = container::volume_remove(
+            engine,
+            &serve::prefix_volume(&config::env_data_dir(scope, name)),
+        );
     }
 
     // Remove config directory
@@ -192,6 +200,30 @@ pub fn set_default_environment(name: &str, write_scope: Scope) -> Result<()> {
         ..base_cfg
     };
     config::write_config(&cfg_path, &new_cfg)
+}
+
+/// Clear the default environment recorded in `write_scope`'s config, leaving
+/// every other setting in that config alone.
+///
+/// Clearing the LOCAL default does not necessarily leave the machine with no
+/// default: `resolve_default_env_name` falls through to the system config, so a
+/// machine-wide default (if one is set) becomes the effective answer again.
+/// Callers report which of the two happened via [`effective_default_env_name`].
+pub fn clear_default_environment(write_scope: Scope) -> Result<()> {
+    let cfg_path = config::config_path(write_scope);
+    let base_cfg = config::read_config::<Config>(&cfg_path).unwrap_or_default();
+    let new_cfg = Config {
+        default_env: None,
+        ..base_cfg
+    };
+    config::write_config(&cfg_path, &new_cfg)
+}
+
+/// The default environment name that commands would resolve right now, or
+/// `None` when there is none. Unlike `resolve_default_environment` this reads
+/// only the name and never errors, so it can report the state after a change.
+pub fn effective_default_env_name() -> Option<String> {
+    resolve_default_env_name().ok()
 }
 
 /// Resolve the default environment. Checks local config first, then system.
