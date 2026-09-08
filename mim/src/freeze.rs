@@ -378,6 +378,9 @@ fn scan_programs(exe_dir: &str) -> Vec<ProgramEntry> {
         .collect()
 }
 
+/// The commands a caller can invoke on a program. A manifest also lists the
+/// terminal actions the compiler synthesizes for `@render` and `@with`, which
+/// are reachable only as a flag on their parent and are marked `internal`.
 fn parse_manifest_commands(path: &Path) -> Vec<String> {
     let Ok(bytes) = fs::read(path) else {
         return Vec::new();
@@ -390,9 +393,16 @@ fn parse_manifest_commands(path: &Path) -> Vec<String> {
     #[derive(serde::Deserialize)]
     struct ManifestStubCmd {
         name: String,
+        #[serde(default)]
+        internal: bool,
     }
     match serde_json::from_slice::<ManifestStub>(&bytes) {
-        Ok(stub) => stub.commands.into_iter().map(|c| c.name).collect(),
+        Ok(stub) => stub
+            .commands
+            .into_iter()
+            .filter(|c| !c.internal)
+            .map(|c| c.name)
+            .collect(),
         Err(_) => Vec::new(),
     }
 }
@@ -564,5 +574,34 @@ mod tests {
         for rel in ["runtime", "pixi/pixi.toml", "pixi/pixi.lock"] {
             assert!(err.contains(rel), "{rel} missing from: {err}");
         }
+    }
+
+    /// A `--' @render` or `--' @with` directive makes the compiler synthesize a
+    /// command that is not callable in its own right; a client selects it with a
+    /// flag on its parent. Counting those reports more commands than the program
+    /// has.
+    #[test]
+    fn a_synthesized_terminal_is_not_a_callable_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("manifest.json");
+        std::fs::write(
+            &manifest,
+            r#"{"name":"todo","commands":[
+                 {"name":"list","internal":false},
+                 {"name":"mlcp_list_draw","internal":true},
+                 {"name":"add","internal":false}
+               ]}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_manifest_commands(&manifest), vec!["list", "add"]);
+    }
+
+    /// A manifest predating the `internal` field names only callable commands.
+    #[test]
+    fn a_command_without_the_field_is_callable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("manifest.json");
+        std::fs::write(&manifest, r#"{"name":"p","commands":[{"name":"only"}]}"#).unwrap();
+        assert_eq!(parse_manifest_commands(&manifest), vec!["only"]);
     }
 }
