@@ -66,44 +66,11 @@ pub fn serve_environment(
         );
     }
 
-    let mut cfg = RunConfig::new(image);
-    cfg.read_only = true;
-    cfg.remove_after = false;
-    cfg.name = Some(container_name.to_string());
-    cfg.ports = ports.to_vec();
-    cfg.publish_host = publish_host.map(str::to_string);
-    cfg.network = network.map(str::to_string);
-    let mh = CONTAINER_MORLOC_HOME;
-    // A served pliable environment needs the same three-way mount the run path
-    // uses. The image carries neither the morloc runtime nor the conda toolchain
-    // -- `morloc init` builds the runtime into `<env>/runtime` and pixi solves the
-    // toolchain into its own volume, both after the image is built -- so serving
-    // with only the state mount leaves the container without `morloc-nexus` on
-    // PATH and without an interpreter for any pool.
-    let (binds, volumes) = crate::base_mounts(data_dir);
-    cfg.bind_mounts = binds;
-    cfg.volumes = volumes;
-    // A host-mounted home shadows the env-owned one for served daemons too, so a
-    // program reading `~/.config` sees the same home as `mim shell`.
-    cfg.bind_mounts.extend(home_mount(mount_home)?);
-    // Docker/podman run as the host UID without mounting the host $HOME; pool
-    // daemons may touch $HOME (matplotlib config, R tempdir), so oci_base_env
-    // points it at a writable, mounted target ($MORLOC_STATE/home). Create it on
-    // the host bind-mount side so those writes do not hit ENOENT.
-    let _ = crate::config::ensure_env_home(data_dir);
-    cfg.env = oci_base_env(mh);
-    // A served container is IMMUTABLE: its runtime prefix is read-only (see
-    // `cfg.read_only = true` above) and its language set is fixed at image-build
-    // time. Mark it so the in-env build hook refuses on-demand language
-    // provisioning (which would need to write the runtime) with an actionable
-    // "rebuild the image with --lang X" message. The pliable `run` path (writable,
-    // persistent runtime mount) is NOT marked, so on-demand works there.
-    cfg.env.push(("MORLOC_IMMUTABLE".to_string(), "1".to_string()));
-    cfg.env.extend(user_env.iter().cloned());
-    cfg.command = Some(command.to_vec());
-    cfg.shm_size = shm_size.clone();
-    cfg.extra_flags = vec!["-d".to_string()];
-    cfg.extra_flags.extend(extra_flags.iter().cloned());
+    let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
+    let cfg = serve_run_config(
+        image, data_dir, container_name, ports, publish_host, network, extra_flags, shm_size,
+        user_env, command, mount_home, suffix,
+    )?;
 
     if verbose {
         let exe = engine_executable(engine);
@@ -378,16 +345,74 @@ pub fn find_running_serve_containers(engine: ContainerEngine) -> Vec<String> {
     }
 }
 
+/// The container a served environment runs in.
+///
+/// A served pliable environment needs the same three-way mount the run path
+/// uses. The image carries neither the morloc runtime nor the conda toolchain
+/// -- `morloc init` builds the runtime into `<env>/runtime` and pixi solves the
+/// toolchain into its own volume, both after the image is built -- so serving
+/// with only the state mount leaves the container without `morloc-nexus` on
+/// PATH and without an interpreter for any pool.
+#[allow(clippy::too_many_arguments)]
+fn serve_run_config(
+    image: &str,
+    data_dir: &str,
+    container_name: &str,
+    ports: &[(u16, u16)],
+    publish_host: Option<&str>,
+    network: Option<&str>,
+    extra_flags: &[String],
+    shm_size: &Option<String>,
+    user_env: &[(String, String)],
+    command: &[String],
+    mount_home: Option<&str>,
+    selinux_suffix: &str,
+) -> Result<RunConfig> {
+    let mut cfg = RunConfig::new(image);
+    cfg.read_only = true;
+    cfg.remove_after = false;
+    cfg.name = Some(container_name.to_string());
+    cfg.ports = ports.to_vec();
+    cfg.publish_host = publish_host.map(str::to_string);
+    cfg.network = network.map(str::to_string);
+    let mh = CONTAINER_MORLOC_HOME;
+    let (binds, volumes) = crate::base_mounts(data_dir);
+    cfg.bind_mounts = binds;
+    cfg.volumes = volumes;
+    // A host-mounted home shadows the env-owned one for served daemons too, so a
+    // program reading `~/.config` sees the same home as `mim shell`.
+    cfg.bind_mounts.extend(home_mount(mount_home)?);
+    // On an SELinux host a bind mount is readable from the container only once
+    // relabelled; the run path asks for that on every mount it makes, and these
+    // are the same directories.
+    cfg.selinux_suffix = selinux_suffix.to_string();
+    // Docker/podman run as the host UID without mounting the host $HOME; pool
+    // daemons may touch $HOME (matplotlib config, R tempdir), so oci_base_env
+    // points it at a writable, mounted target ($MORLOC_STATE/home). Create it on
+    // the host bind-mount side so those writes do not hit ENOENT.
+    let _ = crate::config::ensure_env_home(data_dir);
+    cfg.env = oci_base_env(mh);
+    // A served container is IMMUTABLE: its runtime prefix is read-only (see
+    // `cfg.read_only = true` above) and its language set is fixed at image-build
+    // time. Mark it so the in-env build hook refuses on-demand language
+    // provisioning (which would need to write the runtime) with an actionable
+    // "rebuild the image with --lang X" message. The pliable `run` path (writable,
+    // persistent runtime mount) is NOT marked, so on-demand works there.
+    cfg.env.push(("MORLOC_IMMUTABLE".to_string(), "1".to_string()));
+    cfg.env.extend(user_env.iter().cloned());
+    cfg.command = Some(command.to_vec());
+    cfg.shm_size = shm_size.clone();
+    cfg.extra_flags = vec!["-d".to_string()];
+    cfg.extra_flags.extend(extra_flags.iter().cloned());
+    Ok(cfg)
+}
+
 // ======================================================================
 // Program validation
 // ======================================================================
 
 /// Run `--help` for each installed program inside a container image to
 /// verify that pool processes start correctly (e.g. all imports resolve).
-///
-/// `bind_mounts` should be non-empty for pre-freeze validation (where the
-/// data dir is on the host) and empty for post-unfreeze validation (where
-/// everything is baked into the image).
 pub fn validate_programs(
     engine: ContainerEngine,
     image: &str,
@@ -400,26 +425,17 @@ pub fn validate_programs(
         return Ok(());
     }
     eprintln!("Validating installed programs...");
+    let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
     let mut any_failed = false;
     for prog in programs {
-        let exe_path = format!("{}/bin/{}", CONTAINER_MORLOC_HOME, prog.name);
+        let cfg =
+            program_help_config(image, &prog.name, bind_mounts.clone(), volumes.clone(), suffix);
         if verbose {
             let exe = engine_executable(engine);
-            eprintln!("[mim] {exe} run --rm --entrypoint '' {image} {exe_path} --help");
+            let extra = crate::container::engine_specific_run_flags_io(engine);
+            let args = crate::container::build_run_args(engine, &extra, &cfg);
+            eprintln!("[mim] {exe} {}", args.join(" "));
         }
-        let cfg = RunConfig {
-            bind_mounts: bind_mounts.clone(),
-            volumes: volumes.clone(),
-            command: Some(vec![exe_path, "--help".to_string()]),
-            env: vec![
-                ("MORLOC_HOME".to_string(), CONTAINER_MORLOC_HOME.to_string()),
-                ("MORLOC_STATE".to_string(), CONTAINER_MORLOC_STATE.to_string()),
-            ],
-            // Override the image ENTRYPOINT so the command runs directly
-            // instead of being appended to the router entrypoint.
-            extra_flags: vec!["--entrypoint".to_string(), "".to_string()],
-            ..RunConfig::new(image)
-        };
         let (status, _stdout, stderr) = container_run_quiet(engine, &cfg);
         if status.success() {
             let n = prog.commands.len();
@@ -436,6 +452,47 @@ pub fn validate_programs(
         ));
     }
     Ok(())
+}
+
+/// A one-shot container in the environment, running `command`: the same
+/// mounts, env and entrypoint every other process in the environment gets.
+/// `selinux_suffix` is the caller's relabel decision for the bind mounts.
+pub(crate) fn env_run_config(
+    image: &str,
+    command: Vec<String>,
+    bind_mounts: Vec<(String, String)>,
+    volumes: Vec<(String, String)>,
+    selinux_suffix: &str,
+) -> RunConfig {
+    RunConfig {
+        bind_mounts,
+        volumes,
+        command: Some(command),
+        env: oci_base_env(CONTAINER_MORLOC_HOME),
+        selinux_suffix: selinux_suffix.to_string(),
+        ..RunConfig::new(image)
+    }
+}
+
+/// The container a program is validated in. A launcher is `exec morloc-nexus
+/// ...`, found through PATH, and MORLOC_HOME/bin is on PATH only because
+/// `oci_base_env` puts it there -- the base image cannot bake it, since in a
+/// pliable environment it is a run-time mount.
+pub(crate) fn program_help_config(
+    image: &str,
+    program: &str,
+    bind_mounts: Vec<(String, String)>,
+    volumes: Vec<(String, String)>,
+    selinux_suffix: &str,
+) -> RunConfig {
+    let exe_path = format!("{CONTAINER_MORLOC_HOME}/bin/{program}");
+    env_run_config(
+        image,
+        vec![exe_path, "--help".to_string()],
+        bind_mounts,
+        volumes,
+        selinux_suffix,
+    )
 }
 
 // ======================================================================
@@ -924,6 +981,76 @@ pub fn dump_err_files(logs_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every bind in a served container is a host directory the run path also
+    /// mounts, and on an SELinux host each is readable only once relabelled.
+    /// The suffix the caller decides on must land on every bind mount and on
+    /// no engine volume, which is engine storage and cannot be relabelled.
+    #[test]
+    fn a_served_container_relabels_every_bind_mount_and_no_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_string_lossy().to_string();
+        let cmd = vec!["morloc-nexus".to_string(), "router".to_string()];
+        let cfg = serve_run_config(
+            "img", &data_dir, "morloc-serve-dev", &[(8080, 8080)], None, None, &[], &None, &[],
+            &cmd, None, ":z",
+        )
+        .unwrap();
+        let args = crate::container::build_run_args(
+            ContainerEngine::Docker,
+            &crate::container::engine_specific_run_flags(ContainerEngine::Docker),
+            &cfg,
+        );
+        let mounts: Vec<&String> = args
+            .windows(2)
+            .filter(|w| w[0] == "-v")
+            .map(|w| &w[1])
+            .collect();
+        assert_eq!(mounts.len(), cfg.bind_mounts.len() + cfg.volumes.len(), "{args:?}");
+        for (host, container) in &cfg.bind_mounts {
+            let want = format!("{host}:{container}:z");
+            assert!(mounts.contains(&&want), "{want} missing from {mounts:?}");
+        }
+        for (volume, container) in &cfg.volumes {
+            let want = format!("{volume}:{container}");
+            assert!(mounts.contains(&&want), "{want} missing from {mounts:?}");
+        }
+        // The same env every container process gets, plus the immutability mark.
+        let path = cfg.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone()).unwrap();
+        assert!(path.split(':').any(|d| d == format!("{CONTAINER_MORLOC_HOME}/bin")), "{path}");
+        assert!(cfg.env.contains(&("MORLOC_IMMUTABLE".to_string(), "1".to_string())));
+        assert!(cfg.read_only);
+        assert_eq!(cfg.command.as_deref(), Some(&cmd[..]));
+    }
+
+    /// A launcher is `exec morloc-nexus ...`, resolved through PATH, and the
+    /// base image does not bake MORLOC_HOME/bin onto PATH: that directory is a
+    /// mount that exists only at run time. The env every other container
+    /// process gets supplies it; a validation run without it reports
+    /// `morloc-nexus: not found` for a program that works everywhere else.
+    #[test]
+    fn validation_runs_a_program_with_the_runtime_on_path() {
+        let binds = vec![("/host/env/runtime".to_string(), CONTAINER_MORLOC_HOME.to_string())];
+        let cfg = program_help_config("img", "dna", binds, Vec::new(), ":z");
+        let path = cfg
+            .env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .expect("validation sets PATH");
+        assert!(
+            path.split(':').any(|d| d == format!("{CONTAINER_MORLOC_HOME}/bin")),
+            "{path}"
+        );
+        assert_eq!(
+            cfg.command.as_deref(),
+            Some(&[format!("{CONTAINER_MORLOC_HOME}/bin/dna"), "--help".to_string()][..])
+        );
+        assert_eq!(cfg.selinux_suffix, ":z");
+        // The image's entrypoint is the activation wrapper every process goes
+        // through; bypassing it validates a container nothing else runs in.
+        assert!(!cfg.extra_flags.iter().any(|f| f == "--entrypoint"), "{:?}", cfg.extra_flags);
+    }
 
     #[test]
     fn prefix_volume_names_are_engine_legal_and_readable() {

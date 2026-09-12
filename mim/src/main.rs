@@ -10567,6 +10567,20 @@ run:
         assert!(args.contains(&"-t".to_string()));
     }
 
+    /// Apptainer's `--bind` takes only `ro`/`rw` as options and aborts on any
+    /// other, and it needs no relabel: the process keeps the user's own SELinux
+    /// context. A suffix meant for docker/podman must never reach it.
+    #[test]
+    fn apptainer_binds_carry_no_selinux_suffix() {
+        let mut cfg = RunConfig::new("/path/to/base.sif");
+        cfg.bind_mounts = vec![("/host".to_string(), "/container".to_string())];
+        cfg.selinux_suffix = ":z".to_string();
+        cfg.command = Some(vec!["true".to_string()]);
+        let args = build_run_args(ContainerEngine::Apptainer, &[], &cfg);
+        assert!(args.windows(2).any(|w| w == ["--bind", "/host:/container"]), "{args:?}");
+        assert!(!args.iter().any(|a| a.ends_with(":z")), "{args:?}");
+    }
+
     #[test]
     fn build_run_args_selinux_suffix() {
         let mut cfg = RunConfig::new("img");

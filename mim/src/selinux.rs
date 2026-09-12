@@ -11,10 +11,14 @@ pub enum SELinuxMode {
 }
 
 pub fn detect_selinux() -> SELinuxMode {
-    if !Path::new("/usr/sbin/getenforce").exists() {
+    // Invoked by absolute path: a non-interactive caller (a service unit, a
+    // remote shell) can have a PATH without /usr/sbin, and a lookup failure
+    // there would read as "no SELinux" on an enforcing host.
+    let getenforce = "/usr/sbin/getenforce";
+    if !Path::new(getenforce).exists() {
         return SELinuxMode::Disabled;
     }
-    let Ok(output) = Command::new("getenforce").output() else {
+    let Ok(output) = Command::new(getenforce).output() else {
         return SELinuxMode::Disabled;
     };
     if !output.status.success() {

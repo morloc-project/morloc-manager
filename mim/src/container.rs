@@ -521,10 +521,11 @@ fn build_apptainer_args(extra_engine_flags: &[String], cfg: &RunConfig) -> Vec<S
         args.push(w.clone());
     }
     for (host, container) in &cfg.bind_mounts {
-        // Selinux suffix passes through identically (Apptainer ignores it on
-        // non-selinux systems; on selinux systems the kernel honors it).
+        // No SELinux suffix: `--bind` accepts only `ro`/`rw` as options and
+        // aborts on anything else, and an unprivileged Apptainer process keeps
+        // the user's own context, so nothing needs relabelling.
         args.push("--bind".to_string());
-        args.push(format!("{host}:{container}{}", cfg.selinux_suffix));
+        args.push(format!("{host}:{container}"));
     }
     for (key, val) in &cfg.env {
         args.push("--env".to_string());

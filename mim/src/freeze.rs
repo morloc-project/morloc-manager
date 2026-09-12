@@ -75,7 +75,9 @@ pub fn freeze_environment(
 
     // Validate the programs in the environment as it actually runs: the runtime
     // and the toolchain are mounts, not image layers, so a validation without
-    // them probes an empty directory.
+    // them probes an empty directory. HOME is under the state mount too, and is
+    // created host-side so a program touching it does not hit ENOENT.
+    let _ = config::ensure_env_home(v_data_dir);
     let (bind_mounts, volumes) = crate::base_mounts(v_data_dir);
     crate::serve::validate_programs(engine, env_image, &programs, bind_mounts, volumes, verbose)?;
 
@@ -350,7 +352,7 @@ pub(crate) fn scan_modules(fdb_dir: &str) -> Vec<ModuleEntry> {
         .collect()
 }
 
-fn scan_programs(exe_dir: &str) -> Vec<ProgramEntry> {
+pub(crate) fn scan_programs(exe_dir: &str) -> Vec<ProgramEntry> {
     let exe_path = Path::new(exe_dir);
     if !exe_path.is_dir() {
         return Vec::new();

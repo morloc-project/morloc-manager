@@ -743,12 +743,14 @@ pub(crate) fn probe_extras_container(
         crate::serve::prefix_volume(data_dir),
         format!("{}/.pixi", crate::serve::CONTAINER_PIXI_DIR),
     )];
+    let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
     probe_extras(&morloc_deps::abi::meta_dir(&pixi_dir), &ec.conda_packages, |rel| {
         let in_container = format!("{container_prefix}/{rel}");
         let cfg = RunConfig {
             command: Some(vec!["ldd".to_string(), in_container]),
             bind_mounts: bind_mounts.clone(),
             volumes: volumes.clone(),
+            selinux_suffix: suffix.to_string(),
             ..RunConfig::new(image)
         };
         let (status, stdout, _) = container_run_quiet(engine, &cfg);
@@ -1459,41 +1461,57 @@ fn check_programs_deep(
     data_dir: &Path,
 ) {
     let image = ec.active_image();
-    let mh = crate::serve::CONTAINER_MORLOC_HOME;
     let state = crate::serve::CONTAINER_MORLOC_STATE;
-    // Mount the host env dir at MORLOC_STATE (mutable), not over the baked runtime.
-    let bind_mounts = vec![(data_dir.to_string_lossy().to_string(), state.to_string())];
-    let env = vec![
-        ("MORLOC_HOME".to_string(), mh.to_string()),
-        ("MORLOC_STATE".to_string(), state.to_string()),
-    ];
-
-    // Scan programs from exe/ (one exe/<name>/ subdir per program) under state.
-    let exe_dir = format!("{state}/exe");
-    let cfg = RunConfig {
-        command: Some(vec!["ls".to_string(), exe_dir.clone()]),
-        bind_mounts: bind_mounts.clone(),
-        env: env.clone(),
-        ..RunConfig::new(image)
+    // The same mounts, env and entrypoint every other container process in the
+    // environment gets. The runtime and the toolchain are mounts, not image
+    // layers, so a smoke test without them has no nexus to run.
+    let (bind_mounts, volumes) = crate::base_mounts(&data_dir.to_string_lossy());
+    let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
+    let run = |command: Vec<String>| {
+        let cfg = crate::serve::env_run_config(
+            image,
+            command,
+            bind_mounts.clone(),
+            volumes.clone(),
+            suffix,
+        );
+        if verbose {
+            let exe = engine_executable(engine);
+            let extra = crate::container::engine_specific_run_flags_io(engine);
+            let args = crate::container::build_run_args(engine, &extra, &cfg);
+            eprintln!("[mim] {exe} {}", args.join(" "));
+        }
+        container_run_quiet(engine, &cfg)
     };
-    let (status, stdout, _) = container_run_quiet(engine, &cfg);
+
+    // The state mount is where every installed program lives; a container that
+    // cannot read it (an unlabelled directory on an SELinux host, say) fails
+    // every smoke test with a message about the program rather than the mount.
+    let exe_in_container = format!("{state}/exe");
+    let (status, _, stderr) = run(vec!["test".to_string(), "-r".to_string(), exe_in_container]);
     if !status.success() {
-        c.fail("Cannot list programs in container");
+        let snippet: String = stderr.lines().take(3).collect::<Vec<_>>().join("\n       ");
+        c.fail(&format!("Cannot read the state mount from the container: {snippet}"));
         return;
     }
 
-    let programs: Vec<ProgramEntry> = stdout
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .map(|l| ProgramEntry {
-            name: l.to_string(),
-            commands: Vec::new(),
-        })
-        .collect();
-
+    // The installed programs live in the host-side state dir, which is what
+    // the container sees at MORLOC_STATE, so the list is read where it is.
+    let exe_dir = data_dir.join("exe");
+    let programs = crate::freeze::scan_programs(&exe_dir.to_string_lossy());
+    let known: Vec<&str> = programs.iter().map(|p| p.name.as_str()).collect();
+    if let Ok(entries) = fs::read_dir(&exe_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !known.contains(&name.as_str()) {
+                c.warn(&format!(
+                    "exe/{name} is not an installed program (no {name}-build/manifest.json)"
+                ));
+            }
+        }
+    }
     if programs.is_empty() {
-        c.warn("No programs found in container");
+        c.warn("No programs installed in the environment");
         return;
     }
 
@@ -1501,18 +1519,8 @@ fn check_programs_deep(
         println!("Running smoke tests for {} programs...", programs.len());
     }
     for prog in &programs {
-        let exe_path = format!("{mh}/bin/{}", prog.name);
-        let cfg = RunConfig {
-            command: Some(vec![exe_path.clone(), "--help".to_string()]),
-            bind_mounts: bind_mounts.clone(),
-            env: env.clone(),
-            ..RunConfig::new(image)
-        };
-        if verbose {
-            let exe = engine_executable(engine);
-            eprintln!("[mim] {exe} run --rm {image} {exe_path} --help");
-        }
-        let (status, _, stderr) = container_run_quiet(engine, &cfg);
+        let exe_path = format!("{}/bin/{}", crate::serve::CONTAINER_MORLOC_HOME, prog.name);
+        let (status, _, stderr) = run(vec![exe_path, "--help".to_string()]);
         if status.success() {
             c.pass(&format!("{} -- smoke test passed", prog.name));
         } else {
