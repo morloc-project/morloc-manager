@@ -150,7 +150,46 @@ pub fn freeze_environment(
             .map_err(|e| ManagerError::FreezeError(format!("could not save {tag}: {e}")))?;
         eprintln!("Wrote {path} (load it elsewhere with `{} load -i {path}`)", engine.name());
     }
+    eprintln!();
+    for line in run_hints(engine, tag, &programs, !cmd.is_empty()) {
+        eprintln!("{line}");
+    }
     Ok(())
+}
+
+/// How to run the image just built, with the tag spelled out. An engine
+/// resolves a bare name to `:latest`, and a name it does not hold locally to
+/// a registry pull, so a tag typed from memory fails in ways that do not
+/// mention the image that exists. Engine flags come before the image, where
+/// an engine reads them; anything after it is the container's command.
+fn run_hints(
+    engine: ContainerEngine,
+    tag: &str,
+    programs: &[ProgramEntry],
+    serves: bool,
+) -> Vec<String> {
+    let exe = engine.name();
+    let mut lines = vec![
+        "To use the image:".to_string(),
+        format!("  {exe} run -it --rm {tag} /bin/bash"),
+    ];
+    lines.push(format!("  {exe} run --rm {tag} morloc list --programs"));
+    // One example, on a launcher the validation above just ran.
+    if let Some(first) = programs.first() {
+        lines.push(format!("  {exe} run --rm {tag} {} --help", first.name));
+    }
+    if serves {
+        lines.push(format!(
+            "  {exe} run --rm -p {DEPLOY_HTTP_PORT}:{DEPLOY_HTTP_PORT} {tag}    # serve the exposed set"
+        ));
+    } else {
+        lines.push(
+            "  (no views are declared, so the image has no default command; \
+             `mim view add <program> --as mcp,api` before freezing makes it serve)"
+                .to_string(),
+        );
+    }
+    lines
 }
 
 /// The default command a deployment image serves under: the router over the
@@ -479,6 +518,33 @@ mod tests {
         // the operator's exposure decision, but it can see that eval is
         // expensive and unbounded by what the author declared.
         assert!(!cmd.iter().any(|a| a == "--eval-allow-no-auth"), "{cmd:?}");
+    }
+
+    /// The image leaves the manager's world under a name the operator typed,
+    /// and an engine resolves a bare name to `:latest` and a missing local
+    /// image to a registry pull. The hints spell the full tag and put the
+    /// engine's flags before it, where an engine reads them.
+    #[test]
+    fn run_hints_name_the_tag_and_the_programs() {
+        let programs = vec![
+            ProgramEntry { name: "pacman".to_string(), commands: vec!["play".to_string()] },
+        ];
+        let served = run_hints(ContainerEngine::Podman, "pacman:v1", &programs, true);
+        let text = served.join("\n");
+        assert!(text.contains("podman run -it --rm pacman:v1 /bin/bash"), "{text}");
+        assert!(text.contains("podman run --rm pacman:v1 morloc list --programs"), "{text}");
+        assert!(text.contains("podman run --rm pacman:v1 pacman --help"), "{text}");
+        assert!(
+            text.contains(&format!("podman run --rm -p {DEPLOY_HTTP_PORT}:{DEPLOY_HTTP_PORT} pacman:v1")),
+            "{text}"
+        );
+
+        // With nothing exposed the image has no default command, and a hint to
+        // serve it would start a container that exits at once.
+        let cli_only = run_hints(ContainerEngine::Docker, "pacman:v1", &programs, false);
+        let text = cli_only.join("\n");
+        assert!(text.contains("docker run --rm pacman:v1 pacman --help"), "{text}");
+        assert!(!text.contains("-p "), "{text}");
     }
 
     #[test]
