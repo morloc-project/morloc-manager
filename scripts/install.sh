@@ -57,10 +57,12 @@ else
 fi
 
 # --- pick a downloader ----------------------------------------------------
+# Retry transient failures (GitHub's release CDN returns the odd 5xx) so a
+# single bad response does not abort an install or a CI run.
 if command -v curl >/dev/null 2>&1; then
-  fetch() { curl -fsSL "$1" -o "$2"; }
+  fetch() { curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors "$1" -o "$2"; }
 elif command -v wget >/dev/null 2>&1; then
-  fetch() { wget -qO "$2" "$1"; }
+  fetch() { wget -qO "$2" --tries=5 --waitretry=2 "$1"; }
 else
   err "need curl or wget on PATH"
 fi
