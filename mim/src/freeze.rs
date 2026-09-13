@@ -58,6 +58,7 @@ pub fn freeze_environment(
     v_data_dir: &str,
     tag: &str,
     save_to: Option<&str>,
+    force: bool,
     verbose: bool,
 ) -> Result<()> {
     if !Path::new(v_data_dir).is_dir() {
@@ -72,6 +73,8 @@ pub fn freeze_environment(
             "No morloc programs are installed. Compile and install with 'morloc make --install' before freezing.".to_string()
         ));
     }
+
+    check_programs(v_data_dir, &programs, force)?;
 
     // Validate the programs in the environment as it actually runs: the runtime
     // and the toolchain are mounts, not image layers, so a validation without
@@ -155,6 +158,197 @@ pub fn freeze_environment(
         eprintln!("{line}");
     }
     Ok(())
+}
+
+/// Directories that are the working state of a tool -- a version control
+/// store, a compiler's output, an interpreter's bytecode cache, an editor's
+/// notes -- and never an input to a running program. An installed program is
+/// a mirror of its project directory, and the compiler's install filter drops
+/// only `.git`, so one of these under `exe/<name>/` means the project's
+/// `.morlocignore` does not name it and every freeze would carry it.
+const TOOL_STATE_DIRS: &[&str] = &[
+    ".git",
+    ".claude",
+    ".stack-work",
+    ".cargo",
+    ".pixi",
+    ".venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".ipynb_checkpoints",
+    "__pycache__",
+    "node_modules",
+    "target",
+];
+
+/// A single file this big inside a program is worth a question: pools are a
+/// few megabytes, so it is data or build output.
+const LARGE_FILE_BYTES: u64 = 50 << 20;
+
+/// A program this big in total is worth the same question.
+const HEAVY_PROGRAM_BYTES: u64 = 100 << 20;
+
+/// What a walk of the installed programs found, before anything expensive
+/// runs. Names are program names; paths are relative to `exe/<name>/`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProgramAudit {
+    /// Bytes per program, in program order.
+    sizes: Vec<(String, u64)>,
+    /// Tool-state directories present, sorted.
+    tool_state: Vec<(String, String)>,
+    /// Files past `LARGE_FILE_BYTES`, sorted.
+    large_files: Vec<(String, String, u64)>,
+}
+
+/// Walk `exe/<name>/` for each program. A tool-state directory is recorded
+/// and not entered -- it may be a build tree of gigabytes, and the point of
+/// finding it is to stop quickly -- so a program's size excludes it. Symlinks
+/// are not followed: a link out of the tree is copied as a file by the
+/// staging step, so it is sized as one here.
+fn audit_programs(exe_dir: &Path, names: &[String]) -> ProgramAudit {
+    let mut audit = ProgramAudit::default();
+    for name in names {
+        let root = exe_dir.join(name);
+        let mut total = 0u64;
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                if meta.is_dir() {
+                    let file_name = entry.file_name();
+                    if TOOL_STATE_DIRS.iter().any(|d| file_name.to_str() == Some(d)) {
+                        audit.tool_state.push((name.clone(), rel));
+                        continue;
+                    }
+                    stack.push(path);
+                } else {
+                    total += meta.len();
+                    if meta.len() > LARGE_FILE_BYTES {
+                        audit.large_files.push((name.clone(), rel, meta.len()));
+                    }
+                }
+            }
+        }
+        audit.sizes.push((name.clone(), total));
+    }
+    audit.tool_state.sort();
+    audit.large_files.sort();
+    audit
+}
+
+/// Whether to go on after the audit.
+#[derive(Debug)]
+enum Verdict {
+    Proceed,
+    /// Nothing is wrong, but the weight deserves a look; the caller asks.
+    Confirm,
+    Refuse(String),
+}
+
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// Sizes always, and every large file, so what the image will weigh is on the
+/// screen before the build rather than in `docker images` after it.
+fn audit_report(audit: &ProgramAudit) -> Vec<String> {
+    let mut lines = vec!["Installed programs to freeze:".to_string()];
+    for (name, bytes) in &audit.sizes {
+        lines.push(format!("  {name:<20} {}", megabytes(*bytes)));
+    }
+    for (name, rel, bytes) in &audit.large_files {
+        lines.push(format!("  large file: {name}/{rel} ({})", megabytes(*bytes)));
+    }
+    for (name, rel) in &audit.tool_state {
+        lines.push(format!("  tool state: {name}/{rel} (not sized)"));
+    }
+    lines
+}
+
+/// Tool state is a refusal: it is never something a program reads, it is
+/// always something the project should have ignored, and the fix belongs in
+/// the project rather than in a list the freeze keeps. Weight is a question,
+/// because a program may legitimately carry a data file, and only its author
+/// knows. A terminal is asked; a script has no one to ask and is refused
+/// unless it said `--force`, which answers both.
+fn audit_verdict(audit: &ProgramAudit, force: bool, interactive: bool) -> Verdict {
+    if force {
+        return Verdict::Proceed;
+    }
+    if !audit.tool_state.is_empty() {
+        let mut msg = String::from(
+            "installed programs carry tool-state directories that would be frozen into the image:\n",
+        );
+        for (name, rel) in &audit.tool_state {
+            msg.push_str(&format!("  exe/{name}/{rel}\n"));
+        }
+        msg.push_str(
+            "A program is installed as a mirror of its project directory. Name these in the \
+             project's .morlocignore (one pattern per line, e.g. `target/`), reinstall the \
+             program, and freeze again. To freeze them anyway, pass --force.",
+        );
+        return Verdict::Refuse(msg);
+    }
+    let heavy = audit.sizes.iter().any(|(_, b)| *b > HEAVY_PROGRAM_BYTES)
+        || !audit.large_files.is_empty();
+    if !heavy {
+        return Verdict::Proceed;
+    }
+    if interactive {
+        return Verdict::Confirm;
+    }
+    Verdict::Refuse(format!(
+        "an installed program is larger than {} or holds a file larger than {}, and this \
+         is not a terminal, so nobody can confirm it. A program is installed as a mirror \
+         of its project directory; trim it with the project's .morlocignore and reinstall, \
+         or pass --force to freeze it as is.",
+        megabytes(HEAVY_PROGRAM_BYTES),
+        megabytes(LARGE_FILE_BYTES)
+    ))
+}
+
+/// Refuse or ask before any container runs, so a project that needs its
+/// `.morlocignore` fixed learns that in a second rather than after validation
+/// and a staging copy.
+fn check_programs(v_data_dir: &str, programs: &[ProgramEntry], force: bool) -> Result<()> {
+    use std::io::{self, IsTerminal, Write};
+    let names: Vec<String> = programs.iter().map(|p| p.name.clone()).collect();
+    let audit = audit_programs(&Path::new(v_data_dir).join("exe"), &names);
+    for line in audit_report(&audit) {
+        eprintln!("{line}");
+    }
+    match audit_verdict(&audit, force, io::stdin().is_terminal()) {
+        Verdict::Proceed => Ok(()),
+        Verdict::Refuse(msg) => Err(ManagerError::FreezeError(msg)),
+        Verdict::Confirm => {
+            eprintln!(
+                "A program is installed as a mirror of its project directory, so the sizes \
+                 above are what the image will carry. Trim a program with its .morlocignore \
+                 and reinstall, or continue as is."
+            );
+            eprint!("Continue? [y/N] ");
+            io::stderr().flush().ok();
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer).ok();
+            if matches!(answer.trim(), "y" | "yes" | "Y" | "YES") {
+                Ok(())
+            } else {
+                Err(ManagerError::FreezeError("aborted; nothing was frozen.".to_string()))
+            }
+        }
+    }
 }
 
 /// How to run the image just built, with the tag spelled out. An engine
@@ -588,6 +782,115 @@ mod tests {
         // An adapter nothing was exposed on is absent rather than empty.
         assert_eq!(get("morloc.api"), None);
         assert!(get("org.opencontainers.image.version").is_some());
+    }
+
+    fn project(root: &Path, name: &str, files: &[(&str, usize)]) {
+        for (rel, size) in files {
+            let p = root.join("exe").join(name).join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, vec![b'x'; *size]).unwrap();
+        }
+    }
+
+    /// A program is installed as a mirror of its project directory, and the
+    /// compiler's install filter drops only `.git`. Whatever tooling left
+    /// beside the sources -- a cargo `target/`, a Python cache, an editor's
+    /// notes -- is in `exe/<name>/` and would travel with every freeze.
+    #[test]
+    fn the_audit_finds_tool_state_and_weight() {
+        let root = tempfile::tempdir().unwrap();
+        project(
+            root.path(),
+            "todo",
+            &[
+                ("src/lib.py", 10),
+                ("target/release/big.bin", 10),
+                ("__pycache__/lib.cpython-313.pyc", 10),
+                ("todo-build/pools/py/pool.py", 10),
+            ],
+        );
+        project(root.path(), "atlas", &[("data/genome.fa", LARGE_FILE_BYTES as usize + 1)]);
+        let audit = audit_programs(&root.path().join("exe"), &["todo".to_string(), "atlas".to_string()]);
+        assert_eq!(
+            audit.tool_state,
+            vec![
+                ("todo".to_string(), "__pycache__".to_string()),
+                ("todo".to_string(), "target".to_string()),
+            ]
+        );
+        assert_eq!(audit.large_files.len(), 1);
+        assert_eq!(audit.large_files[0].0, "atlas");
+        assert_eq!(audit.large_files[0].1, "data/genome.fa");
+        // A tool-state directory is reported, not walked: it may be a
+        // multi-gigabyte build tree, and the answer is to refuse quickly.
+        assert_eq!(audit.sizes.iter().find(|(n, _)| n == "todo").unwrap().1, 20);
+        let text = audit_report(&audit).join("\n");
+        assert!(text.contains("todo/target") && text.contains("not sized"), "{text}");
+    }
+
+    /// Tool state is refused outright, with the fix named where it lives: the
+    /// project's `.morlocignore`, followed by a reinstall. `--force` overrides.
+    #[test]
+    fn tool_state_refuses_the_freeze_unless_forced() {
+        let audit = ProgramAudit {
+            sizes: vec![("todo".to_string(), 40)],
+            tool_state: vec![("todo".to_string(), "target".to_string())],
+            large_files: Vec::new(),
+        };
+        match audit_verdict(&audit, false, true) {
+            Verdict::Refuse(msg) => {
+                assert!(msg.contains("todo"), "{msg}");
+                assert!(msg.contains("target"), "{msg}");
+                assert!(msg.contains(".morlocignore"), "{msg}");
+                assert!(msg.contains("--force"), "{msg}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(matches!(audit_verdict(&audit, true, true), Verdict::Proceed));
+    }
+
+    /// Weight is a question, not a refusal: a program may legitimately carry a
+    /// data file. A terminal gets asked; a script has to say `--force`.
+    #[test]
+    fn weight_asks_a_terminal_and_refuses_a_script() {
+        let heavy = ProgramAudit {
+            sizes: vec![("atlas".to_string(), HEAVY_PROGRAM_BYTES + 1)],
+            tool_state: Vec::new(),
+            large_files: Vec::new(),
+        };
+        assert!(matches!(audit_verdict(&heavy, false, true), Verdict::Confirm));
+        match audit_verdict(&heavy, false, false) {
+            Verdict::Refuse(msg) => assert!(msg.contains("--force"), "{msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(matches!(audit_verdict(&heavy, true, false), Verdict::Proceed));
+
+        let big_file = ProgramAudit {
+            sizes: vec![("atlas".to_string(), 1)],
+            tool_state: Vec::new(),
+            large_files: vec![("atlas".to_string(), "data/genome.fa".to_string(), LARGE_FILE_BYTES + 1)],
+        };
+        assert!(matches!(audit_verdict(&big_file, false, true), Verdict::Confirm));
+
+        let light = ProgramAudit {
+            sizes: vec![("todo".to_string(), 40)],
+            tool_state: Vec::new(),
+            large_files: Vec::new(),
+        };
+        assert!(matches!(audit_verdict(&light, false, false), Verdict::Proceed));
+    }
+
+    #[test]
+    fn the_audit_report_shows_every_size_and_every_large_file() {
+        let audit = ProgramAudit {
+            sizes: vec![("atlas".to_string(), 300 << 20), ("todo".to_string(), 1 << 20)],
+            tool_state: Vec::new(),
+            large_files: vec![("atlas".to_string(), "data/genome.fa".to_string(), 299 << 20)],
+        };
+        let text = audit_report(&audit).join("\n");
+        assert!(text.contains("atlas") && text.contains("300.0 MB"), "{text}");
+        assert!(text.contains("todo") && text.contains("1.0 MB"), "{text}");
+        assert!(text.contains("data/genome.fa") && text.contains("299.0 MB"), "{text}");
     }
 
     #[test]

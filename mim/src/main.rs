@@ -652,6 +652,11 @@ Requires at least one program compiled with 'morloc make --install'.")]
         /// between it and this one. Load it there with `docker load -i <path>`.
         #[arg(long)]
         save: Option<String>,
+        /// Freeze even when an installed program carries tool-state
+        /// directories (a cargo target/, a .git/, ...) or is unusually large.
+        /// The fix those refusals ask for is the project's .morlocignore.
+        #[arg(long)]
+        force: bool,
     },
     /// Evaluate a morloc expression against a running serve container
     #[command(display_order = 25)]
@@ -2987,7 +2992,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             Ok(())
         }
         // ---- freeze ----
-        Cmd::Freeze { env, tag, save } => {
+        Cmd::Freeze { env, tag, save, force } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
             if ec.is_dev() {
                 return Err(ManagerError::EnvError(format!(
@@ -3050,7 +3055,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let tag = tag.unwrap_or_else(|| format!("morloc-{env_name}:{}", ver.show()));
             let result = freeze::freeze_environment(
                 env_scope, &env_name, ver.clone(), engine, &image,
-                &data_dir.to_string_lossy(), &tag, save.as_deref(), verbose,
+                &data_dir.to_string_lossy(), &tag, save.as_deref(), force, verbose,
             );
             if result.is_ok() && ec.morloc_version.as_ref() != Some(&ver) {
                 let mut updated = ec.clone();
