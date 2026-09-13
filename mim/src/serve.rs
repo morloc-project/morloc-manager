@@ -654,6 +654,13 @@ pub fn conda_activate_lines() -> [String; 3] {
     ]
 }
 
+/// Activation for an image with no pixi: the prefix, and whatever
+/// `activate.d` scripts survived the cut. PATH is baked by the image.
+pub fn slim_activate_lines() -> [String; 2] {
+    let [prefix, _, activate_d] = conda_activate_lines();
+    [prefix, activate_d]
+}
+
 /// The in-container PATH for a requirement-derived image: installed program
 /// launchers + shims + the init-built morloc-nexus (`$MORLOC_HOME/bin`), the
 /// morloc compiler, the pixi toolchain, then the system tail. Single source of

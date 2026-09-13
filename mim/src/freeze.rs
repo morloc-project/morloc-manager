@@ -36,6 +36,31 @@ fn spec_from_exposure(ex: &ViewSet) -> Option<crate::ServeSpec> {
     ))
 }
 
+/// Which deployment image to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flavor {
+    /// The environment whole: compiler, toolchain, pixi. Can eval and build.
+    Full,
+    /// The programs and what runs them. Cannot eval or build.
+    Slim,
+}
+
+impl Flavor {
+    pub fn label(self) -> &'static str {
+        match self {
+            Flavor::Full => "full",
+            Flavor::Slim => "slim",
+        }
+    }
+}
+
+/// What a slim image needs to know about the environment beyond its data dir:
+/// the base its image was built on, and the system packages layered onto it.
+pub struct SlimBase<'a> {
+    pub base_image: &'a str,
+    pub system_packages: &'a [String],
+}
+
 /// Build a self-contained deployment image from an environment.
 ///
 /// The image is the environment with its mounted halves baked in: the runtime
@@ -45,9 +70,12 @@ fn spec_from_exposure(ex: &ViewSet) -> Option<crate::ServeSpec> {
 /// the artifact is a tag in the engine's image store -- moved by pushing it to
 /// a registry, by `save_to`, or by rebuilding it.
 ///
-/// The base is the environment's own image and cannot be anything else: it
-/// carries pixi to install the toolchain, the activation wrapper every process
-/// goes through, and the compiler a sandboxed eval forks.
+/// The full image's base is the environment's own image and cannot be
+/// anything else: it carries pixi to install the toolchain, the activation
+/// wrapper every process goes through, and the compiler a sandboxed eval
+/// forks. A slim image (`slim` given) uses that image only as a build stage
+/// and starts its final stage from the environment's base; see
+/// [`crate::dockerfile::generate_slim_dockerfile`].
 #[allow(clippy::too_many_arguments)]
 pub fn freeze_environment(
     scope: Scope,
@@ -58,9 +86,11 @@ pub fn freeze_environment(
     v_data_dir: &str,
     tag: &str,
     save_to: Option<&str>,
+    slim: Option<SlimBase<'_>>,
     force: bool,
     verbose: bool,
 ) -> Result<()> {
+    let flavor = if slim.is_some() { Flavor::Slim } else { Flavor::Full };
     if !Path::new(v_data_dir).is_dir() {
         return Err(ManagerError::FreezeError(format!(
             "Data directory does not exist: {v_data_dir}"
@@ -68,12 +98,24 @@ pub fn freeze_environment(
     }
     let modules = scan_modules(&format!("{v_data_dir}/fdb"));
     let programs = scan_programs(&format!("{v_data_dir}/exe"));
-    if programs.is_empty() {
-        return Err(ManagerError::FreezeError(
-            "No morloc programs are installed. Compile and install with 'morloc make --install' before freezing.".to_string()
-        ));
-    }
+    // An environment with nothing installed still freezes -- as a base to run
+    // programs in later, or to hand someone the toolchain -- once the author
+    // has confirmed that is what they mean. The programs directory has to
+    // exist to be copied, whether or not anything is in it.
+    fs::create_dir_all(Path::new(v_data_dir).join("exe"))
+        .map_err(|e| ManagerError::FreezeError(format!("cannot create the programs directory: {e}")))?;
 
+    let exposure = config::read_views(scope, env_name).unwrap_or_default();
+    if flavor == Flavor::Slim {
+        if let Some(eval) = &exposure.eval {
+            return Err(ManagerError::FreezeError(format!(
+                "the environment exposes eval ({}), and a slim image cannot evaluate: it \
+                 carries no compiler. Remove the view (`mim view rm --eval`) or freeze \
+                 without --slim.",
+                eval.allow.join(",")
+            )));
+        }
+    }
     check_programs(v_data_dir, &programs, force)?;
 
     // Validate the programs in the environment as it actually runs: the runtime
@@ -99,30 +141,64 @@ pub fn freeze_environment(
         .map_err(|e| ManagerError::FreezeError(format!("cannot create the build context: {e}")))?;
     eprintln!("Staging the environment into a build context...");
     for rel in &paths {
-        stage_into_context(Path::new(v_data_dir), &context, rel)?;
+        if flavor == Flavor::Slim && rel == "runtime" {
+            stage_runtime_without_build_inputs(Path::new(v_data_dir), &context)?;
+        } else {
+            stage_into_context(Path::new(v_data_dir), &context, rel)?;
+        }
     }
 
-    let exposure = config::read_views(scope, env_name).unwrap_or_default();
     let cmd = deploy_command(&exposure);
     let optional_state: Vec<String> = paths
         .iter()
         .filter(|p| OPTIONAL_STATE.contains(&p.as_str()))
         .cloned()
         .collect();
-    let labels = deploy_labels(env_name, &ver, &programs, &modules, &exposure);
+    let labels = deploy_labels(env_name, &ver, flavor, &programs, &modules, &exposure);
+    // Podman's OCI output format drops HEALTHCHECK and warns.
+    let healthcheck = engine == ContainerEngine::Docker;
 
     let dockerfile = context.join("Dockerfile");
-    let text = crate::dockerfile::generate_deploy_dockerfile(
-        &crate::dockerfile::DeployDockerfileInput {
-            base_image: env_image,
-            cmd: &cmd,
-            optional_state: &optional_state,
-            http_port: DEPLOY_HTTP_PORT,
-            // Podman's OCI output format drops HEALTHCHECK and warns.
-            healthcheck: engine == ContainerEngine::Docker,
-            labels: &labels,
-        },
-    );
+    let text = match &slim {
+        None => crate::dockerfile::generate_deploy_dockerfile(
+            &crate::dockerfile::DeployDockerfileInput {
+                base_image: env_image,
+                cmd: &cmd,
+                optional_state: &optional_state,
+                http_port: DEPLOY_HTTP_PORT,
+                healthcheck,
+                labels: &labels,
+            },
+        ),
+        Some(base) => {
+            let plan = write_prune_lists(Path::new(v_data_dir), &context)?;
+            eprintln!(
+                "Cutting {} build-only packages from the toolchain ({} kept)",
+                plan.removed.len(),
+                plan.kept.len()
+            );
+            if verbose {
+                eprintln!("  removed: {}", plan.removed.join(" "));
+            }
+            let cert_file = crate::cert::stage_into_context(scope, env_name, &context)?;
+            let extras = crate::dockerfile::BuildExtras {
+                system_packages: base.system_packages.to_vec(),
+            };
+            crate::dockerfile::generate_slim_dockerfile(
+                &crate::dockerfile::SlimDockerfileInput {
+                    env_image,
+                    base_image: base.base_image,
+                    extras: &extras,
+                    cert_file: cert_file.as_deref(),
+                    cmd: &cmd,
+                    optional_state: &optional_state,
+                    http_port: DEPLOY_HTTP_PORT,
+                    labels: &labels,
+                    healthcheck,
+                },
+            )
+        }
+    };
     fs::write(&dockerfile, &text)
         .map_err(|e| ManagerError::FreezeError(format!("cannot write the Dockerfile: {e}")))?;
 
@@ -147,6 +223,13 @@ pub fn freeze_environment(
     }
 
     eprintln!("Built {tag}");
+    if flavor == Flavor::Slim {
+        // The image stands alone, so it is checked with nothing mounted: the
+        // launchers must find the nexus, and the nexus and every pool binary
+        // must resolve their libraries from what the cut left behind.
+        check_linkage(engine, tag, verbose)?;
+        crate::serve::validate_programs(engine, tag, &programs, Vec::new(), Vec::new(), verbose)?;
+    }
     if let Some(path) = save_to {
         eprintln!("Saving {tag} to {path}...");
         crate::container::save_image(engine, tag, path)
@@ -154,7 +237,7 @@ pub fn freeze_environment(
         eprintln!("Wrote {path} (load it elsewhere with `{} load -i {path}`)", engine.name());
     }
     eprintln!();
-    for line in run_hints(engine, tag, &programs, !cmd.is_empty()) {
+    for line in run_hints(engine, tag, flavor, &programs, !cmd.is_empty()) {
         eprintln!("{line}");
     }
     Ok(())
@@ -252,8 +335,9 @@ fn audit_programs(exe_dir: &Path, names: &[String]) -> ProgramAudit {
 #[derive(Debug)]
 enum Verdict {
     Proceed,
-    /// Nothing is wrong, but the weight deserves a look; the caller asks.
-    Confirm,
+    /// Nothing is wrong, but something deserves a look; the caller asks,
+    /// prefacing the question with this.
+    Confirm(String),
     Refuse(String),
 }
 
@@ -264,6 +348,9 @@ fn megabytes(bytes: u64) -> String {
 /// Sizes always, and every large file, so what the image will weigh is on the
 /// screen before the build rather than in `docker images` after it.
 fn audit_report(audit: &ProgramAudit) -> Vec<String> {
+    if audit.sizes.is_empty() {
+        return vec!["Installed programs to freeze: none".to_string()];
+    }
     let mut lines = vec!["Installed programs to freeze:".to_string()];
     for (name, bytes) in &audit.sizes {
         lines.push(format!("  {name:<20} {}", megabytes(*bytes)));
@@ -287,6 +374,19 @@ fn audit_verdict(audit: &ProgramAudit, force: bool, interactive: bool) -> Verdic
     if force {
         return Verdict::Proceed;
     }
+    if audit.sizes.is_empty() {
+        let why = "No morloc programs are installed, so the image will hold the environment \
+                   and nothing to run in it. Install one with 'mim install <dir>' first, or \
+                   continue to freeze the environment alone.";
+        return if interactive {
+            Verdict::Confirm(why.to_string())
+        } else {
+            Verdict::Refuse(format!(
+                "{why} This is not a terminal, so nobody can confirm; pass --force to freeze \
+                 an environment with no programs."
+            ))
+        };
+    }
     if !audit.tool_state.is_empty() {
         let mut msg = String::from(
             "installed programs carry tool-state directories that would be frozen into the image:\n",
@@ -307,7 +407,12 @@ fn audit_verdict(audit: &ProgramAudit, force: bool, interactive: bool) -> Verdic
         return Verdict::Proceed;
     }
     if interactive {
-        return Verdict::Confirm;
+        return Verdict::Confirm(
+            "A program is installed as a mirror of its project directory, so the sizes \
+             above are what the image will carry. Trim a program with its .morlocignore \
+             and reinstall, or continue as is."
+                .to_string(),
+        );
     }
     Verdict::Refuse(format!(
         "an installed program is larger than {} or holds a file larger than {}, and this \
@@ -332,12 +437,8 @@ fn check_programs(v_data_dir: &str, programs: &[ProgramEntry], force: bool) -> R
     match audit_verdict(&audit, force, io::stdin().is_terminal()) {
         Verdict::Proceed => Ok(()),
         Verdict::Refuse(msg) => Err(ManagerError::FreezeError(msg)),
-        Verdict::Confirm => {
-            eprintln!(
-                "A program is installed as a mirror of its project directory, so the sizes \
-                 above are what the image will carry. Trim a program with its .morlocignore \
-                 and reinstall, or continue as is."
-            );
+        Verdict::Confirm(why) => {
+            eprintln!("{why}");
             eprint!("Continue? [y/N] ");
             io::stderr().flush().ok();
             let mut answer = String::new();
@@ -359,6 +460,7 @@ fn check_programs(v_data_dir: &str, programs: &[ProgramEntry], force: bool) -> R
 fn run_hints(
     engine: ContainerEngine,
     tag: &str,
+    flavor: Flavor,
     programs: &[ProgramEntry],
     serves: bool,
 ) -> Vec<String> {
@@ -367,7 +469,13 @@ fn run_hints(
         "To use the image:".to_string(),
         format!("  {exe} run -it --rm {tag} /bin/bash"),
     ];
-    lines.push(format!("  {exe} run --rm {tag} morloc list --programs"));
+    // A slim image has no compiler to list programs with; the label does.
+    match flavor {
+        Flavor::Full => lines.push(format!("  {exe} run --rm {tag} morloc list --programs")),
+        Flavor::Slim => lines.push(format!(
+            "  {exe} inspect -f '{{{{index .Config.Labels \"morloc.programs\"}}}}' {tag}"
+        )),
+    }
     // One example, on a launcher the validation above just ran.
     if let Some(first) = programs.first() {
         lines.push(format!("  {exe} run --rm {tag} {} --help", first.name));
@@ -438,6 +546,113 @@ fn stage_into_context(root: &Path, context: &Path, rel: &str) -> Result<()> {
     Ok(())
 }
 
+/// Top-level runtime directories that exist to build programs, not to run
+/// them: the C/C++ headers (with a precompiled header that is most of the
+/// runtime's weight) and the Rust source libmorloc and the nexus were built
+/// from. A slim image leaves them out.
+const RUNTIME_BUILD_INPUTS: [&str; 2] = ["include", "rust"];
+
+/// Stage `runtime/` without its build inputs. The exclusion is by top-level
+/// name only: a directory called `include` deeper in the tree is a binding's
+/// own and travels.
+fn stage_runtime_without_build_inputs(root: &Path, context: &Path) -> Result<()> {
+    let from = root.join("runtime");
+    let to = context.join("runtime");
+    let entries = fs::read_dir(&from)
+        .map_err(|e| ManagerError::FreezeError(format!("cannot read runtime: {e}")))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if RUNTIME_BUILD_INPUTS.contains(&name.as_str()) {
+            continue;
+        }
+        stage_into_context(&from, &to, &name)?;
+    }
+    Ok(())
+}
+
+/// Compute the cut from the environment's own package records and write the
+/// two lists the slim Dockerfile consumes into the build context. The records
+/// come from the host-readable mirror the environment keeps beside its lock
+/// (the prefix itself is engine storage), and the roots from the manifest the
+/// same lock was solved from.
+fn write_prune_lists(v_data_dir: &Path, context: &Path) -> Result<morloc_deps::prune::PrunePlan> {
+    use morloc_deps::prune;
+    let pixi_dir = v_data_dir.join("pixi");
+    let manifest = fs::read_to_string(pixi_dir.join("pixi.toml"))
+        .map_err(|e| ManagerError::FreezeError(format!("cannot read pixi.toml: {e}")))?;
+    let roots = prune::manifest_dependencies(&manifest);
+    let meta_dir = morloc_deps::abi::meta_dir(&pixi_dir);
+    let records = prune::read_records(&meta_dir);
+    if records.is_empty() {
+        return Err(ManagerError::FreezeError(format!(
+            "no package records at {}; the environment's toolchain has not been \
+             materialized. Run 'mim update' first.",
+            meta_dir.display()
+        )));
+    }
+    let plan = prune::plan_prune(&roots, &records).map_err(ManagerError::FreezeError)?;
+    let mut files = Vec::new();
+    for f in &plan.removed_files {
+        files.extend_from_slice(f.as_bytes());
+        files.push(0);
+    }
+    fs::write(context.join(crate::dockerfile::PRUNE_FILES), files)
+        .map_err(|e| ManagerError::FreezeError(format!("cannot write the prune list: {e}")))?;
+    let mut records_text = plan.removed_records.join("\n");
+    if !records_text.is_empty() {
+        records_text.push('\n');
+    }
+    fs::write(context.join(crate::dockerfile::PRUNE_RECORDS), records_text)
+        .map_err(|e| ManagerError::FreezeError(format!("cannot write the prune list: {e}")))?;
+    Ok(plan)
+}
+
+/// The shell that checks a slim image's dynamic linkage, run inside it. The
+/// nexus, libmorloc and every compiled pool must resolve against what the
+/// cut left. The language bindings are left out: they are loaded by an
+/// interpreter that already holds the interpreter's own library, so `ldd`
+/// on them reports that library missing whether or not anything is wrong.
+/// LD_LIBRARY_PATH is what the nexus exports to pools at run time.
+fn linkage_check_script() -> String {
+    let mh = crate::serve::CONTAINER_MORLOC_HOME;
+    let state = crate::serve::CONTAINER_MORLOC_STATE;
+    format!(
+        "export LD_LIBRARY_PATH={mh}/lib; \
+         for f in {mh}/bin/morloc-nexus {mh}/lib/libmorloc.so $(find {state}/exe -name 'pool-*.out'); do \
+           [ -e \"$f\" ] && ldd \"$f\" | sed \"s|^|$f: |\"; \
+         done; true"
+    )
+}
+
+/// Fail the freeze if anything in the slim image cannot resolve a library.
+fn check_linkage(engine: ContainerEngine, tag: &str, verbose: bool) -> Result<()> {
+    eprintln!("Checking dynamic linkage in {tag}...");
+    let cfg = crate::container::RunConfig {
+        command: Some(vec!["sh".to_string(), "-c".to_string(), linkage_check_script()]),
+        ..crate::container::RunConfig::new(tag)
+    };
+    let (status, stdout, stderr) = crate::container::container_run_quiet(engine, &cfg);
+    if verbose {
+        eprintln!("{stdout}");
+    }
+    if !status.success() {
+        return Err(ManagerError::FreezeError(format!(
+            "the linkage check could not run in {tag}: {}",
+            stderr.lines().take(5).collect::<Vec<_>>().join("\n")
+        )));
+    }
+    let missing = morloc_deps::abi::unresolved_libs(&stdout);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(ManagerError::FreezeError(format!(
+        "the slim image is missing shared libraries the programs need:\n  {}\n\
+         The cut removed something a program links against. Freeze without --slim \
+         and report this.",
+        missing.join("\n  ")
+    )))
+}
+
 /// What the image says about itself.
 ///
 /// A frozen image leaves the manager's world entirely: nothing tracks it, and
@@ -448,12 +663,14 @@ fn stage_into_context(root: &Path, context: &Path, rel: &str) -> Result<()> {
 fn deploy_labels(
     env_name: &str,
     ver: &Version,
+    flavor: Flavor,
     programs: &[ProgramEntry],
     modules: &[ModuleEntry],
     exposure: &ViewSet,
 ) -> Vec<(String, String)> {
     let join = |xs: Vec<String>| xs.join(",");
     let mut labels = vec![
+        ("morloc.flavor".to_string(), flavor.label().to_string()),
         (
             "org.opencontainers.image.created".to_string(),
             Utc::now().to_rfc3339(),
@@ -723,7 +940,7 @@ mod tests {
         let programs = vec![
             ProgramEntry { name: "pacman".to_string(), commands: vec!["play".to_string()] },
         ];
-        let served = run_hints(ContainerEngine::Podman, "pacman:v1", &programs, true);
+        let served = run_hints(ContainerEngine::Podman, "pacman:v1", Flavor::Full, &programs, true);
         let text = served.join("\n");
         assert!(text.contains("podman run -it --rm pacman:v1 /bin/bash"), "{text}");
         assert!(text.contains("podman run --rm pacman:v1 morloc list --programs"), "{text}");
@@ -735,7 +952,7 @@ mod tests {
 
         // With nothing exposed the image has no default command, and a hint to
         // serve it would start a container that exits at once.
-        let cli_only = run_hints(ContainerEngine::Docker, "pacman:v1", &programs, false);
+        let cli_only = run_hints(ContainerEngine::Docker, "pacman:v1", Flavor::Full, &programs, false);
         let text = cli_only.join("\n");
         assert!(text.contains("docker run --rm pacman:v1 pacman --help"), "{text}");
         assert!(!text.contains("-p "), "{text}");
@@ -767,7 +984,7 @@ mod tests {
             api: Vec::new(),
             eval: Some(EvalCapability { allow: vec!["dna".to_string()] }),
         };
-        let labels = deploy_labels("dev", &Version::new(0, 101, 0), &programs, &modules, &ex);
+        let labels = deploy_labels("dev", &Version::new(0, 101, 0), Flavor::Slim, &programs, &modules, &ex);
         let get = |k: &str| {
             labels
                 .iter()
@@ -775,6 +992,7 @@ mod tests {
                 .map(|(_, v)| v.clone())
         };
         assert_eq!(get("morloc.environment").as_deref(), Some("dev"));
+        assert_eq!(get("morloc.flavor").as_deref(), Some("slim"));
         assert_eq!(get("morloc.programs").as_deref(), Some("dna"));
         assert_eq!(get("morloc.modules").as_deref(), Some("root-py"));
         assert_eq!(get("morloc.mcp").as_deref(), Some("dna"));
@@ -858,7 +1076,7 @@ mod tests {
             tool_state: Vec::new(),
             large_files: Vec::new(),
         };
-        assert!(matches!(audit_verdict(&heavy, false, true), Verdict::Confirm));
+        assert!(matches!(audit_verdict(&heavy, false, true), Verdict::Confirm(_)));
         match audit_verdict(&heavy, false, false) {
             Verdict::Refuse(msg) => assert!(msg.contains("--force"), "{msg}"),
             other => panic!("expected a refusal, got {other:?}"),
@@ -870,7 +1088,7 @@ mod tests {
             tool_state: Vec::new(),
             large_files: vec![("atlas".to_string(), "data/genome.fa".to_string(), LARGE_FILE_BYTES + 1)],
         };
-        assert!(matches!(audit_verdict(&big_file, false, true), Verdict::Confirm));
+        assert!(matches!(audit_verdict(&big_file, false, true), Verdict::Confirm(_)));
 
         let light = ProgramAudit {
             sizes: vec![("todo".to_string(), 40)],
@@ -878,6 +1096,23 @@ mod tests {
             large_files: Vec::new(),
         };
         assert!(matches!(audit_verdict(&light, false, false), Verdict::Proceed));
+    }
+
+    /// An environment with nothing installed is still worth freezing -- as a
+    /// base, or to hand someone the toolchain -- but not by accident.
+    #[test]
+    fn no_programs_is_a_question_not_a_refusal() {
+        let empty = ProgramAudit::default();
+        match audit_verdict(&empty, false, true) {
+            Verdict::Confirm(why) => assert!(why.contains("No morloc programs"), "{why}"),
+            other => panic!("expected a question, got {other:?}"),
+        }
+        match audit_verdict(&empty, false, false) {
+            Verdict::Refuse(msg) => assert!(msg.contains("--force"), "{msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(matches!(audit_verdict(&empty, true, false), Verdict::Proceed));
+        assert_eq!(audit_report(&empty), vec!["Installed programs to freeze: none"]);
     }
 
     #[test]
@@ -891,6 +1126,103 @@ mod tests {
         assert!(text.contains("atlas") && text.contains("300.0 MB"), "{text}");
         assert!(text.contains("todo") && text.contains("1.0 MB"), "{text}");
         assert!(text.contains("data/genome.fa") && text.contains("299.0 MB"), "{text}");
+    }
+
+    /// A slim image has no `morloc` to list programs with; the label is how
+    /// whoever holds the image learns what is in it.
+    #[test]
+    fn slim_hints_read_the_label_instead_of_running_the_compiler() {
+        let programs = vec![ProgramEntry { name: "dna".to_string(), commands: vec![] }];
+        let text = run_hints(ContainerEngine::Docker, "dna:v1-slim", Flavor::Slim, &programs, false).join("\n");
+        assert!(text.contains("docker inspect -f '{{index .Config.Labels \"morloc.programs\"}}' dna:v1-slim"), "{text}");
+        assert!(!text.contains("morloc list"), "{text}");
+    }
+
+    /// The headers and the Rust source built the runtime; nothing runs them.
+    #[test]
+    fn a_slim_runtime_leaves_its_build_inputs_behind() {
+        let root = tempfile::tempdir().unwrap();
+        for rel in [
+            "runtime/bin/morloc-nexus",
+            "runtime/lib/libmorloc.so",
+            "runtime/opt/pymorloc/include/x.h",
+            "runtime/include/morloc.h",
+            "runtime/rust/Cargo.toml",
+        ] {
+            let p = root.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x").unwrap();
+        }
+        let ctx = root.path().join("ctx");
+        stage_runtime_without_build_inputs(root.path(), &ctx).unwrap();
+        assert!(ctx.join("runtime/bin/morloc-nexus").is_file());
+        assert!(ctx.join("runtime/lib/libmorloc.so").is_file());
+        // Only the top-level build inputs go; a binding's own include dir stays.
+        assert!(ctx.join("runtime/opt/pymorloc/include/x.h").is_file());
+        assert!(!ctx.join("runtime/include").exists());
+        assert!(!ctx.join("runtime/rust").exists());
+    }
+
+    /// The lists the Dockerfile consumes: NUL-separated paths (a path may hold
+    /// anything but NUL) and one record name per line.
+    #[test]
+    fn prune_lists_are_written_from_the_mirror_and_the_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let pixi = root.path().join("pixi");
+        let mirror = pixi.join(morloc_deps::abi::CONDA_META_MIRROR);
+        std::fs::create_dir_all(&mirror).unwrap();
+        std::fs::write(
+            pixi.join("pixi.toml"),
+            "[workspace]\nname = \"x\"\n\n[dependencies]\n\"python\" = \"*\"\n\"rust\" = \"*\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mirror.join("python-3.13.1-h0.json"),
+            r#"{"name":"python","depends":["libgcc"],"files":["bin/python3"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            mirror.join("libgcc-14.2-h0.json"),
+            r#"{"name":"libgcc","depends":[],"files":["lib/libgcc_s.so.1"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            mirror.join("rust-1.83-h0.json"),
+            r#"{"name":"rust","depends":["libgcc"],"files":["bin/rustc","bin/cargo"]}"#,
+        )
+        .unwrap();
+        let ctx = root.path().join("ctx");
+        std::fs::create_dir_all(&ctx).unwrap();
+        let plan = write_prune_lists(root.path(), &ctx).unwrap();
+        assert_eq!(plan.removed, vec!["rust"]);
+        let files = std::fs::read(ctx.join(crate::dockerfile::PRUNE_FILES)).unwrap();
+        assert_eq!(files, b"bin/cargo\0bin/rustc\0conda-meta/rust-1.83-h0.json\0");
+        let records = std::fs::read_to_string(ctx.join(crate::dockerfile::PRUNE_RECORDS)).unwrap();
+        assert_eq!(records, "rust-1.83-h0.json\n");
+    }
+
+    #[test]
+    fn a_slim_freeze_needs_materialized_records() {
+        let root = tempfile::tempdir().unwrap();
+        let pixi = root.path().join("pixi");
+        std::fs::create_dir_all(&pixi).unwrap();
+        std::fs::write(pixi.join("pixi.toml"), "[dependencies]\n\"python\" = \"*\"\n").unwrap();
+        let ctx = root.path().join("ctx");
+        std::fs::create_dir_all(&ctx).unwrap();
+        let err = write_prune_lists(root.path(), &ctx).unwrap_err().to_string();
+        assert!(err.contains("mim update"), "{err}");
+    }
+
+    /// The bindings are deliberately not checked: an interpreter extension
+    /// resolves the interpreter's library from the process that loads it.
+    #[test]
+    fn the_linkage_check_covers_the_nexus_the_library_and_the_pools() {
+        let script = linkage_check_script();
+        assert!(script.contains("/opt/morloc/bin/morloc-nexus"), "{script}");
+        assert!(script.contains("/opt/morloc/lib/libmorloc.so"), "{script}");
+        assert!(script.contains("-name 'pool-*.out'"), "{script}");
+        assert!(!script.contains("rmorloc") && !script.contains("pymorloc"), "{script}");
+        assert!(script.contains("LD_LIBRARY_PATH=/opt/morloc/lib"), "{script}");
     }
 
     #[test]

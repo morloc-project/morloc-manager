@@ -640,7 +640,10 @@ The image serves the exposed set and runs the same programs from a command
 line. It is left in the engine's image store; move it with a registry push,
 with --save, or by rebuilding it.
 
-Requires at least one program compiled with 'morloc make --install'.")]
+Before building, the installed programs are audited: a tool-state directory
+(a cargo target/, .git/, ...) refuses the freeze, and an unusually large
+program or an environment with no programs asks for confirmation. --force
+answers all three.")]
     Freeze {
         /// Environment to freeze (default: the default environment)
         #[arg(long)]
@@ -652,6 +655,11 @@ Requires at least one program compiled with 'morloc make --install'.")]
         /// between it and this one. Load it there with `docker load -i <path>`.
         #[arg(long)]
         save: Option<String>,
+        /// Build a slim image: the programs and what runs them, without the
+        /// compiler, the build toolchain, or pixi. It cannot eval or build.
+        /// Default tag: morloc-<env>:<morloc version>-slim.
+        #[arg(long)]
+        slim: bool,
         /// Freeze even when an installed program carries tool-state
         /// directories (a cargo target/, a .git/, ...) or is unusually large.
         /// The fix those refusals ask for is the project's .morlocignore.
@@ -2992,7 +3000,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             Ok(())
         }
         // ---- freeze ----
-        Cmd::Freeze { env, tag, save, force } => {
+        Cmd::Freeze { env, tag, save, slim, force } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
             if ec.is_dev() {
                 return Err(ManagerError::EnvError(format!(
@@ -3052,10 +3060,15 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let image = ec.active_image().to_string();
             // A tag that says what it is and does not collide with the
             // environment image it is built on.
-            let tag = tag.unwrap_or_else(|| format!("morloc-{env_name}:{}", ver.show()));
+            let suffix = if slim { "-slim" } else { "" };
+            let tag = tag.unwrap_or_else(|| format!("morloc-{env_name}:{}{suffix}", ver.show()));
+            let slim_base = slim.then(|| freeze::SlimBase {
+                base_image: &ec.base_image,
+                system_packages: &ec.system_packages,
+            });
             let result = freeze::freeze_environment(
                 env_scope, &env_name, ver.clone(), engine, &image,
-                &data_dir.to_string_lossy(), &tag, save.as_deref(), force, verbose,
+                &data_dir.to_string_lossy(), &tag, save.as_deref(), slim_base, force, verbose,
             );
             if result.is_ok() && ec.morloc_version.as_ref() != Some(&ver) {
                 let mut updated = ec.clone();
