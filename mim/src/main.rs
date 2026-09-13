@@ -197,6 +197,12 @@ environment; pass `--wizard` to be prompted for each one instead.")]
         /// Docker/podman only; not combinable with --dotfiles.
         #[arg(long = "mount-home", conflicts_with = "dotfiles")]
         mount_home: Option<String>,
+        /// Shared memory (/dev/shm) given to the container, e.g. 2g, 512m
+        /// (default 2g). Morloc passes large values between languages through
+        /// shared memory, so size it for the biggest data a program handles.
+        /// Docker/podman only; apptainer and the native backend use the host's.
+        #[arg(long = "shm-size", value_name = "SIZE")]
+        shm_size: Option<String>,
         /// Path to a corporate CA bundle (PEM/DER) to trust for this
         /// environment's package fetches, for use behind a TLS-inspection
         /// firewall. The certificates are validated and normalized; the file is
@@ -496,6 +502,14 @@ what the corresponding flag set:
         /// No rebuild.
         #[arg(long = "no-mount-home", conflicts_with = "mount_home")]
         no_mount_home: bool,
+        /// Set the shared memory (/dev/shm) given to the container, e.g. 4g,
+        /// 512m. Applies from the next run; docker/podman only. No rebuild.
+        #[arg(long = "shm-size", value_name = "SIZE")]
+        shm_size: Option<String>,
+        /// Reset the container's shared memory to the default (2g).
+        /// Docker/podman only. No rebuild.
+        #[arg(long = "no-shm-size", conflicts_with = "shm_size")]
+        no_shm_size: bool,
         /// Replace the corporate CA bundle trusted by this environment (host
         /// path to a PEM/DER file). Re-validates the certificates and triggers a
         /// rebuild so the new CA is applied. Use after the corporate CA rotates.
@@ -1381,6 +1395,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             no_default_modules,
             dotfiles,
             mount_home,
+            shm_size,
             cert_bundle,
             base,
             system,
@@ -1390,6 +1405,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             non_interactive: _,
         } => {
             if system { check_system_write_access()?; }
+            // Validate the SHM size before anything is touched; the engine check
+            // waits until the backend is known.
+            let shm_size = shm_size
+                .as_deref()
+                .map(types::parse_shm_size)
+                .transpose()
+                .map_err(ManagerError::EnvError)?;
             // Resolve/validate the local runtime dir up front (clap already makes it
             // mutually exclusive with --morloc-version and --dev). An advanced,
             // flag-only mode: it is never offered interactively.
@@ -1452,7 +1474,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     let Backend::Container(eng) = plan.backend else { unreachable!() };
                     return container_new_dev(
                         plan.scope, eng, Some(plan.name), src, plan.lang, plan.system_packages,
-                        plan.conda_packages, plan.dotfiles, plan.mount_home, plan.cert_bundle,
+                        plan.conda_packages, plan.dotfiles, plan.mount_home, shm_size, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
                         plan.requested_version, no_init, plan.make_default, &snapshots,
                     );
@@ -1465,6 +1487,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         if plan.mount_home.is_some() {
                             return Err(mount_home_not_supported());
                         }
+                        if shm_size.is_some() {
+                            return Err(shm_size_not_supported());
+                        }
                         native_new(
                             plan.scope, Some(plan.name), plan.lang, plan.conda_packages,
                             plan.requested_version, None, plan.cert_bundle, no_init, plan.make_default, verbose,
@@ -1473,7 +1498,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     }
                     Backend::Container(eng) => container_new_derived(
                         plan.scope, eng, Some(plan.name), plan.lang, plan.system_packages,
-                        plan.conda_packages, plan.dotfiles, plan.mount_home, plan.cert_bundle,
+                        plan.conda_packages, plan.dotfiles, plan.mount_home, shm_size, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
                         plan.requested_version, None, no_init, plan.make_default, &snapshots,
                     ),
@@ -1550,6 +1575,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if mount_home.is_some() {
                     return Err(mount_home_not_supported());
                 }
+                if shm_size.is_some() {
+                    return Err(shm_size_not_supported());
+                }
                 if base.is_some() {
                     return Err(base_not_supported());
                 }
@@ -1618,8 +1646,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             if let Some(src) = dev {
                 return container_new_dev(
                     scope, resolved_engine, name, src, lang, system_package, conda_package,
-                    dotfiles, mount_home, cert_bundle, base_image, morloc_version, no_init,
-                    set_default, &snapshots,
+                    dotfiles, mount_home, shm_size, cert_bundle, base_image, morloc_version,
+                    no_init, set_default, &snapshots,
                 );
             }
 
@@ -1628,8 +1656,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // native backend's lowering. There is no pull/recipe/base-image path.
             container_new_derived(
                 scope, resolved_engine, name, lang, system_package, conda_package, dotfiles,
-                mount_home, cert_bundle, base_image, morloc_version, local_runtime, no_init,
-                set_default, &snapshots,
+                mount_home, shm_size, cert_bundle, base_image, morloc_version, local_runtime,
+                no_init, set_default, &snapshots,
             )
         }
 
@@ -2503,6 +2531,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             no_dotfiles,
             mount_home,
             no_mount_home,
+            shm_size,
+            no_shm_size,
             cert_bundle,
             no_cert_bundle,
             base,
@@ -2511,6 +2541,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             system,
         } => {
             // ---- Argument validation (no filesystem) ----
+            // `None` = leave the SHM size alone; `Some(v)` = store v, the
+            // `--no-` form storing the default.
+            let shm_size_change: Option<String> = match (&shm_size, no_shm_size) {
+                (Some(raw), _) => Some(types::parse_shm_size(raw).map_err(ManagerError::EnvError)?),
+                (None, true) => Some(types::DEFAULT_SHM_SIZE.to_string()),
+                (None, false) => None,
+            };
             if system && !(set_default || unset_default) {
                 return Err(ManagerError::EnvError(
                     "--system applies only to --set-default / --unset-default (the \
@@ -2555,14 +2592,15 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 && !no_dotfiles
                 && mount_home.is_none()
                 && !no_mount_home
+                && shm_size_change.is_none()
                 && module_snapshots.is_empty()
                 && no_modules_file.is_empty()
             {
                 return Err(ManagerError::EnvError(
                     "nothing to modify: pass --set-default, --unset-default, --dotfiles, \
-                     --mount-home, --lang, --cert-bundle, --base, --system-packages-file, \
-                     --conda-packages-file, or --modules-file (each of which has a \
-                     --no-<flag> form that clears it)".to_string(),
+                     --mount-home, --shm-size, --lang, --cert-bundle, --base, \
+                     --system-packages-file, --conda-packages-file, or --modules-file \
+                     (each of which has a --no-<flag> form that clears it)".to_string(),
                 ));
             }
 
@@ -2619,6 +2657,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     &cfg::env_data_dir(env_scope, &env_name),
                 )?)),
             };
+            if shm_size_change.is_some() && !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
+                return Err(shm_size_not_supported());
+            }
             // A dotfiles copy into a mounted host home would overwrite the user's
             // own files there (their real ~/.bashrc, if they mounted a real home),
             // so the two are exclusive on a configured env as well as on one
@@ -2673,6 +2714,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     "It already uses its own home.",
                 );
             }
+            if no_shm_size && ec.shm_size == types::DEFAULT_SHM_SIZE {
+                return nothing_to_remove(
+                    "custom shared memory size",
+                    &format!("It already uses the default ({}).", types::DEFAULT_SHM_SIZE),
+                );
+            }
             // Clearing a default only ever clears THIS environment's: refuse when
             // the recorded default names someone else, rather than silently
             // dropping a default the user did not mean to touch.
@@ -2709,6 +2756,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     || dotfiles.is_some()
                     || no_dotfiles
                     || mount_home_change.is_some()
+                    || shm_size_change.is_some()
                     || !no_modules_file.is_empty())
             {
                 check_system_write_access()?;
@@ -2809,6 +2857,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                          directory was left in place."
                     ),
                 }
+            }
+
+            // 2a'. shared memory size: pure metadata read at run time, so no
+            //      rebuild; the next `mim run`/`start`/`shell` picks it up.
+            if let Some(size) = shm_size_change {
+                ec.shm_size = size;
+                cfg::write_env_config(env_scope, &env_name, &ec)?;
+                eprintln!(
+                    "Environment '{env_name}' now gives its container {} of shared memory.",
+                    ec.shm_size
+                );
             }
 
             // 2b. module-pin snapshots: deposit for on-demand resolution; no
@@ -5200,6 +5259,17 @@ fn mount_home_not_supported() -> ManagerError {
     ManagerError::EnvError(
         "--mount-home applies only to docker/podman environments; apptainer \
          inherits the host $HOME and the native backend uses your real home"
+            .to_string(),
+    )
+}
+
+/// The single rejection for `--shm-size` on a non-OCI backend: only docker and
+/// podman give a container its own `/dev/shm`; apptainer shares the host's and
+/// the native backend runs on it directly, so there is no size to set.
+fn shm_size_not_supported() -> ManagerError {
+    ManagerError::EnvError(
+        "--shm-size applies only to docker/podman environments; apptainer shares \
+         the host /dev/shm and the native backend uses it directly"
             .to_string(),
     )
 }
@@ -7710,6 +7780,7 @@ fn container_new_derived(
     conda_packages: Vec<String>,
     dotfiles: Option<String>,
     mount_home: Option<String>,
+    shm_size: Option<String>,
     cert_bundle: Option<String>,
     base_image: String,
     requested_version: Option<String>,
@@ -7718,6 +7789,9 @@ fn container_new_derived(
     make_default: bool,
     snapshots: &SnapshotPlan,
 ) -> Result<()> {
+    if shm_size.is_some() && !engine.is_oci() {
+        return Err(shm_size_not_supported());
+    }
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
 
     // Resolve the host home before the (multi-minute) image build, so a bad path
@@ -7779,6 +7853,9 @@ fn container_new_derived(
         ec = ec.with_local_runtime(LocalRuntimeConfig { source: lr.to_string_lossy().into_owned() });
     }
     ec.mount_home = mount_home;
+    if let Some(s) = shm_size {
+        ec.shm_size = s;
+    }
     if let Some(p) = prepared {
         p.apply_to(&mut ec);
     }
@@ -7812,6 +7889,7 @@ fn container_new_dev(
     conda_packages: Vec<String>,
     dotfiles: Option<String>,
     mount_home: Option<String>,
+    shm_size: Option<String>,
     cert_bundle: Option<String>,
     base_image: String,
     requested_version: Option<String>,
@@ -7882,6 +7960,9 @@ fn container_new_dev(
     )
     .with_dev(dev);
     ec.mount_home = mount_home;
+    if let Some(s) = shm_size {
+        ec.shm_size = s;
+    }
     if let Some(p) = prepared {
         p.apply_to(&mut ec);
     }
@@ -9557,6 +9638,40 @@ mod tests {
     }
 
     #[test]
+    fn new_and_modify_parse_shm_size() {
+        let cli = Cli::try_parse_from(["mim", "new", "--shm-size", "4g"]).expect("new --shm-size");
+        assert!(matches!(cli.command, Some(Cmd::New { shm_size: Some(ref s), .. }) if s == "4g"));
+        let cli = Cli::try_parse_from(["mim", "new"]).unwrap();
+        assert!(matches!(cli.command, Some(Cmd::New { shm_size: None, .. })));
+
+        let cli = Cli::try_parse_from(["mim", "modify", "--env", "e", "--shm-size", "4g"])
+            .expect("modify --shm-size");
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Modify { shm_size: Some(ref s), no_shm_size: false, .. }) if s == "4g"
+        ));
+        let cli = Cli::try_parse_from(["mim", "modify", "--env", "e", "--no-shm-size"])
+            .expect("modify --no-shm-size");
+        assert!(matches!(cli.command, Some(Cmd::Modify { shm_size: None, no_shm_size: true, .. })));
+        // Set and reset are exclusive.
+        assert!(Cli::try_parse_from([
+            "mim", "modify", "--env", "e", "--shm-size", "4g", "--no-shm-size"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn new_rejects_a_malformed_shm_size_before_any_side_effect() {
+        let cmd = match Cli::try_parse_from(["mim", "new", "--shm-size", "2x"]).unwrap().command {
+            Some(c) => c,
+            None => unreachable!(),
+        };
+        let err = dispatch(false, false, cmd).unwrap_err().to_string();
+        assert!(err.contains("--shm-size"), "got: {err}");
+        assert!(err.contains("2x"), "got: {err}");
+    }
+
+    #[test]
     fn modify_set_default_is_local_unless_system_flag() {
         // A personal (local) default: no --system.
         let cli = Cli::try_parse_from(["mim", "modify", "--env", "shared", "--set-default"])
@@ -9700,6 +9815,7 @@ mod tests {
         no_mount_home: bool,
         no_cert_bundle: bool,
         no_modules_file: Vec<String>,
+        no_shm_size: bool,
     }
 
     fn modify_cmd(f: ModifyFlags) -> Cmd {
@@ -9720,6 +9836,8 @@ mod tests {
             cert_bundle: None,
             no_cert_bundle: f.no_cert_bundle,
             base: None,
+            shm_size: None,
+            no_shm_size: f.no_shm_size,
             set_default: f.set_default,
             unset_default: f.unset_default,
             system: f.system,
@@ -9952,6 +10070,7 @@ mod tests {
             ("--no-dotfiles", ModifyFlags { no_dotfiles: true, ..Default::default() }),
             ("--no-mount-home", ModifyFlags { no_mount_home: true, ..Default::default() }),
             ("--no-cert-bundle", ModifyFlags { no_cert_bundle: true, ..Default::default() }),
+            ("--no-shm-size", ModifyFlags { no_shm_size: true, ..Default::default() }),
             (
                 "--no-modules-file",
                 ModifyFlags {

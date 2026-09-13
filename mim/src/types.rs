@@ -434,7 +434,41 @@ pub struct EnvironmentConfig {
 }
 
 fn default_shm_size() -> String {
-    "512m".to_string()
+    DEFAULT_SHM_SIZE.to_string()
+}
+
+/// Shared memory given to a docker/podman container when the environment does
+/// not set its own. Morloc moves every large value between pools through
+/// `/dev/shm`, so the engines' 64m default starves any real workload.
+pub const DEFAULT_SHM_SIZE: &str = "2g";
+
+/// Validate and normalize an `--shm-size` value to the form docker and podman
+/// accept: a positive decimal number with an optional unit `b`, `k`, `m`, `g` or
+/// `t` (a trailing `b` allowed, as in `gb`), case-insensitive. Returns the
+/// lowercased value with surrounding whitespace removed, so the stored setting
+/// reads the same however it was typed. The error names what was wrong.
+pub fn parse_shm_size(raw: &str) -> Result<String, String> {
+    let s = raw.trim().to_ascii_lowercase();
+    let digits_end = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
+    let (number, unit) = s.split_at(digits_end);
+    let well_formed_number = !number.is_empty()
+        && number.chars().filter(|&c| c == '.').count() <= 1
+        && !number.starts_with('.')
+        && !number.ends_with('.');
+    if !well_formed_number {
+        return Err(format!(
+            "invalid --shm-size {raw:?}: expected a number with an optional unit, e.g. 2g, 512m or 1.5g"
+        ));
+    }
+    if !matches!(unit, "" | "b" | "k" | "m" | "g" | "t" | "kb" | "mb" | "gb" | "tb") {
+        return Err(format!(
+            "invalid --shm-size {raw:?}: unknown unit {unit:?} (use b, k, m, g or t)"
+        ));
+    }
+    if number.parse::<f64>().map_or(true, |n| n <= 0.0) {
+        return Err(format!("invalid --shm-size {raw:?}: the size must be greater than zero"));
+    }
+    Ok(s)
 }
 
 impl EnvironmentConfig {
@@ -924,5 +958,43 @@ mod exposure_tests {
         let yaml = serde_yaml::to_string(&ex).unwrap();
         let back: ViewSet = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(ex, back);
+    }
+}
+
+#[cfg(test)]
+mod shm_size_tests {
+    use super::*;
+
+    #[test]
+    fn default_shm_size_is_two_gigabytes() {
+        assert_eq!(default_shm_size(), "2g");
+        let ec = EnvironmentConfig::new_backend(
+            "e".into(), Backend::Native, String::new(), None, None, Vec::new(), Vec::new(),
+        );
+        assert_eq!(ec.shm_size, "2g");
+        // A config written before the field existed takes the default too.
+        let ec: EnvironmentConfig =
+            serde_yaml::from_str("name: old\nbase_image: img\nengine: podman\n").unwrap();
+        assert_eq!(ec.shm_size, "2g");
+    }
+
+    #[test]
+    fn parse_shm_size_accepts_engine_syntax() {
+        // The number-plus-optional-unit forms docker and podman accept, normalized
+        // to lowercase so the stored value is stable.
+        for (raw, want) in [
+            ("2g", "2g"), ("512m", "512m"), ("4G", "4g"), ("1024", "1024"),
+            ("1.5g", "1.5g"), ("8gb", "8gb"), ("64k", "64k"), ("100b", "100b"),
+            (" 2g ", "2g"),
+        ] {
+            assert_eq!(parse_shm_size(raw).as_deref(), Ok(want), "input {raw:?}");
+        }
+    }
+
+    #[test]
+    fn parse_shm_size_rejects_garbage() {
+        for raw in ["", "0", "0g", "-1g", "g", "2x", "2 g", "2gg", "1.g", ".5g", "2g2", "abc"] {
+            assert!(parse_shm_size(raw).is_err(), "input {raw:?} should be rejected");
+        }
     }
 }
