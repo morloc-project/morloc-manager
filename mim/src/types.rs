@@ -571,12 +571,14 @@ impl EnvironmentConfig {
 // Container flag configuration
 // ======================================================================
 
-/// Phase of container invocation a flag list applies to. Names match the
-/// CLI subcommand that triggers the phase, so users can grep the same
-/// word in their notes and find both the section in env.flags.yaml and
-/// the subcommand that consumes it.
+/// Phase of container invocation a flag list applies to. `Run` and `Start`
+/// are named after the CLI subcommand that triggers them; `Build` is every
+/// image build the environment does (`new`, `update`, a `modify` that
+/// rebuilds, `freeze`), so a user can grep the same word in their notes and
+/// find both the section in env.flags.yaml and the command that consumes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    Build,
     Run,
     Start,
 }
@@ -639,6 +641,7 @@ impl FlagConfig {
     /// overrides are appended by the caller, not here.
     pub fn materialize(&self, phase: Phase, engine: ContainerEngine) -> Vec<String> {
         let section = match phase {
+            Phase::Build => &self.build,
             Phase::Run => &self.run,
             Phase::Start => &self.start,
         };

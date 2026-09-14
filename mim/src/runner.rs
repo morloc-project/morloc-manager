@@ -28,6 +28,9 @@ pub struct RunRequest {
     pub args: Vec<String>,
     pub user_env: Vec<(String, String)>,
     pub engine_args: Vec<String>,
+    /// A flag file to use in place of the environment's env.flags.yaml for
+    /// this invocation (`--flagfile`); the persisted file is untouched.
+    pub flagfile: Option<String>,
     pub phase: Phase,
     pub slurm_bridge: bool,
 }

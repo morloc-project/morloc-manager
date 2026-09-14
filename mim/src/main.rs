@@ -228,6 +228,16 @@ environment; pass `--wizard` to be prompted for each one instead.")]
         /// the defaults. Requires a terminal.
         #[arg(long, conflicts_with_all = ["non_interactive", "local_runtime"])]
         wizard: bool,
+        /// Install this file as the environment's env.flags.yaml: the engine
+        /// flags for its `build`, `run` and `start` phases, per engine. The file
+        /// is validated and copied whole. Container backends only.
+        #[arg(long, value_name = "FILE")]
+        flagfile: Option<String>,
+        /// One-shot engine flag for the image build, appended to
+        /// env.flags.yaml `build.<engine>` for this invocation only (repeatable;
+        /// not persisted). Container backends only.
+        #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true)]
+        engine_arg: Vec<String>,
         /// Accepted for compatibility and ignored: this is the default.
         #[arg(long, hide = true)]
         non_interactive: bool,
@@ -239,7 +249,10 @@ Examples:
   # runs in default env (see `mim ls`)
   mim run -- morloc --version
   # run in specific env
-  mim run --env dev -- morloc make svc.loc")]
+  mim run --env dev -- morloc make svc.loc
+  # one-shot engine flags: appended (-x) or a replacement file (--flagfile)
+  mim run -x --device=/dev/dri -- ./prog render
+  mim run --flagfile gpu.yaml -- ./prog render")]
     Run {
         /// Command to run inside the container
         command: Vec<String>,
@@ -256,6 +269,11 @@ Examples:
         /// for this invocation only (repeatable; not persisted)
         #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true)]
         engine_arg: Vec<String>,
+        /// Use this flag file instead of the environment's env.flags.yaml for
+        /// this invocation only (the persisted file is not changed). Same
+        /// schema; -x flags are appended after it.
+        #[arg(long, value_name = "FILE")]
+        flagfile: Option<String>,
         /// Expose a SLURM submission bridge inside the container so
         /// labeled remote calls (`big:fn x`) can submit jobs to the
         /// host's sbatch. Requires the environment to use the
@@ -291,6 +309,11 @@ Without --env, the default environment is used.")]
         /// for this invocation only (repeatable; not persisted)
         #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true)]
         engine_arg: Vec<String>,
+        /// Use this flag file instead of the environment's env.flags.yaml for
+        /// this invocation only (the persisted file is not changed). Same
+        /// schema; -x flags are appended after it.
+        #[arg(long, value_name = "FILE")]
+        flagfile: Option<String>,
     },
     /// Remove a morloc environment
     #[command(display_order = 3)]
@@ -393,7 +416,9 @@ Examples:
   mim update --env myenv --force            # force a fresh re-solve
   mim update --env myenv --latest           # move to the newest release
   mim update --env myenv --morloc-version 0.98.0   # move to a specific version
+  mim update --env myenv -x --no-cache      # rebuild with an engine build flag
 
+Persistent build flags belong in the env's env.flags.yaml `build:` section.
 Without --latest/--morloc-version, the environment keeps its current morloc
 version; changing settings (packages, dotfiles, default) is `mim modify`.")]
     Update {
@@ -417,6 +442,12 @@ version; changing settings (packages, dotfiles, default) is `mim modify`.")]
         /// aborts the update (leaving the environment untouched).
         #[arg(long)]
         ignore_module_compat: bool,
+        /// One-shot engine flag for this rebuild's image build, appended to
+        /// env.flags.yaml `build.<engine>` (repeatable; not persisted). Forces
+        /// the rebuild even when the requirements are unchanged. Container
+        /// backends only.
+        #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true)]
+        engine_arg: Vec<String>,
     },
     /// Change an environment's settings (without moving its morloc version)
     #[command(display_order = 8)]
@@ -429,6 +460,7 @@ Examples:
   mim modify --env myenv --conda-packages-file tools.conda
   mim modify --env myenv --system-packages-file tools.apt
   mim modify --env myenv --lang py@3.13
+  mim modify --env myenv --flagfile flags.yaml  # engine flags per phase
 
 Every setting that can be added can also be taken away. `--no-<flag>` clears
 what the corresponding flag set:
@@ -437,6 +469,7 @@ what the corresponding flag set:
   mim modify --env myenv --no-cert-bundle       # stop trusting the corporate CA
   mim modify --env myenv --no-mount-home        # back to the env-owned home
   mim modify --env myenv --no-dotfiles          # take the copied dotfiles back
+  mim modify --env myenv --no-flagfile          # drop the engine flags
   mim modify --env myenv --no-modules-file extra.txt   # drop one pin file
   mim modify --env myenv --unset-default        # stop being the default")]
     Modify {
@@ -510,6 +543,17 @@ what the corresponding flag set:
         /// Docker/podman only. No rebuild.
         #[arg(long = "no-shm-size", conflicts_with = "shm_size")]
         no_shm_size: bool,
+        /// Replace the environment's env.flags.yaml with this file: the engine
+        /// flags for its `build`, `run` and `start` phases, per engine. The file
+        /// is validated and copied whole; it is everything, not an addition.
+        /// `run`/`start` flags apply from the next launch; `build` flags at the
+        /// next `update`. Container backends only. No rebuild.
+        #[arg(long, value_name = "FILE")]
+        flagfile: Option<String>,
+        /// Remove the environment's env.flags.yaml, leaving no extra engine
+        /// flags for any phase. Container backends only. No rebuild.
+        #[arg(long = "no-flagfile", conflicts_with = "flagfile")]
+        no_flagfile: bool,
         /// Replace the corporate CA bundle trusted by this environment (host
         /// path to a PEM/DER file). Re-validates the certificates and triggers a
         /// rebuild so the new CA is applied. Use after the corporate CA rotates.
@@ -547,7 +591,8 @@ what the corresponding flag set:
 Examples:
   mim start                       # serve the default environment's exposed set
   mim start --env myenv -p 9090:8080
-  mim start --mcp mymodule -p 9000:9000   # serve one module as MCP/HTTP")]
+  mim start --mcp mymodule -p 9000:9000   # serve one module as MCP/HTTP
+  mim start --flagfile alt.yaml -p 9090:8080   # a second instance under other flags")]
     Start {
         /// Environment to serve (default: the default environment)
         #[arg(long)]
@@ -598,6 +643,11 @@ Examples:
         /// for this invocation only (repeatable; not persisted)
         #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true)]
         engine_arg: Vec<String>,
+        /// Use this flag file instead of the environment's env.flags.yaml for
+        /// this invocation only (the persisted file is not changed). Same
+        /// schema; -x flags are appended after it.
+        #[arg(long, value_name = "FILE")]
+        flagfile: Option<String>,
         /// Replace an already-running serve container
         #[arg(long)]
         force: bool,
@@ -712,6 +762,11 @@ Sugar for: mim run -- morloc make --install <file>
         /// for this invocation only (repeatable; not persisted)
         #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true)]
         engine_arg: Vec<String>,
+        /// Use this flag file instead of the environment's env.flags.yaml for
+        /// this invocation only (the persisted file is not changed). Same
+        /// schema; -x flags are appended after it.
+        #[arg(long, value_name = "FILE")]
+        flagfile: Option<String>,
     },
     /// Fetch curated example programs (the morloc-dungeon) for a morloc version
     #[command(display_order = 10)]
@@ -1088,6 +1143,7 @@ fn exec_in_env(
     env_vars: Vec<String>,
     env_file: Option<String>,
     engine_arg: Vec<String>,
+    flagfile: Option<String>,
     shell: bool,
     args: Vec<String>,
     slurm_bridge: bool,
@@ -1109,6 +1165,7 @@ fn exec_in_env(
             args,
             user_env,
             engine_args: engine_arg,
+            flagfile,
             phase: Phase::Run,
             slurm_bridge,
         },
@@ -1415,9 +1472,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             set_default,
             no_init,
             wizard,
+            flagfile,
+            engine_arg,
             non_interactive: _,
         } => {
             if system { check_system_write_access()?; }
+            // A named flag file is validated before anything is built or
+            // written, so a schema error costs nothing.
+            if let Some(f) = &flagfile {
+                cfg::read_flag_file(std::path::Path::new(f))?;
+            }
             // Validate the SHM size before anything is touched; the engine check
             // waits until the backend is known.
             let shm_size = shm_size
@@ -1490,6 +1554,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         plan.conda_packages, plan.dotfiles, plan.mount_home, shm_size, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
                         plan.requested_version, no_init, plan.make_default, &snapshots,
+                        flagfile.as_deref(), &engine_arg,
                     );
                 }
                 return match plan.backend {
@@ -1503,6 +1568,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         if shm_size.is_some() {
                             return Err(shm_size_not_supported());
                         }
+                        if !engine_arg.is_empty() {
+                            return Err(engine_arg_not_supported());
+                        }
+                        if flagfile.is_some() {
+                            return Err(flagfile_not_supported());
+                        }
                         native_new(
                             plan.scope, Some(plan.name), plan.lang, plan.conda_packages,
                             plan.requested_version, None, plan.cert_bundle, no_init, plan.make_default, verbose,
@@ -1514,6 +1585,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         plan.conda_packages, plan.dotfiles, plan.mount_home, shm_size, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
                         plan.requested_version, None, no_init, plan.make_default, &snapshots,
+                        flagfile.as_deref(), &engine_arg,
                     ),
                 };
             }
@@ -1594,6 +1666,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if base.is_some() {
                     return Err(base_not_supported());
                 }
+                if !engine_arg.is_empty() {
+                    return Err(engine_arg_not_supported());
+                }
+                if flagfile.is_some() {
+                    return Err(flagfile_not_supported());
+                }
                 return native_new(scope, name, lang, conda_package, morloc_version, local_runtime, cert_bundle, no_init, set_default, verbose, &snapshots);
             }
 
@@ -1660,7 +1738,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 return container_new_dev(
                     scope, resolved_engine, name, src, lang, system_package, conda_package,
                     dotfiles, mount_home, shm_size, cert_bundle, base_image, morloc_version,
-                    no_init, set_default, &snapshots,
+                    no_init, set_default, &snapshots, flagfile.as_deref(), &engine_arg,
                 );
             }
 
@@ -1670,21 +1748,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             container_new_derived(
                 scope, resolved_engine, name, lang, system_package, conda_package, dotfiles,
                 mount_home, shm_size, cert_bundle, base_image, morloc_version, local_runtime,
-                no_init, set_default, &snapshots,
+                no_init, set_default, &snapshots, flagfile.as_deref(), &engine_arg,
             )
         }
 
         // ---- run ----
-        Cmd::Run { command, env, env_vars, env_file, engine_arg, slurm_bridge } => {
+        Cmd::Run { command, env, env_vars, env_file, engine_arg, flagfile, slurm_bridge } => {
             if command.is_empty() {
                 return Err(ManagerError::NoCommand);
             }
-            exec_in_env(verbose, env, env_vars, env_file, engine_arg, false, command, slurm_bridge)
+            exec_in_env(verbose, env, env_vars, env_file, engine_arg, flagfile, false, command, slurm_bridge)
         }
 
         // ---- shell ----
-        Cmd::Shell { env, env_vars, env_file, engine_arg } => {
-            exec_in_env(verbose, env, env_vars, env_file, engine_arg, true, Vec::new(), false)
+        Cmd::Shell { env, env_vars, env_file, engine_arg, flagfile } => {
+            exec_in_env(verbose, env, env_vars, env_file, engine_arg, flagfile, true, Vec::new(), false)
         }
 
         // ---- rm ----
@@ -2362,6 +2440,28 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         // Native environments have no container section.
                         None => {}
                     }
+                    // The engine flag file, and what it materializes to for this
+                    // engine, so a flag applied to every launch is visible here
+                    // and not only in the engine's own output.
+                    if let Some(e) = engine {
+                        let path = cfg::env_flags_yaml_path(scope, &env_name);
+                        if path.is_file() {
+                            println!("  Flags:        {}", path.display());
+                            let fc = cfg::read_flag_config(scope, &env_name).unwrap_or_default();
+                            for (label, phase) in [
+                                ("build", Phase::Build),
+                                ("run", Phase::Run),
+                                ("start", Phase::Start),
+                            ] {
+                                let flags = fc.materialize(phase, e);
+                                if !flags.is_empty() {
+                                    println!("    {label:<6}      {}", flags.join(" "));
+                                }
+                            }
+                        } else {
+                            println!("  Flags:        none (`mim modify --flagfile <file>` to add)");
+                        }
+                    }
                 }
             } else {
                 // Overview
@@ -2477,8 +2577,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         // ---- update ----
         // Rebuild an environment, optionally moving its morloc version. Settings
         // changes (packages/dotfiles/default) are `modify`, not `update`.
-        Cmd::Update { env, morloc_version, latest, force, ignore_module_compat } => {
+        Cmd::Update { env, morloc_version, latest, force, ignore_module_compat, engine_arg } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
+            if !engine_arg.is_empty() && ec.backend.is_native() {
+                return Err(engine_arg_not_supported());
+            }
             if env_scope == Scope::System {
                 check_system_write_access()?;
             }
@@ -2516,11 +2619,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
 
             // --force repairs a stale/half-built env: drop the success marker so
             // materialization always re-solves and rebuilds rather than skipping.
-            if force {
+            // A one-shot build flag is a request for a build, not for whatever the
+            // marker says about the last one.
+            if force || !engine_arg.is_empty() {
                 clear_materialized_marker(env_scope, &env_name, &ec);
             }
 
-            rematerialize_env(env_scope, &env_name, &[], requested, verbose)?;
+            rematerialize_env(env_scope, &env_name, &[], requested, &engine_arg, verbose)?;
             report_rematerialized(ec.backend.is_native(), &env_name);
             // Surface a broken conda extra (unresolved shared libs) LOUDLY now,
             // rather than leaving it to be discovered by running the tool.
@@ -2546,6 +2651,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             no_mount_home,
             shm_size,
             no_shm_size,
+            flagfile,
+            no_flagfile,
             cert_bundle,
             no_cert_bundle,
             base,
@@ -2582,6 +2689,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 (None, true) => Some(Vec::new()),
                 (None, false) => None,
             };
+            // The flag file is validated up front for the same reason; it is
+            // copied, not re-rendered, so the read is a check.
+            if let Some(f) = &flagfile {
+                cfg::read_flag_file(std::path::Path::new(f))?;
+            }
+            let touches_flags = flagfile.is_some() || no_flagfile;
             // Module-pin snapshots are deposited (not solved / not a rebuild);
             // read them up front so a bad path aborts before any side effect.
             let module_snapshots = read_snapshot_files(&modules_file)?;
@@ -2606,12 +2719,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 && mount_home.is_none()
                 && !no_mount_home
                 && shm_size_change.is_none()
+                && !touches_flags
                 && module_snapshots.is_empty()
                 && no_modules_file.is_empty()
             {
                 return Err(ManagerError::EnvError(
                     "nothing to modify: pass --set-default, --unset-default, --dotfiles, \
-                     --mount-home, --shm-size, --lang, --cert-bundle, --base, \
+                     --mount-home, --shm-size, --flagfile, --lang, --cert-bundle, --base, \
                      --system-packages-file, --conda-packages-file, or --modules-file \
                      (each of which has a --no-<flag> form that clears it)".to_string(),
                 ));
@@ -2673,6 +2787,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             if shm_size_change.is_some() && !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
                 return Err(shm_size_not_supported());
             }
+            if touches_flags && ec.backend.is_native() {
+                return Err(flagfile_not_supported());
+            }
             // A dotfiles copy into a mounted host home would overwrite the user's
             // own files there (their real ~/.bashrc, if they mounted a real home),
             // so the two are exclusive on a configured env as well as on one
@@ -2733,6 +2850,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     &format!("It already uses the default ({}).", types::DEFAULT_SHM_SIZE),
                 );
             }
+            if no_flagfile && !cfg::env_flags_yaml_path(env_scope, &env_name).is_file() {
+                return nothing_to_remove(
+                    "engine flag file",
+                    "Its engine runs with no extra flags already.",
+                );
+            }
             // Clearing a default only ever clears THIS environment's: refuse when
             // the recorded default names someone else, rather than silently
             // dropping a default the user did not mean to touch.
@@ -2770,6 +2893,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     || no_dotfiles
                     || mount_home_change.is_some()
                     || shm_size_change.is_some()
+                    || touches_flags
                     || !no_modules_file.is_empty())
             {
                 check_system_write_access()?;
@@ -2883,6 +3007,25 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 );
             }
 
+            // 2a''. engine flag file: replaced whole or removed; read at the next
+            //       launch (`run`/`start` phases) or the next image build (`build`,
+            //       which the cache key notices), so no rebuild here.
+            if let Some(f) = &flagfile {
+                install_env_flagfile(env_scope, &env_name, Some(f))?;
+                let has_build = !cfg::read_flag_config(env_scope, &env_name)?
+                    .materialize(Phase::Build, ec.engine()?)
+                    .is_empty();
+                if has_build {
+                    eprintln!(
+                        "Its build flags apply at the next image build: `mim update --env {env_name}`."
+                    );
+                }
+            }
+            if no_flagfile {
+                cfg::remove_flag_config(env_scope, &env_name)?;
+                eprintln!("Removed the engine flag file of '{env_name}'.");
+            }
+
             // 2b. module-pin snapshots: deposit for on-demand resolution; no
             //     rebuild, no install (the compiler pulls modules at build time).
             //     Removals run FIRST so re-depositing a file under a name being
@@ -2972,7 +3115,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 }
 
                 // Rebuild at the CURRENT morloc version; `modify` never moves it.
-                match rematerialize_env(env_scope, &env_name, &[], Some(keep), verbose) {
+                match rematerialize_env(env_scope, &env_name, &[], Some(keep), &[], verbose) {
                     Ok(()) => {
                         report_rematerialized(ec.backend.is_native(), &env_name);
                         // `modify --conda-packages` is the usual way a broken extra
@@ -3034,6 +3177,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 )));
             }
             let engine = ec.engine()?;
+            freeze::check_engine(engine)?;
             // Detect the version from the container binary for sanity check.
             // The morloc binary can't report prerelease tags (stack limitation),
             // so if major.minor.patch match, keep the recorded version which has
@@ -3066,9 +3210,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 base_image: &ec.base_image,
                 system_packages: &ec.system_packages,
             });
+            let build_flags =
+                cfg::read_flag_config(env_scope, &env_name)?.materialize(Phase::Build, engine);
             let result = freeze::freeze_environment(
                 env_scope, &env_name, ver.clone(), engine, &image,
-                &data_dir.to_string_lossy(), &tag, save.as_deref(), slim_base, force, verbose,
+                &data_dir.to_string_lossy(), &tag, save.as_deref(), slim_base, &build_flags,
+                &ec.shm_size, force, verbose,
             );
             if result.is_ok() && ec.morloc_version.as_ref() != Some(&ver) {
                 let mut updated = ec.clone();
@@ -3079,7 +3226,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         }
 
         // ---- start ----
-        Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, eval_allow_no_auth, port, env_vars, env_file, engine_arg, force } => {
+        Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, eval_allow_no_auth, port, env_vars, env_file, engine_arg, flagfile, force } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
             if ec.is_dev() {
                 return Err(ManagerError::EnvError(format!(
@@ -3150,7 +3297,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let req = ServeRequest {
                 spec, host_port, container_port, user_env,
                 expose, allow_plaintext, allow_no_auth, unsafe_serve,
-                eval_allow_no_auth, engine_args: engine_arg, token, verbose,
+                eval_allow_no_auth, engine_args: engine_arg, flagfile, token, verbose,
             };
             let env = runner::ResolvedEnv { name: env_name.clone(), scope: env_scope, ec };
             let ServeOutcome { handle, url_host, token: eff_token } =
@@ -3309,7 +3456,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         }
 
         // ---- install ----
-        Cmd::Install { src, env, engine_arg } => {
+        Cmd::Install { src, env, engine_arg, flagfile } => {
             // Resolve the target environment up front so the program's declared
             // dependencies can be provisioned into it BEFORE it is built.
             let (env_name, scope, ec) = resolve_env_or_default(env)?;
@@ -3330,6 +3477,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 (env_name.clone(), scope, ec.clone()),
                 &envspec_target,
                 engine_arg.clone(),
+                flagfile.clone(),
                 verbose,
             )?;
 
@@ -3348,7 +3496,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    envspec.json, which gather_env_specs picks up from then on.
             //    Keep the env's current morloc version -- installing a module must
             //    never bump the toolchain out from under it.
-            rematerialize_env(scope, &env_name, &[dry], current_version_tag(&ec), verbose)?;
+            rematerialize_env(scope, &env_name, &[dry], current_version_tag(&ec), &[], verbose)?;
 
             // Timestamp just before the build so the program(s) built this run can
             // be identified by their freshly-(re)written manifest mtime -- robust to
@@ -3384,6 +3532,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     args,
                     user_env: Vec::new(),
                     engine_args: engine_arg,
+                    flagfile,
                     phase: Phase::Run,
                     slurm_bridge: false,
                 },
@@ -3437,7 +3586,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     // supersedes any `morloc make` of it, whatever it declared.
                     let _ = store.remove_named(&key, envstore::Provenance::Scratch);
                 }
-                rematerialize_env(scope, &env_name, &[], current_version_tag(&ec), verbose)?;
+                rematerialize_env(scope, &env_name, &[], current_version_tag(&ec), &[], verbose)?;
             }
             Ok(())
         }
@@ -3747,10 +3896,10 @@ pub(crate) fn native_run_env(
     // Container-only inputs have no meaning on the host; reject rather than
     // silently drop them.
     if !req.engine_args.is_empty() {
-        return Err(ManagerError::EnvError(
-            "--engine-arg / -x is a container-only option; the native backend has no \
-             container engine to pass flags to".to_string(),
-        ));
+        return Err(engine_arg_not_supported());
+    }
+    if req.flagfile.is_some() {
+        return Err(flagfile_not_supported());
     }
     if req.slurm_bridge {
         return Err(ManagerError::EnvError(
@@ -5284,6 +5433,45 @@ fn mount_home_not_supported() -> ManagerError {
 /// The single rejection for `--shm-size` on a non-OCI backend: only docker and
 /// podman give a container its own `/dev/shm`; apptainer shares the host's and
 /// the native backend runs on it directly, so there is no size to set.
+/// The flag configuration an invocation runs under: the file named with
+/// `--flagfile`, or the environment's own env.flags.yaml. A one-shot file
+/// replaces the persisted one whole for this invocation, the way `modify
+/// --flagfile` replaces it for good.
+fn flag_source(scope: Scope, name: &str, flagfile: Option<&str>) -> Result<FlagConfig> {
+    match flagfile {
+        Some(path) => cfg::read_flag_file(std::path::Path::new(path)),
+        None => cfg::read_flag_config(scope, name),
+    }
+}
+
+/// Install `flagfile`, if given, as the environment's env.flags.yaml.
+fn install_env_flagfile(scope: Scope, name: &str, flagfile: Option<&str>) -> Result<()> {
+    if let Some(f) = flagfile {
+        cfg::install_flag_file(
+            std::path::Path::new(f),
+            &cfg::env_flags_yaml_path(scope, name),
+        )?;
+        eprintln!("Installed {f} as the engine flag file of '{name}'.");
+    }
+    Ok(())
+}
+
+fn flagfile_not_supported() -> ManagerError {
+    ManagerError::EnvError(
+        "--flagfile is a container-only option; the native backend has no \
+         container engine to pass flags to"
+            .to_string(),
+    )
+}
+
+fn engine_arg_not_supported() -> ManagerError {
+    ManagerError::EnvError(
+        "--engine-arg / -x is a container-only option; the native backend has no \
+         container engine to pass flags to"
+            .to_string(),
+    )
+}
+
 fn shm_size_not_supported() -> ManagerError {
     ManagerError::EnvError(
         "--shm-size applies only to docker/podman environments; apptainer shares \
@@ -6469,6 +6657,7 @@ fn capture_envspec(
     target: (String, Scope, EnvironmentConfig),
     envspec_target: &str,
     engine_args: Vec<String>,
+    flagfile: Option<String>,
     verbose: bool,
 ) -> Result<envspec::EnvSpec> {
     let json = capture_in_env(
@@ -6479,6 +6668,7 @@ fn capture_envspec(
             envspec_target.to_string(),
         ],
         engine_args,
+        flagfile,
         verbose,
     )?;
     envspec::EnvSpec::from_json(&json).map_err(Into::into)
@@ -6494,13 +6684,20 @@ fn capture_in_env(
     target: (String, Scope, EnvironmentConfig),
     args: Vec<String>,
     engine_args: Vec<String>,
+    flagfile: Option<String>,
     verbose: bool,
 ) -> Result<String> {
     let (name, scope, ec) = target;
     if ec.backend.is_native() {
+        if !engine_args.is_empty() {
+            return Err(engine_arg_not_supported());
+        }
+        if flagfile.is_some() {
+            return Err(flagfile_not_supported());
+        }
         native_capture_env(scope, &name, &args)
     } else {
-        container_capture_env(scope, &name, &ec, &args, &engine_args, verbose)
+        container_capture_env(scope, &name, &ec, &args, &engine_args, flagfile.as_deref(), verbose)
     }
 }
 
@@ -6552,6 +6749,7 @@ fn container_capture_env(
     ec: &EnvironmentConfig,
     args: &[String],
     engine_args: &[String],
+    flagfile: Option<&str>,
     verbose: bool,
 ) -> Result<String> {
     let engine = ec.engine()?;
@@ -6590,7 +6788,8 @@ fn container_capture_env(
     cfg.work_dir = Some(serve::CONTAINER_WORK.to_string());
     cfg.selinux_suffix = volume_suffix(detect_selinux()).to_string();
     cfg.shm_size = Some(ec.shm_size.clone());
-    cfg.extra_flags = engine_args.to_vec();
+    cfg.extra_flags = flag_source(scope, name, flagfile)?.materialize(Phase::Run, engine);
+    cfg.extra_flags.extend(engine_args.iter().cloned());
 
     if verbose {
         eprintln!("[mim] capturing in {}: {}", engine.name(), args.join(" "));
@@ -6639,6 +6838,17 @@ fn system_packages_key_fragment(system_packages: &[String]) -> String {
         String::new()
     } else {
         format!("# system-packages: {}\n", system_packages.join(" "))
+    }
+}
+
+/// The persisted build-phase engine flags as a cache-key line, so an edited
+/// `build:` section rebuilds the image on the next update. Empty when there
+/// are none, so environments without a flag file keep their key.
+fn build_flags_key_fragment(build_flags: &[String]) -> String {
+    if build_flags.is_empty() {
+        String::new()
+    } else {
+        format!("# build-flags: {}\n", build_flags.join(" "))
     }
 }
 
@@ -6801,6 +7011,15 @@ fn materialized_marker(scope: Scope, name: &str, is_native: bool) -> std::path::
     }
 }
 
+/// The engine flags for one invocation: the environment's persisted
+/// `<phase>.all ++ <phase>.<engine>` from its flag file, then the one-shot
+/// `-x` flags, which come last so they win where the engine takes the last
+/// occurrence.
+fn with_one_shot(mut persisted: Vec<String>, one_shot: &[String]) -> Vec<String> {
+    persisted.extend(one_shot.iter().cloned());
+    persisted
+}
+
 /// Delete the `materialized.toml` success marker so the next materialize is
 /// forced to re-solve + rebuild instead of taking the unchanged-manifest skip.
 /// Best-effort.
@@ -6821,6 +7040,7 @@ fn rematerialize_env(
     name: &str,
     extra_specs: &[envspec::EnvSpec],
     requested_version: Option<String>,
+    build_flags: &[String],
     verbose: bool,
 ) -> Result<()> {
     let ec = cfg::read_env_config(scope, name)?;
@@ -6844,7 +7064,7 @@ fn rematerialize_env(
         let source = std::path::PathBuf::from(&dev.source);
         let image_tag = build_dev_container_image(
             scope, name, ce, &specs, &source, &lang_pins, &ec.system_packages,
-            &ec.conda_packages, &stdlib, &ec.base_image,
+            &ec.conda_packages, &stdlib, &ec.base_image, build_flags,
         )?;
         // Re-stage the dependency agent so a newer platform-matched mim (or the
         // MORLOC_MIM_ENV override) propagates on update.
@@ -6890,7 +7110,7 @@ fn rematerialize_env(
     let ce = ec.engine()?;
     let (image_tag, mver) = build_requirement_derived_image(
         scope, name, ce, &specs, &lang_pins, &ec.system_packages, &ec.conda_packages,
-        effective_version, local_runtime.as_deref(), &ec.base_image,
+        effective_version, local_runtime.as_deref(), &ec.base_image, build_flags,
     )?;
     let mut ec = ec;
     ec.built_image = Some(image_tag);
@@ -6914,6 +7134,7 @@ fn build_requirement_derived_image(
     requested_version: Option<&str>,
     local_runtime: Option<&std::path::Path>,
     base_image: &str,
+    one_shot_flags: &[String],
 ) -> Result<(String, String)> {
     // Unlike native, a container HAS a build layer, so host/vcpkg system deps are
     // not a hard blocker here -- they become build-extras (a later --system-packages
@@ -6941,11 +7162,17 @@ fn build_requirement_derived_image(
     // compiler identity) written only after a good build (NOT the working
     // pixi.toml), so a failed build cannot poison the cache, and a rebuilt dev
     // compiler forces a fresh image without a manual `podman rmi`.
+    // The persisted build flags ride the key (an edited `build:` section
+    // rebuilds); the one-shot -x flags do not, or the next plain update would
+    // rebuild again without them.
+    let persisted_build_flags =
+        cfg::read_flag_config(scope, name)?.materialize(Phase::Build, engine);
     let key = format!(
-        "{}{}{}base:{base_image}\n",
+        "{}{}{}{}base:{base_image}\n",
         cache_key(&pixi::requirement_digest(&req.requirements), &req.morloc_bin, system_packages),
         lang_installs_key_fragment(&req.lang_installs),
         cert::cache_fragment_for_env(scope, name),
+        build_flags_key_fragment(&persisted_build_flags),
     );
     let marker = materialized_marker(scope, name, false);
     let unchanged = std::fs::read_to_string(&marker)
@@ -7011,7 +7238,7 @@ fn build_requirement_derived_image(
         context: context.to_string_lossy().to_string(),
         tag: image_tag.clone(),
         build_args: Vec::new(),
-        extra_flags: Vec::new(),
+        extra_flags: with_one_shot(persisted_build_flags, one_shot_flags),
     };
     let status = crate::container::container_build_visible(engine, &cfg);
     if !status.success() {
@@ -7485,6 +7712,7 @@ fn build_dev_container_image(
     conda_packages: &[String],
     stdlib_version: &str,
     base_image: &str,
+    one_shot_flags: &[String],
 ) -> Result<String> {
     morloc_deps::layout::validate_source(source).map_err(ManagerError::EnvError)?;
 
@@ -7545,10 +7773,13 @@ fn build_dev_container_image(
     // install-script contents ride the key (the Dockerfile only names them), so
     // editing an install.sh rebuilds the image. The cert fragment rides too (the
     // Dockerfile only names the cert path), so a rotated CA rebuilds the image.
+    let persisted_build_flags =
+        cfg::read_flag_config(scope, name)?.materialize(Phase::Build, engine);
     let image_inputs = format!(
-        "{df_text}{}{}",
+        "{df_text}{}{}{}",
         lang_installs_key_fragment(&script_langs),
         cert::cache_fragment_for_env(scope, name),
+        build_flags_key_fragment(&persisted_build_flags),
     );
     let img_key = dev_image_key(&pixi::requirement_digest(&requirements), &image_inputs);
     let marker = materialized_marker(scope, name, false);
@@ -7585,7 +7816,7 @@ fn build_dev_container_image(
             context: context.to_string_lossy().to_string(),
             tag: image_tag.clone(),
             build_args: Vec::new(),
-            extra_flags: Vec::new(),
+            extra_flags: with_one_shot(persisted_build_flags, one_shot_flags),
         };
         let status = crate::container::container_build_visible(engine, &cfg);
         if !status.success() {
@@ -7806,11 +8037,16 @@ fn container_new_derived(
     no_init: bool,
     make_default: bool,
     snapshots: &SnapshotPlan,
+    flagfile: Option<&str>,
+    build_flags: &[String],
 ) -> Result<()> {
     if shm_size.is_some() && !engine.is_oci() {
         return Err(shm_size_not_supported());
     }
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
+    // The flag file goes in before the image build so its `build:` section
+    // applies to the first build too.
+    install_env_flagfile(scope, &env_name, flagfile)?;
 
     // Resolve the host home before the (multi-minute) image build, so a bad path
     // fails fast.
@@ -7847,7 +8083,7 @@ fn container_new_derived(
     } else {
         let (image, version) = build_requirement_derived_image(
             scope, &env_name, engine, &[], &lang_pins, &system_packages, &conda_packages,
-            requested_version.as_deref(), local_runtime.as_deref(), &base_image,
+            requested_version.as_deref(), local_runtime.as_deref(), &base_image, build_flags,
         )?;
         (Some(image), version.parse::<Version>().ok())
     };
@@ -7914,6 +8150,8 @@ fn container_new_dev(
     no_init: bool,
     make_default: bool,
     snapshots: &SnapshotPlan,
+    flagfile: Option<&str>,
+    build_flags: &[String],
 ) -> Result<()> {
     // A dev env's tooling (the container image + baked toolchain + pixi env) is
     // provisioned only for docker/podman; the deepest funnel for the OCI-only
@@ -7928,6 +8166,7 @@ fn container_new_dev(
     // the version (matching the interactive default).
     let name = name.or_else(|| Some("dev".to_string()));
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
+    install_env_flagfile(scope, &env_name, flagfile)?;
     // Resolve the host home before the image build, so a bad path fails fast.
     let mount_home = match &mount_home {
         Some(raw) => Some(resolve_mount_home(
@@ -7955,7 +8194,7 @@ fn container_new_dev(
         // A brand-new env has no installed programs yet, so no program specs.
         let image_tag = build_dev_container_image(
             scope, &env_name, engine, &[], &source_path, &lang_pins, &system_packages,
-            &conda_packages, &stdlib, &base_image,
+            &conda_packages, &stdlib, &base_image, build_flags,
         )?;
         (Some(image_tag), stdlib.parse::<Version>().ok())
     };
@@ -8333,7 +8572,8 @@ pub(crate) fn container_serve(
         mcp_token = Some(t.clone());
         user_env.push(("MORLOC_MCP_TOKEN".to_string(), t));
     }
-    let mut extra_flags = cfg::read_flag_config(env.scope, env_name)?.materialize(Phase::Start, engine);
+    let mut extra_flags = flag_source(env.scope, env_name, req.flagfile.as_deref())?
+        .materialize(Phase::Start, engine);
     extra_flags.extend(req.engine_args.iter().cloned());
 
     // Serving mounts the runtime and the toolchain, so a half-provisioned
@@ -8557,7 +8797,7 @@ pub(crate) fn container_run_env(
     // Materialize flags from env.flags.yaml for the active phase + engine,
     // then append CLI one-shot overrides. The flag-file errors out on the
     // legacy flat env.flags format with a migration hint.
-    let mut extra_flags = cfg::read_flag_config(env_scope, &env_name)?
+    let mut extra_flags = flag_source(env_scope, &env_name, req.flagfile.as_deref())?
         .materialize(phase, engine);
     extra_flags.extend(cli_engine_args.iter().cloned());
 
@@ -8895,6 +9135,9 @@ pub(crate) struct ServeRequest {
     pub allow_no_auth: bool,
     pub unsafe_serve: bool,
     pub engine_args: Vec<String>,
+    /// A flag file to use in place of the environment's env.flags.yaml for
+    /// this serve (`--flagfile`); the persisted file is untouched.
+    pub flagfile: Option<String>,
     pub token: Option<String>,
     pub verbose: bool,
 }
@@ -9617,12 +9860,13 @@ mod tests {
         ])
         .expect("update should parse --morloc-version");
         match cli.command {
-            Some(Cmd::Update { env, morloc_version, latest, force, ignore_module_compat }) => {
+            Some(Cmd::Update { env, morloc_version, latest, force, ignore_module_compat, engine_arg }) => {
                 assert_eq!(env.as_deref(), Some("e"));
                 assert_eq!(morloc_version.as_deref(), Some("0.98.0"));
                 assert!(!latest);
                 assert!(!force);
                 assert!(!ignore_module_compat);
+                assert!(engine_arg.is_empty());
             }
             _ => panic!("expected Cmd::Update"),
         }
@@ -9639,6 +9883,73 @@ mod tests {
             cli.command,
             Some(Cmd::Update { ignore_module_compat: true, .. })
         ));
+    }
+
+    #[test]
+    fn update_and_new_take_one_shot_build_flags() {
+        let cli = Cli::try_parse_from([
+            "mim", "update", "--env", "e", "-x", "--no-cache", "--engine-arg", "--pull",
+        ])
+        .expect("update -x should parse");
+        match cli.command {
+            Some(Cmd::Update { engine_arg, .. }) => {
+                assert_eq!(engine_arg, vec!["--no-cache", "--pull"]);
+            }
+            _ => panic!("expected Cmd::Update"),
+        }
+        let cli = Cli::try_parse_from(["mim", "new", "e", "-x", "--platform=linux/amd64"])
+            .expect("new -x should parse");
+        match cli.command {
+            Some(Cmd::New { engine_arg, .. }) => {
+                assert_eq!(engine_arg, vec!["--platform=linux/amd64"]);
+            }
+            _ => panic!("expected Cmd::New"),
+        }
+    }
+
+    #[test]
+    fn every_engine_launcher_takes_a_one_shot_flagfile() {
+        // run/shell/install/start launch an engine; each can swap the persisted
+        // flag file for one invocation without touching it.
+        for argv in [
+            vec!["mim", "run", "--flagfile", "alt.yaml", "--", "true"],
+            vec!["mim", "shell", "--flagfile", "alt.yaml"],
+            vec!["mim", "install", "--flagfile", "alt.yaml", "main.loc"],
+            vec!["mim", "start", "--flagfile", "alt.yaml"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let flagfile = match cli.command {
+                Some(Cmd::Run { flagfile, .. })
+                | Some(Cmd::Shell { flagfile, .. })
+                | Some(Cmd::Install { flagfile, .. })
+                | Some(Cmd::Start { flagfile, .. }) => flagfile,
+                _ => panic!("{argv:?}"),
+            };
+            assert_eq!(flagfile.as_deref(), Some("alt.yaml"), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn new_and_modify_persist_a_flagfile_and_modify_can_clear_it() {
+        let cli = Cli::try_parse_from(["mim", "new", "e", "--flagfile", "f.yaml"]).unwrap();
+        assert!(matches!(cli.command, Some(Cmd::New { flagfile: Some(ref f), .. }) if f == "f.yaml"));
+        let cli = Cli::try_parse_from(["mim", "modify", "--env", "e", "--flagfile", "f.yaml"]).unwrap();
+        assert!(matches!(cli.command, Some(Cmd::Modify { flagfile: Some(ref f), no_flagfile: false, .. }) if f == "f.yaml"));
+        let cli = Cli::try_parse_from(["mim", "modify", "--env", "e", "--no-flagfile"]).unwrap();
+        assert!(matches!(cli.command, Some(Cmd::Modify { flagfile: None, no_flagfile: true, .. })));
+        // Setting and clearing in one command is a contradiction.
+        assert!(Cli::try_parse_from(["mim", "modify", "--env", "e", "--flagfile", "f", "--no-flagfile"]).is_err());
+    }
+
+    #[test]
+    fn build_flags_ride_the_image_cache_key() {
+        // A changed `build:` section must rebuild the image on the next update;
+        // an empty one must not perturb the key of an environment that never
+        // had flags.
+        assert_eq!(build_flags_key_fragment(&[]), "");
+        let frag = build_flags_key_fragment(&["--pull".to_string(), "--no-cache".to_string()]);
+        assert!(frag.contains("--pull --no-cache"), "{frag}");
+        assert!(frag.ends_with('\n'), "{frag:?}");
     }
 
     #[test]
@@ -9856,6 +10167,8 @@ mod tests {
             base: None,
             shm_size: None,
             no_shm_size: f.no_shm_size,
+            flagfile: None,
+            no_flagfile: false,
             set_default: f.set_default,
             unset_default: f.unset_default,
             system: f.system,
@@ -10573,7 +10886,7 @@ mod tests {
     #[test]
     fn flag_config_default_is_all_empty() {
         let fc = FlagConfig::default();
-        for phase in [Phase::Run, Phase::Start] {
+        for phase in [Phase::Build, Phase::Run, Phase::Start] {
             for eng in [
                 ContainerEngine::Docker,
                 ContainerEngine::Podman,
@@ -10603,6 +10916,45 @@ run:
             vec!["--shared"]
         );
         assert!(fc.materialize(Phase::Start, ContainerEngine::Apptainer).is_empty());
+    }
+
+    #[test]
+    fn flag_config_build_phase_materializes_like_the_others() {
+        let yaml = r#"
+build:
+  all:
+    - --no-cache
+  podman:
+    - --format=docker
+run:
+  podman:
+    - --nv
+"#;
+        let fc: FlagConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            fc.materialize(Phase::Build, ContainerEngine::Podman),
+            vec!["--no-cache", "--format=docker"]
+        );
+        assert_eq!(
+            fc.materialize(Phase::Build, ContainerEngine::Docker),
+            vec!["--no-cache"]
+        );
+        // The phases do not leak into each other.
+        assert_eq!(fc.materialize(Phase::Run, ContainerEngine::Podman), vec!["--nv"]);
+    }
+
+    #[test]
+    fn build_phase_flags_put_the_one_shot_flags_after_the_persisted_ones() {
+        let yaml = "build:\n  all:\n    - --pull\n";
+        let fc: FlagConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            with_one_shot(fc.materialize(Phase::Build, ContainerEngine::Docker), &["--no-cache".to_string()]),
+            vec!["--pull", "--no-cache"]
+        );
+        assert_eq!(
+            with_one_shot(FlagConfig::default().materialize(Phase::Build, ContainerEngine::Docker), &[]),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -10639,6 +10991,37 @@ run:
             fc.materialize(Phase::Run, ContainerEngine::Apptainer),
             vec!["--nv"]
         );
+    }
+
+    #[test]
+    fn a_flagfile_is_validated_then_copied_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("flags.yaml");
+        let dst = dir.path().join("env").join("env.flags.yaml");
+        let text = "# keep the GPU\nrun:\n  apptainer:\n    - --nv\n";
+        std::fs::write(&src, text).unwrap();
+        cfg::install_flag_file(&src, &dst).unwrap();
+        // The bytes travel unchanged, comments included: the file is the
+        // user's, not a rendering of it.
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), text);
+        assert_eq!(
+            cfg::read_flag_file(&dst).unwrap().materialize(Phase::Run, ContainerEngine::Apptainer),
+            vec!["--nv"]
+        );
+    }
+
+    #[test]
+    fn a_flagfile_that_breaks_the_schema_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("flags.yaml");
+        let dst = dir.path().join("env.flags.yaml");
+        std::fs::write(&src, "runn:\n  podman:\n    - --nv\n").unwrap();
+        let err = cfg::install_flag_file(&src, &dst).unwrap_err().to_string();
+        assert!(err.contains("runn"), "got: {err}");
+        assert!(!dst.exists());
+        // A missing source is an error naming the path, not an empty config.
+        let err = cfg::read_flag_file(&dir.path().join("nope.yaml")).unwrap_err().to_string();
+        assert!(err.contains("nope.yaml"), "got: {err}");
     }
 
     #[test]
@@ -11359,6 +11742,7 @@ run:
             args: vec!["morloc".to_string(), "--version".to_string()],
             user_env: Vec::new(),
             engine_args,
+            flagfile: None,
             phase: Phase::Run,
             slurm_bridge,
         }

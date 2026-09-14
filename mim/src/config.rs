@@ -535,9 +535,48 @@ pub fn read_flag_config(scope: Scope, name: &str) -> Result<FlagConfig> {
     if !yaml_path.is_file() {
         return Ok(FlagConfig::default());
     }
-    let mut cfg: FlagConfig = read_yaml_config(&yaml_path)?;
+    read_flag_file(&yaml_path)
+}
+
+/// Read a flag file at an explicit path: a user's `--flagfile`, or the
+/// environment's own. Same strict schema and shell expansion as
+/// [`read_flag_config`]; unlike it, a missing file is an error, since a path
+/// the user named should exist.
+pub fn read_flag_file(path: &Path) -> Result<FlagConfig> {
+    let mut cfg: FlagConfig = read_yaml_config(path)?;
     expand_flag_config(&mut cfg);
     Ok(cfg)
+}
+
+/// Make `src` the environment's flag file at `dst`, replacing whatever was
+/// there. The file is validated first so a schema error leaves the old one in
+/// place, then copied byte for byte: the user wrote it, comments and all, and
+/// a re-rendering would lose those.
+pub fn install_flag_file(src: &Path, dst: &Path) -> Result<()> {
+    read_flag_file(src)?;
+    let dir = dst.parent().unwrap();
+    fs::create_dir_all(dir).map_err(|e| ManagerError::ConfigParseError {
+        path: dst.display().to_string(),
+        msg: e.to_string(),
+    })?;
+    fs::copy(src, dst).map_err(|e| ManagerError::ConfigParseError {
+        path: dst.display().to_string(),
+        msg: format!("cannot copy {}: {e}", src.display()),
+    })?;
+    Ok(())
+}
+
+/// Remove the environment's flag file. Returns whether there was one.
+pub fn remove_flag_config(scope: Scope, name: &str) -> Result<bool> {
+    let yaml_path = env_flags_yaml_path(scope, name);
+    match fs::remove_file(&yaml_path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(ManagerError::ConfigParseError {
+            path: yaml_path.display().to_string(),
+            msg: e.to_string(),
+        }),
+    }
 }
 
 

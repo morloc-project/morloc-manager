@@ -61,6 +61,21 @@ pub struct SlimBase<'a> {
     pub system_packages: &'a [String],
 }
 
+/// A freeze is an OCI image built from a generated Dockerfile, which only
+/// docker and podman can do. Apptainer builds from a definition file and keeps
+/// no image store, so it is refused before any staging or validation runs.
+pub fn check_engine(engine: ContainerEngine) -> Result<()> {
+    match engine {
+        ContainerEngine::Docker | ContainerEngine::Podman => Ok(()),
+        ContainerEngine::Apptainer => Err(ManagerError::FreezeError(format!(
+            "freezing an {} environment is not supported: a deployment image is built \
+             from a Dockerfile, which needs docker or podman. Freeze an environment \
+             created with `--engine docker` or `--engine podman` instead.",
+            engine.name()
+        ))),
+    }
+}
+
 /// Build a self-contained deployment image from an environment.
 ///
 /// The image is the environment with its mounted halves baked in: the runtime
@@ -87,9 +102,12 @@ pub fn freeze_environment(
     tag: &str,
     save_to: Option<&str>,
     slim: Option<SlimBase<'_>>,
+    build_flags: &[String],
+    shm_size: &str,
     force: bool,
     verbose: bool,
 ) -> Result<()> {
+    check_engine(engine)?;
     let flavor = if slim.is_some() { Flavor::Slim } else { Flavor::Full };
     if !Path::new(v_data_dir).is_dir() {
         return Err(ManagerError::FreezeError(format!(
@@ -154,7 +172,7 @@ pub fn freeze_environment(
         .filter(|p| OPTIONAL_STATE.contains(&p.as_str()))
         .cloned()
         .collect();
-    let labels = deploy_labels(env_name, &ver, flavor, &programs, &modules, &exposure);
+    let labels = deploy_labels(env_name, &ver, flavor, &programs, &modules, &exposure, shm_size);
     // Podman's OCI output format drops HEALTHCHECK and warns.
     let healthcheck = engine == ContainerEngine::Docker;
 
@@ -208,7 +226,7 @@ pub fn freeze_environment(
         context: context.to_string_lossy().to_string(),
         tag: tag.to_string(),
         build_args: Vec::new(),
-        extra_flags: Vec::new(),
+        extra_flags: build_flags.to_vec(),
     };
     let status = crate::container::container_build_visible(engine, &cfg);
     // The context is large (the runtime alone is around a hundred megabytes) and
@@ -237,7 +255,7 @@ pub fn freeze_environment(
         eprintln!("Wrote {path} (load it elsewhere with `{} load -i {path}`)", engine.name());
     }
     eprintln!();
-    for line in run_hints(engine, tag, flavor, &programs, !cmd.is_empty()) {
+    for line in run_hints(engine, tag, flavor, &programs, !cmd.is_empty(), shm_size) {
         eprintln!("{line}");
     }
     Ok(())
@@ -463,6 +481,7 @@ fn run_hints(
     flavor: Flavor,
     programs: &[ProgramEntry],
     serves: bool,
+    shm_size: &str,
 ) -> Vec<String> {
     let exe = engine.name();
     let mut lines = vec![
@@ -480,9 +499,12 @@ fn run_hints(
     if let Some(first) = programs.first() {
         lines.push(format!("  {exe} run --rm {tag} {} --help", first.name));
     }
+    // The engine's default /dev/shm (64m under docker) is smaller than what
+    // morloc moves between pools; the image cannot set it, so the hint carries
+    // the size the environment served with. The deployer may size it otherwise.
     if serves {
         lines.push(format!(
-            "  {exe} run --rm -p {DEPLOY_HTTP_PORT}:{DEPLOY_HTTP_PORT} {tag}    # serve the exposed set"
+            "  {exe} run --rm --shm-size {shm_size} -p {DEPLOY_HTTP_PORT}:{DEPLOY_HTTP_PORT} {tag}    # serve the exposed set"
         ));
     } else {
         lines.push(
@@ -667,6 +689,7 @@ fn deploy_labels(
     programs: &[ProgramEntry],
     modules: &[ModuleEntry],
     exposure: &ViewSet,
+    shm_size: &str,
 ) -> Vec<(String, String)> {
     let join = |xs: Vec<String>| xs.join(",");
     let mut labels = vec![
@@ -689,6 +712,9 @@ fn deploy_labels(
             "morloc.programs".to_string(),
             join(programs.iter().map(|p| p.name.clone()).collect()),
         ),
+        // What the environment gave its container: a suggestion for whoever
+        // runs the image, since /dev/shm is sized by the run, not the image.
+        ("morloc.suggested-shm-size".to_string(), shm_size.to_string()),
     ];
     if !modules.is_empty() {
         labels.push((
@@ -910,6 +936,15 @@ mod tests {
     const WHOLE: [&str; 4] = ["runtime", "exe", "pixi/pixi.toml", "pixi/pixi.lock"];
 
     #[test]
+    fn a_freeze_needs_an_engine_that_builds_from_a_dockerfile() {
+        assert!(check_engine(ContainerEngine::Docker).is_ok());
+        assert!(check_engine(ContainerEngine::Podman).is_ok());
+        let err = check_engine(ContainerEngine::Apptainer).unwrap_err().to_string();
+        assert!(err.contains("apptainer"), "got: {err}");
+        assert!(err.contains("docker or podman"), "got: {err}");
+    }
+
+    #[test]
     fn a_deployment_image_serves_the_declared_set() {
         let ex = ViewSet {
             mcp: vec!["dna".to_string()],
@@ -940,19 +975,22 @@ mod tests {
         let programs = vec![
             ProgramEntry { name: "pacman".to_string(), commands: vec!["play".to_string()] },
         ];
-        let served = run_hints(ContainerEngine::Podman, "pacman:v1", Flavor::Full, &programs, true);
+        let served = run_hints(ContainerEngine::Podman, "pacman:v1", Flavor::Full, &programs, true, "4g");
         let text = served.join("\n");
         assert!(text.contains("podman run -it --rm pacman:v1 /bin/bash"), "{text}");
-        assert!(text.contains("podman run --rm pacman:v1 morloc list --programs"), "{text}");
-        assert!(text.contains("podman run --rm pacman:v1 pacman --help"), "{text}");
+        // The serve hint carries the shared-memory size the environment ran
+        // with: an engine's default /dev/shm is far smaller than what morloc
+        // moves between pools, and nothing in the image can set it.
         assert!(
-            text.contains(&format!("podman run --rm -p {DEPLOY_HTTP_PORT}:{DEPLOY_HTTP_PORT} pacman:v1")),
+            text.contains(&format!("podman run --rm --shm-size 4g -p {DEPLOY_HTTP_PORT}:{DEPLOY_HTTP_PORT} pacman:v1")),
             "{text}"
         );
+        assert!(text.contains("podman run --rm pacman:v1 morloc list --programs"), "{text}");
+        assert!(text.contains("podman run --rm pacman:v1 pacman --help"), "{text}");
 
         // With nothing exposed the image has no default command, and a hint to
         // serve it would start a container that exits at once.
-        let cli_only = run_hints(ContainerEngine::Docker, "pacman:v1", Flavor::Full, &programs, false);
+        let cli_only = run_hints(ContainerEngine::Docker, "pacman:v1", Flavor::Full, &programs, false, "2g");
         let text = cli_only.join("\n");
         assert!(text.contains("docker run --rm pacman:v1 pacman --help"), "{text}");
         assert!(!text.contains("-p "), "{text}");
@@ -984,7 +1022,7 @@ mod tests {
             api: Vec::new(),
             eval: Some(EvalCapability { allow: vec!["dna".to_string()] }),
         };
-        let labels = deploy_labels("dev", &Version::new(0, 101, 0), Flavor::Slim, &programs, &modules, &ex);
+        let labels = deploy_labels("dev", &Version::new(0, 101, 0), Flavor::Slim, &programs, &modules, &ex, "4g");
         let get = |k: &str| {
             labels
                 .iter()
@@ -997,6 +1035,9 @@ mod tests {
         assert_eq!(get("morloc.modules").as_deref(), Some("root-py"));
         assert_eq!(get("morloc.mcp").as_deref(), Some("dna"));
         assert_eq!(get("morloc.eval").as_deref(), Some("dna"));
+        // A suggestion, not a setting: the deployer sizes /dev/shm, and this
+        // records what the environment was built and tested with.
+        assert_eq!(get("morloc.suggested-shm-size").as_deref(), Some("4g"));
         // An adapter nothing was exposed on is absent rather than empty.
         assert_eq!(get("morloc.api"), None);
         assert!(get("org.opencontainers.image.version").is_some());
@@ -1133,7 +1174,7 @@ mod tests {
     #[test]
     fn slim_hints_read_the_label_instead_of_running_the_compiler() {
         let programs = vec![ProgramEntry { name: "dna".to_string(), commands: vec![] }];
-        let text = run_hints(ContainerEngine::Docker, "dna:v1-slim", Flavor::Slim, &programs, false).join("\n");
+        let text = run_hints(ContainerEngine::Docker, "dna:v1-slim", Flavor::Slim, &programs, false, "2g").join("\n");
         assert!(text.contains("docker inspect -f '{{index .Config.Labels \"morloc.programs\"}}' dna:v1-slim"), "{text}");
         assert!(!text.contains("morloc list"), "{text}");
     }
