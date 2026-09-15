@@ -41,6 +41,11 @@ pub struct RunConfig {
     pub work_dir: Option<String>,
     pub selinux_suffix: String,
     pub extra_flags: Vec<String>,
+    /// The architecture the image was built for, passed as `--platform` so the
+    /// engine never guesses from the host or from `DOCKER_DEFAULT_PLATFORM`.
+    /// `None` leaves the choice to the engine. Apptainer has no equivalent and
+    /// ignores it.
+    pub platform: Option<crate::arch::Arch>,
 }
 
 impl RunConfig {
@@ -62,6 +67,7 @@ impl RunConfig {
             work_dir: None,
             selinux_suffix: String::new(),
             extra_flags: Vec::new(),
+            platform: None,
         }
     }
 }
@@ -76,6 +82,10 @@ pub struct BuildConfig {
     /// plus any one-shot CLI overrides). Forwarded verbatim into the build
     /// argv after `--build-arg` pairs, before the context.
     pub extra_flags: Vec<String>,
+    /// The architecture to build for, passed as `--platform`: it selects the
+    /// base image's manifest entry and the emulator every RUN step executes
+    /// under. `None` leaves it to the engine.
+    pub platform: Option<crate::arch::Arch>,
 }
 
 
@@ -355,6 +365,7 @@ pub fn volume_exists(engine: ContainerEngine, name: &str) -> bool {
 pub fn volume_copy(
     engine: ContainerEngine,
     image: &str,
+    platform: Option<crate::arch::Arch>,
     from: &str,
     to: &str,
     to_mount: &str,
@@ -368,6 +379,7 @@ pub fn volume_copy(
             (from.to_string(), format!("{from_mount}:ro")),
             (to.to_string(), to_mount.to_string()),
         ],
+        platform,
         remove_after: true,
         command: Some(vec![
             "cp".to_string(),
@@ -544,11 +556,22 @@ fn build_oci_run_args(
         args.push(format!("{key}={val}"));
     }
     args.extend(cfg.extra_flags.iter().cloned());
+    push_platform(&mut args, cfg.platform);
     args.push(cfg.image.clone());
     if let Some(ref cmd) = cfg.command {
         args.extend(cmd.iter().cloned());
     }
     args
+}
+
+/// `--platform` goes after the user's flags: the engine takes the last
+/// occurrence, so the image's own architecture always wins over a stray one in
+/// a flag file or `-x`.
+fn push_platform(args: &mut Vec<String>, platform: Option<crate::arch::Arch>) {
+    if let Some(a) = platform {
+        args.push("--platform".to_string());
+        args.push(a.oci_platform().to_string());
+    }
 }
 
 /// Apptainer/Singularity argv builder. Translates RunConfig to `apptainer
@@ -698,6 +721,7 @@ pub fn build_build_args(cfg: &BuildConfig) -> Vec<String> {
         args.push(format!("{key}={val}"));
     }
     args.extend(cfg.extra_flags.iter().cloned());
+    push_platform(&mut args, cfg.platform);
     args.push(cfg.context.clone());
     args
 }

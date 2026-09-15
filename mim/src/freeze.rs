@@ -3,6 +3,7 @@ use std::path::Path;
 
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use crate::arch::Arch;
 use crate::config;
 use crate::error::{ManagerError, Result};
 use crate::types::*;
@@ -104,6 +105,7 @@ pub fn freeze_environment(
     slim: Option<SlimBase<'_>>,
     build_flags: &[String],
     shm_size: &str,
+    platform: Option<Arch>,
     force: bool,
     verbose: bool,
 ) -> Result<()> {
@@ -142,7 +144,7 @@ pub fn freeze_environment(
     // created host-side so a program touching it does not hit ENOENT.
     let _ = config::ensure_env_home(v_data_dir);
     let (bind_mounts, volumes) = crate::base_mounts(v_data_dir);
-    crate::serve::validate_programs(engine, env_image, &programs, bind_mounts, volumes, verbose)?;
+    crate::serve::validate_programs(engine, env_image, platform, &programs, bind_mounts, volumes, verbose)?;
 
     let paths = frozen_paths(Path::new(v_data_dir))?;
     for rel in &paths {
@@ -227,6 +229,7 @@ pub fn freeze_environment(
         tag: tag.to_string(),
         build_args: Vec::new(),
         extra_flags: build_flags.to_vec(),
+        platform,
     };
     let status = crate::container::container_build_visible(engine, &cfg);
     // The context is large (the runtime alone is around a hundred megabytes) and
@@ -245,8 +248,8 @@ pub fn freeze_environment(
         // The image stands alone, so it is checked with nothing mounted: the
         // launchers must find the nexus, and the nexus and every pool binary
         // must resolve their libraries from what the cut left behind.
-        check_linkage(engine, tag, verbose)?;
-        crate::serve::validate_programs(engine, tag, &programs, Vec::new(), Vec::new(), verbose)?;
+        check_linkage(engine, tag, platform, verbose)?;
+        crate::serve::validate_programs(engine, tag, platform, &programs, Vec::new(), Vec::new(), verbose)?;
     }
     if let Some(path) = save_to {
         eprintln!("Saving {tag} to {path}...");
@@ -647,10 +650,16 @@ fn linkage_check_script() -> String {
 }
 
 /// Fail the freeze if anything in the slim image cannot resolve a library.
-fn check_linkage(engine: ContainerEngine, tag: &str, verbose: bool) -> Result<()> {
+fn check_linkage(
+    engine: ContainerEngine,
+    tag: &str,
+    platform: Option<Arch>,
+    verbose: bool,
+) -> Result<()> {
     eprintln!("Checking dynamic linkage in {tag}...");
     let cfg = crate::container::RunConfig {
         command: Some(vec!["sh".to_string(), "-c".to_string(), linkage_check_script()]),
+        platform,
         ..crate::container::RunConfig::new(tag)
     };
     let (status, stdout, stderr) = crate::container::container_run_quiet(engine, &cfg);

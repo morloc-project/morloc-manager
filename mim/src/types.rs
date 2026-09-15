@@ -301,7 +301,7 @@ impl Default for Config {
 
 /// Current on-disk schema version for `env.yaml`. Bump when the field set
 /// changes incompatibly and add a matching arm to `migrate_env_config`.
-pub const CURRENT_ENV_SCHEMA: u32 = 4;
+pub const CURRENT_ENV_SCHEMA: u32 = 5;
 
 /// Records written before schema versioning existed carry no `schema_version`
 /// field; they are the v1 baseline.
@@ -431,6 +431,13 @@ pub struct EnvironmentConfig {
     /// backend uses the real one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mount_home: Option<String>,
+    /// The CPU architecture a container environment's image was built for.
+    /// Every build and run of the image passes it as the engine's `--platform`,
+    /// and every update re-solves and re-downloads for it. Recorded for every
+    /// container env; `None` (a record written before the field existed, or a
+    /// native env) means the host's architecture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<crate::arch::Arch>,
 }
 
 fn default_shm_size() -> String {
@@ -506,6 +513,29 @@ impl EnvironmentConfig {
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
             mount_home: None,
+            arch: None,
+        }
+    }
+
+    /// The architecture a container env's image targets: the recorded one, else
+    /// the host's (a record that predates the field).
+    pub fn container_arch(&self) -> crate::error::Result<crate::arch::Arch> {
+        self.arch.map_or_else(crate::arch::Arch::host, Ok)
+    }
+
+    /// The engine and architecture this container env is built for.
+    pub fn container_target(&self) -> crate::error::Result<crate::arch::ContainerTarget> {
+        Ok(crate::arch::ContainerTarget { engine: self.engine()?, arch: self.container_arch()? })
+    }
+
+    /// What this env's engine is told to build and run at (`--platform`): the
+    /// image's architecture for docker/podman; none for apptainer and native,
+    /// which have no such flag. Computed from the record rather than left to
+    /// the engine's host default, which is what a wrong-arch run would be.
+    pub fn oci_arch(&self) -> crate::error::Result<Option<crate::arch::Arch>> {
+        match self.backend.container_engine() {
+            Some(e) if e.is_oci() => Ok(Some(self.container_arch()?)),
+            _ => Ok(None),
         }
     }
 

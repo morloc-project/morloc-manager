@@ -23,6 +23,10 @@ pub struct EnvInfo {
     /// A dev environment (built from a mounted source tree). For these the
     /// version above is the stdlib base, not the compiler.
     pub is_dev: bool,
+    /// The image architecture of a docker/podman env; `None` for the other
+    /// backends, which build for and run on the host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch: Option<crate::arch::Arch>,
 }
 
 // ======================================================================
@@ -260,7 +264,8 @@ pub fn rename_environment(
             let to = serve::prefix_volume(&new_data);
             eprintln!("Copying the solved conda prefix of '{old}' to its new volume...");
             let mount = format!("{}/.pixi", serve::CONTAINER_PIXI_DIR);
-            if let Err(msg) = container::volume_copy(engine, image, &from, &to, &mount) {
+            let platform = ec.oci_arch()?;
+            if let Err(msg) = container::volume_copy(engine, image, platform, &from, &to, &mount) {
                 let _ = container::volume_remove(engine, &to);
                 return Err(ManagerError::EnvError(format!(
                     "could not copy the conda prefix volume of '{old}':\n{msg}"
@@ -431,6 +436,7 @@ pub fn list_environments(scope: Scope, default_env: Option<&str>) -> Vec<EnvInfo
             result.push(EnvInfo {
                 name: name.clone(),
                 is_dev: ec.is_dev(),
+                arch: ec.oci_arch().ok().flatten(),
                 morloc_version: ec.morloc_version,
                 is_default: default_env == Some(name.as_str()),
             });

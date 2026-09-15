@@ -298,6 +298,12 @@ fn migrate_env_config(mut ec: EnvironmentConfig) -> Result<EnvironmentConfig> {
             // drop the mount and run with the env-owned home, so the version is
             // bumped to make that record refuse to load there.
             3 => ec.schema_version = 4,
+            // v4 -> v5: added the optional `arch` (defaults to the host's).
+            // Additive on disk, but a v5 record read by a v4 mim would rebuild
+            // and run the image at the host architecture, silently replacing a
+            // cross-architecture image, so the version is bumped to make that
+            // record refuse to load there.
+            4 => ec.schema_version = 5,
             v => {
                 return Err(ManagerError::EnvError(format!(
                     "environment '{}' uses env schema v{v} with no migration path to v{}; \
@@ -545,7 +551,28 @@ pub fn read_flag_config(scope: Scope, name: &str) -> Result<FlagConfig> {
 pub fn read_flag_file(path: &Path) -> Result<FlagConfig> {
     let mut cfg: FlagConfig = read_yaml_config(path)?;
     expand_flag_config(&mut cfg);
+    for section in [&cfg.build, &cfg.run, &cfg.start] {
+        for list in [&section.all, &section.docker, &section.podman, &section.apptainer] {
+            reject_platform_flag(list)?;
+        }
+    }
     Ok(cfg)
+}
+
+/// `--platform` is owned by the environment's `arch`: as a raw engine flag it
+/// would select a base image the pixi lock, the compiler and the mim agent were
+/// not built for, or run the built image at the wrong platform. Checked on the
+/// flag file's every section and on one-shot `-x` flags alike.
+pub fn reject_platform_flag(flags: &[String]) -> Result<()> {
+    if flags.iter().any(|a| a == "--platform" || a.starts_with("--platform=")) {
+        return Err(ManagerError::EnvError(
+            "--platform cannot be passed as an engine flag: the pixi lock, the \
+             compiler and the mim agent must all match the image's architecture. \
+             Choose it with `mim new --arch <x86_64|arm64>` instead."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Make `src` the environment's flag file at `dst`, replacing whatever was
@@ -823,8 +850,51 @@ mod tests {
         let mut ec = parse(V1_YAML);
         ec.schema_version = 3;
         let migrated = migrate_env_config(ec).expect("v3 migrates");
-        assert_eq!(migrated.schema_version, 4);
+        assert_eq!(migrated.schema_version, CURRENT_ENV_SCHEMA);
         assert!(migrated.mount_home.is_none());
+    }
+
+    #[test]
+    fn v4_record_migrates_to_v5_at_the_host_arch() {
+        // The `arch` field is additive on disk: a v4 record has no recorded
+        // architecture, which resolves to the host's.
+        let mut ec = parse(V1_YAML);
+        ec.schema_version = 4;
+        let migrated = migrate_env_config(ec).expect("v4 migrates");
+        assert_eq!(migrated.schema_version, CURRENT_ENV_SCHEMA);
+        assert!(migrated.arch.is_none());
+        assert_eq!(migrated.container_arch().unwrap(), crate::arch::Arch::host().unwrap());
+    }
+
+    #[test]
+    fn arch_round_trips_through_yaml_in_its_canonical_spelling() {
+        let mut ec = parse(V1_YAML);
+        ec.arch = Some(crate::arch::Arch::X86_64);
+        let text = serde_yaml::to_string(&ec).unwrap();
+        assert!(text.contains("arch: x86_64"), "{text}");
+        let back = parse(&text);
+        assert_eq!(back.arch, Some(crate::arch::Arch::X86_64));
+        assert_eq!(back.container_arch().unwrap(), crate::arch::Arch::X86_64);
+        // Only the canonical spelling is stored, so only it is read back.
+        assert!(serde_yaml::from_str::<EnvironmentConfig>(&text.replace("x86_64", "amd64")).is_err());
+        // An env without one writes no key at all.
+        let plain = parse(V1_YAML);
+        assert!(!serde_yaml::to_string(&plain).unwrap().contains("arch"));
+    }
+
+    #[test]
+    fn oci_arch_follows_the_record_and_the_engine() {
+        let mut ec = parse(V1_YAML);
+        ec.backend = Backend::Container(ContainerEngine::Docker);
+        ec.arch = Some(crate::arch::Arch::Arm64);
+        assert_eq!(ec.oci_arch().unwrap(), Some(crate::arch::Arch::Arm64));
+        ec.backend = Backend::Container(ContainerEngine::Podman);
+        assert_eq!(ec.oci_arch().unwrap(), Some(crate::arch::Arch::Arm64));
+        // Apptainer and native have no --platform.
+        ec.backend = Backend::Container(ContainerEngine::Apptainer);
+        assert_eq!(ec.oci_arch().unwrap(), None);
+        ec.backend = Backend::Native;
+        assert_eq!(ec.oci_arch().unwrap(), None);
     }
 
     #[test]

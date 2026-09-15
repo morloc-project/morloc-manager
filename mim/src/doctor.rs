@@ -425,7 +425,8 @@ fn runtime_dir_from_activation(activation: &[(String, String)]) -> Option<PathBu
         .map(|p| p.to_path_buf())
 }
 
-/// The provisioned runtime version: the `.provisioned` stamp, else the dir name.
+/// The provisioned runtime version: the `.provisioned` stamp, else the version
+/// segment of the store path (`runtimes/<version>/<triple>/`).
 fn runtime_store_version(runtime_dir: &Path) -> Option<String> {
     fs::read_to_string(runtime_dir.join(".provisioned"))
         .ok()
@@ -433,6 +434,7 @@ fn runtime_store_version(runtime_dir: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
         .or_else(|| {
             runtime_dir
+                .parent()?
                 .file_name()
                 .and_then(|n| n.to_str())
                 .map(str::to_string)
@@ -744,6 +746,7 @@ pub(crate) fn probe_extras_container(
         format!("{}/.pixi", crate::serve::CONTAINER_PIXI_DIR),
     )];
     let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
+    let platform = ec.oci_arch().ok().flatten();
     probe_extras(&morloc_deps::abi::meta_dir(&pixi_dir), &ec.conda_packages, |rel| {
         let in_container = format!("{container_prefix}/{rel}");
         let cfg = RunConfig {
@@ -751,6 +754,7 @@ pub(crate) fn probe_extras_container(
             bind_mounts: bind_mounts.clone(),
             volumes: volumes.clone(),
             selinux_suffix: suffix.to_string(),
+            platform,
             ..RunConfig::new(image)
         };
         let (status, stdout, _) = container_run_quiet(engine, &cfg);
@@ -1467,14 +1471,16 @@ fn check_programs_deep(
     // layers, so a smoke test without them has no nexus to run.
     let (bind_mounts, volumes) = crate::base_mounts(&data_dir.to_string_lossy());
     let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
+    let platform = ec.oci_arch().ok().flatten();
     let run = |command: Vec<String>| {
-        let cfg = crate::serve::env_run_config(
+        let mut cfg = crate::serve::env_run_config(
             image,
             command,
             bind_mounts.clone(),
             volumes.clone(),
             suffix,
         );
+        cfg.platform = platform;
         if verbose {
             let exe = engine_executable(engine);
             let extra = crate::container::engine_specific_run_flags_io(engine);

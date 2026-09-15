@@ -8,6 +8,7 @@ use crate::container::{
     container_run, container_run_quiet, container_stop, container_remove, engine_executable,
     exit_code_to_int, RunConfig,
 };
+use crate::arch::Arch;
 use crate::error::{ManagerError, Result};
 use crate::types::*;
 
@@ -28,6 +29,7 @@ pub fn serve_environment(
     user_env: &[(String, String)],
     command: &[String],
     mount_home: Option<&str>,
+    platform: Option<Arch>,
 ) -> Result<()> {
     if matches!(engine, ContainerEngine::Apptainer) {
         // Apptainer already runs in the host netns; `network`/`publish_host`
@@ -69,7 +71,7 @@ pub fn serve_environment(
     let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
     let cfg = serve_run_config(
         image, data_dir, container_name, ports, publish_host, network, extra_flags, shm_size,
-        user_env, command, mount_home, suffix,
+        user_env, command, mount_home, suffix, platform,
     )?;
 
     if verbose {
@@ -367,8 +369,10 @@ fn serve_run_config(
     command: &[String],
     mount_home: Option<&str>,
     selinux_suffix: &str,
+    platform: Option<Arch>,
 ) -> Result<RunConfig> {
     let mut cfg = RunConfig::new(image);
+    cfg.platform = platform;
     cfg.read_only = true;
     cfg.remove_after = false;
     cfg.name = Some(container_name.to_string());
@@ -416,6 +420,7 @@ fn serve_run_config(
 pub fn validate_programs(
     engine: ContainerEngine,
     image: &str,
+    platform: Option<Arch>,
     programs: &[ProgramEntry],
     bind_mounts: Vec<(String, String)>,
     volumes: Vec<(String, String)>,
@@ -428,8 +433,9 @@ pub fn validate_programs(
     let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
     let mut any_failed = false;
     for prog in programs {
-        let cfg =
+        let mut cfg =
             program_help_config(image, &prog.name, bind_mounts.clone(), volumes.clone(), suffix);
+        cfg.platform = platform;
         if verbose {
             let exe = engine_executable(engine);
             let extra = crate::container::engine_specific_run_flags_io(engine);
@@ -1009,7 +1015,7 @@ mod tests {
         let cmd = vec!["morloc-nexus".to_string(), "router".to_string()];
         let cfg = serve_run_config(
             "img", &data_dir, "morloc-serve-dev", &[(8080, 8080)], None, None, &[], &None, &[],
-            &cmd, None, ":z",
+            &cmd, None, ":z", None,
         )
         .unwrap();
         let args = crate::container::build_run_args(
