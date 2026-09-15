@@ -327,6 +327,82 @@ pub fn volume_remove(engine: ContainerEngine, name: &str) -> ExitStatus {
     }
 }
 
+/// Whether an engine-managed volume of this name exists. Apptainer has no
+/// volumes, so nothing ever exists there.
+pub fn volume_exists(engine: ContainerEngine, name: &str) -> bool {
+    match argstyle(engine) {
+        ArgStyle::Oci => {
+            let exe = engine_executable(engine);
+            Command::new(exe)
+                .args(["volume", "inspect", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+        ArgStyle::Apptainer => false,
+    }
+}
+
+/// Copy the contents of volume `from` into a fresh volume `to`, through a
+/// throwaway container of `image`. Neither engine can rename a volume, so this
+/// is how a volume follows its environment. `to` is mounted at `to_mount`, a
+/// path the image prepares with the mode a new volume should inherit; `from`
+/// is mounted read-only elsewhere. Runs as the host user like every other
+/// materialize step, so the copy keeps the ownership the prefix was written
+/// with.
+pub fn volume_copy(
+    engine: ContainerEngine,
+    image: &str,
+    from: &str,
+    to: &str,
+    to_mount: &str,
+) -> Result<(), String> {
+    if argstyle(engine) != ArgStyle::Oci {
+        return Err("apptainer has no volumes to copy".to_string());
+    }
+    let from_mount = "/mnt/morloc-volume-from";
+    let cfg = RunConfig {
+        volumes: vec![
+            (from.to_string(), format!("{from_mount}:ro")),
+            (to.to_string(), to_mount.to_string()),
+        ],
+        remove_after: true,
+        command: Some(vec![
+            "cp".to_string(),
+            "-a".to_string(),
+            format!("{from_mount}/."),
+            format!("{to_mount}/"),
+        ]),
+        ..RunConfig::new(image)
+    };
+    let (status, _, stderr) = container_run_quiet(engine, &cfg);
+    if status.success() {
+        Ok(())
+    } else {
+        Err(stderr.trim().to_string())
+    }
+}
+
+/// Give a local image a second tag. The image keeps its old tag; drop that with
+/// `remove_image`, which only untags while another tag still references it.
+pub fn tag_image(engine: ContainerEngine, from: &str, to: &str) -> Result<(), String> {
+    match argstyle(engine) {
+        ArgStyle::Oci => {
+            let exe = engine_executable(engine);
+            let (status, _, stderr) =
+                run_process_quiet(exe, &["tag".to_string(), from.to_string(), to.to_string()]);
+            if status.success() {
+                Ok(())
+            } else {
+                Err(stderr.trim().to_string())
+            }
+        }
+        ArgStyle::Apptainer => Err("apptainer has no image store to tag in".to_string()),
+    }
+}
+
 /// Write an image to a tarball with the engine's own `save`, so an artifact can
 /// cross to a machine with no registry between them. The result is what
 /// `docker load` / `podman load` reads back: every layer, including the base.

@@ -455,6 +455,7 @@ version; changing settings (packages, dotfiles, default) is `mim modify`.")]
 Examples:
   mim modify --env myenv --set-default   # make myenv your default
   sudo mim modify --env shared --set-default --system
+  mim modify --env myenv --env-name newname   # rename it (a default follows)
   mim modify --env myenv --dotfiles ~/mydots
   mim modify --env myenv --mount-home ~/morloc-homes/myenv
   mim modify --env myenv --conda-packages-file tools.conda
@@ -476,6 +477,14 @@ what the corresponding flag set:
         /// Environment to modify (default: the default environment)
         #[arg(long)]
         env: Option<String>,
+        /// Rename the environment. Its directories move, its built image is
+        /// re-tagged and its solved conda prefix is copied to the volume for
+        /// the new name; a default that named it follows. Refused while the
+        /// environment is being served. Container backends only: a native
+        /// environment's toolchain and programs are built at paths that
+        /// include its name. No rebuild. The reversal is renaming it back.
+        #[arg(long = "env-name", value_name = "NAME")]
+        env_name: Option<String>,
         /// Re-pin language toolchain(s): `lang` or `lang@version` (repeatable /
         /// comma-separated). Triggers a rebuild at the current morloc version.
         #[arg(long)]
@@ -2637,6 +2646,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         // Change an environment's settings without moving its morloc version.
         Cmd::Modify {
             env,
+            env_name: new_name,
             lang,
             no_lang,
             system_packages_file,
@@ -2711,7 +2721,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 || cert_bundle.is_some()
                 || no_cert_bundle
                 || base.is_some();
-            if !set_default
+            if new_name.is_none()
+                && !set_default
                 && !unset_default
                 && !will_rebuild
                 && dotfiles.is_none()
@@ -2724,9 +2735,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 && no_modules_file.is_empty()
             {
                 return Err(ManagerError::EnvError(
-                    "nothing to modify: pass --set-default, --unset-default, --dotfiles, \
-                     --mount-home, --shm-size, --flagfile, --lang, --cert-bundle, --base, \
-                     --system-packages-file, --conda-packages-file, or --modules-file \
+                    "nothing to modify: pass --env-name, --set-default, --unset-default, \
+                     --dotfiles, --mount-home, --shm-size, --flagfile, --lang, --cert-bundle, \
+                     --base, --system-packages-file, --conda-packages-file, or --modules-file \
                      (each of which has a --no-<flag> form that clears it)".to_string(),
                 ));
             }
@@ -2735,6 +2746,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
 
             // ---- Validation that needs the resolved env, done BEFORE any side
             //      effect so an invalid request never leaves partial changes. ----
+            // A rename moves the directories a live serve is running out of and
+            // retires the container name it was launched under.
+            if let Some(new) = &new_name {
+                environment::validate_rename(env_scope, &env_name, new, &ec)?;
+                if env_serve_alive(env_scope, &env_name, &ec) {
+                    return Err(ManagerError::EnvError(format!(
+                        "environment '{env_name}' is being served; stop it first with \
+                         'mim stop --env {env_name}', then rename it."
+                    )));
+                }
+            }
             // Only apt packages are container-only; conda packages land in the
             // pixi solve, which the native backend has too.
             if touches_apt && ec.backend.is_native() {
@@ -2777,11 +2799,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     Some(None)
                 }
                 None => None,
+                // Checked against the data directory the env will have once a
+                // rename in the same command has run.
                 Some(raw) => Some(Some(resolve_mount_home(
                     raw,
                     ec.backend.container_engine(),
                     env_scope,
-                    &cfg::env_data_dir(env_scope, &env_name),
+                    &cfg::env_data_dir(env_scope, new_name.as_deref().unwrap_or(&env_name)),
                 )?)),
             };
             if shm_size_change.is_some() && !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
@@ -2888,7 +2912,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // personal (local) set-default does not, and is handled in its own
             // block below.
             if env_scope == Scope::System
-                && (will_rebuild
+                && (new_name.is_some()
+                    || will_rebuild
                     || dotfiles.is_some()
                     || no_dotfiles
                     || mount_home_change.is_some()
@@ -2923,6 +2948,23 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             };
 
             // ---- Side effects (all inputs validated) ----
+            // 0. rename: runs first so every later step, and every message,
+            //    addresses the environment by its new name. Whatever the
+            //    validation above materialized into the env directories (the
+            //    certificates) moves with them.
+            let env_name = match &new_name {
+                Some(new) => {
+                    ec = environment::rename_environment(env_scope, &env_name, new, &ec)?;
+                    match environment::effective_default_env_name() {
+                        Some(d) if d == *new => {
+                            eprintln!("Renamed environment '{env_name}' to '{new}' (still the default).")
+                        }
+                        _ => eprintln!("Renamed environment '{env_name}' to '{new}'."),
+                    }
+                    new.clone()
+                }
+                None => env_name,
+            };
             // 1. set-default / unset-default (pure metadata, no rebuild): personal
             //    (local) by default, machine-wide with --system (root).
             if set_default {
@@ -7148,7 +7190,7 @@ fn build_requirement_derived_image(
     let env_dir = cfg::env_data_dir(scope, name);
     let context = env_dir.join(CONTAINER_BUILD_SUBDIR);
     let manifest = pixi::render_manifest(&req.requirements);
-    let image_tag = format!("localhost/morloc-env:{name}");
+    let image_tag = environment::env_image_tag(name);
 
     // Prime the requirements store unconditionally (like the native path), BEFORE
     // the cache-hit early return: the store reflects the env's config/inputs, so a
@@ -7735,7 +7777,7 @@ fn build_dev_container_image(
     let (_specs, lang_spec, requirements) =
         build_env_requirements(stdlib_version, &platform, program_specs, lang_pins, conda_packages, &support)?;
     let manifest = pixi::render_manifest(&requirements);
-    let image_tag = format!("localhost/morloc-env:{name}");
+    let image_tag = environment::env_image_tag(name);
 
     let env_dir = cfg::env_data_dir(scope, name);
     let context = env_dir.join(CONTAINER_BUILD_SUBDIR);
@@ -10085,6 +10127,29 @@ mod tests {
     }
 
     #[test]
+    fn modify_env_name_parses_alone_and_alongside_other_settings() {
+        let cli = Cli::try_parse_from(["mim", "modify", "--env", "old", "--env-name", "new"])
+            .expect("modify --env-name should parse");
+        match cli.command {
+            Some(Cmd::Modify { env, env_name, .. }) => {
+                assert_eq!(env.as_deref(), Some("old"));
+                assert_eq!(env_name.as_deref(), Some("new"));
+            }
+            _ => panic!("expected Cmd::Modify"),
+        }
+        // A rename combines with a default change: the rename runs first and
+        // the default is then set on the new name.
+        let cli = Cli::try_parse_from([
+            "mim", "modify", "--env", "old", "--env-name", "new", "--set-default",
+        ])
+        .expect("modify --env-name --set-default should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Modify { env_name: Some(_), set_default: true, .. })
+        ));
+    }
+
+    #[test]
     fn modify_rejects_a_flag_and_its_negation_together() {
         // Asking to both set and clear a setting is a contradiction, caught at
         // parse time rather than resolved by argument order.
@@ -10133,6 +10198,7 @@ mod tests {
     // so they can be exercised straight through `dispatch`.
     #[derive(Default)]
     struct ModifyFlags {
+        env_name: Option<String>,
         set_default: bool,
         unset_default: bool,
         system: bool,
@@ -10150,6 +10216,7 @@ mod tests {
     fn modify_cmd(f: ModifyFlags) -> Cmd {
         Cmd::Modify {
             env: Some("e".to_string()),
+            env_name: f.env_name,
             lang: Vec::new(),
             no_lang: f.no_lang,
             system_packages_file: None,
@@ -10382,6 +10449,16 @@ mod tests {
     fn modify_requires_at_least_one_change() {
         let err = dispatch(false, false, modify_cmd(ModifyFlags::default())).unwrap_err();
         assert!(err.to_string().contains("nothing to modify"), "got: {err}");
+    }
+
+    #[test]
+    fn modify_env_name_counts_as_a_change() {
+        let f = ModifyFlags { env_name: Some("renamed".to_string()), ..Default::default() };
+        let err = dispatch(false, false, modify_cmd(f)).unwrap_err();
+        assert!(
+            !err.to_string().contains("nothing to modify"),
+            "--env-name alone should be a change; got: {err}"
+        );
     }
 
     #[test]
