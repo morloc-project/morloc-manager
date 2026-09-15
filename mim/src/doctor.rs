@@ -425,7 +425,8 @@ fn runtime_dir_from_activation(activation: &[(String, String)]) -> Option<PathBu
         .map(|p| p.to_path_buf())
 }
 
-/// The provisioned runtime version: the `.provisioned` stamp, else the dir name.
+/// The provisioned runtime version: the `.provisioned` stamp, else the version
+/// segment of the store path (`runtimes/<version>/<triple>/`).
 fn runtime_store_version(runtime_dir: &Path) -> Option<String> {
     fs::read_to_string(runtime_dir.join(".provisioned"))
         .ok()
@@ -433,6 +434,7 @@ fn runtime_store_version(runtime_dir: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
         .or_else(|| {
             runtime_dir
+                .parent()?
                 .file_name()
                 .and_then(|n| n.to_str())
                 .map(str::to_string)
@@ -744,6 +746,7 @@ pub(crate) fn probe_extras_container(
         format!("{}/.pixi", crate::serve::CONTAINER_PIXI_DIR),
     )];
     let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
+    let platform = ec.oci_arch().ok().flatten();
     probe_extras(&morloc_deps::abi::meta_dir(&pixi_dir), &ec.conda_packages, |rel| {
         let in_container = format!("{container_prefix}/{rel}");
         let cfg = RunConfig {
@@ -751,6 +754,7 @@ pub(crate) fn probe_extras_container(
             bind_mounts: bind_mounts.clone(),
             volumes: volumes.clone(),
             selinux_suffix: suffix.to_string(),
+            platform,
             ..RunConfig::new(image)
         };
         let (status, stdout, _) = container_run_quiet(engine, &cfg);
@@ -1139,7 +1143,7 @@ fn check_mount_home(c: &mut Counts, ec: &EnvironmentConfig) {
     } else {
         c.fail(&format!(
             "Host home {src} is mounted as $HOME but is missing\n       \
-             Restore that directory, or drop the mount: mim modify --env {} --mount-home none",
+             Restore that directory, or drop the mount: mim modify --env {} --no-mount-home",
             ec.name
         ));
     }
@@ -1467,14 +1471,16 @@ fn check_programs_deep(
     // layers, so a smoke test without them has no nexus to run.
     let (bind_mounts, volumes) = crate::base_mounts(&data_dir.to_string_lossy());
     let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
+    let platform = ec.oci_arch().ok().flatten();
     let run = |command: Vec<String>| {
-        let cfg = crate::serve::env_run_config(
+        let mut cfg = crate::serve::env_run_config(
             image,
             command,
             bind_mounts.clone(),
             volumes.clone(),
             suffix,
         );
+        cfg.platform = platform;
         if verbose {
             let exe = engine_executable(engine);
             let extra = crate::container::engine_specific_run_flags_io(engine);
@@ -1660,6 +1666,36 @@ fn check_slurm_prereqs(c: &mut Counts, engine: ContainerEngine, ec: &Environment
                 runtime_dir, e
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod mount_home_tests {
+    use super::*;
+
+    /// The way out of a vanished host home is `--no-mount-home`; every value
+    /// given to `--mount-home` is a path, so advising a word would create and
+    /// mount a directory of that name.
+    #[test]
+    fn missing_host_home_advises_no_mount_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("vanished").to_string_lossy().into_owned();
+        let mut ec = EnvironmentConfig::new_backend(
+            "e".to_string(),
+            Backend::Container(ContainerEngine::Podman),
+            "ubuntu:24.04".to_string(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        ec.mount_home = Some(gone);
+        let mut c = Counts::new(true);
+        check_mount_home(&mut c, &ec);
+        assert_eq!(c.fail, 1);
+        let msg = &c.checks[0].message;
+        assert!(msg.contains("mim modify --env e --no-mount-home"), "{msg}");
+        assert!(!msg.contains("--mount-home none"), "{msg}");
     }
 }
 

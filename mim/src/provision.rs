@@ -1,5 +1,5 @@
 //! Native-environment provisioning: fetch the version-matched morloc compiler
-//! and the rust sources from a GitHub release into `runtimes/<version>/`, so
+//! and the rust sources from a GitHub release into `runtimes/<version>/<triple>/`, so
 //! `morloc init` (pointed at `<dir>/rust` via MORLOC_RUST_DIR) can build the
 //! runtime from source and set up a native environment with no container.
 //!
@@ -37,7 +37,7 @@ pub const PIXI_VERSION: &str = "0.76.2";
 /// the manager can render pixi manifests without executing the compiler on the
 /// host. Filename in the runtime store once downloaded.
 const LANG_SUPPORT_ASSET: &str = "morloc-lang-support.json";
-/// Filename of the downloaded lang-support table inside `runtimes/<version>/`.
+/// Filename of the downloaded lang-support table inside a runtime store dir.
 pub const LANG_SUPPORT_FILE: &str = "lang-support.json";
 /// The per-platform prebuilt binaries in a release: just the morloc compiler.
 /// libmorloc.so + morloc-nexus are NOT here -- they are built from the
@@ -158,18 +158,6 @@ pub fn host_release_triple() -> Option<&'static str> {
     release_triple(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// The release triple for a container built on this host: a container runs Linux
-/// (matching the host arch), so on a macOS host it is the Linux triple, not the
-/// (possibly unpublished) macOS one. Errors if the host arch has no published
-/// Linux binaries.
-pub fn container_release_triple() -> Result<&'static str> {
-    release_triple("linux", std::env::consts::ARCH).ok_or_else(|| {
-        ManagerError::BackendUnsupported(format!(
-            "no prebuilt binaries are published for the container platform (linux/{})",
-            std::env::consts::ARCH
-        ))
-    })
-}
 
 /// GitHub download URL for `asset` of a release `tag` (e.g. "v0.98.3" or "dev").
 pub fn asset_url(tag: &str, asset: &str) -> String {
@@ -312,9 +300,12 @@ pub fn resolve_tag(requested: &str) -> Result<String> {
     }
 }
 
-/// The per-version native runtime store directory.
-pub fn runtimes_dir(scope: Scope, version: &str) -> PathBuf {
-    config::data_dir(scope).join("runtimes").join(version)
+/// The runtime store directory for one (version, release triple) pair. The
+/// compiler binary inside is built for `triple`, so the store is keyed on both:
+/// a native env and a container env at the same version, or two container envs
+/// of different architectures, each get their own directory.
+pub fn runtimes_dir(scope: Scope, version: &str, triple: &str) -> PathBuf {
+    config::data_dir(scope).join("runtimes").join(version).join(triple)
 }
 
 /// Download a URL to a path via curl (follows redirects; fails on HTTP error).
@@ -424,7 +415,7 @@ fn make_executable(path: &Path) -> Result<()> {
         .map_err(|e| ManagerError::EnvError(format!("cannot chmod {}: {e}", path.display())))
 }
 
-// Layout of a provisioned runtime store (`runtimes/<version>/`), shared by the
+// Layout of a provisioned runtime store (`runtimes/<version>/<triple>/`), shared by the
 // code that writes it (provision_runtime), copies it (stage_runtime), and
 // consumes it (main.rs). One place to change if the store layout ever moves.
 
@@ -643,8 +634,8 @@ pub fn fetch_manifest(tag: &str) -> Result<ReleaseManifest> {
     ReleaseManifest::from_json(&text)
 }
 
-/// Provision the runtime for `triple` into `runtimes/<version>/` and return that
-/// directory (its `rust/` subdir is `morloc init`'s MORLOC_RUST_DIR). Downloads
+/// Provision the runtime for `triple` into `runtimes/<version>/<triple>/` and
+/// return that directory (its `rust/` subdir is `morloc init`'s MORLOC_RUST_DIR). Downloads
 /// the version-matched morloc compiler plus the rust sources; `morloc init`
 /// builds libmorloc.so, morloc-nexus, and rustmorloc locally from that source.
 /// The already-installed `mim` bootstrap is not re-fetched.
@@ -670,7 +661,7 @@ pub fn provision_runtime(
         ))
     })?;
 
-    let dir = runtimes_dir(scope, &version);
+    let dir = runtimes_dir(scope, &version, triple);
     // A completion stamp -- written only after every artifact is downloaded,
     // verified, and extracted -- is the idempotency gate. Gating on mere file
     // presence would bless a truncated or half-extracted runtime from an
@@ -872,7 +863,7 @@ fn copy_dir_inner(
     Ok(())
 }
 
-/// Stage a provisioned runtime (`runtimes/<version>/`, from `provision_runtime`)
+/// Stage a provisioned runtime (`runtimes/<version>/<triple>/`, from `provision_runtime`)
 /// into a container build context's `runtime/` directory: the morloc compiler
 /// plus the Rust workspace source. libmorloc.so + morloc-nexus are built from
 /// that source in-image by `morloc init`, so they are not staged. Everything
@@ -1001,9 +992,11 @@ mod tests {
     }
 
     #[test]
-    fn runtimes_dir_is_versioned() {
-        let d = runtimes_dir(Scope::Local, "0.98.3");
-        assert!(d.ends_with("morloc/runtimes/0.98.3"));
+    fn runtimes_dir_is_keyed_on_version_and_triple() {
+        let d = runtimes_dir(Scope::Local, "0.98.3", "linux-x86_64");
+        assert!(d.ends_with("morloc/runtimes/0.98.3/linux-x86_64"));
+        // Two triples of one version never share a compiler binary.
+        assert_ne!(d, runtimes_dir(Scope::Local, "0.98.3", "linux-arm64"));
     }
 
     #[test]
@@ -1066,16 +1059,6 @@ mod tests {
         let no_digests =
             format!(r#"{{"schema":1,"version":"1.0.0","rust_src":"r",{vers},"triples":{{}}}}"#);
         assert!(ReleaseManifest::from_json(&no_digests).is_err());
-    }
-
-    #[test]
-    fn container_release_triple_matches_linux_host_arch() {
-        // Never the host's OS -- always Linux (a container runs Linux), matching
-        // the host arch.
-        assert_eq!(
-            container_release_triple().ok(),
-            release_triple("linux", std::env::consts::ARCH),
-        );
     }
 
     #[test]

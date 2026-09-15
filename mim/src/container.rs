@@ -41,6 +41,11 @@ pub struct RunConfig {
     pub work_dir: Option<String>,
     pub selinux_suffix: String,
     pub extra_flags: Vec<String>,
+    /// The architecture the image was built for, passed as `--platform` so the
+    /// engine never guesses from the host or from `DOCKER_DEFAULT_PLATFORM`.
+    /// `None` leaves the choice to the engine. Apptainer has no equivalent and
+    /// ignores it.
+    pub platform: Option<crate::arch::Arch>,
 }
 
 impl RunConfig {
@@ -62,6 +67,7 @@ impl RunConfig {
             work_dir: None,
             selinux_suffix: String::new(),
             extra_flags: Vec::new(),
+            platform: None,
         }
     }
 }
@@ -76,6 +82,10 @@ pub struct BuildConfig {
     /// plus any one-shot CLI overrides). Forwarded verbatim into the build
     /// argv after `--build-arg` pairs, before the context.
     pub extra_flags: Vec<String>,
+    /// The architecture to build for, passed as `--platform`: it selects the
+    /// base image's manifest entry and the emulator every RUN step executes
+    /// under. `None` leaves it to the engine.
+    pub platform: Option<crate::arch::Arch>,
 }
 
 
@@ -327,6 +337,84 @@ pub fn volume_remove(engine: ContainerEngine, name: &str) -> ExitStatus {
     }
 }
 
+/// Whether an engine-managed volume of this name exists. Apptainer has no
+/// volumes, so nothing ever exists there.
+pub fn volume_exists(engine: ContainerEngine, name: &str) -> bool {
+    match argstyle(engine) {
+        ArgStyle::Oci => {
+            let exe = engine_executable(engine);
+            Command::new(exe)
+                .args(["volume", "inspect", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+        ArgStyle::Apptainer => false,
+    }
+}
+
+/// Copy the contents of volume `from` into a fresh volume `to`, through a
+/// throwaway container of `image`. Neither engine can rename a volume, so this
+/// is how a volume follows its environment. `to` is mounted at `to_mount`, a
+/// path the image prepares with the mode a new volume should inherit; `from`
+/// is mounted read-only elsewhere. Runs as the host user like every other
+/// materialize step, so the copy keeps the ownership the prefix was written
+/// with.
+pub fn volume_copy(
+    engine: ContainerEngine,
+    image: &str,
+    platform: Option<crate::arch::Arch>,
+    from: &str,
+    to: &str,
+    to_mount: &str,
+) -> Result<(), String> {
+    if argstyle(engine) != ArgStyle::Oci {
+        return Err("apptainer has no volumes to copy".to_string());
+    }
+    let from_mount = "/mnt/morloc-volume-from";
+    let cfg = RunConfig {
+        volumes: vec![
+            (from.to_string(), format!("{from_mount}:ro")),
+            (to.to_string(), to_mount.to_string()),
+        ],
+        platform,
+        remove_after: true,
+        command: Some(vec![
+            "cp".to_string(),
+            "-a".to_string(),
+            format!("{from_mount}/."),
+            format!("{to_mount}/"),
+        ]),
+        ..RunConfig::new(image)
+    };
+    let (status, _, stderr) = container_run_quiet(engine, &cfg);
+    if status.success() {
+        Ok(())
+    } else {
+        Err(stderr.trim().to_string())
+    }
+}
+
+/// Give a local image a second tag. The image keeps its old tag; drop that with
+/// `remove_image`, which only untags while another tag still references it.
+pub fn tag_image(engine: ContainerEngine, from: &str, to: &str) -> Result<(), String> {
+    match argstyle(engine) {
+        ArgStyle::Oci => {
+            let exe = engine_executable(engine);
+            let (status, _, stderr) =
+                run_process_quiet(exe, &["tag".to_string(), from.to_string(), to.to_string()]);
+            if status.success() {
+                Ok(())
+            } else {
+                Err(stderr.trim().to_string())
+            }
+        }
+        ArgStyle::Apptainer => Err("apptainer has no image store to tag in".to_string()),
+    }
+}
+
 /// Write an image to a tarball with the engine's own `save`, so an artifact can
 /// cross to a machine with no registry between them. The result is what
 /// `docker load` / `podman load` reads back: every layer, including the base.
@@ -468,11 +556,22 @@ fn build_oci_run_args(
         args.push(format!("{key}={val}"));
     }
     args.extend(cfg.extra_flags.iter().cloned());
+    push_platform(&mut args, cfg.platform);
     args.push(cfg.image.clone());
     if let Some(ref cmd) = cfg.command {
         args.extend(cmd.iter().cloned());
     }
     args
+}
+
+/// `--platform` goes after the user's flags: the engine takes the last
+/// occurrence, so the image's own architecture always wins over a stray one in
+/// a flag file or `-x`.
+fn push_platform(args: &mut Vec<String>, platform: Option<crate::arch::Arch>) {
+    if let Some(a) = platform {
+        args.push("--platform".to_string());
+        args.push(a.oci_platform().to_string());
+    }
 }
 
 /// Apptainer/Singularity argv builder. Translates RunConfig to `apptainer
@@ -622,6 +721,7 @@ pub fn build_build_args(cfg: &BuildConfig) -> Vec<String> {
         args.push(format!("{key}={val}"));
     }
     args.extend(cfg.extra_flags.iter().cloned());
+    push_platform(&mut args, cfg.platform);
     args.push(cfg.context.clone());
     args
 }

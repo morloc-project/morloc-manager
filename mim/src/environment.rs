@@ -23,6 +23,10 @@ pub struct EnvInfo {
     /// A dev environment (built from a mounted source tree). For these the
     /// version above is the stdlib base, not the compiler.
     pub is_dev: bool,
+    /// The image architecture of a docker/podman env; `None` for the other
+    /// backends, which build for and run on the host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch: Option<crate::arch::Arch>,
 }
 
 // ======================================================================
@@ -168,6 +172,261 @@ pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &
     Ok(())
 }
 
+/// The tag of the requirement-derived image an environment builds for itself.
+/// Derived from the name, so a rename re-tags it.
+pub fn env_image_tag(name: &str) -> String {
+    format!("localhost/morloc-env:{name}")
+}
+
+/// Why an environment cannot be renamed right now, checked before any side
+/// effect. A native environment is refused outright: its conda prefix, its
+/// MORLOC_HOME and every installed program's launcher and manifest carry the
+/// absolute host path that includes the name, and none of them can be moved in
+/// place.
+pub fn validate_rename(scope: Scope, old: &str, new: &str, ec: &EnvironmentConfig) -> Result<()> {
+    validate_env_name(new)?;
+    if new == old {
+        return Err(ManagerError::EnvError(format!(
+            "environment '{old}' already has that name; nothing to rename."
+        )));
+    }
+    if config::env_config_dir(scope, new).exists() || config::env_data_dir(scope, new).exists() {
+        return Err(ManagerError::EnvError(format!(
+            "an environment named '{new}' already exists; pick another name, or remove \
+             it first with 'mim rm {new}'."
+        )));
+    }
+    if ec.backend.is_native() {
+        return Err(ManagerError::EnvError(format!(
+            "environment '{old}' uses the native backend, whose toolchain, runtime and \
+             installed programs are built at absolute paths that include its name; it \
+             cannot be renamed in place. Create the environment again under the new \
+             name with 'mim new {new} --engine native' and reinstall its programs."
+        )));
+    }
+    Ok(())
+}
+
+/// Rename a container-backed environment: its config and data directories move,
+/// its record is rewritten under the new name, and every engine-side object
+/// derived from the name follows -- the built image is re-tagged and the solved
+/// conda prefix is copied into the volume named for the new data directory,
+/// since neither docker nor podman can rename a volume. Paths inside the
+/// container are the same for every environment, so nothing in the moved trees
+/// needs rewriting. A default that pointed at the old name follows it.
+///
+/// Every step that can fail is undone in reverse if a later one does, so a
+/// failed rename leaves the environment exactly as it was. The caller has
+/// already checked that nothing is serving it.
+pub fn rename_environment(
+    scope: Scope,
+    old: &str,
+    new: &str,
+    ec: &EnvironmentConfig,
+) -> Result<EnvironmentConfig> {
+    validate_rename(scope, old, new, ec)?;
+    let old_data = config::env_data_dir(scope, old);
+    let new_data = config::env_data_dir(scope, new);
+    let old_cfg = config::env_config_dir(scope, old);
+    let new_cfg = config::env_config_dir(scope, new);
+    let engine = ec.backend.container_engine().filter(|e| e.is_oci());
+    let mut new_ec = ec.clone();
+    new_ec.name = new.to_string();
+
+    // Each completed step pushes its reversal; a failure runs them last-first.
+    let mut undo: Vec<Box<dyn FnOnce()>> = Vec::new();
+    let fail = |undo: Vec<Box<dyn FnOnce()>>, e: ManagerError| -> Result<EnvironmentConfig> {
+        for step in undo.into_iter().rev() {
+            step();
+        }
+        Err(e)
+    };
+
+    // The solved prefix, keyed on the data directory path (see
+    // `serve::prefix_volume`). Copied first: it is the slow step and the one
+    // most likely to fail, and until the directories move nothing else has
+    // changed.
+    let mut old_volume: Option<String> = None;
+    let mut old_tag: Option<String> = None;
+    if let Some(engine) = engine {
+        let from = serve::prefix_volume(&old_data);
+        if container::volume_exists(engine, &from) {
+            let Some(image) = ec
+                .built_image
+                .as_deref()
+                .filter(|img| image_exists_locally(engine, img))
+            else {
+                return Err(ManagerError::EnvError(format!(
+                    "environment '{old}' has a solved conda prefix but no built image to \
+                     copy it with; rebuild first with 'mim update --env {old}'."
+                )));
+            };
+            let to = serve::prefix_volume(&new_data);
+            eprintln!("Copying the solved conda prefix of '{old}' to its new volume...");
+            let mount = format!("{}/.pixi", serve::CONTAINER_PIXI_DIR);
+            let platform = ec.oci_arch()?;
+            if let Err(msg) = container::volume_copy(engine, image, platform, &from, &to, &mount) {
+                let _ = container::volume_remove(engine, &to);
+                return Err(ManagerError::EnvError(format!(
+                    "could not copy the conda prefix volume of '{old}':\n{msg}"
+                )));
+            }
+            let to_undo = to.clone();
+            undo.push(Box::new(move || {
+                let _ = container::volume_remove(engine, &to_undo);
+            }));
+            old_volume = Some(from);
+        }
+        // Only the name-derived tag follows the name; a custom tag stays valid.
+        if ec.built_image.as_deref() == Some(env_image_tag(old).as_str()) {
+            let from = env_image_tag(old);
+            let to = env_image_tag(new);
+            if image_exists_locally(engine, &from) {
+                if let Err(msg) = container::tag_image(engine, &from, &to) {
+                    return fail(
+                        undo,
+                        ManagerError::EnvError(format!(
+                            "could not re-tag the image of '{old}' as {to}:\n{msg}"
+                        )),
+                    );
+                }
+                let to_undo = to.clone();
+                undo.push(Box::new(move || {
+                    container::remove_image(engine, &to_undo);
+                }));
+                old_tag = Some(from);
+            }
+            new_ec.built_image = Some(to);
+        }
+    }
+
+    // The directories. Each rename is within one parent, so it never crosses
+    // a filesystem.
+    if let Err(e) = fs::rename(&old_cfg, &new_cfg) {
+        return fail(
+            undo,
+            ManagerError::EnvError(format!(
+                "cannot move {} to {}: {e}",
+                old_cfg.display(),
+                new_cfg.display()
+            )),
+        );
+    }
+    {
+        let (from, to) = (new_cfg.clone(), old_cfg.clone());
+        undo.push(Box::new(move || {
+            let _ = fs::rename(&from, &to);
+        }));
+    }
+    if old_data.is_dir() {
+        if let Err(e) = fs::rename(&old_data, &new_data) {
+            return fail(
+                undo,
+                ManagerError::EnvError(format!(
+                    "cannot move {} to {}: {e}",
+                    old_data.display(),
+                    new_data.display()
+                )),
+            );
+        }
+        let (from, to) = (new_data.clone(), old_data.clone());
+        undo.push(Box::new(move || {
+            let _ = fs::rename(&from, &to);
+        }));
+    }
+
+    // A recorded host path (an apptainer image, a mounted home, a CA bundle)
+    // that sat inside the trees that just moved has moved with them.
+    let mut recorded: Vec<&mut String> = Vec::new();
+    recorded.extend(new_ec.base_sif.as_mut());
+    recorded.extend(new_ec.layered_sif.as_mut());
+    recorded.extend(new_ec.mount_home.as_mut());
+    recorded.extend(new_ec.cert_bundle.as_mut());
+    recorded.extend(new_ec.dev.as_mut().map(|d| &mut d.source));
+    recorded.extend(new_ec.local_runtime.as_mut().map(|l| &mut l.source));
+    for p in recorded {
+        let moved = relocate_path(p, &old_cfg, &new_cfg)
+            .or_else(|| relocate_path(p, &old_data, &new_data));
+        if let Some(m) = moved {
+            *p = m;
+        }
+    }
+    if let Err(e) = config::write_env_config(scope, new, &new_ec) {
+        return fail(undo, e);
+    }
+
+    // Committed. What remains is cleanup of the old identity and the pointers
+    // to it; none of it can un-rename the environment, so failures here are
+    // reported, not unwound.
+    // The serve record moved with the config dir and names a container that
+    // no longer exists (the caller refused a live serve).
+    config::remove_serve_runtime(scope, new);
+    if let Some(engine) = engine {
+        if let Some(v) = old_volume {
+            if !container::volume_remove(engine, &v).success() {
+                eprintln!("Warning: could not remove the old conda prefix volume {v}.");
+            }
+        }
+        if let Some(t) = old_tag {
+            if !container::remove_image(engine, &t) {
+                eprintln!("Warning: could not drop the old image tag {t}.");
+            }
+        }
+    }
+    rename_default_pointers(scope, old, new);
+    Ok(new_ec)
+}
+
+/// `path` with the `old_root` prefix replaced by `new_root`, or `None` when
+/// the path does not lie under `old_root`.
+fn relocate_path(path: &str, old_root: &std::path::Path, new_root: &std::path::Path) -> Option<String> {
+    std::path::Path::new(path)
+        .strip_prefix(old_root)
+        .ok()
+        .map(|rest| new_root.join(rest).to_string_lossy().into_owned())
+}
+
+/// Whether the default recorded in the `cfg_scope` config named the environment
+/// that was just renamed (in `env_scope`), and so should now name it by its new
+/// name. A local pointer resolves local-first, so it named this environment when
+/// the environment was local, or when it was system-scope and no local
+/// environment of the old name shadows it (`old_resolves` is false). A system
+/// pointer only ever names a system environment.
+fn default_pointer_follows(cfg_scope: Scope, env_scope: Scope, old_resolves: bool) -> bool {
+    match cfg_scope {
+        Scope::Local => env_scope == Scope::Local || !old_resolves,
+        Scope::System => env_scope == Scope::System,
+    }
+}
+
+/// Repoint every default that named the renamed environment. Best-effort: a
+/// config that cannot be rewritten is reported, since the environment has
+/// already moved.
+fn rename_default_pointers(env_scope: Scope, old: &str, new: &str) {
+    let old_resolves = config::find_env_scope(old).is_ok();
+    for cfg_scope in [Scope::Local, Scope::System] {
+        if !default_pointer_follows(cfg_scope, env_scope, old_resolves) {
+            continue;
+        }
+        let cfg_path = config::config_path(cfg_scope);
+        let Ok(cfg) = config::read_config::<Config>(&cfg_path) else { continue };
+        if cfg.default_env.as_deref() != Some(old) {
+            continue;
+        }
+        let new_cfg = Config {
+            default_env: Some(new.to_string()),
+            ..cfg
+        };
+        if config::write_config(&cfg_path, &new_cfg).is_err() {
+            eprintln!(
+                "Warning: could not update the default in {}; it still names '{old}'. \
+                 Set it again with: mim modify --env {new} --set-default",
+                cfg_path.display()
+            );
+        }
+    }
+}
+
 /// List environments in the given scope.
 pub fn list_environments(scope: Scope, default_env: Option<&str>) -> Vec<EnvInfo> {
     let names = config::list_env_names(scope);
@@ -177,6 +436,7 @@ pub fn list_environments(scope: Scope, default_env: Option<&str>) -> Vec<EnvInfo
             result.push(EnvInfo {
                 name: name.clone(),
                 is_dev: ec.is_dev(),
+                arch: ec.oci_arch().ok().flatten(),
                 morloc_version: ec.morloc_version,
                 is_default: default_env == Some(name.as_str()),
             });
@@ -281,5 +541,49 @@ fn resolve_default_env_name() -> Result<String> {
 // Internal
 // ======================================================================
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
 
+    #[test]
+    fn env_image_tag_is_name_derived() {
+        assert_eq!(env_image_tag("myenv"), "localhost/morloc-env:myenv");
+    }
 
+    #[test]
+    fn relocate_path_moves_only_paths_under_the_old_root() {
+        let old = Path::new("/data/environments/old");
+        let new = Path::new("/data/environments/new");
+        assert_eq!(
+            relocate_path("/data/environments/old/sif/base.sif", old, new).as_deref(),
+            Some("/data/environments/new/sif/base.sif")
+        );
+        // A sibling whose name merely starts with the old name is not under it.
+        assert_eq!(relocate_path("/data/environments/older/base.sif", old, new), None);
+        assert_eq!(relocate_path("/elsewhere/base.sif", old, new), None);
+    }
+
+    #[test]
+    fn local_default_follows_a_local_rename() {
+        assert!(default_pointer_follows(Scope::Local, Scope::Local, false));
+        // Even when a system env of the old name remains: the local pointer
+        // resolved local-first, to the env that moved.
+        assert!(default_pointer_follows(Scope::Local, Scope::Local, true));
+    }
+
+    #[test]
+    fn local_default_follows_a_system_rename_only_when_unshadowed() {
+        assert!(default_pointer_follows(Scope::Local, Scope::System, false));
+        // A local env of the old name is what the pointer named; leave it.
+        assert!(!default_pointer_follows(Scope::Local, Scope::System, true));
+    }
+
+    #[test]
+    fn system_default_follows_only_a_system_rename() {
+        assert!(default_pointer_follows(Scope::System, Scope::System, false));
+        assert!(default_pointer_follows(Scope::System, Scope::System, true));
+        assert!(!default_pointer_follows(Scope::System, Scope::Local, false));
+        assert!(!default_pointer_follows(Scope::System, Scope::Local, true));
+    }
+}

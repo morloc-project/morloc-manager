@@ -1,3 +1,4 @@
+mod arch;
 mod bridge;
 mod cert;
 mod config;
@@ -133,6 +134,7 @@ Examples:
   mim new                                   # latest morloc, default backend
   mim new foo --lang py@3.12
   mim new bar --engine podman
+  mim new x86 --engine docker --arch x86_64 # an image for x86 deployment hosts
   mim new baz --morloc-version 0.98.0       # names it `v0.98.0`
   mim new --morloc-version 0.98.0 --set-default
   mim new --wizard                          # prompt for every setting
@@ -214,6 +216,13 @@ environment; pass `--wizard` to be prompted for each one instead.")]
         /// (debian:bookworm-slim). Container backends only.
         #[arg(long, value_enum)]
         base: Option<BaseImage>,
+        /// CPU architecture to build the container image for (default: this
+        /// machine's). `amd64` and `aarch64` are accepted spellings. A foreign
+        /// architecture builds and runs under the engine's emulation (Rosetta
+        /// or QEMU), which is slow but produces an image that deploys natively
+        /// on that architecture. Docker/podman only.
+        #[arg(long, value_enum)]
+        arch: Option<arch::Arch>,
         /// Create in system scope (requires root)
         #[arg(long)]
         system: bool,
@@ -228,6 +237,16 @@ environment; pass `--wizard` to be prompted for each one instead.")]
         /// the defaults. Requires a terminal.
         #[arg(long, conflicts_with_all = ["non_interactive", "local_runtime"])]
         wizard: bool,
+        /// Install this file as the environment's env.flags.yaml: the engine
+        /// flags for its `build`, `run` and `start` phases, per engine. The file
+        /// is validated and copied whole. Container backends only.
+        #[arg(long, value_name = "FILE")]
+        flagfile: Option<String>,
+        /// One-shot engine flag for the image build, appended to
+        /// env.flags.yaml `build.<engine>` for this invocation only (repeatable;
+        /// not persisted). Container backends only.
+        #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true, value_parser = engine_arg_value)]
+        engine_arg: Vec<String>,
         /// Accepted for compatibility and ignored: this is the default.
         #[arg(long, hide = true)]
         non_interactive: bool,
@@ -239,7 +258,10 @@ Examples:
   # runs in default env (see `mim ls`)
   mim run -- morloc --version
   # run in specific env
-  mim run --env dev -- morloc make svc.loc")]
+  mim run --env dev -- morloc make svc.loc
+  # one-shot engine flags: appended (-x) or a replacement file (--flagfile)
+  mim run -x --device=/dev/dri -- ./prog render
+  mim run --flagfile gpu.yaml -- ./prog render")]
     Run {
         /// Command to run inside the container
         command: Vec<String>,
@@ -254,8 +276,13 @@ Examples:
         env_file: Option<String>,
         /// One-shot engine flag, appended to env.flags.yaml `run.<engine>`
         /// for this invocation only (repeatable; not persisted)
-        #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true)]
+        #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true, value_parser = engine_arg_value)]
         engine_arg: Vec<String>,
+        /// Use this flag file instead of the environment's env.flags.yaml for
+        /// this invocation only (the persisted file is not changed). Same
+        /// schema; -x flags are appended after it.
+        #[arg(long, value_name = "FILE")]
+        flagfile: Option<String>,
         /// Expose a SLURM submission bridge inside the container so
         /// labeled remote calls (`big:fn x`) can submit jobs to the
         /// host's sbatch. Requires the environment to use the
@@ -289,8 +316,13 @@ Without --env, the default environment is used.")]
         env_file: Option<String>,
         /// One-shot engine flag, appended to env.flags.yaml `run.<engine>`
         /// for this invocation only (repeatable; not persisted)
-        #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true)]
+        #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true, value_parser = engine_arg_value)]
         engine_arg: Vec<String>,
+        /// Use this flag file instead of the environment's env.flags.yaml for
+        /// this invocation only (the persisted file is not changed). Same
+        /// schema; -x flags are appended after it.
+        #[arg(long, value_name = "FILE")]
+        flagfile: Option<String>,
     },
     /// Remove a morloc environment
     #[command(display_order = 3)]
@@ -390,10 +422,12 @@ Examples:
 Examples:
   mim update                        # re-solve/rebuild at the current version
   mim update --env myenv
-  mim update --env myenv --force            # force a fresh re-solve
+  mim update --env myenv --reinit           # discard the solve and rebuild from scratch
   mim update --env myenv --latest           # move to the newest release
   mim update --env myenv --morloc-version 0.98.0   # move to a specific version
+  mim update --env myenv -x --no-cache      # rebuild with an engine build flag
 
+Persistent build flags belong in the env's env.flags.yaml `build:` section.
 Without --latest/--morloc-version, the environment keeps its current morloc
 version; changing settings (packages, dotfiles, default) is `mim modify`.")]
     Update {
@@ -408,15 +442,23 @@ version; changing settings (packages, dotfiles, default) is `mim modify`.")]
         /// rebuild.
         #[arg(long)]
         latest: bool,
-        /// Force a full re-solve and rebuild even when nothing changed (repair a
-        /// stale or half-built environment).
+        /// Discard what was built and rebuild from the environment's settings and
+        /// installed programs: the solved toolchain, its lock, the scratch builds
+        /// and the language bindings all go, then everything is solved and built
+        /// again. Repairs a stale or half-built environment.
         #[arg(long)]
-        force: bool,
+        reinit: bool,
         /// Proceed even if an installed module declares a morloc-version range
         /// that excludes the target compiler. Without this, such a conflict
         /// aborts the update (leaving the environment untouched).
         #[arg(long)]
         ignore_module_compat: bool,
+        /// One-shot engine flag for this rebuild's image build, appended to
+        /// env.flags.yaml `build.<engine>` (repeatable; not persisted). Forces
+        /// the rebuild even when the requirements are unchanged. Container
+        /// backends only.
+        #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true, value_parser = engine_arg_value)]
+        engine_arg: Vec<String>,
     },
     /// Change an environment's settings (without moving its morloc version)
     #[command(display_order = 8)]
@@ -424,11 +466,13 @@ version; changing settings (packages, dotfiles, default) is `mim modify`.")]
 Examples:
   mim modify --env myenv --set-default   # make myenv your default
   sudo mim modify --env shared --set-default --system
+  mim modify --env myenv --env-name newname   # rename it (a default follows)
   mim modify --env myenv --dotfiles ~/mydots
   mim modify --env myenv --mount-home ~/morloc-homes/myenv
   mim modify --env myenv --conda-packages-file tools.conda
   mim modify --env myenv --system-packages-file tools.apt
   mim modify --env myenv --lang py@3.13
+  mim modify --env myenv --flagfile flags.yaml  # engine flags per phase
 
 Every setting that can be added can also be taken away. `--no-<flag>` clears
 what the corresponding flag set:
@@ -437,12 +481,21 @@ what the corresponding flag set:
   mim modify --env myenv --no-cert-bundle       # stop trusting the corporate CA
   mim modify --env myenv --no-mount-home        # back to the env-owned home
   mim modify --env myenv --no-dotfiles          # take the copied dotfiles back
+  mim modify --env myenv --no-flagfile          # drop the engine flags
   mim modify --env myenv --no-modules-file extra.txt   # drop one pin file
   mim modify --env myenv --unset-default        # stop being the default")]
     Modify {
         /// Environment to modify (default: the default environment)
         #[arg(long)]
         env: Option<String>,
+        /// Rename the environment. Its directories move, its built image is
+        /// re-tagged and its solved conda prefix is copied to the volume for
+        /// the new name; a default that named it follows. Refused while the
+        /// environment is being served. Container backends only: a native
+        /// environment's toolchain and programs are built at paths that
+        /// include its name. No rebuild. The reversal is renaming it back.
+        #[arg(long = "env-name", value_name = "NAME")]
+        env_name: Option<String>,
         /// Re-pin language toolchain(s): `lang` or `lang@version` (repeatable /
         /// comma-separated). Triggers a rebuild at the current morloc version.
         #[arg(long)]
@@ -510,6 +563,17 @@ what the corresponding flag set:
         /// Docker/podman only. No rebuild.
         #[arg(long = "no-shm-size", conflicts_with = "shm_size")]
         no_shm_size: bool,
+        /// Replace the environment's env.flags.yaml with this file: the engine
+        /// flags for its `build`, `run` and `start` phases, per engine. The file
+        /// is validated and copied whole; it is everything, not an addition.
+        /// `run`/`start` flags apply from the next launch; `build` flags at the
+        /// next `update`. Container backends only. No rebuild.
+        #[arg(long, value_name = "FILE")]
+        flagfile: Option<String>,
+        /// Remove the environment's env.flags.yaml, leaving no extra engine
+        /// flags for any phase. Container backends only. No rebuild.
+        #[arg(long = "no-flagfile", conflicts_with = "flagfile")]
+        no_flagfile: bool,
         /// Replace the corporate CA bundle trusted by this environment (host
         /// path to a PEM/DER file). Re-validates the certificates and triggers a
         /// rebuild so the new CA is applied. Use after the corporate CA rotates.
@@ -547,7 +611,8 @@ what the corresponding flag set:
 Examples:
   mim start                       # serve the default environment's exposed set
   mim start --env myenv -p 9090:8080
-  mim start --mcp mymodule -p 9000:9000   # serve one module as MCP/HTTP")]
+  mim start --mcp mymodule -p 9000:9000   # serve one module as MCP/HTTP
+  mim start --flagfile alt.yaml -p 9090:8080   # a second instance under other flags")]
     Start {
         /// Environment to serve (default: the default environment)
         #[arg(long)]
@@ -596,8 +661,13 @@ Examples:
         env_file: Option<String>,
         /// One-shot engine flag, appended to env.flags.yaml `start.<engine>`
         /// for this invocation only (repeatable; not persisted)
-        #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true)]
+        #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true, value_parser = engine_arg_value)]
         engine_arg: Vec<String>,
+        /// Use this flag file instead of the environment's env.flags.yaml for
+        /// this invocation only (the persisted file is not changed). Same
+        /// schema; -x flags are appended after it.
+        #[arg(long, value_name = "FILE")]
+        flagfile: Option<String>,
         /// Replace an already-running serve container
         #[arg(long)]
         force: bool,
@@ -710,8 +780,13 @@ Sugar for: mim run -- morloc make --install <file>
         env: Option<String>,
         /// One-shot engine flag, appended to env.flags.yaml `run.<engine>`
         /// for this invocation only (repeatable; not persisted)
-        #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true)]
+        #[arg(short = 'x', long = "engine-arg", allow_hyphen_values = true, value_parser = engine_arg_value)]
         engine_arg: Vec<String>,
+        /// Use this flag file instead of the environment's env.flags.yaml for
+        /// this invocation only (the persisted file is not changed). Same
+        /// schema; -x flags are appended after it.
+        #[arg(long, value_name = "FILE")]
+        flagfile: Option<String>,
     },
     /// Fetch curated example programs (the morloc-dungeon) for a morloc version
     #[command(display_order = 10)]
@@ -1088,6 +1163,7 @@ fn exec_in_env(
     env_vars: Vec<String>,
     env_file: Option<String>,
     engine_arg: Vec<String>,
+    flagfile: Option<String>,
     shell: bool,
     args: Vec<String>,
     slurm_bridge: bool,
@@ -1109,6 +1185,7 @@ fn exec_in_env(
             args,
             user_env,
             engine_args: engine_arg,
+            flagfile,
             phase: Phase::Run,
             slurm_bridge,
         },
@@ -1381,14 +1458,23 @@ fn check_podman_additional_stores(engine: ContainerEngine) -> bool {
 // Dispatch
 // ======================================================================
 
-/// The ` [version]` / ` [dev, stdlib X]` suffix a listing shows after an env
-/// name, marking dev envs and their stdlib base.
+/// The bracketed marks after a listed env's name: its version (or dev status),
+/// plus its architecture when the image is not native to this machine, since
+/// that is the one case where running it means emulation.
 fn env_version_marker(e: &environment::EnvInfo) -> String {
-    match &e.morloc_version {
-        Some(v) if e.is_dev => format!(" [dev, stdlib {}]", v.show()),
-        Some(v) => format!(" [{}]", v.show()),
-        None if e.is_dev => " [dev]".to_string(),
-        None => String::new(),
+    let mut marks: Vec<String> = match &e.morloc_version {
+        Some(v) if e.is_dev => vec!["dev".to_string(), format!("stdlib {}", v.show())],
+        Some(v) => vec![v.show()],
+        None if e.is_dev => vec!["dev".to_string()],
+        None => Vec::new(),
+    };
+    if let Some(a) = e.arch.filter(|a| a.is_foreign_to_host()) {
+        marks.push(a.to_string());
+    }
+    if marks.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", marks.join(", "))
     }
 }
 
@@ -1411,13 +1497,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             shm_size,
             cert_bundle,
             base,
+            arch,
             system,
             set_default,
             no_init,
             wizard,
+            flagfile,
+            engine_arg,
             non_interactive: _,
         } => {
             if system { check_system_write_access()?; }
+            // A named flag file is validated before anything is built or
+            // written, so a schema error costs nothing.
+            if let Some(f) = &flagfile {
+                cfg::read_flag_file(std::path::Path::new(f))?;
+            }
             // Validate the SHM size before anything is touched; the engine check
             // waits until the backend is known.
             let shm_size = shm_size
@@ -1486,10 +1580,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     // A dev plan is always container + local (enforced in the session).
                     let Backend::Container(eng) = plan.backend else { unreachable!() };
                     return container_new_dev(
-                        plan.scope, eng, Some(plan.name), src, plan.lang, plan.system_packages,
-                        plan.conda_packages, plan.dotfiles, plan.mount_home, shm_size, plan.cert_bundle,
+                        plan.scope, arch::ContainerTarget::new(eng, arch)?, Some(plan.name), src,
+                        plan.lang, plan.system_packages, plan.conda_packages, plan.dotfiles,
+                        plan.mount_home, shm_size, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
                         plan.requested_version, no_init, plan.make_default, &snapshots,
+                        flagfile.as_deref(), &engine_arg,
                     );
                 }
                 return match plan.backend {
@@ -1497,11 +1593,20 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         if base.is_some() {
                             return Err(base_not_supported());
                         }
+                        if arch.is_some() {
+                            return Err(arch::arch_not_supported());
+                        }
                         if plan.mount_home.is_some() {
                             return Err(mount_home_not_supported());
                         }
                         if shm_size.is_some() {
                             return Err(shm_size_not_supported());
+                        }
+                        if !engine_arg.is_empty() {
+                            return Err(engine_arg_not_supported());
+                        }
+                        if flagfile.is_some() {
+                            return Err(flagfile_not_supported());
                         }
                         native_new(
                             plan.scope, Some(plan.name), plan.lang, plan.conda_packages,
@@ -1510,10 +1615,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         )
                     }
                     Backend::Container(eng) => container_new_derived(
-                        plan.scope, eng, Some(plan.name), plan.lang, plan.system_packages,
-                        plan.conda_packages, plan.dotfiles, plan.mount_home, shm_size, plan.cert_bundle,
+                        plan.scope, arch::ContainerTarget::new(eng, arch)?, Some(plan.name),
+                        plan.lang, plan.system_packages, plan.conda_packages, plan.dotfiles,
+                        plan.mount_home, shm_size, plan.cert_bundle,
                         base.unwrap_or_default().image().to_string(),
                         plan.requested_version, None, no_init, plan.make_default, &snapshots,
+                        flagfile.as_deref(), &engine_arg,
                     ),
                 };
             }
@@ -1594,6 +1701,15 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if base.is_some() {
                     return Err(base_not_supported());
                 }
+                if arch.is_some() {
+                    return Err(arch::arch_not_supported());
+                }
+                if !engine_arg.is_empty() {
+                    return Err(engine_arg_not_supported());
+                }
+                if flagfile.is_some() {
+                    return Err(flagfile_not_supported());
+                }
                 return native_new(scope, name, lang, conda_package, morloc_version, local_runtime, cert_bundle, no_init, set_default, verbose, &snapshots);
             }
 
@@ -1656,11 +1772,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // packages) is shared.
             // The chosen container base image (default heavy/ubuntu).
             let base_image = base.unwrap_or_default().image().to_string();
+            let target = arch::ContainerTarget::new(resolved_engine, arch)?;
             if let Some(src) = dev {
                 return container_new_dev(
-                    scope, resolved_engine, name, src, lang, system_package, conda_package,
+                    scope, target, name, src, lang, system_package, conda_package,
                     dotfiles, mount_home, shm_size, cert_bundle, base_image, morloc_version,
-                    no_init, set_default, &snapshots,
+                    no_init, set_default, &snapshots, flagfile.as_deref(), &engine_arg,
                 );
             }
 
@@ -1668,23 +1785,23 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // built from a generated Dockerfile that runs pixi inside, sharing the
             // native backend's lowering. There is no pull/recipe/base-image path.
             container_new_derived(
-                scope, resolved_engine, name, lang, system_package, conda_package, dotfiles,
+                scope, target, name, lang, system_package, conda_package, dotfiles,
                 mount_home, shm_size, cert_bundle, base_image, morloc_version, local_runtime,
-                no_init, set_default, &snapshots,
+                no_init, set_default, &snapshots, flagfile.as_deref(), &engine_arg,
             )
         }
 
         // ---- run ----
-        Cmd::Run { command, env, env_vars, env_file, engine_arg, slurm_bridge } => {
+        Cmd::Run { command, env, env_vars, env_file, engine_arg, flagfile, slurm_bridge } => {
             if command.is_empty() {
                 return Err(ManagerError::NoCommand);
             }
-            exec_in_env(verbose, env, env_vars, env_file, engine_arg, false, command, slurm_bridge)
+            exec_in_env(verbose, env, env_vars, env_file, engine_arg, flagfile, false, command, slurm_bridge)
         }
 
         // ---- shell ----
-        Cmd::Shell { env, env_vars, env_file, engine_arg } => {
-            exec_in_env(verbose, env, env_vars, env_file, engine_arg, true, Vec::new(), false)
+        Cmd::Shell { env, env_vars, env_file, engine_arg, flagfile } => {
+            exec_in_env(verbose, env, env_vars, env_file, engine_arg, flagfile, true, Vec::new(), false)
         }
 
         // ---- rm ----
@@ -1983,6 +2100,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     .as_deref() == Some(env_name.as_str());
 
                 let engine = ec.backend.container_engine();
+                let info_arch = ec.oci_arch().ok().flatten();
                 let is_oci = matches!(engine, Some(e) if e.is_oci());
                 let scope_str = match scope { Scope::Local => "local", Scope::System => "system" };
                 // Folders (host paths). Natively the runtime shares the data dir;
@@ -2122,6 +2240,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         is_default: bool,
                         backend: String,
                         #[serde(skip_serializing_if = "Option::is_none")]
+                        arch: Option<arch::Arch>,
+                        #[serde(skip_serializing_if = "Option::is_none")]
                         morloc_version: Option<Version>,
                         #[serde(skip_serializing_if = "Option::is_none")]
                         dev: Option<DevInfo>,
@@ -2167,6 +2287,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         scope: scope_str.to_string(),
                         is_default,
                         backend: ec.backend.label().to_string(),
+                        arch: info_arch,
                         morloc_version: ec.morloc_version.clone(),
                         dev: ec.dev.as_ref().map(|d| DevInfo {
                             source: d.source.clone(),
@@ -2211,6 +2332,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     println!("Scope:     {scope_str}");
                     println!("Default:   {}", if is_default { "yes" } else { "no" });
                     println!("Backend:   {}", ec.backend.label());
+                    if let Some(a) = info_arch {
+                        let how = if a.is_foreign_to_host() { "emulated on this host" } else { "native" };
+                        println!("Arch:      {a}  ({how})");
+                    }
                     if let Some(ref dev) = ec.dev {
                         // A dev env: the version below is the stdlib base; the compiler
                         // is built by the developer from the mounted source.
@@ -2362,6 +2487,28 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         // Native environments have no container section.
                         None => {}
                     }
+                    // The engine flag file, and what it materializes to for this
+                    // engine, so a flag applied to every launch is visible here
+                    // and not only in the engine's own output.
+                    if let Some(e) = engine {
+                        let path = cfg::env_flags_yaml_path(scope, &env_name);
+                        if path.is_file() {
+                            println!("  Flags:        {}", path.display());
+                            let fc = cfg::read_flag_config(scope, &env_name).unwrap_or_default();
+                            for (label, phase) in [
+                                ("build", Phase::Build),
+                                ("run", Phase::Run),
+                                ("start", Phase::Start),
+                            ] {
+                                let flags = fc.materialize(phase, e);
+                                if !flags.is_empty() {
+                                    println!("    {label:<6}      {}", flags.join(" "));
+                                }
+                            }
+                        } else {
+                            println!("  Flags:        none (`mim modify --flagfile <file>` to add)");
+                        }
+                    }
                 }
             } else {
                 // Overview
@@ -2477,8 +2624,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         // ---- update ----
         // Rebuild an environment, optionally moving its morloc version. Settings
         // changes (packages/dotfiles/default) are `modify`, not `update`.
-        Cmd::Update { env, morloc_version, latest, force, ignore_module_compat } => {
+        Cmd::Update { env, morloc_version, latest, reinit, ignore_module_compat, engine_arg } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
+            if !engine_arg.is_empty() && ec.backend.is_native() {
+                return Err(engine_arg_not_supported());
+            }
             if env_scope == Scope::System {
                 check_system_write_access()?;
             }
@@ -2514,13 +2664,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 gate_module_compat(env_scope, &env_name, &requested, ignore_module_compat)?
                     .or(requested);
 
-            // --force repairs a stale/half-built env: drop the success marker so
-            // materialization always re-solves and rebuilds rather than skipping.
-            if force {
+            // --reinit repairs a stale/half-built env: everything derived from the
+            // inputs goes, so materialization solves and builds it all again. A
+            // one-shot build flag is a request for a build, not for whatever the
+            // marker says about the last one.
+            if reinit {
+                reset_for_reinit(env_scope, &env_name, &ec)?;
+            } else if !engine_arg.is_empty() {
                 clear_materialized_marker(env_scope, &env_name, &ec);
             }
 
-            rematerialize_env(env_scope, &env_name, &[], requested, verbose)?;
+            rematerialize_env(env_scope, &env_name, &[], requested, &engine_arg, verbose)?;
             report_rematerialized(ec.backend.is_native(), &env_name);
             // Surface a broken conda extra (unresolved shared libs) LOUDLY now,
             // rather than leaving it to be discovered by running the tool.
@@ -2532,6 +2686,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         // Change an environment's settings without moving its morloc version.
         Cmd::Modify {
             env,
+            env_name: new_name,
             lang,
             no_lang,
             system_packages_file,
@@ -2546,6 +2701,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             no_mount_home,
             shm_size,
             no_shm_size,
+            flagfile,
+            no_flagfile,
             cert_bundle,
             no_cert_bundle,
             base,
@@ -2582,6 +2739,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 (None, true) => Some(Vec::new()),
                 (None, false) => None,
             };
+            // The flag file is validated up front for the same reason; it is
+            // copied, not re-rendered, so the read is a check.
+            if let Some(f) = &flagfile {
+                cfg::read_flag_file(std::path::Path::new(f))?;
+            }
+            let touches_flags = flagfile.is_some() || no_flagfile;
             // Module-pin snapshots are deposited (not solved / not a rebuild);
             // read them up front so a bad path aborts before any side effect.
             let module_snapshots = read_snapshot_files(&modules_file)?;
@@ -2598,7 +2761,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 || cert_bundle.is_some()
                 || no_cert_bundle
                 || base.is_some();
-            if !set_default
+            if new_name.is_none()
+                && !set_default
                 && !unset_default
                 && !will_rebuild
                 && dotfiles.is_none()
@@ -2606,13 +2770,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 && mount_home.is_none()
                 && !no_mount_home
                 && shm_size_change.is_none()
+                && !touches_flags
                 && module_snapshots.is_empty()
                 && no_modules_file.is_empty()
             {
                 return Err(ManagerError::EnvError(
-                    "nothing to modify: pass --set-default, --unset-default, --dotfiles, \
-                     --mount-home, --shm-size, --lang, --cert-bundle, --base, \
-                     --system-packages-file, --conda-packages-file, or --modules-file \
+                    "nothing to modify: pass --env-name, --set-default, --unset-default, \
+                     --dotfiles, --mount-home, --shm-size, --flagfile, --lang, --cert-bundle, \
+                     --base, --system-packages-file, --conda-packages-file, or --modules-file \
                      (each of which has a --no-<flag> form that clears it)".to_string(),
                 ));
             }
@@ -2621,6 +2786,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
 
             // ---- Validation that needs the resolved env, done BEFORE any side
             //      effect so an invalid request never leaves partial changes. ----
+            // A rename moves the directories a live serve is running out of and
+            // retires the container name it was launched under.
+            if let Some(new) = &new_name {
+                environment::validate_rename(env_scope, &env_name, new, &ec)?;
+                if env_serve_alive(env_scope, &env_name, &ec) {
+                    return Err(ManagerError::EnvError(format!(
+                        "environment '{env_name}' is being served; stop it first with \
+                         'mim stop --env {env_name}', then rename it."
+                    )));
+                }
+            }
             // Only apt packages are container-only; conda packages land in the
             // pixi solve, which the native backend has too.
             if touches_apt && ec.backend.is_native() {
@@ -2663,15 +2839,20 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     Some(None)
                 }
                 None => None,
+                // Checked against the data directory the env will have once a
+                // rename in the same command has run.
                 Some(raw) => Some(Some(resolve_mount_home(
                     raw,
                     ec.backend.container_engine(),
                     env_scope,
-                    &cfg::env_data_dir(env_scope, &env_name),
+                    &cfg::env_data_dir(env_scope, new_name.as_deref().unwrap_or(&env_name)),
                 )?)),
             };
             if shm_size_change.is_some() && !ec.backend.container_engine().is_some_and(|e| e.is_oci()) {
                 return Err(shm_size_not_supported());
+            }
+            if touches_flags && ec.backend.is_native() {
+                return Err(flagfile_not_supported());
             }
             // A dotfiles copy into a mounted host home would overwrite the user's
             // own files there (their real ~/.bashrc, if they mounted a real home),
@@ -2733,6 +2914,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     &format!("It already uses the default ({}).", types::DEFAULT_SHM_SIZE),
                 );
             }
+            if no_flagfile && !cfg::env_flags_yaml_path(env_scope, &env_name).is_file() {
+                return nothing_to_remove(
+                    "engine flag file",
+                    "Its engine runs with no extra flags already.",
+                );
+            }
             // Clearing a default only ever clears THIS environment's: refuse when
             // the recorded default names someone else, rather than silently
             // dropping a default the user did not mean to touch.
@@ -2765,11 +2952,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // personal (local) set-default does not, and is handled in its own
             // block below.
             if env_scope == Scope::System
-                && (will_rebuild
+                && (new_name.is_some()
+                    || will_rebuild
                     || dotfiles.is_some()
                     || no_dotfiles
                     || mount_home_change.is_some()
                     || shm_size_change.is_some()
+                    || touches_flags
                     || !no_modules_file.is_empty())
             {
                 check_system_write_access()?;
@@ -2799,6 +2988,23 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             };
 
             // ---- Side effects (all inputs validated) ----
+            // 0. rename: runs first so every later step, and every message,
+            //    addresses the environment by its new name. Whatever the
+            //    validation above materialized into the env directories (the
+            //    certificates) moves with them.
+            let env_name = match &new_name {
+                Some(new) => {
+                    ec = environment::rename_environment(env_scope, &env_name, new, &ec)?;
+                    match environment::effective_default_env_name() {
+                        Some(d) if d == *new => {
+                            eprintln!("Renamed environment '{env_name}' to '{new}' (still the default).")
+                        }
+                        _ => eprintln!("Renamed environment '{env_name}' to '{new}'."),
+                    }
+                    new.clone()
+                }
+                None => env_name,
+            };
             // 1. set-default / unset-default (pure metadata, no rebuild): personal
             //    (local) by default, machine-wide with --system (root).
             if set_default {
@@ -2883,6 +3089,25 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 );
             }
 
+            // 2a''. engine flag file: replaced whole or removed; read at the next
+            //       launch (`run`/`start` phases) or the next image build (`build`,
+            //       which the cache key notices), so no rebuild here.
+            if let Some(f) = &flagfile {
+                install_env_flagfile(env_scope, &env_name, Some(f))?;
+                let has_build = !cfg::read_flag_config(env_scope, &env_name)?
+                    .materialize(Phase::Build, ec.engine()?)
+                    .is_empty();
+                if has_build {
+                    eprintln!(
+                        "Its build flags apply at the next image build: `mim update --env {env_name}`."
+                    );
+                }
+            }
+            if no_flagfile {
+                cfg::remove_flag_config(env_scope, &env_name)?;
+                eprintln!("Removed the engine flag file of '{env_name}'.");
+            }
+
             // 2b. module-pin snapshots: deposit for on-demand resolution; no
             //     rebuild, no install (the compiler pulls modules at build time).
             //     Removals run FIRST so re-depositing a file under a name being
@@ -2927,6 +3152,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 // failed rebuild restores them exactly -- like the cert snapshot.
                 let req_snapshot = envstore::EnvContext::new(&cfg::env_data_dir(env_scope, &env_name))
                     .snapshot_requirements();
+                // The manifest and lock too: a failed rebuild has already re-solved
+                // them for the new config, and the make-time agent solves whatever
+                // lock it finds against the rolled-back store. Restoring the pair
+                // makes the next `pixi install --locked` return the prefix to the
+                // world the store describes.
+                let pixi_snapshot =
+                    snapshot_pixi_files(&cfg::env_data_dir(env_scope, &env_name).join("pixi"));
 
                 // Each file is the env's whole list for its source; edit and
                 // re-apply to change it.
@@ -2972,7 +3204,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 }
 
                 // Rebuild at the CURRENT morloc version; `modify` never moves it.
-                match rematerialize_env(env_scope, &env_name, &[], Some(keep), verbose) {
+                match rematerialize_env(env_scope, &env_name, &[], Some(keep), &[], verbose) {
                     Ok(()) => {
                         report_rematerialized(ec.backend.is_native(), &env_name);
                         // `modify --conda-packages` is the usual way a broken extra
@@ -2988,6 +3220,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         // toolchain.json/extras.json.
                         let _ = cfg::write_env_config(env_scope, &env_name, &prev_ec);
                         let _ = cfg::write_env_inputs(env_scope, &env_name, &prev_inputs);
+                        restore_pixi_files(&pixi_snapshot);
                         let _ = envstore::EnvContext::new(&cfg::env_data_dir(env_scope, &env_name))
                             .restore_requirements(&req_snapshot);
                         if let Some(snap) = &cert_snapshot {
@@ -3034,6 +3267,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 )));
             }
             let engine = ec.engine()?;
+            freeze::check_engine(engine)?;
             // Detect the version from the container binary for sanity check.
             // The morloc binary can't report prerelease tags (stack limitation),
             // so if major.minor.patch match, keep the recorded version which has
@@ -3066,9 +3300,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 base_image: &ec.base_image,
                 system_packages: &ec.system_packages,
             });
+            let build_flags =
+                cfg::read_flag_config(env_scope, &env_name)?.materialize(Phase::Build, engine);
+            let platform = ec.oci_arch()?;
             let result = freeze::freeze_environment(
                 env_scope, &env_name, ver.clone(), engine, &image,
-                &data_dir.to_string_lossy(), &tag, save.as_deref(), slim_base, force, verbose,
+                &data_dir.to_string_lossy(), &tag, save.as_deref(), slim_base, &build_flags,
+                &ec.shm_size, platform, force, verbose,
             );
             if result.is_ok() && ec.morloc_version.as_ref() != Some(&ver) {
                 let mut updated = ec.clone();
@@ -3079,7 +3317,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         }
 
         // ---- start ----
-        Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, eval_allow_no_auth, port, env_vars, env_file, engine_arg, force } => {
+        Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, eval_allow_no_auth, port, env_vars, env_file, engine_arg, flagfile, force } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
             if ec.is_dev() {
                 return Err(ManagerError::EnvError(format!(
@@ -3150,7 +3388,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let req = ServeRequest {
                 spec, host_port, container_port, user_env,
                 expose, allow_plaintext, allow_no_auth, unsafe_serve,
-                eval_allow_no_auth, engine_args: engine_arg, token, verbose,
+                eval_allow_no_auth, engine_args: engine_arg, flagfile, token, verbose,
             };
             let env = runner::ResolvedEnv { name: env_name.clone(), scope: env_scope, ec };
             let ServeOutcome { handle, url_host, token: eff_token } =
@@ -3309,7 +3547,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         }
 
         // ---- install ----
-        Cmd::Install { src, env, engine_arg } => {
+        Cmd::Install { src, env, engine_arg, flagfile } => {
             // Resolve the target environment up front so the program's declared
             // dependencies can be provisioned into it BEFORE it is built.
             let (env_name, scope, ec) = resolve_env_or_default(env)?;
@@ -3330,6 +3568,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 (env_name.clone(), scope, ec.clone()),
                 &envspec_target,
                 engine_arg.clone(),
+                flagfile.clone(),
                 verbose,
             )?;
 
@@ -3348,7 +3587,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    envspec.json, which gather_env_specs picks up from then on.
             //    Keep the env's current morloc version -- installing a module must
             //    never bump the toolchain out from under it.
-            rematerialize_env(scope, &env_name, &[dry], current_version_tag(&ec), verbose)?;
+            rematerialize_env(scope, &env_name, &[dry], current_version_tag(&ec), &[], verbose)?;
 
             // Timestamp just before the build so the program(s) built this run can
             // be identified by their freshly-(re)written manifest mtime -- robust to
@@ -3384,6 +3623,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     args,
                     user_env: Vec::new(),
                     engine_args: engine_arg,
+                    flagfile,
                     phase: Phase::Run,
                     slurm_bridge: false,
                 },
@@ -3437,7 +3677,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     // supersedes any `morloc make` of it, whatever it declared.
                     let _ = store.remove_named(&key, envstore::Provenance::Scratch);
                 }
-                rematerialize_env(scope, &env_name, &[], current_version_tag(&ec), verbose)?;
+                rematerialize_env(scope, &env_name, &[], current_version_tag(&ec), &[], verbose)?;
             }
             Ok(())
         }
@@ -3747,10 +3987,10 @@ pub(crate) fn native_run_env(
     // Container-only inputs have no meaning on the host; reject rather than
     // silently drop them.
     if !req.engine_args.is_empty() {
-        return Err(ManagerError::EnvError(
-            "--engine-arg / -x is a container-only option; the native backend has no \
-             container engine to pass flags to".to_string(),
-        ));
+        return Err(engine_arg_not_supported());
+    }
+    if req.flagfile.is_some() {
+        return Err(flagfile_not_supported());
     }
     if req.slurm_bridge {
         return Err(ManagerError::EnvError(
@@ -3870,7 +4110,7 @@ fn resolve_release_tag() -> String {
 /// compiler natively (NixOS/musl) -- no manual file shuttling required.
 fn load_lang_support(
     runtime_dir: &std::path::Path,
-    engine: Option<ContainerEngine>,
+    container: Option<arch::ContainerTarget>,
     base_image: &str,
 ) -> Result<langsupport::LangSupport> {
     if let Ok(path) = std::env::var("MORLOC_LANG_SUPPORT") {
@@ -3892,7 +4132,7 @@ fn load_lang_support(
     // compiler at build time) and cache it next to the runtime so later runs skip
     // regeneration.
     let morloc_bin = provision::runtime_morloc_bin(runtime_dir);
-    let json = emit_lang_support(&morloc_bin, engine, base_image)?;
+    let json = emit_lang_support(&morloc_bin, container, base_image)?;
     let _ = std::fs::write(&table, &json);
     langsupport::LangSupport::from_json(&json).map_err(Into::into)
 }
@@ -3902,10 +4142,12 @@ fn load_lang_support(
 /// there and a container engine is available, runs the SAME compiler inside the
 /// engine's base image -- where it is guaranteed to run, being the binary baked
 /// into the image being built. This is what makes `--engine podman` dev builds
-/// work on hosts that cannot run the glibc compiler, with no manual step.
+/// work on hosts that cannot run the glibc compiler, with no manual step, and
+/// what runs a foreign-architecture compiler at all (the container is started
+/// at the image's platform, so the binary executes under the engine's emulation).
 fn emit_lang_support(
     morloc_bin: &std::path::Path,
-    engine: Option<ContainerEngine>,
+    container: Option<arch::ContainerTarget>,
     base_image: &str,
 ) -> Result<String> {
     if let Ok(out) = Command::new(morloc_bin).arg("lang-support").output() {
@@ -3913,8 +4155,8 @@ fn emit_lang_support(
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
         }
     }
-    if let Some(engine) = engine {
-        return emit_lang_support_in_container(morloc_bin, engine, base_image);
+    if let Some(target) = container {
+        return emit_lang_support_in_container(morloc_bin, target, base_image);
     }
     Err(ManagerError::EnvError(
         "could not obtain the language-support table: the provisioned compiler could \
@@ -3931,9 +4173,10 @@ fn emit_lang_support(
 /// into the slim base first; its directory is mounted read-only.
 fn emit_lang_support_in_container(
     morloc_bin: &std::path::Path,
-    engine: ContainerEngine,
+    target: arch::ContainerTarget,
     base_image: &str,
 ) -> Result<String> {
+    let engine = target.engine;
     if matches!(engine, ContainerEngine::Apptainer) {
         return Err(ManagerError::EnvError(
             "cannot generate the language-support table under apptainer; set \
@@ -3953,7 +4196,6 @@ fn emit_lang_support_in_container(
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| ManagerError::EnvError(format!("{} has no file name", real.display())))?;
-    let mount = format!("{}:/morloc-src:ro", dir.display());
     // Best-effort apt (still works if the base already has the libs), then exec
     // the compiler so ONLY its lang-support JSON reaches stdout.
     // The GHC-linked compiler needs libgmp + libz, and commonly libffi, at
@@ -3968,20 +4210,19 @@ fn emit_lang_support_in_container(
         "Generating the language-support table in a {} container...",
         engine.name()
     );
-    let out = Command::new(crate::container::engine_executable(engine))
-        .args([
-            "run", "--rm", "-v", mount.as_str(), base_image, "sh", "-c",
-            script.as_str(),
-        ])
-        .output()
-        .map_err(|e| ManagerError::EnvError(format!("failed to run {}: {e}", engine.name())))?;
-    if !out.status.success() {
+    let cfg = container::RunConfig {
+        bind_mounts: vec![(dir.display().to_string(), "/morloc-src:ro".to_string())],
+        command: Some(vec!["sh".to_string(), "-c".to_string(), script]),
+        platform: target.platform(),
+        ..container::RunConfig::new(base_image)
+    };
+    let (status, stdout, stderr) = container::container_run_quiet(engine, &cfg);
+    if !status.success() {
         return Err(ManagerError::EnvError(format!(
-            "generating the language-support table in a container failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
+            "generating the language-support table in a container failed:\n{stderr}"
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(stdout)
 }
 
 /// Run `morloc init` on the host to build the environment's language shims into
@@ -4151,7 +4392,7 @@ fn lang_installs_key_fragment(langs: &[(String, String)]) -> String {
 /// container: render + lock + build an image). The requirement set is the
 /// backend-neutral IR; the pixi manifest is rendered from it at the point of use.
 struct ResolvedRequirements {
-    /// The downloaded runtime store (`runtimes/<version>/`); its `rust/` subdir
+    /// The downloaded runtime store (`runtimes/<version>/<triple>/`); its `rust/` subdir
     /// is `morloc init`'s MORLOC_RUST_DIR.
     runtime_dir: std::path::PathBuf,
     /// The concrete morloc version provisioned.
@@ -4185,7 +4426,7 @@ fn resolve_env_requirements(
     program_specs: &[envspec::EnvSpec],
     lang_pins: &[(String, Option<String>)],
     conda_packages: &[String],
-    engine: Option<ContainerEngine>,
+    container: Option<arch::ContainerTarget>,
     requested_version: Option<&str>,
     local_runtime: Option<&std::path::Path>,
     base_image: &str,
@@ -4205,7 +4446,7 @@ fn resolve_env_requirements(
         // whose binary the host cannot exec (NixOS/musl) -- inside the engine's base
         // image, so the version below must come from the table it produces rather
         // than a separate host-only `--version` probe.
-        let json = emit_lang_support(&morloc_bin, engine, base_image)?;
+        let json = emit_lang_support(&morloc_bin, container, base_image)?;
         let support = langsupport::LangSupport::from_json(&json)?;
         let version = local_version_tag(&support.morloc_version, &morloc_bin)?;
         (local.to_path_buf(), version, morloc_bin, support)
@@ -4216,11 +4457,11 @@ fn resolve_env_requirements(
             .map(|v| v.to_string())
             .unwrap_or_else(resolve_release_tag);
         // The runtime triple follows the BUILD target, not the host: a container
-        // backend builds and runs the compiler inside a Linux image (matching the
-        // host arch), so on a macOS host it needs the Linux runtime, not the
+        // backend builds and runs the compiler inside a Linux image of the env's
+        // architecture, so on a macOS host it needs the Linux runtime, not the
         // (possibly unpublished) macOS one. Native builds on the host itself.
-        let triple = match engine {
-            Some(_) => provision::release_triple("linux", std::env::consts::ARCH),
+        let triple = match container {
+            Some(t) => Some(t.arch.release_triple()),
             None => provision::host_release_triple(),
         }
         .ok_or_else(|| {
@@ -4232,22 +4473,24 @@ fn resolve_env_requirements(
         })?;
         let (runtime_dir, version) = provision::provision_runtime(scope, &tag, triple)?;
         let morloc_bin = provision::runtime_morloc_bin(&runtime_dir);
-        // `engine` lets the table be generated in a container when the host cannot
-        // run the compiler (native passes None; it runs on the host by definition).
-        let support = load_lang_support(&runtime_dir, engine, base_image)?;
+        // `container` lets the table be generated in a container when the host
+        // cannot run the compiler (native passes None; it runs on the host by
+        // definition).
+        let support = load_lang_support(&runtime_dir, container, base_image)?;
         (runtime_dir, version, morloc_bin, support)
     };
 
     // Script-provisioned languages (futhark) install via a container script, not
     // conda; reject them on non-OCI backends before the (doomed) solve/build.
     let lang_installs = script_provisioned_langs(lang_pins, &support);
-    reject_script_langs_off_oci(&lang_installs, engine)?;
+    reject_script_langs_off_oci(&lang_installs, container.map(|t| t.engine))?;
 
-    // A container build solves for the container's LINUX platform (the host may be
-    // macOS, whose osx-* platform the in-container `pixi install` would reject);
-    // native runs on the host, so it uses the host platform.
-    let platform = match engine {
-        Some(_) => container_conda_platform(),
+    // A container build solves for the container's LINUX platform at the env's
+    // architecture (the host may be macOS, whose osx-* platform the in-container
+    // `pixi install` would reject, or a different CPU); native runs on the host,
+    // so it uses the host platform.
+    let platform = match container {
+        Some(t) => t.arch.conda_platform(),
         None => hostprobe::probe_host().platform,
     };
     let (specs, lang_spec, requirements) =
@@ -4263,6 +4506,57 @@ fn resolve_env_requirements(
         lang_installs,
         support,
     })
+}
+
+/// After a host-side solve of `pixi_dir`: the requirement set rebuilt with every
+/// shim interpreter the solve pulled in that no spec declares (see
+/// `abi::undeclared_shim_runtimes`) declared as a language, or `None` when the
+/// solve pulled none. The caller re-renders and re-solves with the result, so the
+/// interpreter lands inside morloc's supported window with the binder
+/// dependencies `morloc init` needs to build its binding. Without this, a conda
+/// extra that depends on python gives the prefix whatever python conda likes
+/// best -- possibly one morloc cannot build against -- and a binding built for
+/// it is stale the moment a program declaring python solves.
+fn adopt_pulled_runtimes(
+    pixi_dir: &std::path::Path,
+    platform: &str,
+    version: &str,
+    support: &langsupport::LangSupport,
+    specs: &[envspec::EnvSpec],
+    program_specs: &[envspec::EnvSpec],
+    lang_pins: &[(String, Option<String>)],
+    conda_packages: &[String],
+) -> Result<Option<(Vec<envspec::EnvSpec>, Option<envspec::EnvSpec>, pixi::RequirementSet)>> {
+    let locked = pixi::locked_packages(pixi_dir, platform)?;
+    let pulled = morloc_deps::abi::undeclared_shim_runtimes(&locked, specs, support);
+    if pulled.is_empty() {
+        return Ok(None);
+    }
+    eprintln!("{}", envstore::adoption_note(&pulled));
+    let mut with_pulled = program_specs.to_vec();
+    with_pulled.push(envstore::adopted_language_spec(&pulled, version));
+    build_env_requirements(version, platform, &with_pulled, lang_pins, conda_packages, support)
+        .map(Some)
+}
+
+/// Refuse to call a rebuild done while a binding under the runtime `home` does
+/// not match an interpreter the prefix holds. `morloc init` skips a language it
+/// cannot find inside the prefix with a warning and builds the rest, so a
+/// materialize can succeed and still leave a python program to fail at start-up
+/// with "No module named pymorloc"; this turns that into the rebuild's failure,
+/// with the init output above it saying why.
+fn check_runtime_bindings(name: &str, home: &std::path::Path, pixi_dir: &std::path::Path) -> Result<()> {
+    let defects = morloc_deps::abi::shim_defects(home, &morloc_deps::abi::meta_dir(pixi_dir));
+    if defects.is_empty() {
+        return Ok(());
+    }
+    Err(ManagerError::EnvError(format!(
+        "environment '{name}' was rebuilt, but its morloc language bindings do not match \
+         the interpreters it holds:\n  {}\nThe `morloc init` output above says what \
+         happened to the build. The runtime is at {}.",
+        defects.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("\n  "),
+        home.display()
+    )))
 }
 
 /// Fold the user's `--lang` pins into the program specs and solve the pixi
@@ -4324,7 +4618,7 @@ fn materialize_native_env(
     // Native runs on the host, so the compiler executes there -- no engine needed.
     // Native: the compiler runs on the host, so the base image is unused (it only
     // matters for the container lang-support fallback, which native never hits).
-    let req = resolve_env_requirements(
+    let mut req = resolve_env_requirements(
         scope, program_specs, lang_pins, conda_packages, None, requested_version, local_runtime, CONTAINER_BASE_IMAGE,
     )?;
 
@@ -4397,6 +4691,16 @@ fn materialize_native_env(
     let ssl_cert = cert::host_bundle_if_present(scope, name);
     eprintln!("Solving native toolchain with pixi (this may take a few minutes)...");
     pixi::solve(&pixi_dir, &pixi_bin, ssl_cert.as_deref(), fhs)?;
+    if let Some((specs, lang_spec, requirements)) = adopt_pulled_runtimes(
+        &pixi_dir, &hostprobe::probe_host().platform, &req.version, &req.support, &req.specs,
+        program_specs, lang_pins, conda_packages,
+    )? {
+        req.specs = specs;
+        req.lang_spec = lang_spec;
+        req.requirements = requirements;
+        pixi::write_manifest(&pixi_dir, &pixi::render_manifest(&req.requirements))?;
+        pixi::solve(&pixi_dir, &pixi_bin, ssl_cert.as_deref(), fhs)?;
+    }
     // A filesystem that folds letter case (the macOS default) merges conda files
     // whose names differ only in case, leaving a header holding another header's
     // contents. Refuse the prefix before anything is compiled against it.
@@ -4423,6 +4727,7 @@ fn materialize_native_env(
         fhs_wrapper.as_ref().map(|p| p.to_string_lossy()).as_deref(),
         verbose,
     )?;
+    check_runtime_bindings(name, &env_dir, &pixi_dir)?;
 
     // Pin the interpreter minors the shims were just built against (see
     // record_abi_lock_or_warn). The env's pixi dir is the EnvContext default.
@@ -5284,6 +5589,84 @@ fn mount_home_not_supported() -> ManagerError {
 /// The single rejection for `--shm-size` on a non-OCI backend: only docker and
 /// podman give a container its own `/dev/shm`; apptainer shares the host's and
 /// the native backend runs on it directly, so there is no size to set.
+/// The flag configuration an invocation runs under: the file named with
+/// `--flagfile`, or the environment's own env.flags.yaml. A one-shot file
+/// replaces the persisted one whole for this invocation, the way `modify
+/// --flagfile` replaces it for good.
+fn flag_source(scope: Scope, name: &str, flagfile: Option<&str>) -> Result<FlagConfig> {
+    match flagfile {
+        Some(path) => cfg::read_flag_file(std::path::Path::new(path)),
+        None => cfg::read_flag_config(scope, name),
+    }
+}
+
+/// Install `flagfile`, if given, as the environment's env.flags.yaml.
+fn install_env_flagfile(scope: Scope, name: &str, flagfile: Option<&str>) -> Result<()> {
+    if let Some(f) = flagfile {
+        cfg::install_flag_file(
+            std::path::Path::new(f),
+            &cfg::env_flags_yaml_path(scope, name),
+        )?;
+        eprintln!("Installed {f} as the engine flag file of '{name}'.");
+    }
+    Ok(())
+}
+
+fn flagfile_not_supported() -> ManagerError {
+    ManagerError::EnvError(
+        "--flagfile is a container-only option; the native backend has no \
+         container engine to pass flags to"
+            .to_string(),
+    )
+}
+
+/// Parse one `-x` engine flag: any flag but `--platform`, which the environment's
+/// architecture owns (see `cfg::reject_platform_flag`). Rejecting at parse time
+/// covers every command that takes `-x` without each remembering to check.
+fn engine_arg_value(s: &str) -> std::result::Result<String, String> {
+    cfg::reject_platform_flag(std::slice::from_ref(&s.to_string()))
+        .map(|()| s.to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// A foreign-architecture image builds and runs under the engine's emulation;
+/// say so once, up front, since `morloc init` compiles the runtime in it.
+fn warn_if_emulated(arch: arch::Arch) {
+    if let Ok(host) = arch::Arch::host() {
+        if arch != host {
+            eprintln!(
+                "Note: building an image for {arch} on an {host} host; the build runs \
+                 under the engine's emulation (Rosetta or QEMU) and is much slower than \
+                 native."
+            );
+        }
+    }
+}
+
+/// The failure text for an image build, naming the emulation prerequisite when
+/// the image is foreign to the host: that is the one cause the engine reports
+/// only as an opaque `exec format error` from inside a RUN step.
+fn image_build_failure(arch: arch::Arch, what: &str) -> String {
+    if arch.is_foreign_to_host() {
+        format!(
+            "{what}. The image targets {arch}, which this host runs through emulation: \
+             if the output above shows `exec format error`, the engine has no emulator \
+             for {arch} registered (Docker Desktop provides one; on Linux install \
+             qemu-user-static and its binfmt registration)."
+        )
+    } else {
+        what.to_string()
+    }
+}
+
+fn engine_arg_not_supported() -> ManagerError {
+    ManagerError::EnvError(
+        "--engine-arg / -x is a container-only option; the native backend has no \
+         container engine to pass flags to"
+            .to_string(),
+    )
+}
+
 fn shm_size_not_supported() -> ManagerError {
     ManagerError::EnvError(
         "--shm-size applies only to docker/podman environments; apptainer shares \
@@ -5468,8 +5851,8 @@ fn local_version_tag(reported_version: &str, ctx: &std::path::Path) -> Result<St
 /// host, or the release binary downloaded for a foreign host; set `MORLOC_MIM_ENV`
 /// to a locally-built mim to test one. A dev env is a container, so the staged
 /// binary must match the container platform, not necessarily the host.
-fn stage_dev_agent(scope: Scope, name: &str) -> Result<()> {
-    let src = provision::mim_for_triple(scope, provision::container_release_triple()?)?;
+fn stage_dev_agent(scope: Scope, name: &str, arch: arch::Arch) -> Result<()> {
+    let src = provision::mim_for_triple(scope, arch.release_triple())?;
     let dest_dir = cfg::env_data_dir(scope, name).join(DEV_BIN_SUBDIR);
     std::fs::create_dir_all(&dest_dir).map_err(|e| {
         ManagerError::EnvError(format!("cannot create {}: {e}", dest_dir.display()))
@@ -6469,6 +6852,7 @@ fn capture_envspec(
     target: (String, Scope, EnvironmentConfig),
     envspec_target: &str,
     engine_args: Vec<String>,
+    flagfile: Option<String>,
     verbose: bool,
 ) -> Result<envspec::EnvSpec> {
     let json = capture_in_env(
@@ -6479,6 +6863,7 @@ fn capture_envspec(
             envspec_target.to_string(),
         ],
         engine_args,
+        flagfile,
         verbose,
     )?;
     envspec::EnvSpec::from_json(&json).map_err(Into::into)
@@ -6494,13 +6879,20 @@ fn capture_in_env(
     target: (String, Scope, EnvironmentConfig),
     args: Vec<String>,
     engine_args: Vec<String>,
+    flagfile: Option<String>,
     verbose: bool,
 ) -> Result<String> {
     let (name, scope, ec) = target;
     if ec.backend.is_native() {
+        if !engine_args.is_empty() {
+            return Err(engine_arg_not_supported());
+        }
+        if flagfile.is_some() {
+            return Err(flagfile_not_supported());
+        }
         native_capture_env(scope, &name, &args)
     } else {
-        container_capture_env(scope, &name, &ec, &args, &engine_args, verbose)
+        container_capture_env(scope, &name, &ec, &args, &engine_args, flagfile.as_deref(), verbose)
     }
 }
 
@@ -6552,6 +6944,7 @@ fn container_capture_env(
     ec: &EnvironmentConfig,
     args: &[String],
     engine_args: &[String],
+    flagfile: Option<&str>,
     verbose: bool,
 ) -> Result<String> {
     let engine = ec.engine()?;
@@ -6590,7 +6983,9 @@ fn container_capture_env(
     cfg.work_dir = Some(serve::CONTAINER_WORK.to_string());
     cfg.selinux_suffix = volume_suffix(detect_selinux()).to_string();
     cfg.shm_size = Some(ec.shm_size.clone());
-    cfg.extra_flags = engine_args.to_vec();
+    cfg.platform = ec.oci_arch()?;
+    cfg.extra_flags = flag_source(scope, name, flagfile)?.materialize(Phase::Run, engine);
+    cfg.extra_flags.extend(engine_args.iter().cloned());
 
     if verbose {
         eprintln!("[mim] capturing in {}: {}", engine.name(), args.join(" "));
@@ -6639,6 +7034,17 @@ fn system_packages_key_fragment(system_packages: &[String]) -> String {
         String::new()
     } else {
         format!("# system-packages: {}\n", system_packages.join(" "))
+    }
+}
+
+/// The persisted build-phase engine flags as a cache-key line, so an edited
+/// `build:` section rebuilds the image on the next update. Empty when there
+/// are none, so environments without a flag file keep their key.
+fn build_flags_key_fragment(build_flags: &[String]) -> String {
+    if build_flags.is_empty() {
+        String::new()
+    } else {
+        format!("# build-flags: {}\n", build_flags.join(" "))
     }
 }
 
@@ -6801,11 +7207,120 @@ fn materialized_marker(scope: Scope, name: &str, is_native: bool) -> std::path::
     }
 }
 
+/// The engine flags for one invocation: the environment's persisted
+/// `<phase>.all ++ <phase>.<engine>` from its flag file, then the one-shot
+/// `-x` flags, which come last so they win where the engine takes the last
+/// occurrence.
+fn with_one_shot(mut persisted: Vec<String>, one_shot: &[String]) -> Vec<String> {
+    persisted.extend(one_shot.iter().cloned());
+    persisted
+}
+
+/// The manifest and lock of a pixi project as they are now, `None` for one that
+/// is absent, keyed by path so `restore_pixi_files` can put both back exactly.
+fn snapshot_pixi_files(pixi_dir: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+    ["pixi.toml", "pixi.lock"]
+        .iter()
+        .map(|f| {
+            let path = pixi_dir.join(f);
+            let content = std::fs::read(&path).ok();
+            (path, content)
+        })
+        .collect()
+}
+
+/// Put back what `snapshot_pixi_files` captured, absence included. Best-effort:
+/// this runs on a rollback path, where the original error is the one to report.
+fn restore_pixi_files(snapshot: &[(std::path::PathBuf, Option<Vec<u8>>)]) {
+    for (path, content) in snapshot {
+        let _ = match content {
+            Some(bytes) => std::fs::write(path, bytes),
+            None => std::fs::remove_file(path).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }
+            }),
+        };
+    }
+}
+
 /// Delete the `materialized.toml` success marker so the next materialize is
 /// forced to re-solve + rebuild instead of taking the unchanged-manifest skip.
 /// Best-effort.
 fn clear_materialized_marker(scope: Scope, name: &str, ec: &EnvironmentConfig) {
     let _ = std::fs::remove_file(materialized_marker(scope, name, ec.backend.is_native()));
+}
+
+/// Discard everything an environment derived from its inputs, so the rebuild
+/// that follows produces it all again from what persists: the settings
+/// (`mim modify`), the installed programs and their dependencies, the pinned
+/// languages, and the deposited module pins. What goes: the scratch builds, the
+/// interpreter pins, the solve cache, the lock, the solved conda prefix, and
+/// the success marker. The language bindings go with the rebuild's own
+/// `morloc init -f`, which cleans what it owns before building.
+///
+/// Installed programs keep their launchers and manifests, which is what makes
+/// them persistent; a compiled pool built against the previous runtime is
+/// rebuilt by the next `morloc make`, as after any update.
+fn reset_for_reinit(scope: Scope, name: &str, ec: &EnvironmentConfig) -> Result<()> {
+    if env_serve_alive(scope, name, ec) {
+        return Err(ManagerError::EnvError(format!(
+            "environment '{name}' is being served; stop it first with \
+             'mim stop --env {name}', then rebuild it."
+        )));
+    }
+    let data_dir = cfg::env_data_dir(scope, name);
+    discard_derived_state(&data_dir, ec.backend.container_engine())?;
+    clear_materialized_marker(scope, name, ec);
+    eprintln!(
+        "Discarded the solved toolchain, scratch builds and language bindings of \
+         '{name}'; rebuilding it from its settings and installed programs..."
+    );
+    Ok(())
+}
+
+/// The filesystem half of `reset_for_reinit`, on an environment data dir: drop
+/// the scratch specs, the interpreter pins, the solve cache, the lock, and the
+/// solved prefix (the engine volume when `engine` manages one, and any prefix
+/// tree or record mirror under the pixi project).
+fn discard_derived_state(data_dir: &std::path::Path, engine: Option<ContainerEngine>) -> Result<()> {
+    let ctx = envstore::EnvContext::new(data_dir);
+    ctx.clear_scratch()?;
+    ctx.clear_abi_lock()?;
+    ctx.clear_solve_cache()?;
+    let pixi_dir = ctx.pixi_dir();
+    let remove = |path: &std::path::Path, dir: bool| -> Result<()> {
+        let result = if dir {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ManagerError::EnvError(format!(
+                "cannot remove {}: {e}",
+                path.display()
+            ))),
+        }
+    };
+    remove(&pixi_dir.join("pixi.lock"), false)?;
+    // The prefix: an engine volume for a container, a directory under the pixi
+    // project for native (and for a container an empty mount point, or the tree
+    // an older mim solved onto the host). The record mirror goes with it, so
+    // nothing describes a world that no longer exists.
+    if let Some(engine) = engine {
+        let volume = serve::prefix_volume(data_dir);
+        if container::volume_exists(engine, &volume)
+            && !container::volume_remove(engine, &volume).success()
+        {
+            return Err(ManagerError::EnvError(format!(
+                "cannot remove the conda prefix volume '{volume}'; is a container of \
+                 this environment still running? Stop it and run this again."
+            )));
+        }
+    }
+    remove(&morloc_deps::abi::conda_prefix(&pixi_dir), true)?;
+    remove(&pixi_dir.join(morloc_deps::abi::CONDA_META_MIRROR), true)?;
+    Ok(())
 }
 
 /// Re-solve and re-materialize an environment from the union of every installed
@@ -6821,6 +7336,7 @@ fn rematerialize_env(
     name: &str,
     extra_specs: &[envspec::EnvSpec],
     requested_version: Option<String>,
+    build_flags: &[String],
     verbose: bool,
 ) -> Result<()> {
     let ec = cfg::read_env_config(scope, name)?;
@@ -6839,16 +7355,16 @@ fn rematerialize_env(
     // but builds NO compiler (that is the developer's, in the dev shell). Route to
     // the dev provisioner, updating the stdlib base.
     if let Some(dev) = ec.dev.clone() {
-        let ce = ec.engine()?;
+        let target = ec.container_target()?;
         let stdlib = resolve_stdlib_version(effective_version)?;
         let source = std::path::PathBuf::from(&dev.source);
         let image_tag = build_dev_container_image(
-            scope, name, ce, &specs, &source, &lang_pins, &ec.system_packages,
-            &ec.conda_packages, &stdlib, &ec.base_image,
+            scope, name, target, &specs, &source, &lang_pins, &ec.system_packages,
+            &ec.conda_packages, &stdlib, &ec.base_image, build_flags,
         )?;
         // Re-stage the dependency agent so a newer platform-matched mim (or the
         // MORLOC_MIM_ENV override) propagates on update.
-        stage_dev_agent(scope, name)?;
+        stage_dev_agent(scope, name, target.arch)?;
         let mut ec = ec;
         // Preserve the prior recorded version if the new stdlib base fails to parse
         // (e.g. a malformed --morloc-version), so a bad input never silently wipes a
@@ -6887,10 +7403,10 @@ fn rematerialize_env(
         return Ok(());
     }
 
-    let ce = ec.engine()?;
     let (image_tag, mver) = build_requirement_derived_image(
-        scope, name, ce, &specs, &lang_pins, &ec.system_packages, &ec.conda_packages,
-        effective_version, local_runtime.as_deref(), &ec.base_image,
+        scope, name, ec.container_target()?, &specs, &lang_pins, &ec.system_packages,
+        &ec.conda_packages, effective_version, local_runtime.as_deref(), &ec.base_image,
+        build_flags,
     )?;
     let mut ec = ec;
     ec.built_image = Some(image_tag);
@@ -6906,7 +7422,7 @@ fn rematerialize_env(
 fn build_requirement_derived_image(
     scope: Scope,
     name: &str,
-    engine: ContainerEngine,
+    target: arch::ContainerTarget,
     program_specs: &[envspec::EnvSpec],
     lang_pins: &[(String, Option<String>)],
     system_packages: &[String],
@@ -6914,20 +7430,24 @@ fn build_requirement_derived_image(
     requested_version: Option<&str>,
     local_runtime: Option<&std::path::Path>,
     base_image: &str,
+    one_shot_flags: &[String],
 ) -> Result<(String, String)> {
+    let arch::ContainerTarget { engine, arch } = target;
     // Unlike native, a container HAS a build layer, so host/vcpkg system deps are
     // not a hard blocker here -- they become build-extras (a later --system-packages
     // flag). native_blockers therefore does not apply to the container path.
-    // Pass the engine so the language-support table can be generated in a
-    // container when the host cannot run the compiler (NixOS/musl).
-    let req = resolve_env_requirements(
-        scope, program_specs, lang_pins, conda_packages, Some(engine), requested_version, local_runtime, base_image,
+    // Pass the target so the language-support table can be generated in a
+    // container when the host cannot run the compiler (NixOS/musl, or a foreign
+    // architecture).
+    let mut req = resolve_env_requirements(
+        scope, program_specs, lang_pins, conda_packages, Some(target), requested_version,
+        local_runtime, base_image,
     )?;
 
     let env_dir = cfg::env_data_dir(scope, name);
     let context = env_dir.join(CONTAINER_BUILD_SUBDIR);
     let manifest = pixi::render_manifest(&req.requirements);
-    let image_tag = format!("localhost/morloc-env:{name}");
+    let image_tag = environment::env_image_tag(name);
 
     // Prime the requirements store unconditionally (like the native path), BEFORE
     // the cache-hit early return: the store reflects the env's config/inputs, so a
@@ -6941,11 +7461,17 @@ fn build_requirement_derived_image(
     // compiler identity) written only after a good build (NOT the working
     // pixi.toml), so a failed build cannot poison the cache, and a rebuilt dev
     // compiler forces a fresh image without a manual `podman rmi`.
+    // The persisted build flags ride the key (an edited `build:` section
+    // rebuilds); the one-shot -x flags do not, or the next plain update would
+    // rebuild again without them.
+    let persisted_build_flags =
+        cfg::read_flag_config(scope, name)?.materialize(Phase::Build, engine);
     let key = format!(
-        "{}{}{}base:{base_image}\n",
+        "{}{}{}{}base:{base_image}\narch:{arch}\n",
         cache_key(&pixi::requirement_digest(&req.requirements), &req.morloc_bin, system_packages),
         lang_installs_key_fragment(&req.lang_installs),
         cert::cache_fragment_for_env(scope, name),
+        build_flags_key_fragment(&persisted_build_flags),
     );
     let marker = materialized_marker(scope, name, false);
     let unchanged = std::fs::read_to_string(&marker)
@@ -6974,16 +7500,25 @@ fn build_requirement_derived_image(
     let ssl_cert = cert::host_bundle_if_present(scope, name);
     eprintln!("Solving + locking the environment with pixi...");
     pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
+    if let Some((specs, lang_spec, requirements)) = adopt_pulled_runtimes(
+        &pixi_host, &arch.conda_platform(), &req.version, &req.support, &req.specs,
+        program_specs, lang_pins, conda_packages,
+    )? {
+        req.specs = specs;
+        req.lang_spec = lang_spec;
+        req.requirements = requirements;
+        pixi::write_manifest(&pixi_host, &pixi::render_manifest(&req.requirements))?;
+        pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
+    }
 
     // Build the requirement-INDEPENDENT base image (base tools + pixi + the
     // compiler/rust source). The env-specific pixi solve + `morloc init` run in a
     // container step below, writing into the host mounts.
     eprintln!("Staging the morloc runtime into the build context...");
-    // A container runs Linux (matching the host arch); the staged mim agent must
+    // A container runs Linux at the env's architecture; the staged mim agent must
     // match that platform, not the host's (identical to the triple
     // `provision_runtime` used above).
-    let container_triple = provision::container_release_triple()?;
-    provision::stage_runtime(scope, container_triple, &req.runtime_dir, &context.join("runtime"))?;
+    provision::stage_runtime(scope, arch.release_triple(), &req.runtime_dir, &context.join("runtime"))?;
     let lang_install_names = stage_lang_installs(&context, &req.lang_installs)?;
     // Stage the corp CA into the build context (COPY-ed into the image and
     // trusted before any network build step).
@@ -7011,14 +7546,15 @@ fn build_requirement_derived_image(
         context: context.to_string_lossy().to_string(),
         tag: image_tag.clone(),
         build_args: Vec::new(),
-        extra_flags: Vec::new(),
+        extra_flags: with_one_shot(persisted_build_flags, one_shot_flags),
+        platform: target.platform(),
     };
     let status = crate::container::container_build_visible(engine, &cfg);
     if !status.success() {
         return Err(ManagerError::EngineError {
             engine,
             code: crate::container::exit_code_to_int(status),
-            stderr: "requirement-derived base image build failed".to_string(),
+            stderr: image_build_failure(arch, "requirement-derived base image build failed"),
         });
     }
 
@@ -7026,7 +7562,8 @@ fn build_requirement_derived_image(
     // (as the host UID via keep-id), writing into the host-mounted /env and
     // MORLOC_HOME -- prefix-correct because solved at their final runtime paths.
     eprintln!("Materializing the environment (pixi install + morloc init) in a container...");
-    materialize_container_env(engine, &image_tag, &env_dir, true)?;
+    materialize_container_env(target, &image_tag, &env_dir, true)?;
+    check_runtime_bindings(name, &home_host, &pixi_host)?;
 
     // Pin the interpreter minors the shims were just built against, read from the
     // now-solved conda prefix under the env's (host-mounted) pixi dir.
@@ -7377,11 +7914,12 @@ mv "{pixi_dir}/{mirror}.new" "{pixi_dir}/{mirror}"
 /// (keep-id via `container_run`), so the results are host-owned and writable by
 /// a later in-container `morloc make`.
 fn materialize_container_env(
-    engine: ContainerEngine,
+    target: arch::ContainerTarget,
     image: &str,
     env_dir: &std::path::Path,
     build_runtime: bool,
 ) -> Result<()> {
+    let engine = target.engine;
     let v_data_dir = env_dir.to_string_lossy().to_string();
     // Solve /env from its mounted pixi.toml/lock. For a release env, also activate
     // the now-solved toolchain and build libmorloc/nexus into MORLOC_HOME. A dev
@@ -7417,6 +7955,7 @@ fn materialize_container_env(
         work_dir: Some(serve::CONTAINER_PIXI_DIR.to_string()),
         selinux_suffix: volume_suffix(detect_selinux()).to_string(),
         extra_flags: Vec::new(),
+        platform: target.platform(),
     };
     let (status, _out, stderr) = crate::container::container_run(engine, &cfg);
     if !status.success() {
@@ -7446,14 +7985,6 @@ fn materialize_container_env(
 // the dev shell, where the toolchain and the mounted source are on PATH.
 // ======================================================================
 
-/// The conda platform a container build targets. The host renders+locks the pixi
-/// manifest before the container exists, so it must pin LINUX (not the host
-/// platform, which would wrongly lock `osx-*` on a macOS host and then fail the
-/// in-container `pixi install --locked`), matching the arch the container runs.
-fn container_conda_platform() -> String {
-    morloc_deps::platform::conda_platform_for("linux", std::env::consts::ARCH)
-}
-
 /// First 16 hex chars of the SHA-256 of `data` -- a stable short digest.
 fn short_hash(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -7477,7 +8008,7 @@ fn dev_image_key(world_digest: &str, dockerfile: &str) -> String {
 fn build_dev_container_image(
     scope: Scope,
     name: &str,
-    engine: ContainerEngine,
+    target: arch::ContainerTarget,
     program_specs: &[envspec::EnvSpec],
     source: &std::path::Path,
     lang_pins: &[(String, Option<String>)],
@@ -7485,7 +8016,9 @@ fn build_dev_container_image(
     conda_packages: &[String],
     stdlib_version: &str,
     base_image: &str,
+    one_shot_flags: &[String],
 ) -> Result<String> {
+    let arch::ContainerTarget { engine, arch } = target;
     morloc_deps::layout::validate_source(source).map_err(ManagerError::EnvError)?;
 
     // Parse the mounted source's YAMLs (no compiler exists yet) for the pixi solve
@@ -7503,11 +8036,15 @@ fn build_dev_container_image(
     reject_script_langs_off_oci(&script_langs, Some(engine))?;
     let install_names: Vec<String> = script_langs.iter().map(|(l, _)| l.clone()).collect();
 
-    let platform = container_conda_platform();
-    let (_specs, lang_spec, requirements) =
+    // The host renders + locks the pixi manifest before the container exists, so
+    // it pins the container's Linux platform at the env's architecture (never the
+    // host platform, which would lock `osx-*` on a macOS host and fail the
+    // in-container `pixi install --locked`).
+    let platform = arch.conda_platform();
+    let (specs, lang_spec, requirements) =
         build_env_requirements(stdlib_version, &platform, program_specs, lang_pins, conda_packages, &support)?;
     let manifest = pixi::render_manifest(&requirements);
-    let image_tag = format!("localhost/morloc-env:{name}");
+    let image_tag = environment::env_image_tag(name);
 
     let env_dir = cfg::env_data_dir(scope, name);
     let context = env_dir.join(CONTAINER_BUILD_SUBDIR);
@@ -7545,10 +8082,13 @@ fn build_dev_container_image(
     // install-script contents ride the key (the Dockerfile only names them), so
     // editing an install.sh rebuilds the image. The cert fragment rides too (the
     // Dockerfile only names the cert path), so a rotated CA rebuilds the image.
+    let persisted_build_flags =
+        cfg::read_flag_config(scope, name)?.materialize(Phase::Build, engine);
     let image_inputs = format!(
-        "{df_text}{}{}",
+        "{df_text}{}{}{}",
         lang_installs_key_fragment(&script_langs),
         cert::cache_fragment_for_env(scope, name),
+        build_flags_key_fragment(&persisted_build_flags),
     );
     let img_key = dev_image_key(&pixi::requirement_digest(&requirements), &image_inputs);
     let marker = materialized_marker(scope, name, false);
@@ -7567,6 +8107,13 @@ fn build_dev_container_image(
         let ssl_cert = cert::host_bundle_if_present(scope, name);
         eprintln!("Solving + locking the dev environment with pixi...");
         pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
+        if let Some((_, _, requirements)) = adopt_pulled_runtimes(
+            &pixi_host, &platform, stdlib_version, &support, &specs, program_specs, lang_pins,
+            conda_packages,
+        )? {
+            pixi::write_manifest(&pixi_host, &pixi::render_manifest(&requirements))?;
+            pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
+        }
 
         std::fs::create_dir_all(&context).map_err(|e| {
             ManagerError::EnvError(format!("cannot create {}: {e}", context.display()))
@@ -7585,14 +8132,15 @@ fn build_dev_container_image(
             context: context.to_string_lossy().to_string(),
             tag: image_tag.clone(),
             build_args: Vec::new(),
-            extra_flags: Vec::new(),
+            extra_flags: with_one_shot(persisted_build_flags, one_shot_flags),
+            platform: target.platform(),
         };
         let status = crate::container::container_build_visible(engine, &cfg);
         if !status.success() {
             return Err(ManagerError::EngineError {
                 engine,
                 code: crate::container::exit_code_to_int(status),
-                stderr: "dev environment base image build failed".to_string(),
+                stderr: image_build_failure(arch, "dev environment base image build failed"),
             });
         }
     }
@@ -7602,7 +8150,7 @@ fn build_dev_container_image(
     // idempotent; the marker is written only on success so a failure is never skipped.
     if !up_to_date {
         eprintln!("Provisioning the dev environment (pixi install)...");
-        materialize_container_env(engine, &image_tag, &env_dir, false)?;
+        materialize_container_env(target, &image_tag, &env_dir, false)?;
         record_abi_lock_or_warn(&env_dir, name, stdlib_version, &support);
         let _ = std::fs::write(&marker, &img_key);
     }
@@ -7791,7 +8339,7 @@ fn shell_prompt_setup(
 /// image. Mirrors `native_new`; the run substrate is unchanged.
 fn container_new_derived(
     scope: Scope,
-    engine: ContainerEngine,
+    target: arch::ContainerTarget,
     name: Option<String>,
     lang: Vec<String>,
     system_packages: Vec<String>,
@@ -7806,11 +8354,18 @@ fn container_new_derived(
     no_init: bool,
     make_default: bool,
     snapshots: &SnapshotPlan,
+    flagfile: Option<&str>,
+    build_flags: &[String],
 ) -> Result<()> {
+    let engine = target.engine;
     if shm_size.is_some() && !engine.is_oci() {
         return Err(shm_size_not_supported());
     }
+    warn_if_emulated(target.arch);
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
+    // The flag file goes in before the image build so its `build:` section
+    // applies to the first build too.
+    install_env_flagfile(scope, &env_name, flagfile)?;
 
     // Resolve the host home before the (multi-minute) image build, so a bad path
     // fails fast.
@@ -7846,8 +8401,8 @@ fn container_new_derived(
         (None, None)
     } else {
         let (image, version) = build_requirement_derived_image(
-            scope, &env_name, engine, &[], &lang_pins, &system_packages, &conda_packages,
-            requested_version.as_deref(), local_runtime.as_deref(), &base_image,
+            scope, &env_name, target, &[], &lang_pins, &system_packages, &conda_packages,
+            requested_version.as_deref(), local_runtime.as_deref(), &base_image, build_flags,
         )?;
         (Some(image), version.parse::<Version>().ok())
     };
@@ -7871,6 +8426,7 @@ fn container_new_derived(
         ec = ec.with_local_runtime(LocalRuntimeConfig { source: lr.to_string_lossy().into_owned() });
     }
     ec.mount_home = mount_home;
+    ec.arch = Some(target.arch);
     if let Some(s) = shm_size {
         ec.shm_size = s;
     }
@@ -7899,7 +8455,7 @@ fn resolve_stdlib_version(requested: Option<&str>) -> Result<String> {
 /// `run`/`serve`/`info`/`update` treat it as a dev env.
 fn container_new_dev(
     scope: Scope,
-    engine: ContainerEngine,
+    target: arch::ContainerTarget,
     name: Option<String>,
     source: String,
     lang: Vec<String>,
@@ -7914,13 +8470,17 @@ fn container_new_dev(
     no_init: bool,
     make_default: bool,
     snapshots: &SnapshotPlan,
+    flagfile: Option<&str>,
+    build_flags: &[String],
 ) -> Result<()> {
+    let engine = target.engine;
     // A dev env's tooling (the container image + baked toolchain + pixi env) is
     // provisioned only for docker/podman; the deepest funnel for the OCI-only
     // contract (native is rejected earlier; apptainer can reach here).
     if !engine.is_oci() {
         return Err(dev_requires_oci());
     }
+    warn_if_emulated(target.arch);
     let source_path = resolve_dev_source(&source).map_err(ManagerError::EnvError)?;
     let source = source_path.to_string_lossy().into_owned();
 
@@ -7928,6 +8488,7 @@ fn container_new_dev(
     // the version (matching the interactive default).
     let name = name.or_else(|| Some("dev".to_string()));
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
+    install_env_flagfile(scope, &env_name, flagfile)?;
     // Resolve the host home before the image build, so a bad path fails fast.
     let mount_home = match &mount_home {
         Some(raw) => Some(resolve_mount_home(
@@ -7954,8 +8515,8 @@ fn container_new_dev(
         let stdlib = resolve_stdlib_version(requested_version.as_deref())?;
         // A brand-new env has no installed programs yet, so no program specs.
         let image_tag = build_dev_container_image(
-            scope, &env_name, engine, &[], &source_path, &lang_pins, &system_packages,
-            &conda_packages, &stdlib, &base_image,
+            scope, &env_name, target, &[], &source_path, &lang_pins, &system_packages,
+            &conda_packages, &stdlib, &base_image, build_flags,
         )?;
         (Some(image_tag), stdlib.parse::<Version>().ok())
     };
@@ -7978,6 +8539,7 @@ fn container_new_dev(
     )
     .with_dev(dev);
     ec.mount_home = mount_home;
+    ec.arch = Some(target.arch);
     if let Some(s) = shm_size {
         ec.shm_size = s;
     }
@@ -7987,7 +8549,7 @@ fn container_new_dev(
     // Stage the dependency agent into the runtime-bin mount unless this was a
     // --no-init dry run (nothing to provision against yet).
     if !no_init {
-        stage_dev_agent(scope, &ec.name)?;
+        stage_dev_agent(scope, &ec.name, target.arch)?;
     }
     finalize_new_env(scope, &ec, lang_pins, make_default)
 }
@@ -8333,7 +8895,8 @@ pub(crate) fn container_serve(
         mcp_token = Some(t.clone());
         user_env.push(("MORLOC_MCP_TOKEN".to_string(), t));
     }
-    let mut extra_flags = cfg::read_flag_config(env.scope, env_name)?.materialize(Phase::Start, engine);
+    let mut extra_flags = flag_source(env.scope, env_name, req.flagfile.as_deref())?
+        .materialize(Phase::Start, engine);
     extra_flags.extend(req.engine_args.iter().cloned());
 
     // Serving mounts the runtime and the toolchain, so a half-provisioned
@@ -8341,11 +8904,12 @@ pub(crate) fn container_serve(
     // shadows the image with empty directories.
     require_materialized(&data_dir.to_string_lossy(), false)?;
 
+    let platform = ec.oci_arch()?;
     serve::serve_environment(
         engine, req.verbose, &image, &data_dir.to_string_lossy(), &container_name,
         &[(req.host_port, req.container_port)], plan.publish_host.as_deref(), plan.network.as_deref(),
         &extra_flags, &Some(ec.shm_size.clone()), &user_env, &plan.command,
-        ec.mount_home.as_deref(),
+        ec.mount_home.as_deref(), platform,
     )?;
 
     let url_host = if req.expose {
@@ -8557,7 +9121,7 @@ pub(crate) fn container_run_env(
     // Materialize flags from env.flags.yaml for the active phase + engine,
     // then append CLI one-shot overrides. The flag-file errors out on the
     // legacy flat env.flags format with a migration hint.
-    let mut extra_flags = cfg::read_flag_config(env_scope, &env_name)?
+    let mut extra_flags = flag_source(env_scope, &env_name, req.flagfile.as_deref())?
         .materialize(phase, engine);
     extra_flags.extend(cli_engine_args.iter().cloned());
 
@@ -8565,13 +9129,14 @@ pub(crate) fn container_run_env(
     let is_home_dir = normalize_trailing(&cwd) == normalize_trailing(&home);
     // A dev env's compiler is host-mounted (dev-bin), not baked into the image.
     let is_dev = ec.dev.is_some();
+    let platform = ec.oci_arch()?;
 
     if !is_init && !suffix.is_empty() && !is_home_dir {
         selinux::validate_mount_path(&cwd)?;
         run_with_config(
             engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd, suffix,
             shell, args, false, &ec.shm_size, &extra_flags, user_env,
-            bridge_mount.as_deref(), is_dev, ec.mount_home.as_deref(),
+            bridge_mount.as_deref(), is_dev, ec.mount_home.as_deref(), platform,
         )
     } else {
         let (cwd_final, skip_work_mount) = if is_home_dir && !suffix.is_empty() && !is_init {
@@ -8585,7 +9150,7 @@ pub(crate) fn container_run_env(
         run_with_config(
             engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd_final, suffix,
             shell, args, is_init || skip_work_mount, &ec.shm_size, &extra_flags, user_env,
-            bridge_mount.as_deref(), is_dev, ec.mount_home.as_deref(),
+            bridge_mount.as_deref(), is_dev, ec.mount_home.as_deref(), platform,
         )
     }
 }
@@ -8622,6 +9187,7 @@ fn run_with_config(
     bridge_socket: Option<&std::path::Path>,
     is_dev: bool,
     mount_home: Option<&str>,
+    platform: Option<arch::Arch>,
 ) -> Result<()> {
     if shell {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -8782,6 +9348,7 @@ fn run_with_config(
         selinux_suffix: suffix.to_string(),
         command: cmd,
         extra_flags: extra_flags.to_vec(),
+        platform,
         ..RunConfig::new(image)
     };
 
@@ -8895,6 +9462,9 @@ pub(crate) struct ServeRequest {
     pub allow_no_auth: bool,
     pub unsafe_serve: bool,
     pub engine_args: Vec<String>,
+    /// A flag file to use in place of the environment's env.flags.yaml for
+    /// this serve (`--flagfile`); the persisted file is untouched.
+    pub flagfile: Option<String>,
     pub token: Option<String>,
     pub verbose: bool,
 }
@@ -9611,25 +10181,64 @@ mod tests {
     }
 
     #[test]
-    fn update_takes_version_and_force() {
+    fn discard_derived_state_keeps_what_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let ctx = envstore::EnvContext::new(data_dir);
+        let spec = r#"{"envspec_version":2,"morloc_version":"0.99.0","languages":[{"lang":"py"}]}"#;
+        ctx.write_spec("keeper", envstore::Provenance::Installed, spec).unwrap();
+        ctx.write_spec("scratchy", envstore::Provenance::Scratch, spec).unwrap();
+        ctx.write_conda_extras(&["bat".to_string()]).unwrap();
+        let pixi = ctx.pixi_dir();
+        std::fs::create_dir_all(morloc_deps::abi::conda_prefix(&pixi).join("conda-meta")).unwrap();
+        std::fs::create_dir_all(pixi.join(morloc_deps::abi::CONDA_META_MIRROR)).unwrap();
+        std::fs::write(pixi.join("pixi.toml"), "").unwrap();
+        std::fs::write(pixi.join("pixi.lock"), "").unwrap();
+        std::fs::write(pixi.join(".morloc-activation.json"), "[]").unwrap();
+        std::fs::write(pixi.join(".morloc-solved-digest"), "x").unwrap();
+        std::fs::write(ctx.requirements_dir().join("abi-lock.json"), spec).unwrap();
+        // The runtime and installed launchers are not this step's to touch.
+        std::fs::create_dir_all(data_dir.join("exe/keeper")).unwrap();
+
+        discard_derived_state(data_dir, None).unwrap();
+
+        assert_eq!(ctx.installed_program_names().unwrap(), vec!["keeper".to_string()]);
+        assert_eq!(ctx.program_names().unwrap(), vec!["keeper".to_string()]);
+        assert_eq!(ctx.read_conda_extras().unwrap(), vec!["bat".to_string()]);
+        assert!(!ctx.has_abi_lock());
+        assert!(!pixi.join("pixi.lock").exists());
+        assert!(!pixi.join(".morloc-activation.json").exists());
+        assert!(!pixi.join(".morloc-solved-digest").exists());
+        assert!(!morloc_deps::abi::conda_prefix(&pixi).exists());
+        assert!(!pixi.join(morloc_deps::abi::CONDA_META_MIRROR).exists());
+        // The manifest is re-rendered by the rebuild; leaving it is harmless.
+        assert!(data_dir.join("exe/keeper").is_dir());
+        // Idempotent: a second discard on the emptied env is not an error.
+        discard_derived_state(data_dir, None).unwrap();
+    }
+
+    #[test]
+    fn update_takes_version_and_reinit() {
         let cli = Cli::try_parse_from([
             "mim", "update", "--env", "e", "--morloc-version", "0.98.0",
         ])
         .expect("update should parse --morloc-version");
         match cli.command {
-            Some(Cmd::Update { env, morloc_version, latest, force, ignore_module_compat }) => {
+            Some(Cmd::Update { env, morloc_version, latest, reinit, ignore_module_compat, engine_arg }) => {
                 assert_eq!(env.as_deref(), Some("e"));
                 assert_eq!(morloc_version.as_deref(), Some("0.98.0"));
                 assert!(!latest);
-                assert!(!force);
+                assert!(!reinit);
                 assert!(!ignore_module_compat);
+                assert!(engine_arg.is_empty());
             }
             _ => panic!("expected Cmd::Update"),
         }
-        // --force and --latest parse.
-        let cli = Cli::try_parse_from(["mim", "update", "--env", "e", "--force", "--latest"])
-            .expect("update --force --latest should parse");
-        assert!(matches!(cli.command, Some(Cmd::Update { latest: true, force: true, .. })));
+        // --reinit and --latest parse together; --force is gone.
+        let cli = Cli::try_parse_from(["mim", "update", "--env", "e", "--reinit", "--latest"])
+            .expect("update --reinit --latest should parse");
+        assert!(matches!(cli.command, Some(Cmd::Update { latest: true, reinit: true, .. })));
+        assert!(Cli::try_parse_from(["mim", "update", "--env", "e", "--force"]).is_err());
         // --ignore-module-compat parses.
         let cli = Cli::try_parse_from(
             ["mim", "update", "--env", "e", "--ignore-module-compat"],
@@ -9639,6 +10248,73 @@ mod tests {
             cli.command,
             Some(Cmd::Update { ignore_module_compat: true, .. })
         ));
+    }
+
+    #[test]
+    fn update_and_new_take_one_shot_build_flags() {
+        let cli = Cli::try_parse_from([
+            "mim", "update", "--env", "e", "-x", "--no-cache", "--engine-arg", "--pull",
+        ])
+        .expect("update -x should parse");
+        match cli.command {
+            Some(Cmd::Update { engine_arg, .. }) => {
+                assert_eq!(engine_arg, vec!["--no-cache", "--pull"]);
+            }
+            _ => panic!("expected Cmd::Update"),
+        }
+        let cli = Cli::try_parse_from(["mim", "new", "e", "-x", "--no-cache"])
+            .expect("new -x should parse");
+        match cli.command {
+            Some(Cmd::New { engine_arg, .. }) => {
+                assert_eq!(engine_arg, vec!["--no-cache"]);
+            }
+            _ => panic!("expected Cmd::New"),
+        }
+    }
+
+    #[test]
+    fn every_engine_launcher_takes_a_one_shot_flagfile() {
+        // run/shell/install/start launch an engine; each can swap the persisted
+        // flag file for one invocation without touching it.
+        for argv in [
+            vec!["mim", "run", "--flagfile", "alt.yaml", "--", "true"],
+            vec!["mim", "shell", "--flagfile", "alt.yaml"],
+            vec!["mim", "install", "--flagfile", "alt.yaml", "main.loc"],
+            vec!["mim", "start", "--flagfile", "alt.yaml"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let flagfile = match cli.command {
+                Some(Cmd::Run { flagfile, .. })
+                | Some(Cmd::Shell { flagfile, .. })
+                | Some(Cmd::Install { flagfile, .. })
+                | Some(Cmd::Start { flagfile, .. }) => flagfile,
+                _ => panic!("{argv:?}"),
+            };
+            assert_eq!(flagfile.as_deref(), Some("alt.yaml"), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn new_and_modify_persist_a_flagfile_and_modify_can_clear_it() {
+        let cli = Cli::try_parse_from(["mim", "new", "e", "--flagfile", "f.yaml"]).unwrap();
+        assert!(matches!(cli.command, Some(Cmd::New { flagfile: Some(ref f), .. }) if f == "f.yaml"));
+        let cli = Cli::try_parse_from(["mim", "modify", "--env", "e", "--flagfile", "f.yaml"]).unwrap();
+        assert!(matches!(cli.command, Some(Cmd::Modify { flagfile: Some(ref f), no_flagfile: false, .. }) if f == "f.yaml"));
+        let cli = Cli::try_parse_from(["mim", "modify", "--env", "e", "--no-flagfile"]).unwrap();
+        assert!(matches!(cli.command, Some(Cmd::Modify { flagfile: None, no_flagfile: true, .. })));
+        // Setting and clearing in one command is a contradiction.
+        assert!(Cli::try_parse_from(["mim", "modify", "--env", "e", "--flagfile", "f", "--no-flagfile"]).is_err());
+    }
+
+    #[test]
+    fn build_flags_ride_the_image_cache_key() {
+        // A changed `build:` section must rebuild the image on the next update;
+        // an empty one must not perturb the key of an environment that never
+        // had flags.
+        assert_eq!(build_flags_key_fragment(&[]), "");
+        let frag = build_flags_key_fragment(&["--pull".to_string(), "--no-cache".to_string()]);
+        assert!(frag.contains("--pull --no-cache"), "{frag}");
+        assert!(frag.ends_with('\n'), "{frag:?}");
     }
 
     #[test]
@@ -9774,6 +10450,29 @@ mod tests {
     }
 
     #[test]
+    fn modify_env_name_parses_alone_and_alongside_other_settings() {
+        let cli = Cli::try_parse_from(["mim", "modify", "--env", "old", "--env-name", "new"])
+            .expect("modify --env-name should parse");
+        match cli.command {
+            Some(Cmd::Modify { env, env_name, .. }) => {
+                assert_eq!(env.as_deref(), Some("old"));
+                assert_eq!(env_name.as_deref(), Some("new"));
+            }
+            _ => panic!("expected Cmd::Modify"),
+        }
+        // A rename combines with a default change: the rename runs first and
+        // the default is then set on the new name.
+        let cli = Cli::try_parse_from([
+            "mim", "modify", "--env", "old", "--env-name", "new", "--set-default",
+        ])
+        .expect("modify --env-name --set-default should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Modify { env_name: Some(_), set_default: true, .. })
+        ));
+    }
+
+    #[test]
     fn modify_rejects_a_flag_and_its_negation_together() {
         // Asking to both set and clear a setting is a contradiction, caught at
         // parse time rather than resolved by argument order.
@@ -9822,6 +10521,7 @@ mod tests {
     // so they can be exercised straight through `dispatch`.
     #[derive(Default)]
     struct ModifyFlags {
+        env_name: Option<String>,
         set_default: bool,
         unset_default: bool,
         system: bool,
@@ -9839,6 +10539,7 @@ mod tests {
     fn modify_cmd(f: ModifyFlags) -> Cmd {
         Cmd::Modify {
             env: Some("e".to_string()),
+            env_name: f.env_name,
             lang: Vec::new(),
             no_lang: f.no_lang,
             system_packages_file: None,
@@ -9856,6 +10557,8 @@ mod tests {
             base: None,
             shm_size: None,
             no_shm_size: f.no_shm_size,
+            flagfile: None,
+            no_flagfile: false,
             set_default: f.set_default,
             unset_default: f.unset_default,
             system: f.system,
@@ -10069,6 +10772,16 @@ mod tests {
     fn modify_requires_at_least_one_change() {
         let err = dispatch(false, false, modify_cmd(ModifyFlags::default())).unwrap_err();
         assert!(err.to_string().contains("nothing to modify"), "got: {err}");
+    }
+
+    #[test]
+    fn modify_env_name_counts_as_a_change() {
+        let f = ModifyFlags { env_name: Some("renamed".to_string()), ..Default::default() };
+        let err = dispatch(false, false, modify_cmd(f)).unwrap_err();
+        assert!(
+            !err.to_string().contains("nothing to modify"),
+            "--env-name alone should be a change; got: {err}"
+        );
     }
 
     #[test]
@@ -10562,6 +11275,7 @@ mod tests {
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
             mount_home: None,
+            arch: None,
         };
         cfg::write_config(&path, &ec).unwrap();
         let ec2: EnvironmentConfig = cfg::read_config(&path).unwrap();
@@ -10573,7 +11287,7 @@ mod tests {
     #[test]
     fn flag_config_default_is_all_empty() {
         let fc = FlagConfig::default();
-        for phase in [Phase::Run, Phase::Start] {
+        for phase in [Phase::Build, Phase::Run, Phase::Start] {
             for eng in [
                 ContainerEngine::Docker,
                 ContainerEngine::Podman,
@@ -10603,6 +11317,135 @@ run:
             vec!["--shared"]
         );
         assert!(fc.materialize(Phase::Start, ContainerEngine::Apptainer).is_empty());
+    }
+
+    #[test]
+    fn flag_config_build_phase_materializes_like_the_others() {
+        let yaml = r#"
+build:
+  all:
+    - --no-cache
+  podman:
+    - --format=docker
+run:
+  podman:
+    - --nv
+"#;
+        let fc: FlagConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            fc.materialize(Phase::Build, ContainerEngine::Podman),
+            vec!["--no-cache", "--format=docker"]
+        );
+        assert_eq!(
+            fc.materialize(Phase::Build, ContainerEngine::Docker),
+            vec!["--no-cache"]
+        );
+        // The phases do not leak into each other.
+        assert_eq!(fc.materialize(Phase::Run, ContainerEngine::Podman), vec!["--nv"]);
+    }
+
+    #[test]
+    fn build_phase_flags_put_the_one_shot_flags_after_the_persisted_ones() {
+        let yaml = "build:\n  all:\n    - --pull\n";
+        let fc: FlagConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            with_one_shot(fc.materialize(Phase::Build, ContainerEngine::Docker), &["--no-cache".to_string()]),
+            vec!["--pull", "--no-cache"]
+        );
+        assert_eq!(
+            with_one_shot(FlagConfig::default().materialize(Phase::Build, ContainerEngine::Docker), &[]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn new_takes_an_arch_in_every_ecosystem_spelling() {
+        for (spelling, want) in [
+            ("x86_64", arch::Arch::X86_64),
+            ("amd64", arch::Arch::X86_64),
+            ("arm64", arch::Arch::Arm64),
+            ("aarch64", arch::Arch::Arm64),
+        ] {
+            let cli = Cli::try_parse_from(["mim", "new", "e", "--arch", spelling])
+                .unwrap_or_else(|e| panic!("--arch {spelling} should parse: {e}"));
+            match cli.command {
+                Some(Cmd::New { arch, .. }) => assert_eq!(arch, Some(want), "{spelling}"),
+                _ => panic!("expected Cmd::New"),
+            }
+        }
+        // No image is published for it, so it is not a choice.
+        assert!(Cli::try_parse_from(["mim", "new", "e", "--arch", "riscv64"]).is_err());
+        // The OCI os/arch pair is docker's spelling, not this option's.
+        assert!(Cli::try_parse_from(["mim", "new", "e", "--arch", "linux/amd64"]).is_err());
+    }
+
+    #[test]
+    fn a_raw_platform_flag_is_refused_everywhere_it_could_enter() {
+        // One-shot -x flags on every command that takes them, in either spelling
+        // (each -x carries one token, so the bare form is `-x --platform -x <p>`).
+        for cmd in ["new", "run", "shell", "update", "start", "install"] {
+            for flag in ["--platform=linux/amd64", "--platform"] {
+                let argv = ["mim", cmd, "-x", flag];
+                let err = match Cli::try_parse_from(argv) {
+                    Err(e) => e.to_string(),
+                    Ok(_) => panic!("{argv:?} should be refused"),
+                };
+                assert!(err.contains("--arch"), "{argv:?}: {err}");
+            }
+        }
+        assert!(Cli::try_parse_from(["mim", "run", "-x", "--no-cache", "--", "true"]).is_ok());
+        // Every section of a flag file, for any engine.
+        let tmp = tempfile::tempdir().unwrap();
+        for (section, engine) in [("build", "docker"), ("run", "all"), ("start", "podman")] {
+            let path = tmp.path().join(format!("{section}-{engine}.yaml"));
+            std::fs::write(&path, format!("{section}:\n  {engine}:\n    - --platform=linux/amd64\n"))
+                .unwrap();
+            let err = cfg::read_flag_file(&path).unwrap_err().to_string();
+            assert!(err.contains("--arch"), "{section}/{engine}: {err}");
+        }
+        let ok = tmp.path().join("ok.yaml");
+        std::fs::write(&ok, "build:\n  docker:\n    - --no-cache\n").unwrap();
+        assert!(cfg::read_flag_file(&ok).is_ok());
+    }
+
+    #[test]
+    fn oci_run_args_carry_the_platform_after_user_flags_and_before_the_image() {
+        let mut cfg = RunConfig::new("img");
+        cfg.platform = Some(arch::Arch::X86_64);
+        cfg.extra_flags = vec!["--no-cache".to_string()];
+        for engine in [ContainerEngine::Docker, ContainerEngine::Podman] {
+            let args = build_run_args(engine, &engine_specific_run_flags(engine), &cfg);
+            let at = |flag: &str| args.iter().position(|a| a == flag).unwrap_or_else(|| panic!("{flag} missing: {args:?}"));
+            assert_eq!(args[at("--platform") + 1], "linux/amd64");
+            // Last wins for the engine, so the image's own platform comes after
+            // anything a flag file or -x could have added.
+            assert!(at("--no-cache") < at("--platform"));
+            assert!(at("--platform") < at("img"));
+        }
+        // Apptainer has no such flag.
+        let args = build_run_args(ContainerEngine::Apptainer, &[], &cfg);
+        assert!(!args.iter().any(|a| a == "--platform"), "{args:?}");
+        // Unset: nothing is emitted, so the engine's own default applies.
+        cfg.platform = None;
+        let args = build_run_args(ContainerEngine::Docker, &[], &cfg);
+        assert!(!args.iter().any(|a| a == "--platform"), "{args:?}");
+    }
+
+    #[test]
+    fn build_args_carry_the_platform_after_user_flags_and_before_the_context() {
+        let cfg = BuildConfig {
+            dockerfile: "/tmp/Dockerfile".to_string(),
+            context: "/tmp/ctx".to_string(),
+            tag: "test:v1".to_string(),
+            build_args: Vec::new(),
+            extra_flags: vec!["--no-cache".to_string()],
+            platform: Some(arch::Arch::Arm64),
+        };
+        let args = build_build_args(&cfg);
+        let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        assert_eq!(args[at("--platform") + 1], "linux/arm64");
+        assert!(at("--no-cache") < at("--platform"));
+        assert!(at("--platform") < at("/tmp/ctx"));
     }
 
     #[test]
@@ -10639,6 +11482,37 @@ run:
             fc.materialize(Phase::Run, ContainerEngine::Apptainer),
             vec!["--nv"]
         );
+    }
+
+    #[test]
+    fn a_flagfile_is_validated_then_copied_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("flags.yaml");
+        let dst = dir.path().join("env").join("env.flags.yaml");
+        let text = "# keep the GPU\nrun:\n  apptainer:\n    - --nv\n";
+        std::fs::write(&src, text).unwrap();
+        cfg::install_flag_file(&src, &dst).unwrap();
+        // The bytes travel unchanged, comments included: the file is the
+        // user's, not a rendering of it.
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), text);
+        assert_eq!(
+            cfg::read_flag_file(&dst).unwrap().materialize(Phase::Run, ContainerEngine::Apptainer),
+            vec!["--nv"]
+        );
+    }
+
+    #[test]
+    fn a_flagfile_that_breaks_the_schema_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("flags.yaml");
+        let dst = dir.path().join("env.flags.yaml");
+        std::fs::write(&src, "runn:\n  podman:\n    - --nv\n").unwrap();
+        let err = cfg::install_flag_file(&src, &dst).unwrap_err().to_string();
+        assert!(err.contains("runn"), "got: {err}");
+        assert!(!dst.exists());
+        // A missing source is an error naming the path, not an empty config.
+        let err = cfg::read_flag_file(&dir.path().join("nope.yaml")).unwrap_err().to_string();
+        assert!(err.contains("nope.yaml"), "got: {err}");
     }
 
     #[test]
@@ -10785,6 +11659,7 @@ run:
             tag: "test:v1".to_string(),
             build_args: vec![("BASE".to_string(), "ubuntu:22.04".to_string())],
             extra_flags: Vec::new(),
+            platform: None,
         };
         let args = build_build_args(&cfg);
         assert_eq!(args[0], "build");
@@ -10801,10 +11676,11 @@ run:
             context: "/tmp/ctx".to_string(),
             tag: "test:v1".to_string(),
             build_args: vec![("BASE".to_string(), "ubuntu:22.04".to_string())],
-            extra_flags: vec!["--platform=linux/amd64".to_string()],
+            extra_flags: vec!["--no-cache".to_string()],
+            platform: None,
         };
         let args = build_build_args(&cfg);
-        let flag_idx = args.iter().position(|a| a == "--platform=linux/amd64").unwrap();
+        let flag_idx = args.iter().position(|a| a == "--no-cache").unwrap();
         let ctx_idx = args.iter().position(|a| a == "/tmp/ctx").unwrap();
         assert!(flag_idx < ctx_idx);
     }
@@ -10956,6 +11832,7 @@ run:
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
             mount_home: None,
+            arch: None,
         };
         let yaml = serde_yaml::to_string(&ec).unwrap();
         std::fs::write(&path, yaml).unwrap();
@@ -11012,6 +11889,7 @@ run:
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
             mount_home: None,
+            arch: None,
         };
         assert_eq!(ec.active_image(), "/layered.sif");
     }
@@ -11040,6 +11918,7 @@ run:
             cert_bundle: None,
             cert_fingerprints: Vec::new(),
             mount_home: None,
+            arch: None,
         };
         assert_eq!(ec.active_image(), "/base.sif");
     }
@@ -11348,6 +12227,7 @@ run:
                 cert_bundle: None,
                 cert_fingerprints: Vec::new(),
                 mount_home: None,
+                arch: None,
             },
         }
     }
@@ -11359,6 +12239,7 @@ run:
             args: vec!["morloc".to_string(), "--version".to_string()],
             user_env: Vec::new(),
             engine_args,
+            flagfile: None,
             phase: Phase::Run,
             slurm_bridge,
         }
@@ -11613,6 +12494,7 @@ run:
             morloc_version: Some(Version::new(0, 96, 0)),
             is_default: false,
             is_dev: true,
+            arch: None,
         };
         assert_eq!(env_version_marker(&dev), " [dev, stdlib 0.96.0]");
         let rel = environment::EnvInfo {
@@ -11620,8 +12502,28 @@ run:
             morloc_version: Some(Version::new(0, 98, 0)),
             is_default: false,
             is_dev: false,
+            arch: None,
         };
         assert_eq!(env_version_marker(&rel), " [0.98.0]");
+    }
+
+    #[test]
+    fn env_version_marker_names_only_a_foreign_arch() {
+        let host = arch::Arch::host().unwrap();
+        let foreign = arch::Arch::foreign_to_host();
+        let mut e = environment::EnvInfo {
+            name: "r".to_string(),
+            morloc_version: Some(Version::new(0, 98, 0)),
+            is_default: false,
+            is_dev: false,
+            arch: Some(host),
+        };
+        // Native to this machine: nothing to flag.
+        assert_eq!(env_version_marker(&e), " [0.98.0]");
+        e.arch = Some(foreign);
+        assert_eq!(env_version_marker(&e), format!(" [0.98.0, {foreign}]"));
+        e.morloc_version = None;
+        assert_eq!(env_version_marker(&e), format!(" [{foreign}]"));
     }
 
     fn lang_support_fixture() -> langsupport::LangSupport {

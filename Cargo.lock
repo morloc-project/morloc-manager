@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "mim"
-version = "0.31.0"
+version = "0.31.1"
 dependencies = [
  "anstream",
  "chrono",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "morloc-deps"
-version = "0.31.0"
+version = "0.31.1"
 dependencies = [
  "nix",
  "pem",
