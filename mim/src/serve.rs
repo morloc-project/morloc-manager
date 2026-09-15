@@ -534,7 +534,7 @@ pub fn home_mount(mount_home: Option<&str>) -> Result<Vec<(String, String)>> {
     if !std::path::Path::new(src).is_dir() {
         return Err(ManagerError::EnvError(format!(
             "the environment's host home '{src}' is missing. Restore that directory, \
-             or drop the mount with `mim modify --env <env> --mount-home none`."
+             or drop the mount with `mim modify --env <env> --no-mount-home`."
         )));
     }
     Ok(vec![(
@@ -988,6 +988,15 @@ pub fn dump_err_files(logs_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_host_home_advises_no_mount_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("vanished").to_string_lossy().into_owned();
+        let err = home_mount(Some(&gone)).unwrap_err().to_string();
+        assert!(err.contains("--no-mount-home"), "{err}");
+        assert!(!err.contains("--mount-home none"), "{err}");
+    }
 
     /// Every bind in a served container is a host directory the run path also
     /// mounts, and on an SELinux host each is readable only once relabelled.

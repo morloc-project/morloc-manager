@@ -1139,7 +1139,7 @@ fn check_mount_home(c: &mut Counts, ec: &EnvironmentConfig) {
     } else {
         c.fail(&format!(
             "Host home {src} is mounted as $HOME but is missing\n       \
-             Restore that directory, or drop the mount: mim modify --env {} --mount-home none",
+             Restore that directory, or drop the mount: mim modify --env {} --no-mount-home",
             ec.name
         ));
     }
@@ -1660,6 +1660,36 @@ fn check_slurm_prereqs(c: &mut Counts, engine: ContainerEngine, ec: &Environment
                 runtime_dir, e
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod mount_home_tests {
+    use super::*;
+
+    /// The way out of a vanished host home is `--no-mount-home`; every value
+    /// given to `--mount-home` is a path, so advising a word would create and
+    /// mount a directory of that name.
+    #[test]
+    fn missing_host_home_advises_no_mount_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("vanished").to_string_lossy().into_owned();
+        let mut ec = EnvironmentConfig::new_backend(
+            "e".to_string(),
+            Backend::Container(ContainerEngine::Podman),
+            "ubuntu:24.04".to_string(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        ec.mount_home = Some(gone);
+        let mut c = Counts::new(true);
+        check_mount_home(&mut c, &ec);
+        assert_eq!(c.fail, 1);
+        let msg = &c.checks[0].message;
+        assert!(msg.contains("mim modify --env e --no-mount-home"), "{msg}");
+        assert!(!msg.contains("--mount-home none"), "{msg}");
     }
 }
 
