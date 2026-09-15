@@ -201,13 +201,11 @@ fn minor_pin(version: &str) -> Option<String> {
 ///
 /// `windows` gives morloc's supported version range per language (short code ->
 /// conda match-spec). An interpreter whose solved version falls OUTSIDE its window
-/// is NOT pinned: such a version is never a valid ABI target for this morloc (a
-/// shim build always clamps to the window), so it can only have arrived by being
-/// pulled transitively by an unrelated package -- conda then picks the latest
-/// release, which may be a version morloc bans (e.g. python 3.14 broke the CPython
-/// C-API pymorloc.c uses). Pinning it would fold an unsatisfiable interval into
-/// every later solve (`>=3.10,<3.14` AND `>=3.14,<3.15`); skipping it lets the
-/// solve proceed and lets a re-provision clear the spurious lock.
+/// is declared but NOT pinned: no shim can have been built against it, and pinning
+/// it would fold an unsatisfiable interval into every later solve (`>=3.10,<3.14`
+/// AND `>=3.14,<3.15`). Declaring it without a pin makes the next solve clamp it
+/// into the window (the language clamp applies to every declared language), after
+/// which the shim is built and the pin recorded.
 pub fn abi_lock_spec(
     meta_dir: &Path,
     morloc_version: &str,
@@ -218,18 +216,13 @@ pub fn abi_lock_spec(
         .iter()
         .filter_map(|(pkg, lang)| {
             let version = versions.get(*pkg)?;
-            // Only pin an interpreter this morloc actually supports; an
-            // out-of-window version is a transitive pull, not a shim target.
-            if let Some(window) = windows.get(*lang) {
-                if !crate::constraint::VersionRange::parse(window)
+            let in_window = windows.get(*lang).map_or(true, |window| {
+                crate::constraint::VersionRange::parse(window)
                     .map(|r| r.satisfies(version))
                     .unwrap_or(true)
-                {
-                    return None;
-                }
-            }
-            let pin = minor_pin(version)?;
-            Some(LangReq { lang: lang.to_string(), constraint: Some(pin), std: None })
+            });
+            let constraint = if in_window { Some(minor_pin(version)?) } else { None };
+            Some(LangReq { lang: lang.to_string(), constraint, std: None })
         })
         .collect();
     if langs.is_empty() {
@@ -237,6 +230,204 @@ pub fn abi_lock_spec(
     } else {
         Some(EnvSpec::from_languages(morloc_version, langs))
     }
+}
+
+/// The shim interpreters a solve pulled into the world that no spec declares --
+/// a conda extra depending on python, say -- as morloc short codes, in
+/// `ABI_PACKAGES` order. Only languages `support` describes are reported, since
+/// only those can be declared (an undescribed language has no window to clamp
+/// to and no binder to build).
+///
+/// An interpreter the world holds is a language the environment has, whether or
+/// not a program asked for it: `morloc init` builds a binding for every
+/// interpreter it finds in the prefix, and that build needs the language's binder
+/// dependencies and an interpreter inside morloc's supported window. Declaring
+/// the language is what supplies both, so a caller re-solves with the returned
+/// languages added.
+pub fn undeclared_shim_runtimes(
+    locked: &[crate::pixi::LockedPackage],
+    specs: &[EnvSpec],
+    support: &crate::langsupport::LangSupport,
+) -> Vec<String> {
+    let declared: BTreeSet<&str> = specs
+        .iter()
+        .flat_map(|s| s.languages.iter().map(|l| l.lang.as_str()))
+        .collect();
+    ABI_PACKAGES
+        .iter()
+        .filter(|(pkg, lang)| {
+            locked.iter().any(|p| p.kind == "conda" && p.name == *pkg)
+                && support.languages.contains_key(*lang)
+                && !declared.contains(lang)
+        })
+        .map(|(_, lang)| lang.to_string())
+        .collect()
+}
+
+/// The shim-marker filename `morloc init` writes for a morloc language code
+/// (the compiler's `DF.lsName`). `rust` has no langSetup shim (its marshaller is
+/// a cargo build), so it maps to nothing. `julia` is normalized from the
+/// compiler's `jl` at `EnvSpec` ingestion, so it arrives here as `julia`.
+pub fn shim_marker_name(lang: &str) -> Option<&'static str> {
+    match lang {
+        "py" => Some("python"),
+        "r" => Some("R"),
+        "cpp" => Some("C++"),
+        "julia" => Some("Julia"),
+        _ => None,
+    }
+}
+
+/// Map a solved-runtime language code (from `pixi::runtime_languages`, e.g.
+/// `python`) back to its morloc short code (`py`), so shim-marker lookups have
+/// one key space. `rust` has no shim; `cpp` is not a conda runtime.
+pub fn runtime_to_morloc_lang(runtime: &str) -> Option<&'static str> {
+    match runtime {
+        "python" => Some("py"),
+        "r" => Some("r"),
+        "julia" => Some("julia"),
+        _ => None,
+    }
+}
+
+/// The per-language shim-marker directory under the runtime home
+/// (`MORLOC_HOME`). A marker records that `morloc init` built the language's
+/// binding; the force-clean of `init -f` wipes the whole directory.
+pub fn lang_marker_dir(home: &Path) -> PathBuf {
+    home.join("opt").join("lang-configured")
+}
+
+/// A way in which a language binding under the runtime home fails to match the
+/// interpreter the conda prefix holds. Each is a state a program's pool would
+/// only discover at start-up, as an import error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShimDefect {
+    /// The interpreter is in the prefix but `morloc init` never built its
+    /// binding -- init skipped the language, or the build failed.
+    NotBuilt { lang: String, version: String },
+    /// The marker says the binding was built, but the artifact is gone.
+    ArtifactMissing { lang: String, artifact: String },
+    /// The binding is tagged to another interpreter minor than the prefix
+    /// holds; the interpreter's importer will not even see the file.
+    MinorMismatch { lang: String, built: String, solved: String },
+}
+
+impl ShimDefect {
+    /// The morloc short code of the affected language.
+    pub fn lang(&self) -> &str {
+        match self {
+            ShimDefect::NotBuilt { lang, .. }
+            | ShimDefect::ArtifactMissing { lang, .. }
+            | ShimDefect::MinorMismatch { lang, .. } => lang,
+        }
+    }
+}
+
+impl std::fmt::Display for ShimDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShimDefect::NotBuilt { lang, version } => write!(
+                f,
+                "{lang}: the environment holds {} {version} but no morloc binding was built for it",
+                language_display(lang)
+            ),
+            ShimDefect::ArtifactMissing { lang, artifact } => {
+                write!(f, "{lang}: the morloc binding {artifact} is missing")
+            }
+            ShimDefect::MinorMismatch { lang, built, solved } => write!(
+                f,
+                "{lang}: the morloc binding was built for {} {built} but the environment holds {solved}",
+                language_display(lang)
+            ),
+        }
+    }
+}
+
+/// The interpreter's everyday name for a morloc short code, for messages.
+pub fn language_display(lang: &str) -> &'static str {
+    match lang {
+        "py" => "python",
+        "r" => "R",
+        "julia" => "julia",
+        _ => "the interpreter",
+    }
+}
+
+/// The major.minor a python binding under `home` was built for, read from the
+/// CPython ABI tag in its filename (`opt/pymorloc.cpython-3XY-*.so` -> `3.XY`).
+/// `None` when no binding is there.
+pub fn python_shim_minor(home: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(home.join("opt")).ok()?;
+    entries.flatten().find_map(|e| {
+        let name = e.file_name();
+        let name = name.to_str()?;
+        let tag = name.strip_prefix("pymorloc.cpython-")?;
+        let digits: String = tag.chars().take_while(char::is_ascii_digit).collect();
+        let (major, minor) = digits.split_at(1.min(digits.len()));
+        if major.is_empty() || minor.is_empty() {
+            return None;
+        }
+        Some(format!("{major}.{minor}"))
+    })
+}
+
+/// The bindings under the runtime `home` that do not match the interpreters the
+/// prefix described by `meta_dir` holds -- for every ABI interpreter present
+/// there. Empty means every present interpreter has a binding built for it.
+///
+/// The check reads artifacts, not only markers: a marker survives a moved
+/// interpreter, and a binding tagged to the previous minor is exactly the state
+/// that surfaces later as "No module named pymorloc".
+pub fn shim_defects(home: &Path, meta_dir: &Path) -> Vec<ShimDefect> {
+    let versions = abi_versions(meta_dir);
+    let markers = lang_marker_dir(home);
+    let mut defects = Vec::new();
+    for (pkg, lang) in ABI_PACKAGES {
+        let Some(version) = versions.get(*pkg) else { continue };
+        let lang = lang.to_string();
+        let Some(marker) = shim_marker_name(&lang) else { continue };
+        if !markers.join(marker).exists() {
+            defects.push(ShimDefect::NotBuilt { lang, version: version.clone() });
+            continue;
+        }
+        match lang.as_str() {
+            "py" => match python_shim_minor(home) {
+                None => defects.push(ShimDefect::ArtifactMissing {
+                    lang,
+                    artifact: "opt/pymorloc.cpython-*.so".to_string(),
+                }),
+                Some(built) => {
+                    let solved = major_minor(version);
+                    if built != solved {
+                        defects.push(ShimDefect::MinorMismatch { lang, built, solved });
+                    }
+                }
+            },
+            "r" => {
+                let lib = home.join("lib");
+                let present = std::fs::read_dir(&lib)
+                    .map(|d| {
+                        d.flatten().any(|e| {
+                            e.file_name().to_string_lossy().starts_with("librmorloc.")
+                        })
+                    })
+                    .unwrap_or(false);
+                if !present {
+                    defects.push(ShimDefect::ArtifactMissing {
+                        lang,
+                        artifact: "lib/librmorloc.so".to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    defects
+}
+
+/// `MAJOR.MINOR` of a version string (the whole string when it has fewer parts).
+fn major_minor(version: &str) -> String {
+    version.splitn(3, '.').take(2).collect::<Vec<_>>().join(".")
 }
 
 #[cfg(test)]
@@ -400,31 +591,196 @@ mod tests {
     }
 
     #[test]
-    fn abi_lock_skips_interpreter_outside_supported_window() {
-        // A python pulled transitively (no py program, so no window clamp) resolves
-        // to the latest release, 3.14 -- outside morloc's `>=3.10,<3.14` window.
-        // Pinning it would poison every later solve, so it must be dropped; the
-        // in-window r-base beside it is still pinned.
+    fn abi_lock_declares_but_does_not_pin_an_interpreter_outside_the_window() {
+        // A python pulled transitively resolves to the latest release, 3.14 --
+        // outside morloc's `>=3.10,<3.14` window. Pinning it would poison every
+        // later solve; leaving it out would let the next solve keep it there. So
+        // it is declared unpinned: the language clamp then moves it into the
+        // window. The in-window r-base beside it is pinned as usual.
         let tmp = tempfile::tempdir().unwrap();
         let prefix = tmp.path();
         write_meta(prefix, "python", "3.14.0");
         write_meta(prefix, "r-base", "4.3.3");
 
-        let spec = abi_lock_spec(prefix, "0.99.0", &windows()).expect("r-base is in window");
-        let pins: Vec<(String, String)> = spec
+        let spec = abi_lock_spec(prefix, "0.99.0", &windows()).expect("interpreters present");
+        let pins: Vec<(String, Option<String>)> = spec
             .languages
             .iter()
-            .map(|l| (l.lang.clone(), l.constraint.clone().unwrap()))
+            .map(|l| (l.lang.clone(), l.constraint.clone()))
             .collect();
-        assert_eq!(pins, vec![("r".to_string(), ">=4.3,<4.4".to_string())]);
+        assert_eq!(
+            pins,
+            vec![
+                ("py".to_string(), None),
+                ("r".to_string(), Some(">=4.3,<4.4".to_string())),
+            ]
+        );
     }
 
     #[test]
-    fn abi_lock_absent_when_every_interpreter_out_of_window() {
-        // Only an out-of-window python: nothing valid to pin -> no lock at all.
+    fn abi_lock_declares_a_lone_out_of_window_interpreter() {
         let tmp = tempfile::tempdir().unwrap();
         write_meta(tmp.path(), "python", "3.14.0");
-        assert!(abi_lock_spec(tmp.path(), "0.99.0", &windows()).is_none());
+        let spec = abi_lock_spec(tmp.path(), "0.99.0", &windows()).expect("python present");
+        assert_eq!(spec.languages.len(), 1);
+        assert_eq!(spec.languages[0].lang, "py");
+        assert_eq!(spec.languages[0].constraint, None);
+    }
+
+    fn support() -> crate::langsupport::LangSupport {
+        crate::langsupport::LangSupport::from_json(
+            r#"{"morloc_version":"0.99.0","toolchain":[],
+                "languages":{
+                  "py":{"runtime":{"package":"python","version":">=3.10,<3.14","default":"3.12"},"requires":[]},
+                  "r":{"runtime":{"package":"r-base","version":">=4.0","default":"4.4"},"requires":[]},
+                  "cpp":{"runtime":null,"requires":[]}}}"#,
+        )
+        .unwrap()
+    }
+
+    fn locked(names: &[&str]) -> Vec<crate::pixi::LockedPackage> {
+        names
+            .iter()
+            .map(|n| crate::pixi::LockedPackage {
+                name: n.to_string(),
+                version: "1".to_string(),
+                kind: "conda".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn undeclared_shim_runtimes_reports_pulled_interpreters_no_spec_declares() {
+        // A C++-only program plus a conda extra that dragged python in.
+        let cpp_only = EnvSpec::from_json(
+            r#"{"envspec_version":2,"morloc_version":"0.99.0","languages":[{"lang":"cpp"}]}"#,
+        )
+        .unwrap();
+        let world = locked(&["python", "numpy", "r-base", "gcc"]);
+        assert_eq!(
+            undeclared_shim_runtimes(&world, &[cpp_only.clone()], &support()),
+            vec!["py".to_string(), "r".to_string()]
+        );
+
+        // Declaring python (a py program, a pin, or the abi-lock) settles it.
+        let py = EnvSpec::from_json(
+            r#"{"envspec_version":2,"morloc_version":"0.99.0","languages":[{"lang":"py"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            undeclared_shim_runtimes(&world, &[cpp_only, py], &support()),
+            vec!["r".to_string()]
+        );
+
+        // Nothing pulled -> nothing to adopt; a pypi `python` is not the interpreter.
+        assert!(undeclared_shim_runtimes(&locked(&["gcc"]), &[], &support()).is_empty());
+        let mut pypi = locked(&["python"]);
+        pypi[0].kind = "pypi".to_string();
+        assert!(undeclared_shim_runtimes(&pypi, &[], &support()).is_empty());
+    }
+
+    #[test]
+    fn undeclared_shim_runtimes_ignores_a_language_the_table_lacks() {
+        // A table from a morloc without R: r-base in the world is not adoptable
+        // (there is no window to clamp to and no binder to build).
+        let no_r = crate::langsupport::LangSupport::from_json(
+            r#"{"morloc_version":"0.99.0","toolchain":[],"languages":{
+                  "py":{"runtime":{"package":"python","version":">=3.10,<3.14","default":"3.12"},"requires":[]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            undeclared_shim_runtimes(&locked(&["python", "r-base"]), &[], &no_r),
+            vec!["py".to_string()]
+        );
+    }
+
+    #[test]
+    fn shim_marker_name_maps_only_shim_bearing_langs() {
+        assert_eq!(shim_marker_name("py"), Some("python"));
+        assert_eq!(shim_marker_name("r"), Some("R"));
+        assert_eq!(shim_marker_name("cpp"), Some("C++"));
+        assert_eq!(shim_marker_name("julia"), Some("Julia"));
+        // rust has no langSetup shim; an unknown code maps to nothing.
+        assert_eq!(shim_marker_name("rust"), None);
+        assert_eq!(shim_marker_name("nope"), None);
+        assert_eq!(runtime_to_morloc_lang("python"), Some("py"));
+        assert_eq!(runtime_to_morloc_lang("rust"), None);
+    }
+
+    /// A runtime home holding a python binding tagged to `tag` and its marker.
+    fn home_with_python_shim(home: &Path, tag: &str) {
+        std::fs::create_dir_all(lang_marker_dir(home)).unwrap();
+        std::fs::write(lang_marker_dir(home).join("python"), "").unwrap();
+        std::fs::write(
+            home.join("opt").join(format!("pymorloc.cpython-{tag}-x86_64-linux-gnu.so")),
+            "",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn python_shim_minor_reads_the_cpython_abi_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(python_shim_minor(tmp.path()), None);
+        home_with_python_shim(tmp.path(), "312");
+        assert_eq!(python_shim_minor(tmp.path()), Some("3.12".to_string()));
+        std::fs::remove_file(
+            tmp.path().join("opt/pymorloc.cpython-312-x86_64-linux-gnu.so"),
+        )
+        .unwrap();
+        // The unsuffixed symlink the Makefile leaves is not a binding.
+        std::fs::write(tmp.path().join("opt/pymorloc"), "").unwrap();
+        assert_eq!(python_shim_minor(tmp.path()), None);
+    }
+
+    #[test]
+    fn shim_defects_reports_missing_stale_and_unbuilt_bindings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let meta = tmp.path().join("conda-meta");
+
+        // No interpreter in the prefix: nothing can be defective.
+        write_meta(&meta, "gcc", "14.1");
+        assert!(shim_defects(&home, &meta).is_empty());
+
+        // python in the prefix, never built (init skipped it).
+        write_meta(&meta, "python", "3.13.2");
+        assert_eq!(
+            shim_defects(&home, &meta),
+            vec![ShimDefect::NotBuilt { lang: "py".into(), version: "3.13.2".into() }]
+        );
+
+        // Built for the interpreter the prefix holds: clean.
+        home_with_python_shim(&home, "313");
+        assert!(shim_defects(&home, &meta).is_empty());
+
+        // The prefix moved to 3.12 under a marker that still says "built".
+        std::fs::remove_file(meta.join("python-3.13.2-0.json")).unwrap();
+        write_meta(&meta, "python", "3.12.9");
+        assert_eq!(
+            shim_defects(&home, &meta),
+            vec![ShimDefect::MinorMismatch {
+                lang: "py".into(),
+                built: "3.13".into(),
+                solved: "3.12".into()
+            }]
+        );
+
+        // The artifact vanished behind its marker.
+        std::fs::remove_file(home.join("opt/pymorloc.cpython-313-x86_64-linux-gnu.so")).unwrap();
+        assert!(matches!(
+            shim_defects(&home, &meta).as_slice(),
+            [ShimDefect::ArtifactMissing { lang, .. }] if lang == "py"
+        ));
+
+        // R: marker + library present is clean; marker alone is a missing artifact.
+        write_meta(&meta, "r-base", "4.4.1");
+        std::fs::write(lang_marker_dir(&home).join("R"), "").unwrap();
+        let defects = shim_defects(&home, &meta);
+        assert!(defects.iter().any(|d| matches!(d, ShimDefect::ArtifactMissing { lang, .. } if lang == "r")));
+        std::fs::create_dir_all(home.join("lib")).unwrap();
+        std::fs::write(home.join("lib/librmorloc.so"), "").unwrap();
+        assert!(shim_defects(&home, &meta).iter().all(|d| d.lang() != "r"));
     }
 
     #[test]

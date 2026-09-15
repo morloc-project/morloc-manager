@@ -27,6 +27,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use morloc_deps::abi;
 use morloc_deps::envspec::{EnvSpec, LocalAnchor};
 use morloc_deps::envstore::{EnvContext, Provenance, SolveInputs};
 use morloc_deps::error::DepsError;
@@ -107,6 +108,31 @@ pub fn sync(
         Err(e) => return Err(e),
     };
 
+    // Now that the prefix is final, a binding the marker calls built may not
+    // match the interpreter the prefix holds (moved by this or an earlier solve,
+    // or the artifact gone). Such a binding fails only when a pool imports it,
+    // so it is rebuilt here like a missing one: its marker goes, which is what
+    // an incremental `morloc init` keys the rebuild on.
+    let stale = stale_declared_shims(&es, &home, &abi::meta_dir(&ctx.pixi_dir()));
+    if !stale.is_empty() && env_is_immutable() {
+        return Err(DepsError::Env(format!(
+            "building '{name}' needs morloc bindings this environment holds for another \
+             interpreter version:\n  {}\nA served or frozen image cannot rebuild them. \
+             Rebuild the environment: `mim update --reinit`.",
+            stale.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("\n  ")
+        )));
+    }
+    let mut missing = missing;
+    for defect in &stale {
+        eprintln!("Rebuilding a morloc binding: {defect}.");
+        if let Some(marker) = abi::shim_marker_name(defect.lang()) {
+            let _ = std::fs::remove_file(abi::lang_marker_dir(&home).join(marker));
+        }
+        if !missing.iter().any(|l| l == defect.lang()) {
+            missing.push(defect.lang().to_string());
+        }
+    }
+
     // On-demand provisioning (mutable env): build the missing shims before the
     // pools that link them are compiled. `ctx.sync` provisioned the interpreters
     // and recorded their abi-lock; the marker stays absent until the build
@@ -136,46 +162,26 @@ pub fn sync(
 /// a failed build or an immutable-env refusal is re-detected on every retry.
 /// Returns morloc short codes (py/r/cpp/julia), which are also valid `--lang` pins.
 fn declared_langs_missing_shims(es: &EnvSpec, home: &Path) -> Vec<String> {
-    let marker_dir = lang_marker_dir(home);
+    let marker_dir = abi::lang_marker_dir(home);
     es.languages
         .iter()
-        .filter_map(|l| shim_marker_name(&l.lang).map(|m| (l.lang.clone(), m)))
+        .filter_map(|l| abi::shim_marker_name(&l.lang).map(|m| (l.lang.clone(), m)))
         .filter(|(_, marker)| !marker_dir.join(marker).exists())
         .map(|(lang, _)| lang)
         .collect()
 }
 
-/// Map a morloc language code to the shim-marker filename `morloc init` writes
-/// (the compiler's `DF.lsName`). `rust` has no langSetup shim (its marshaller is a
-/// cargo build), so it maps to nothing. `julia` is normalized from the compiler's
-/// `jl` at `EnvSpec` ingestion, so it arrives here as `julia`. The single source
-/// of the marker filenames -- callers with a conda runtime code map it back first
-/// (see [`runtime_to_morloc_lang`]).
-fn shim_marker_name(lang: &str) -> Option<&'static str> {
-    match lang {
-        "py" => Some("python"),
-        "r" => Some("R"),
-        "cpp" => Some("C++"),
-        "julia" => Some("Julia"),
-        _ => None,
-    }
-}
-
-/// Map a solved-runtime language code (from `pixi::runtime_languages`, e.g.
-/// `python`) back to its morloc short code (`py`), so shim-marker lookups have one
-/// key space. `rust` has no shim; `cpp` is not a conda runtime.
-fn runtime_to_morloc_lang(runtime: &str) -> Option<&'static str> {
-    match runtime {
-        "python" => Some("py"),
-        "r" => Some("r"),
-        "julia" => Some("julia"),
-        _ => None,
-    }
-}
-
-/// The per-language shim-marker directory under the runtime home.
-fn lang_marker_dir(home: &Path) -> PathBuf {
-    home.join("opt").join("lang-configured")
+/// The bindings of the languages a program's pools USE that no longer match the
+/// interpreter the prefix holds: the marker says built, but the artifact is gone
+/// or tagged to another minor. Declared languages only, like
+/// [`declared_langs_missing_shims`], so an interpreter a dependency pulled in
+/// never triggers a rebuild for a program that does not use it.
+fn stale_declared_shims(es: &EnvSpec, home: &Path, meta_dir: &Path) -> Vec<abi::ShimDefect> {
+    abi::shim_defects(home, meta_dir)
+        .into_iter()
+        .filter(|d| !matches!(d, abi::ShimDefect::NotBuilt { .. }))
+        .filter(|d| es.languages.iter().any(|l| l.lang == d.lang()))
+        .collect()
 }
 
 /// The runtime home (`MORLOC_HOME`) where `morloc init` writes shims and their
@@ -256,9 +262,9 @@ pub fn clean() -> Result<(), DepsError> {
 /// `MORLOC_HOME` (e.g. `mim clean` run outside an env) simply skips this.
 fn invalidate_shim_markers(dropped: &[String]) {
     let Ok(home) = morloc_home() else { return };
-    let dir = lang_marker_dir(&home);
+    let dir = abi::lang_marker_dir(&home);
     for lang in dropped {
-        if let Some(marker) = runtime_to_morloc_lang(lang).and_then(shim_marker_name) {
+        if let Some(marker) = abi::runtime_to_morloc_lang(lang).and_then(abi::shim_marker_name) {
             let _ = std::fs::remove_file(dir.join(marker));
         }
     }
@@ -358,21 +364,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shim_marker_name_maps_only_shim_bearing_langs() {
-        assert_eq!(shim_marker_name("py"), Some("python"));
-        assert_eq!(shim_marker_name("r"), Some("R"));
-        assert_eq!(shim_marker_name("cpp"), Some("C++"));
-        assert_eq!(shim_marker_name("julia"), Some("Julia"));
-        // rust has no langSetup shim; an unknown code maps to nothing.
-        assert_eq!(shim_marker_name("rust"), None);
-        assert_eq!(shim_marker_name("nope"), None);
-    }
-
-    #[test]
     fn declared_langs_missing_shims_uses_declared_langs_and_markers() {
         let home = tempfile::tempdir().unwrap();
         // Only python's binding is built.
-        let markers = lang_marker_dir(home.path());
+        let markers = abi::lang_marker_dir(home.path());
         std::fs::create_dir_all(&markers).unwrap();
         std::fs::write(markers.join("python"), "").unwrap();
 
@@ -387,5 +382,38 @@ mod tests {
             declared_langs_missing_shims(&es, home.path()),
             vec!["r".to_string(), "cpp".to_string(), "julia".to_string()]
         );
+    }
+
+    #[test]
+    fn stale_declared_shims_covers_only_bindings_the_program_uses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let meta = tmp.path().join("conda-meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        // The prefix holds python 3.12; the binding was built for 3.13.
+        std::fs::write(meta.join("python-3.12.9-0.json"), r#"{"name":"python","version":"3.12.9"}"#).unwrap();
+        let markers = abi::lang_marker_dir(&home);
+        std::fs::create_dir_all(&markers).unwrap();
+        std::fs::write(markers.join("python"), "").unwrap();
+        std::fs::write(home.join("opt/pymorloc.cpython-313-x86_64-linux-gnu.so"), "").unwrap();
+
+        let py = EnvSpec::from_json(
+            r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}]}"#,
+        )
+        .unwrap();
+        let stale = stale_declared_shims(&py, &home, &meta);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].lang(), "py");
+
+        // A C++ program does not care that the python binding is stale.
+        let cpp = EnvSpec::from_json(
+            r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"cpp"}]}"#,
+        )
+        .unwrap();
+        assert!(stale_declared_shims(&cpp, &home, &meta).is_empty());
+
+        // An unbuilt binding is the missing-marker path's business, not this one's.
+        std::fs::remove_file(markers.join("python")).unwrap();
+        assert!(stale_declared_shims(&py, &home, &meta).is_empty());
     }
 }

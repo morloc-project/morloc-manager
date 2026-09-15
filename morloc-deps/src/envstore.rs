@@ -297,6 +297,21 @@ impl EnvContext {
         Ok(())
     }
 
+    /// Drop the recorded shim-ABI pin. A rebuild that re-solves from scratch and
+    /// rebuilds every binding (`mim update --reinit`) owes the interpreters no
+    /// loyalty, so the pin goes before the solve and is re-recorded after it.
+    pub fn clear_abi_lock(&self) -> Result<()> {
+        remove_if_present(&self.abi_lock_path())
+    }
+
+    /// Forget the last successful in-env solve (its world digest and cached
+    /// activation), so the next `sync` re-solves and re-captures instead of
+    /// fast-pathing past a prefix that was rebuilt underneath it.
+    pub fn clear_solve_cache(&self) -> Result<()> {
+        remove_if_present(&self.solved_digest_path())?;
+        remove_if_present(&self.activation_cache_path())
+    }
+
     /// The env's shim-ABI pin spec, if one has been recorded.
     fn read_abi_lock(&self) -> Result<Option<EnvSpec>> {
         read_optional_spec(&self.abi_lock_path())
@@ -535,7 +550,7 @@ impl EnvContext {
         // In-container path (mim-env): the built image already sets the CA env vars,
         // which the pixi subprocess inherits, so no override is needed. No FHS
         // wrapping: the in-env agent already runs inside its execution environment.
-        let solved = if try_locked
+        let mut solved = if try_locked
             && crate::pixi::install_locked(&pixi_dir, inputs.pixi_bin, None, None)?
         {
             false
@@ -543,6 +558,24 @@ impl EnvContext {
             crate::pixi::solve(&pixi_dir, inputs.pixi_bin, None, None)?;
             true
         };
+        // An interpreter the solve pulled in that nothing declares (a conda extra
+        // depending on python) is a language this environment now has: `morloc
+        // init` will build its binding, which needs the binder dependencies and an
+        // interpreter inside morloc's window. Declare it and solve again. The
+        // digest recorded below stays the declared world's, so the next make still
+        // fast-paths; the pin recorded after this solve is what carries the
+        // adoption forward.
+        let locked = crate::pixi::locked_packages(&pixi_dir, inputs.platform)?;
+        let pulled = crate::abi::undeclared_shim_runtimes(&locked, specs, inputs.lang_support);
+        if !pulled.is_empty() {
+            eprintln!("{}", adoption_note(&pulled));
+            let mut adopted = specs.to_vec();
+            adopted.push(adopted_language_spec(&pulled, &inputs.lang_support.morloc_version));
+            let reqs = self.requirement_set(&adopted, inputs)?;
+            crate::pixi::write_manifest(&pixi_dir, &crate::pixi::render_manifest(&reqs))?;
+            crate::pixi::solve(&pixi_dir, inputs.pixi_bin, None, None)?;
+            solved = true;
+        }
         // Keep the host-readable record mirror in step with the prefix that was
         // just installed, so a host reading this environment does not describe a
         // world it has moved on from. A failure here leaves the prefix correct and
@@ -780,6 +813,31 @@ fn remove_if_present(path: &Path) -> Result<()> {
 /// program name, then by path, so the gather order is deterministic (it feeds the
 /// merged requirement set) and reads in program order. A missing directory yields
 /// an empty list.
+/// A languages-only spec declaring `langs` (morloc short codes) with no version
+/// constraint, so the language clamp bounds each to morloc's supported window
+/// and its binder dependencies join the world. Built for interpreters a solve
+/// pulled in without a declaration; see `abi::undeclared_shim_runtimes`.
+pub fn adopted_language_spec(langs: &[String], morloc_version: &str) -> EnvSpec {
+    EnvSpec::from_languages(
+        morloc_version,
+        langs
+            .iter()
+            .map(|lang| crate::envspec::LangReq { lang: lang.clone(), constraint: None, std: None })
+            .collect(),
+    )
+}
+
+/// What the user is told when a solve adopts interpreters no program declared.
+pub fn adoption_note(langs: &[String]) -> String {
+    let names: Vec<&str> = langs.iter().map(|l| crate::abi::language_display(l)).collect();
+    format!(
+        "Note: the solve pulled in {} without a program declaring it; adopting it as \
+         an environment language so it stays within morloc's supported range and \
+         its morloc binding can be built.",
+        names.join(", ")
+    )
+}
+
 fn json_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_json(dir, true, &mut files)?;
@@ -1151,10 +1209,12 @@ mod tests {
     }
 
     #[test]
-    fn record_abi_lock_skips_python_outside_supported_window() {
+    fn record_abi_lock_declares_python_outside_supported_window_unpinned() {
         // A python 3.14 in the prefix (transitively pulled, banned by the window)
-        // must NOT be recorded -- otherwise every later solve folds in an
-        // unsatisfiable `>=3.10,<3.14` AND `>=3.14,<3.15` and pixi fails cryptically.
+        // must NOT be pinned -- otherwise every later solve folds in an
+        // unsatisfiable `>=3.10,<3.14` AND `>=3.14,<3.15` and pixi fails
+        // cryptically -- but it IS declared, so the next solve clamps it into the
+        // window instead of leaving it where no binding can be built.
         let (_d, ctx) = ctx();
         let prefix = crate::abi::conda_prefix(&ctx.pixi_dir());
         let meta = prefix.join("conda-meta");
@@ -1164,7 +1224,9 @@ mod tests {
         ctx.record_abi_lock("0.99.0", &support()).unwrap();
         let mut solve_set = Vec::new();
         ctx.append_abi_lock(&mut solve_set).unwrap();
-        assert!(solve_set.is_empty(), "an out-of-window interpreter must not be pinned");
+        assert_eq!(solve_set.len(), 1);
+        assert_eq!(solve_set[0].languages[0].lang, "py");
+        assert_eq!(solve_set[0].languages[0].constraint, None);
     }
 
     #[test]

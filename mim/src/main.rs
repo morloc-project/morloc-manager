@@ -422,7 +422,7 @@ Examples:
 Examples:
   mim update                        # re-solve/rebuild at the current version
   mim update --env myenv
-  mim update --env myenv --force            # force a fresh re-solve
+  mim update --env myenv --reinit           # discard the solve and rebuild from scratch
   mim update --env myenv --latest           # move to the newest release
   mim update --env myenv --morloc-version 0.98.0   # move to a specific version
   mim update --env myenv -x --no-cache      # rebuild with an engine build flag
@@ -442,10 +442,12 @@ version; changing settings (packages, dotfiles, default) is `mim modify`.")]
         /// rebuild.
         #[arg(long)]
         latest: bool,
-        /// Force a full re-solve and rebuild even when nothing changed (repair a
-        /// stale or half-built environment).
+        /// Discard what was built and rebuild from the environment's settings and
+        /// installed programs: the solved toolchain, its lock, the scratch builds
+        /// and the language bindings all go, then everything is solved and built
+        /// again. Repairs a stale or half-built environment.
         #[arg(long)]
-        force: bool,
+        reinit: bool,
         /// Proceed even if an installed module declares a morloc-version range
         /// that excludes the target compiler. Without this, such a conflict
         /// aborts the update (leaving the environment untouched).
@@ -2622,7 +2624,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         // ---- update ----
         // Rebuild an environment, optionally moving its morloc version. Settings
         // changes (packages/dotfiles/default) are `modify`, not `update`.
-        Cmd::Update { env, morloc_version, latest, force, ignore_module_compat, engine_arg } => {
+        Cmd::Update { env, morloc_version, latest, reinit, ignore_module_compat, engine_arg } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
             if !engine_arg.is_empty() && ec.backend.is_native() {
                 return Err(engine_arg_not_supported());
@@ -2662,11 +2664,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 gate_module_compat(env_scope, &env_name, &requested, ignore_module_compat)?
                     .or(requested);
 
-            // --force repairs a stale/half-built env: drop the success marker so
-            // materialization always re-solves and rebuilds rather than skipping.
-            // A one-shot build flag is a request for a build, not for whatever the
+            // --reinit repairs a stale/half-built env: everything derived from the
+            // inputs goes, so materialization solves and builds it all again. A
+            // one-shot build flag is a request for a build, not for whatever the
             // marker says about the last one.
-            if force || !engine_arg.is_empty() {
+            if reinit {
+                reset_for_reinit(env_scope, &env_name, &ec)?;
+            } else if !engine_arg.is_empty() {
                 clear_materialized_marker(env_scope, &env_name, &ec);
             }
 
@@ -3148,6 +3152,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 // failed rebuild restores them exactly -- like the cert snapshot.
                 let req_snapshot = envstore::EnvContext::new(&cfg::env_data_dir(env_scope, &env_name))
                     .snapshot_requirements();
+                // The manifest and lock too: a failed rebuild has already re-solved
+                // them for the new config, and the make-time agent solves whatever
+                // lock it finds against the rolled-back store. Restoring the pair
+                // makes the next `pixi install --locked` return the prefix to the
+                // world the store describes.
+                let pixi_snapshot =
+                    snapshot_pixi_files(&cfg::env_data_dir(env_scope, &env_name).join("pixi"));
 
                 // Each file is the env's whole list for its source; edit and
                 // re-apply to change it.
@@ -3209,6 +3220,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         // toolchain.json/extras.json.
                         let _ = cfg::write_env_config(env_scope, &env_name, &prev_ec);
                         let _ = cfg::write_env_inputs(env_scope, &env_name, &prev_inputs);
+                        restore_pixi_files(&pixi_snapshot);
                         let _ = envstore::EnvContext::new(&cfg::env_data_dir(env_scope, &env_name))
                             .restore_requirements(&req_snapshot);
                         if let Some(snap) = &cert_snapshot {
@@ -4496,6 +4508,57 @@ fn resolve_env_requirements(
     })
 }
 
+/// After a host-side solve of `pixi_dir`: the requirement set rebuilt with every
+/// shim interpreter the solve pulled in that no spec declares (see
+/// `abi::undeclared_shim_runtimes`) declared as a language, or `None` when the
+/// solve pulled none. The caller re-renders and re-solves with the result, so the
+/// interpreter lands inside morloc's supported window with the binder
+/// dependencies `morloc init` needs to build its binding. Without this, a conda
+/// extra that depends on python gives the prefix whatever python conda likes
+/// best -- possibly one morloc cannot build against -- and a binding built for
+/// it is stale the moment a program declaring python solves.
+fn adopt_pulled_runtimes(
+    pixi_dir: &std::path::Path,
+    platform: &str,
+    version: &str,
+    support: &langsupport::LangSupport,
+    specs: &[envspec::EnvSpec],
+    program_specs: &[envspec::EnvSpec],
+    lang_pins: &[(String, Option<String>)],
+    conda_packages: &[String],
+) -> Result<Option<(Vec<envspec::EnvSpec>, Option<envspec::EnvSpec>, pixi::RequirementSet)>> {
+    let locked = pixi::locked_packages(pixi_dir, platform)?;
+    let pulled = morloc_deps::abi::undeclared_shim_runtimes(&locked, specs, support);
+    if pulled.is_empty() {
+        return Ok(None);
+    }
+    eprintln!("{}", envstore::adoption_note(&pulled));
+    let mut with_pulled = program_specs.to_vec();
+    with_pulled.push(envstore::adopted_language_spec(&pulled, version));
+    build_env_requirements(version, platform, &with_pulled, lang_pins, conda_packages, support)
+        .map(Some)
+}
+
+/// Refuse to call a rebuild done while a binding under the runtime `home` does
+/// not match an interpreter the prefix holds. `morloc init` skips a language it
+/// cannot find inside the prefix with a warning and builds the rest, so a
+/// materialize can succeed and still leave a python program to fail at start-up
+/// with "No module named pymorloc"; this turns that into the rebuild's failure,
+/// with the init output above it saying why.
+fn check_runtime_bindings(name: &str, home: &std::path::Path, pixi_dir: &std::path::Path) -> Result<()> {
+    let defects = morloc_deps::abi::shim_defects(home, &morloc_deps::abi::meta_dir(pixi_dir));
+    if defects.is_empty() {
+        return Ok(());
+    }
+    Err(ManagerError::EnvError(format!(
+        "environment '{name}' was rebuilt, but its morloc language bindings do not match \
+         the interpreters it holds:\n  {}\nThe `morloc init` output above says what \
+         happened to the build. The runtime is at {}.",
+        defects.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("\n  "),
+        home.display()
+    )))
+}
+
 /// Fold the user's `--lang` pins into the program specs and solve the pixi
 /// requirements for `platform` against `support`. Shared by the release
 /// (`resolve_env_requirements`) and dev (`build_dev_container_image`) builders,
@@ -4555,7 +4618,7 @@ fn materialize_native_env(
     // Native runs on the host, so the compiler executes there -- no engine needed.
     // Native: the compiler runs on the host, so the base image is unused (it only
     // matters for the container lang-support fallback, which native never hits).
-    let req = resolve_env_requirements(
+    let mut req = resolve_env_requirements(
         scope, program_specs, lang_pins, conda_packages, None, requested_version, local_runtime, CONTAINER_BASE_IMAGE,
     )?;
 
@@ -4628,6 +4691,16 @@ fn materialize_native_env(
     let ssl_cert = cert::host_bundle_if_present(scope, name);
     eprintln!("Solving native toolchain with pixi (this may take a few minutes)...");
     pixi::solve(&pixi_dir, &pixi_bin, ssl_cert.as_deref(), fhs)?;
+    if let Some((specs, lang_spec, requirements)) = adopt_pulled_runtimes(
+        &pixi_dir, &hostprobe::probe_host().platform, &req.version, &req.support, &req.specs,
+        program_specs, lang_pins, conda_packages,
+    )? {
+        req.specs = specs;
+        req.lang_spec = lang_spec;
+        req.requirements = requirements;
+        pixi::write_manifest(&pixi_dir, &pixi::render_manifest(&req.requirements))?;
+        pixi::solve(&pixi_dir, &pixi_bin, ssl_cert.as_deref(), fhs)?;
+    }
     // A filesystem that folds letter case (the macOS default) merges conda files
     // whose names differ only in case, leaving a header holding another header's
     // contents. Refuse the prefix before anything is compiled against it.
@@ -4654,6 +4727,7 @@ fn materialize_native_env(
         fhs_wrapper.as_ref().map(|p| p.to_string_lossy()).as_deref(),
         verbose,
     )?;
+    check_runtime_bindings(name, &env_dir, &pixi_dir)?;
 
     // Pin the interpreter minors the shims were just built against (see
     // record_abi_lock_or_warn). The env's pixi dir is the EnvContext default.
@@ -7142,11 +7216,111 @@ fn with_one_shot(mut persisted: Vec<String>, one_shot: &[String]) -> Vec<String>
     persisted
 }
 
+/// The manifest and lock of a pixi project as they are now, `None` for one that
+/// is absent, keyed by path so `restore_pixi_files` can put both back exactly.
+fn snapshot_pixi_files(pixi_dir: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+    ["pixi.toml", "pixi.lock"]
+        .iter()
+        .map(|f| {
+            let path = pixi_dir.join(f);
+            let content = std::fs::read(&path).ok();
+            (path, content)
+        })
+        .collect()
+}
+
+/// Put back what `snapshot_pixi_files` captured, absence included. Best-effort:
+/// this runs on a rollback path, where the original error is the one to report.
+fn restore_pixi_files(snapshot: &[(std::path::PathBuf, Option<Vec<u8>>)]) {
+    for (path, content) in snapshot {
+        let _ = match content {
+            Some(bytes) => std::fs::write(path, bytes),
+            None => std::fs::remove_file(path).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }
+            }),
+        };
+    }
+}
+
 /// Delete the `materialized.toml` success marker so the next materialize is
 /// forced to re-solve + rebuild instead of taking the unchanged-manifest skip.
 /// Best-effort.
 fn clear_materialized_marker(scope: Scope, name: &str, ec: &EnvironmentConfig) {
     let _ = std::fs::remove_file(materialized_marker(scope, name, ec.backend.is_native()));
+}
+
+/// Discard everything an environment derived from its inputs, so the rebuild
+/// that follows produces it all again from what persists: the settings
+/// (`mim modify`), the installed programs and their dependencies, the pinned
+/// languages, and the deposited module pins. What goes: the scratch builds, the
+/// interpreter pins, the solve cache, the lock, the solved conda prefix, and
+/// the success marker. The language bindings go with the rebuild's own
+/// `morloc init -f`, which cleans what it owns before building.
+///
+/// Installed programs keep their launchers and manifests, which is what makes
+/// them persistent; a compiled pool built against the previous runtime is
+/// rebuilt by the next `morloc make`, as after any update.
+fn reset_for_reinit(scope: Scope, name: &str, ec: &EnvironmentConfig) -> Result<()> {
+    if env_serve_alive(scope, name, ec) {
+        return Err(ManagerError::EnvError(format!(
+            "environment '{name}' is being served; stop it first with \
+             'mim stop --env {name}', then rebuild it."
+        )));
+    }
+    let data_dir = cfg::env_data_dir(scope, name);
+    discard_derived_state(&data_dir, ec.backend.container_engine())?;
+    clear_materialized_marker(scope, name, ec);
+    eprintln!(
+        "Discarded the solved toolchain, scratch builds and language bindings of \
+         '{name}'; rebuilding it from its settings and installed programs..."
+    );
+    Ok(())
+}
+
+/// The filesystem half of `reset_for_reinit`, on an environment data dir: drop
+/// the scratch specs, the interpreter pins, the solve cache, the lock, and the
+/// solved prefix (the engine volume when `engine` manages one, and any prefix
+/// tree or record mirror under the pixi project).
+fn discard_derived_state(data_dir: &std::path::Path, engine: Option<ContainerEngine>) -> Result<()> {
+    let ctx = envstore::EnvContext::new(data_dir);
+    ctx.clear_scratch()?;
+    ctx.clear_abi_lock()?;
+    ctx.clear_solve_cache()?;
+    let pixi_dir = ctx.pixi_dir();
+    let remove = |path: &std::path::Path, dir: bool| -> Result<()> {
+        let result = if dir {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ManagerError::EnvError(format!(
+                "cannot remove {}: {e}",
+                path.display()
+            ))),
+        }
+    };
+    remove(&pixi_dir.join("pixi.lock"), false)?;
+    // The prefix: an engine volume for a container, a directory under the pixi
+    // project for native (and for a container an empty mount point, or the tree
+    // an older mim solved onto the host). The record mirror goes with it, so
+    // nothing describes a world that no longer exists.
+    if let Some(engine) = engine {
+        let volume = serve::prefix_volume(data_dir);
+        if container::volume_exists(engine, &volume)
+            && !container::volume_remove(engine, &volume).success()
+        {
+            return Err(ManagerError::EnvError(format!(
+                "cannot remove the conda prefix volume '{volume}'; is a container of \
+                 this environment still running? Stop it and run this again."
+            )));
+        }
+    }
+    remove(&morloc_deps::abi::conda_prefix(&pixi_dir), true)?;
+    remove(&pixi_dir.join(morloc_deps::abi::CONDA_META_MIRROR), true)?;
+    Ok(())
 }
 
 /// Re-solve and re-materialize an environment from the union of every installed
@@ -7265,7 +7439,7 @@ fn build_requirement_derived_image(
     // Pass the target so the language-support table can be generated in a
     // container when the host cannot run the compiler (NixOS/musl, or a foreign
     // architecture).
-    let req = resolve_env_requirements(
+    let mut req = resolve_env_requirements(
         scope, program_specs, lang_pins, conda_packages, Some(target), requested_version,
         local_runtime, base_image,
     )?;
@@ -7326,6 +7500,16 @@ fn build_requirement_derived_image(
     let ssl_cert = cert::host_bundle_if_present(scope, name);
     eprintln!("Solving + locking the environment with pixi...");
     pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
+    if let Some((specs, lang_spec, requirements)) = adopt_pulled_runtimes(
+        &pixi_host, &arch.conda_platform(), &req.version, &req.support, &req.specs,
+        program_specs, lang_pins, conda_packages,
+    )? {
+        req.specs = specs;
+        req.lang_spec = lang_spec;
+        req.requirements = requirements;
+        pixi::write_manifest(&pixi_host, &pixi::render_manifest(&req.requirements))?;
+        pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
+    }
 
     // Build the requirement-INDEPENDENT base image (base tools + pixi + the
     // compiler/rust source). The env-specific pixi solve + `morloc init` run in a
@@ -7379,6 +7563,7 @@ fn build_requirement_derived_image(
     // MORLOC_HOME -- prefix-correct because solved at their final runtime paths.
     eprintln!("Materializing the environment (pixi install + morloc init) in a container...");
     materialize_container_env(target, &image_tag, &env_dir, true)?;
+    check_runtime_bindings(name, &home_host, &pixi_host)?;
 
     // Pin the interpreter minors the shims were just built against, read from the
     // now-solved conda prefix under the env's (host-mounted) pixi dir.
@@ -7856,7 +8041,7 @@ fn build_dev_container_image(
     // host platform, which would lock `osx-*` on a macOS host and fail the
     // in-container `pixi install --locked`).
     let platform = arch.conda_platform();
-    let (_specs, lang_spec, requirements) =
+    let (specs, lang_spec, requirements) =
         build_env_requirements(stdlib_version, &platform, program_specs, lang_pins, conda_packages, &support)?;
     let manifest = pixi::render_manifest(&requirements);
     let image_tag = environment::env_image_tag(name);
@@ -7922,6 +8107,13 @@ fn build_dev_container_image(
         let ssl_cert = cert::host_bundle_if_present(scope, name);
         eprintln!("Solving + locking the dev environment with pixi...");
         pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
+        if let Some((_, _, requirements)) = adopt_pulled_runtimes(
+            &pixi_host, &platform, stdlib_version, &support, &specs, program_specs, lang_pins,
+            conda_packages,
+        )? {
+            pixi::write_manifest(&pixi_host, &pixi::render_manifest(&requirements))?;
+            pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
+        }
 
         std::fs::create_dir_all(&context).map_err(|e| {
             ManagerError::EnvError(format!("cannot create {}: {e}", context.display()))
@@ -9989,26 +10181,64 @@ mod tests {
     }
 
     #[test]
-    fn update_takes_version_and_force() {
+    fn discard_derived_state_keeps_what_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let ctx = envstore::EnvContext::new(data_dir);
+        let spec = r#"{"envspec_version":2,"morloc_version":"0.99.0","languages":[{"lang":"py"}]}"#;
+        ctx.write_spec("keeper", envstore::Provenance::Installed, spec).unwrap();
+        ctx.write_spec("scratchy", envstore::Provenance::Scratch, spec).unwrap();
+        ctx.write_conda_extras(&["bat".to_string()]).unwrap();
+        let pixi = ctx.pixi_dir();
+        std::fs::create_dir_all(morloc_deps::abi::conda_prefix(&pixi).join("conda-meta")).unwrap();
+        std::fs::create_dir_all(pixi.join(morloc_deps::abi::CONDA_META_MIRROR)).unwrap();
+        std::fs::write(pixi.join("pixi.toml"), "").unwrap();
+        std::fs::write(pixi.join("pixi.lock"), "").unwrap();
+        std::fs::write(pixi.join(".morloc-activation.json"), "[]").unwrap();
+        std::fs::write(pixi.join(".morloc-solved-digest"), "x").unwrap();
+        std::fs::write(ctx.requirements_dir().join("abi-lock.json"), spec).unwrap();
+        // The runtime and installed launchers are not this step's to touch.
+        std::fs::create_dir_all(data_dir.join("exe/keeper")).unwrap();
+
+        discard_derived_state(data_dir, None).unwrap();
+
+        assert_eq!(ctx.installed_program_names().unwrap(), vec!["keeper".to_string()]);
+        assert_eq!(ctx.program_names().unwrap(), vec!["keeper".to_string()]);
+        assert_eq!(ctx.read_conda_extras().unwrap(), vec!["bat".to_string()]);
+        assert!(!ctx.has_abi_lock());
+        assert!(!pixi.join("pixi.lock").exists());
+        assert!(!pixi.join(".morloc-activation.json").exists());
+        assert!(!pixi.join(".morloc-solved-digest").exists());
+        assert!(!morloc_deps::abi::conda_prefix(&pixi).exists());
+        assert!(!pixi.join(morloc_deps::abi::CONDA_META_MIRROR).exists());
+        // The manifest is re-rendered by the rebuild; leaving it is harmless.
+        assert!(data_dir.join("exe/keeper").is_dir());
+        // Idempotent: a second discard on the emptied env is not an error.
+        discard_derived_state(data_dir, None).unwrap();
+    }
+
+    #[test]
+    fn update_takes_version_and_reinit() {
         let cli = Cli::try_parse_from([
             "mim", "update", "--env", "e", "--morloc-version", "0.98.0",
         ])
         .expect("update should parse --morloc-version");
         match cli.command {
-            Some(Cmd::Update { env, morloc_version, latest, force, ignore_module_compat, engine_arg }) => {
+            Some(Cmd::Update { env, morloc_version, latest, reinit, ignore_module_compat, engine_arg }) => {
                 assert_eq!(env.as_deref(), Some("e"));
                 assert_eq!(morloc_version.as_deref(), Some("0.98.0"));
                 assert!(!latest);
-                assert!(!force);
+                assert!(!reinit);
                 assert!(!ignore_module_compat);
                 assert!(engine_arg.is_empty());
             }
             _ => panic!("expected Cmd::Update"),
         }
-        // --force and --latest parse.
-        let cli = Cli::try_parse_from(["mim", "update", "--env", "e", "--force", "--latest"])
-            .expect("update --force --latest should parse");
-        assert!(matches!(cli.command, Some(Cmd::Update { latest: true, force: true, .. })));
+        // --reinit and --latest parse together; --force is gone.
+        let cli = Cli::try_parse_from(["mim", "update", "--env", "e", "--reinit", "--latest"])
+            .expect("update --reinit --latest should parse");
+        assert!(matches!(cli.command, Some(Cmd::Update { latest: true, reinit: true, .. })));
+        assert!(Cli::try_parse_from(["mim", "update", "--env", "e", "--force"]).is_err());
         // --ignore-module-compat parses.
         let cli = Cli::try_parse_from(
             ["mim", "update", "--env", "e", "--ignore-module-compat"],
