@@ -14,38 +14,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::{DepsError, Result};
 use crate::version::ENVSPEC_VERSION;
 
-/// How local (filesystem-path) dependencies are relocated when a spec is resolved.
-/// One policy per provenance so the two paths share exactly one implementation.
-pub enum LocalAnchor<'a> {
-    /// Scratch/dev-loop: resolve to the canonical real path under `root`, keep
-    /// `editable`. Valid only while that path exists (native host / `/work`).
-    Live { root: &'a Path },
-    /// Install: copy each Python local's source under `copy_root` and reference it
-    /// state-relative (`<state_root>/local/<key>/<name>`, plain install). `root` is
-    /// the project root the source paths resolve against.
-    Relocated {
-        root: &'a Path,
-        copy_root: &'a Path,
-        state_root: &'a str,
-        key: &'a str,
-    },
-}
-
-impl<'a> LocalAnchor<'a> {
-    fn root(&self) -> &Path {
-        match self {
-            LocalAnchor::Live { root } | LocalAnchor::Relocated { root, .. } => root,
-        }
-    }
-}
-
-/// A source-tree copy the caller must perform for a `Relocated` resolution (the
-/// fs copy lives in `mim`, which owns the copy utility; this crate stays fs-light).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CopyJob {
-    pub src: PathBuf,
-    pub dest: PathBuf,
-}
+/// The pixi-manifest-relative directory under which installed local Python
+/// dependencies are snapshotted: `local/<name>/<content hash>`. Inside the pixi
+/// project dir so the path is the same string on the host, in a container's
+/// `/env` mount, and in a frozen image, and pixi records it relatively in the
+/// lock.
+pub const VENDOR_DIR: &str = "local";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LangReq {
@@ -91,6 +65,12 @@ pub enum PackageReq {
         #[serde(default)]
         editable: bool,
     },
+    /// A snapshot of a local Python dependency taken when its program was
+    /// installed. `path` is relative to the pixi manifest dir
+    /// (`local/<name>/<content hash>`); the install is never editable. Written
+    /// only by the environment manager into its requirements store, never by
+    /// the compiler.
+    Vendored { name: String, path: String },
 }
 
 impl PackageReq {
@@ -103,7 +83,8 @@ impl PackageReq {
             | PackageReq::Pkg { name, .. }
             | PackageReq::Cran { name, .. }
             | PackageReq::Bioconductor { name, .. }
-            | PackageReq::Local { name, .. } => name,
+            | PackageReq::Local { name, .. }
+            | PackageReq::Vendored { name, .. } => name,
         }
     }
 
@@ -243,66 +224,31 @@ impl EnvSpec {
             .collect()
     }
 
-    /// Resolve every local (filesystem-path) dependency in place, according to the
-    /// `anchor` policy, and return the file-copy jobs the caller must perform
-    /// (empty for `Live`). ONE resolver shared by both provenances so validation,
-    /// path shape, and editable semantics cannot drift:
-    ///
-    ///   * `Live` (scratch): rewrite each local path to its canonical real path
-    ///     under `root`, keeping `editable`. Valid only while that path exists
-    ///     (native host / the `/work` mount) -- the transient dev-loop form.
-    ///   * `Relocated` (install): copy each PYTHON local's source into the state
-    ///     volume and rewrite its path to the state-relative location with
-    ///     `editable = false` (a durable snapshot). Rust/other locals are left
-    ///     untouched (a rust crate is compiled into the pool binary, not solved).
-    ///
-    /// A Python local must be pip-installable (a `pyproject.toml`/`setup.py` in the
-    /// resolved source dir) under BOTH anchors -- no PYTHONPATH fallback that would
-    /// escape the solved world. pixi resolves a relative path against pixi.toml's
-    /// dir (not the project), so a local path must be absolute/state-relative here.
-    pub fn resolve_local_deps(&mut self, anchor: &LocalAnchor) -> Result<Vec<CopyJob>> {
-        let mut jobs = Vec::new();
+    /// Resolve every local (filesystem-path) dependency in place to its canonical
+    /// real path under `root`, keeping `editable`: the live dev-loop form, valid
+    /// only while that path exists (a native host, or the `/work` mount). An
+    /// installed program's Python locals are snapshotted instead (see
+    /// `PackageReq::Vendored`), which the environment manager does before calling
+    /// this.
+    pub fn resolve_local_deps(&mut self, root: &Path) -> Result<()> {
         for (lang, reqs) in self.packages.iter_mut() {
             for r in reqs.iter_mut() {
-                let PackageReq::Local { name, path, editable } = r else { continue };
-                // Rust/Julia locals are owned by cargo/Pkg at pool build; under
-                // Relocated they need no copy and their solved path is irrelevant
-                // (dropped by aggregate), so leave them as-is.
-                if lang != "py" && matches!(anchor, LocalAnchor::Relocated { .. }) {
-                    continue;
-                }
-                let real_src = std::fs::canonicalize(anchor.root().join(&*path)).map_err(|e| {
-                    DepsError::Env(format!(
-                        "local dependency '{name}' path '{path}' does not resolve under \
-                         project root {}: {e}",
-                        anchor.root().display()
-                    ))
-                })?;
-                if lang == "py"
-                    && !real_src.join("pyproject.toml").exists()
-                    && !real_src.join("setup.py").exists()
-                {
-                    return Err(DepsError::Env(format!(
-                        "local python dependency '{name}' at {} is not pip-installable \
-                         (no pyproject.toml or setup.py). Add a minimal pyproject.toml, \
-                         or vendor it differently.",
-                        real_src.display()
-                    )));
-                }
-                match anchor {
-                    LocalAnchor::Live { .. } => {
-                        *path = real_src.to_string_lossy().into_owned();
-                    }
-                    LocalAnchor::Relocated { copy_root, state_root, key, .. } => {
-                        let rel = format!("local/{key}/{name}");
-                        jobs.push(CopyJob { src: real_src, dest: copy_root.join(&rel) });
-                        *path = format!("{state_root}/{rel}");
-                        *editable = false;
-                    }
-                }
+                let PackageReq::Local { name, path, .. } = r else { continue };
+                *path = local_source(root, lang, name, path)?
+                    .to_string_lossy()
+                    .into_owned();
             }
         }
-        Ok(jobs)
+        Ok(())
+    }
+
+    /// Whether the spec declares a Python local (filesystem-path) dependency
+    /// that has not been snapshotted.
+    pub fn has_py_locals(&self) -> bool {
+        self.packages
+            .get("py")
+            .map(|reqs| reqs.iter().any(|r| matches!(r, PackageReq::Local { .. })))
+            .unwrap_or(false)
     }
 
     /// Whether the spec declares any local (filesystem-path) dependency, in any
@@ -315,12 +261,33 @@ impl EnvSpec {
             .any(|r| matches!(r, PackageReq::Local { .. }))
     }
 
-    /// Serialize back to JSON (used after `resolve_local_deps` rewrites paths, so
-    /// the stored world spec carries absolute local paths).
+    /// Serialize back to JSON (used after local paths were resolved or
+    /// snapshotted, so the stored world spec never carries a module-relative path).
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string(self)
             .map_err(|e| DepsError::Env(format!("cannot serialize envspec: {e}")))
     }
+}
+
+/// The canonical real directory of a local dependency declared as `path`
+/// (module-relative) under `root`, checked for existence. A Python local must be
+/// pip-installable (a `pyproject.toml` or `setup.py` there): there is no
+/// PYTHONPATH fallback that would escape the solved world.
+pub fn local_source(root: &Path, lang: &str, name: &str, path: &str) -> Result<PathBuf> {
+    let real = std::fs::canonicalize(root.join(path)).map_err(|e| {
+        DepsError::Env(format!(
+            "local dependency '{name}' path '{path}' does not resolve under project root {}: {e}",
+            root.display()
+        ))
+    })?;
+    if lang == "py" && !real.join("pyproject.toml").exists() && !real.join("setup.py").exists() {
+        return Err(DepsError::Env(format!(
+            "local python dependency '{name}' at {} is not pip-installable (no pyproject.toml \
+             or setup.py). Add a minimal pyproject.toml, or vendor it differently.",
+            real.display()
+        )));
+    }
+    Ok(real)
 }
 
 #[cfg(test)]
@@ -478,14 +445,14 @@ mod tests {
 
         let s = r#"{"envspec_version":2,"morloc_version":"0","packages":{"py":[{"name":"mylib","source":"local","path":"vendor/mylib","editable":true}]}}"#;
         let mut spec = EnvSpec::from_json(s).unwrap();
-        let jobs = spec.resolve_local_deps(&LocalAnchor::Live { root: root.path() }).unwrap();
-        assert!(jobs.is_empty(), "Live emits no copy jobs");
+        spec.resolve_local_deps(root.path()).unwrap();
         match &spec.packages["py"][0] {
             PackageReq::Local { path, editable, .. } => {
-                // The stored path is now absolute and points at the real dir;
-                // Live keeps editable.
-                assert!(std::path::Path::new(path).is_absolute());
-                assert!(path.ends_with("vendor/mylib") || path.contains("mylib"));
+                // The stored path is now the real dir; editable is kept.
+                assert_eq!(
+                    std::path::Path::new(path),
+                    std::fs::canonicalize(&pkg).unwrap()
+                );
                 assert!(*editable);
             }
             other => panic!("expected Local, got {other:?}"),
@@ -493,38 +460,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_local_deps_relocated_rewrites_and_emits_copy_job() {
-        let root = tempfile::tempdir().unwrap();
-        let copy_root = tempfile::tempdir().unwrap();
-        let pkg = root.path().join("vendor/mylib");
-        std::fs::create_dir_all(&pkg).unwrap();
-        std::fs::write(pkg.join("pyproject.toml"), "[project]\nname='mylib'\n").unwrap();
-        let s = r#"{"envspec_version":2,"morloc_version":"0","packages":{"py":[{"name":"mylib","source":"local","path":"vendor/mylib","editable":true}],"rust":[{"name":"mycrate","source":"local","path":"vendor/mycrate","editable":false}]}}"#;
-        let mut spec = EnvSpec::from_json(s).unwrap();
-        let jobs = spec
-            .resolve_local_deps(&LocalAnchor::Relocated {
-                root: root.path(),
-                copy_root: copy_root.path(),
-                state_root: "/opt/morloc-state",
-                key: "prog",
-            })
-            .unwrap();
-        // Exactly one copy job (the py local); rust is left untouched, no job.
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].src, std::fs::canonicalize(&pkg).unwrap());
-        assert_eq!(jobs[0].dest, copy_root.path().join("local/prog/mylib"));
+    fn vendored_round_trips_and_is_not_a_py_local() {
+        // The manager's snapshot form: tagged `vendored`, manifest-relative path,
+        // no editable flag. It is no longer an unresolved local.
+        const S: &str = r#"{"envspec_version":2,"morloc_version":"0","packages":{"py":[{"name":"mylib","source":"vendored","path":"local/mylib/0123456789ab"}]}}"#;
+        let spec = EnvSpec::from_json(S).unwrap();
         match &spec.packages["py"][0] {
-            PackageReq::Local { path, editable, .. } => {
-                assert_eq!(path, "/opt/morloc-state/local/prog/mylib");
-                assert!(!editable, "Relocated forces plain install");
+            PackageReq::Vendored { name, path } => {
+                assert_eq!(name, "mylib");
+                assert_eq!(path, "local/mylib/0123456789ab");
             }
-            other => panic!("expected Local, got {other:?}"),
+            other => panic!("expected Vendored, got {other:?}"),
         }
-        // Rust local path unchanged (compiled into the pool binary, not solved).
-        match &spec.packages["rust"][0] {
-            PackageReq::Local { path, .. } => assert_eq!(path, "vendor/mycrate"),
-            other => panic!("expected rust Local, got {other:?}"),
-        }
+        assert!(!spec.has_py_locals());
+        assert!(!spec.has_local_deps());
+        let again = EnvSpec::from_json(&spec.to_json().unwrap()).unwrap();
+        assert_eq!(again.packages["py"][0], spec.packages["py"][0]);
     }
 
     #[test]
@@ -534,9 +485,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("bare")).unwrap();
         let s = r#"{"envspec_version":2,"morloc_version":"0","packages":{"py":[{"name":"bare","source":"local","path":"bare","editable":false}]}}"#;
         let mut spec = EnvSpec::from_json(s).unwrap();
-        let err = spec
-            .resolve_local_deps(&LocalAnchor::Live { root: root.path() })
-            .unwrap_err();
+        let err = spec.resolve_local_deps(root.path()).unwrap_err();
         assert!(format!("{err}").contains("pip-installable"));
     }
 
@@ -545,8 +494,6 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let s = r#"{"envspec_version":2,"morloc_version":"0","packages":{"rust":[{"name":"mycrate","source":"local","path":"nope/mycrate","editable":false}]}}"#;
         let mut spec = EnvSpec::from_json(s).unwrap();
-        assert!(spec
-            .resolve_local_deps(&LocalAnchor::Live { root: root.path() })
-            .is_err());
+        assert!(spec.resolve_local_deps(root.path()).is_err());
     }
 }

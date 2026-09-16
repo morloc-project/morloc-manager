@@ -13,9 +13,10 @@ const REQUIRED_PARTS: [&str; 4] = ["runtime", "exe", "pixi/pixi.toml", "pixi/pix
 
 /// Parts that travel when the environment has them. Module sources and the
 /// install prefix for local native dependencies are on a pool's search path,
-/// so they are not merely nice to have -- they are absent only when the
-/// environment never had them.
-const OPTIONAL_STATE: [&str; 3] = ["fdb", "src", "modules"];
+/// and the snapshots of local Python dependencies are what the lock's path
+/// entries resolve to, so they are not merely nice to have -- they are absent
+/// only when the environment never had them.
+const OPTIONAL_STATE: [&str; 4] = ["fdb", "src", "modules", "pixi/local"];
 
 /// Port the deployment image's router listens on. A fixed, documented port is
 /// what makes `docker run -p <host>:8080 <image>` work without reading the
@@ -1293,10 +1294,10 @@ mod tests {
         assert!(!got.contains(&"fdb".to_string()), "{got:?}");
 
         let mut with_extras: Vec<&str> = WHOLE.to_vec();
-        with_extras.extend(["fdb", "src", "modules"]);
+        with_extras.extend(["fdb", "src", "modules", "pixi/local"]);
         let full = env_dir(&with_extras);
         let got = frozen_paths(full.path()).unwrap();
-        for rel in ["fdb", "src", "modules"] {
+        for rel in ["fdb", "src", "modules", "pixi/local"] {
             assert!(got.contains(&rel.to_string()), "{rel} missing from {got:?}");
         }
     }

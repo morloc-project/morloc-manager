@@ -196,9 +196,11 @@ fn canonical_constraint(constraint: &str) -> String {
 }
 
 /// A pypi (`[pypi-dependencies]`) requirement: a version match-spec, or a local
-/// filesystem-path dependency (uv editable/plain install). The path is resolved
-/// to an absolute location before it reaches here (native real path, or the fixed
-/// container anchor), since pixi resolves a relative path against pixi.toml's dir.
+/// filesystem-path dependency (uv editable/plain install). The path is either the
+/// absolute real path of a live source or a `./`-relative path inside the pixi
+/// project dir (an installed snapshot); pixi resolves a relative path against
+/// pixi.toml's dir, and a module-relative path from the compiler must never
+/// reach here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PypiReq {
     Version(String),
@@ -227,9 +229,11 @@ fn insert_pypi(map: &mut BTreeMap<String, PypiReq>, name: &str, req: PypiReq) ->
                     return Err(DepsError::Env(format!(
                         "conflicting pypi requirements for '{name}': a package cannot be both a \
                          version dependency and a local path, and two programs in one environment \
-                         cannot vendor DIFFERENT local sources under the same distribution name \
-                         '{name}'. Rename one distribution, or install them into separate \
-                         environments."
+                         cannot use local sources with DIFFERENT contents under the same \
+                         distribution name '{name}' ({a} vs {b}). Rename one distribution, or \
+                         install them into separate environments.",
+                        a = describe_pypi(o.get()),
+                        b = describe_pypi(&req)
                     )))
                 }
             };
@@ -237,6 +241,15 @@ fn insert_pypi(map: &mut BTreeMap<String, PypiReq>, name: &str, req: PypiReq) ->
         }
     }
     Ok(())
+}
+
+/// A pypi requirement as named in a conflict message.
+fn describe_pypi(req: &PypiReq) -> String {
+    match req {
+        PypiReq::Version(c) => format!("version '{c}'"),
+        PypiReq::Local { path, editable: true } => format!("editable path '{path}'"),
+        PypiReq::Local { path, editable: false } => format!("path '{path}'"),
+    }
 }
 
 /// Insert or merge a conda dependency (constraint + channel). Constraints
@@ -424,11 +437,27 @@ fn aggregate(
                              conda-forge (source: conda) or upgrade mim."
                         )))
                     }
+                    // An installed snapshot: a plain install from inside the pixi
+                    // project dir. Only Python locals are snapshotted.
+                    PackageReq::Vendored { name, path } => match lang.as_str() {
+                        "py" => insert_pypi(
+                            &mut pypi,
+                            name,
+                            PypiReq::Local { path: format!("./{path}"), editable: false },
+                        )?,
+                        other => {
+                            return Err(DepsError::Env(format!(
+                                "vendored dependency '{name}' for language '{other}' is not \
+                                 a Python snapshot; the environment's requirements store is \
+                                 corrupt."
+                            )))
+                        }
+                    },
                     // Local (filesystem-path) deps. Python lowers to a pixi
                     // editable/plain path entry; Rust and Julia local crates are
                     // owned by cargo / Pkg.jl at pool build (like Crates/Pkg), so
-                    // they are dropped here. The path is already absolute (resolved
-                    // by the caller against the project root / container anchor).
+                    // they are dropped here. The path is already the real source
+                    // dir (resolved by the caller against the project root).
                     PackageReq::Local { name, path, editable } => match lang.as_str() {
                         "py" => insert_pypi(
                             &mut pypi,
@@ -1263,6 +1292,56 @@ platforms = [\"linux-64\"]
         );
         // The rust local crate is not a pixi dependency.
         assert!(!out.contains("mycrate"), "rust local crate must not reach pixi:\n{out}");
+    }
+
+    #[test]
+    fn vendored_dep_lowers_to_manifest_relative_plain_path() {
+        // An installed snapshot is referenced relative to pixi.toml's dir, so the
+        // lock records it relatively and the same string works on the host, in a
+        // container's /env mount, and in a frozen image.
+        const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"mylib","source":"vendored","path":"local/mylib/0123456789ab"}]}}"#;
+        let out = render_with(EnvSpec::from_json(S).unwrap());
+        assert!(
+            out.contains("\"mylib\" = { path = \"./local/mylib/0123456789ab\", editable = false }"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn same_vendored_snapshot_from_two_programs_coalesces() {
+        // Two programs vendoring identical content land on the same
+        // content-addressed path, which is one requirement, not a conflict.
+        const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"mylib","source":"vendored","path":"local/mylib/0123456789ab"}]}}"#;
+        let a = EnvSpec::from_json(S).unwrap();
+        let b = EnvSpec::from_json(S).unwrap();
+        let (_, pypi) = aggregate(&[a, b], &sample_support()).unwrap();
+        assert_eq!(
+            pypi["mylib"],
+            PypiReq::Local { path: "./local/mylib/0123456789ab".into(), editable: false }
+        );
+    }
+
+    #[test]
+    fn different_local_sources_for_one_name_conflict() {
+        // Two different snapshots (or a snapshot vs a live path) under one
+        // distribution name is a genuine conflict; the message names both.
+        const A: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"mylib","source":"vendored","path":"local/mylib/aaaaaaaaaaaa"}]}}"#;
+        const B: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"mylib","source":"local","path":"/work/mylib","editable":true}]}}"#;
+        let a = EnvSpec::from_json(A).unwrap();
+        let b = EnvSpec::from_json(B).unwrap();
+        let err = aggregate(&[a, b], &sample_support()).unwrap_err().to_string();
+        assert!(err.contains("conflicting pypi requirements for 'mylib'"), "{err}");
+        assert!(err.contains("./local/mylib/aaaaaaaaaaaa"), "{err}");
+        assert!(err.contains("editable path '/work/mylib'"), "{err}");
+    }
+
+    #[test]
+    fn version_and_local_for_one_name_conflict() {
+        const A: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"mylib","source":"pypi","constraint":">=1"}]}}"#;
+        const B: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"mylib","source":"vendored","path":"local/mylib/aaaaaaaaaaaa"}]}}"#;
+        let a = EnvSpec::from_json(A).unwrap();
+        let b = EnvSpec::from_json(B).unwrap();
+        assert!(aggregate(&[a, b], &sample_support()).is_err());
     }
 
     #[test]

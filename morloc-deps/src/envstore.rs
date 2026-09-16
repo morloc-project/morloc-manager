@@ -223,13 +223,25 @@ impl EnvContext {
         Ok(specs)
     }
 
+    /// The scratch builds' specs, ordered by slot.
+    pub fn gather_scratch(&self) -> Result<Vec<EnvSpec>> {
+        read_specs(&self.provenance_dir(Provenance::Scratch))
+    }
+
     /// The full declared world: the installed baseline then `scratch`, each
     /// ordered by program name. The total order matters: the union feeds a
     /// solve-cache marker compared as text, so a non-deterministic order churns.
     pub fn gather(&self) -> Result<Vec<EnvSpec>> {
         let mut specs = self.gather_installed()?;
-        specs.extend(read_specs(&self.provenance_dir(Provenance::Scratch))?);
+        specs.extend(self.gather_scratch()?);
         Ok(specs)
+    }
+
+    /// The stored spec JSON of an installed program.
+    pub fn read_installed(&self, program: &str) -> Result<String> {
+        let path = self.provenance_dir(Provenance::Installed).join(format!("{program}.json"));
+        std::fs::read_to_string(&path)
+            .map_err(|e| DepsError::Env(format!("cannot read {}: {e}", path.display())))
     }
 
     /// `<env_home>/requirements/toolchain.json` -- the env's initialization pins
