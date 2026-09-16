@@ -3573,10 +3573,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             )?;
 
             // Python local (filesystem-path) deps are provisioned AFTER the build:
-            // they are runtime-only (the pool build does not import them) and their
-            // per-program copy key is not known until the program builds. Hold them
-            // back from the pre-build solve; registry deps that the build needs to
-            // compile stay.
+            // they are runtime-only (the pool build does not import them) and the
+            // build hook snapshots them into the environment as the program
+            // installs. Hold them back from the pre-build solve; registry deps
+            // that the build needs to compile stay.
             let has_py_locals = localdeps::has_py_locals(&dry);
             let mut dry = dry;
             localdeps::strip_py_locals(&mut dry);
@@ -3588,13 +3588,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    Keep the env's current morloc version -- installing a module must
             //    never bump the toolchain out from under it.
             rematerialize_env(scope, &env_name, &[dry], current_version_tag(&ec), &[], verbose)?;
-
-            // Timestamp just before the build so the program(s) built this run can
-            // be identified by their freshly-(re)written manifest mtime -- robust to
-            // re-install, where the build overwrites an existing build dir (a new-file
-            // set-diff would miss it).
-            let env_dir = cfg::env_data_dir(scope, &env_name);
-            let build_start = std::time::SystemTime::now();
 
             // 3. Build + install into the now-complete environment. Step 2 may
             //    have rebuilt the image, so re-read the config.
@@ -3633,50 +3626,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 &installed_program_names(&cfg::env_data_dir(scope, &env_name)),
             );
 
-            // 4. Provision Python local deps now that the program is built. For each
-            //    program built this run that declares py locals: resolve its spec
-            //    (copy the source into the state volume + rewrite to the state path,
-            //    plain install), write that RESOLVED spec to the store as Installed,
-            //    and supersede any prior scratch build -- all BEFORE the re-solve, so
-            //    `gather_env_specs` (which prefers the store) feeds the solve the
-            //    correct path. Rust locals need no copy (compiled into the pool binary
-            //    during step 3).
+            // 4. The build hook (`mim sync --installed`) snapshotted the program's
+            //    Python locals into the environment and stored its resolved spec.
+            //    Re-solve so the manager's world (lock, image, cache marker) carries
+            //    them too; the pre-build solve above held them back.
             if has_py_locals {
-                // `ec` was moved into the build above; re-read it (cheap, and the
-                // build may have rebuilt the image) for the backend + version.
                 let ec = cfg::read_env_config(scope, &env_name)?;
-                let module_root = install_module_root(&src, is_dir)?;
-                // The location the copied sources are referenced by: the real host
-                // env dir (native) or the in-container state mount (container).
-                let state_root = if ec.backend.is_native() {
-                    env_dir.to_string_lossy().into_owned()
-                } else {
-                    serve::CONTAINER_MORLOC_STATE.to_string()
-                };
-                let store = envstore::EnvContext::new(&env_dir);
-                for (key, envspec_path) in programs_built_since(&env_dir, build_start) {
-                    let mut spec = match std::fs::read_to_string(&envspec_path)
-                        .ok()
-                        .and_then(|j| envspec::EnvSpec::from_json(&j).ok())
-                    {
-                        Some(s) if localdeps::has_py_locals(&s) => s,
-                        _ => continue,
-                    };
-                    let jobs = spec.resolve_local_deps(&envspec::LocalAnchor::Relocated {
-                        root: &module_root,
-                        copy_root: &env_dir,
-                        state_root: &state_root,
-                        key: &key,
-                    })?;
-                    localdeps::perform_copy_jobs(&jobs)?;
-                    // Store the resolved spec so the re-solve reads the state path,
-                    // and supersede any prior scratch build (its stale /work editable
-                    // path must not linger in the solve).
-                    store.write_spec(&key, envstore::Provenance::Installed, &spec.to_json()?)?;
-                    // Sweep every per-world scratch slot for this name: the install
-                    // supersedes any `morloc make` of it, whatever it declared.
-                    let _ = store.remove_named(&key, envstore::Provenance::Scratch);
-                }
                 rematerialize_env(scope, &env_name, &[], current_version_tag(&ec), &[], verbose)?;
             }
             Ok(())
@@ -4636,7 +4591,7 @@ fn materialize_native_env(
     // The conda prefix lives under this root and its activation feeds
     // CFLAGS/CXXFLAGS, which every C build tool word-splits.
     cfg::reject_whitespace_root(&env_dir)?;
-    prime_requirements_store(&env_dir, req.lang_spec.as_ref(), conda_packages);
+    prime_requirements_store(&env_dir, req.lang_spec.as_ref(), conda_packages)?;
     let pixi_dir = env_dir.join("pixi");
     let manifest = pixi::render_manifest(&req.requirements);
 
@@ -4769,69 +4724,87 @@ fn prepend_to_path(activation: &mut Vec<(String, String)>, dirs: &[std::path::Pa
     activation.push(("PATH".to_string(), prefix));
 }
 
-/// Collect the requirements of every program installed into a native env by
-/// reading the `envspec.json` files morloc writes into each program's build dir
-/// under the env's MORLOC_HOME. A malformed or unreadable spec is skipped (with
-/// a warning) rather than aborting the whole re-solve.
-/// The build-dir program key for an `envspec.json` path: the parent dir is
-/// `<key>-build`, so strip the suffix.
-fn build_dir_key(envspec_path: &std::path::Path) -> Option<String> {
-    envspec_path
-        .parent()
-        .and_then(|d| d.file_name())
-        .and_then(|n| n.to_str())
-        .map(|b| b.strip_suffix("-build").unwrap_or(b).to_string())
-}
-
-/// The (program key, its `envspec.json` path) of each installed program whose
-/// build `manifest.json` was written at or after `since` -- i.e. built by the
-/// install that just ran. `manifest.json` is rewritten on every build, so a
-/// RE-install (which overwrites an existing build dir) is detected too, unlike a
-/// new-file set-diff. Also naturally handles a package that builds several
-/// programs.
-fn programs_built_since(
-    env_dir: &std::path::Path,
-    since: std::time::SystemTime,
-) -> Vec<(String, std::path::PathBuf)> {
+/// The (program key, `envspec.json` path) of every installed program: the
+/// compiler writes each program's spec to `exe/<key>/<key>-build/envspec.json`.
+/// Nothing else under the env dir is a program of the environment (a scratch
+/// build under the env-owned home, a build dir nested in a program's source
+/// mirror), so nothing else is enumerated. Sorted by key.
+fn installed_build_specs(env_dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
     let mut out = Vec::new();
-    for envspec_path in find_envspec_files(env_dir) {
-        let Some(key) = build_dir_key(&envspec_path) else { continue };
-        let manifest = envspec_path.with_file_name("manifest.json");
-        let built = std::fs::metadata(&manifest)
-            .and_then(|m| m.modified())
-            .map(|t| t >= since)
-            .unwrap_or(false);
-        if built {
-            out.push((key, envspec_path));
+    let Ok(entries) = std::fs::read_dir(env_dir.join("exe")) else { return out };
+    for entry in entries.flatten() {
+        let key = entry.file_name().to_string_lossy().into_owned();
+        let spec = entry.path().join(format!("{key}-build")).join("envspec.json");
+        if spec.is_file() {
+            out.push((key, spec));
         }
     }
+    out.sort();
     out
 }
 
-/// Mirror each installed program's build-dir `envspec.json` into the env's
-/// requirements store under `installed/<key>.json`. The in-env `morloc-env`
-/// agent reads only the store, so this keeps its view of the installed baseline
-/// complete -- otherwise a scratch sync would solve a world missing the
-/// installed programs' deps and uninstall them. Best-effort.
-///
-/// A program ALREADY in the store is skipped: its store entry is authoritative
-/// (an install with local deps writes a resolved, state-path spec there BEFORE the
-/// re-solve). Re-mirroring the build-dir spec would downgrade that resolved spec
-/// back to raw module-relative local paths -- the very corruption to avoid. So
-/// this only mirrors programs the store does not yet describe (which never carry
-/// unresolved local deps: the install path resolves+stores them first).
-fn seed_installed_store(env_dir: &std::path::Path) {
+/// An installed program's spec in store form. Read from `spec_json` (the store
+/// entry, or the build-dir spec of a program the store does not describe yet),
+/// with any Python local the compiler left module-relative -- or an earlier mim
+/// left at an absolute path -- snapshotted into the pixi dir
+/// (`localdeps::repair_installed_py_locals`). A spec that resolves cleanly is
+/// returned unchanged, so the caller can tell whether the store needs rewriting.
+fn installed_spec(
+    env_dir: &std::path::Path,
+    key: &str,
+    spec_json: &str,
+) -> Result<(envspec::EnvSpec, bool)> {
+    let mut spec = envspec::EnvSpec::from_json(spec_json)?;
+    if !localdeps::has_py_locals(&spec) {
+        return Ok((spec, false));
+    }
+    localdeps::repair_installed_py_locals(env_dir, key, &mut spec)?;
+    Ok((spec, true))
+}
+
+/// Bring the requirements store's installed tier in line with the programs
+/// under `exe/`: a program the store does not describe is seeded from its
+/// build-dir `envspec.json`, and an entry still carrying an unsnapshotted
+/// Python local is repaired in place. The in-env agent reads only the store, so
+/// this is what keeps its view of the installed baseline complete -- otherwise
+/// a scratch sync would solve a world missing the installed programs' deps and
+/// uninstall them. A program whose local source the environment no longer
+/// holds is an error naming it: a raw module-relative path must never reach a
+/// solve.
+fn seed_installed_store(env_dir: &std::path::Path) -> Result<()> {
     let ctx = envstore::EnvContext::new(env_dir);
     let stored: std::collections::HashSet<String> =
-        ctx.program_names().unwrap_or_default().into_iter().collect();
-    for path in find_envspec_files(env_dir) {
-        if let (Some(key), Ok(json)) = (build_dir_key(&path), std::fs::read_to_string(&path)) {
-            if stored.contains(&key) {
-                continue;
-            }
-            let _ = ctx.write_spec(&key, envstore::Provenance::Installed, &json);
+        ctx.installed_program_names().unwrap_or_default().into_iter().collect();
+    for (key, path) in installed_build_specs(env_dir) {
+        if stored.contains(&key) {
+            continue;
+        }
+        let json = std::fs::read_to_string(&path)
+            .map_err(|e| ManagerError::EnvError(format!("cannot read {}: {e}", path.display())))?;
+        let (spec, _) = installed_spec(env_dir, &key, &json)?;
+        ctx.write_spec(&key, envstore::Provenance::Installed, &spec.to_json()?)?;
+        // The install supersedes any scratch build of the same program.
+        ctx.remove_named(&key, envstore::Provenance::Scratch)?;
+    }
+    for key in stored {
+        // An entry for a program the environment does not hold (its build
+        // failed, it was removed, or it was mirrored from a build dir that was
+        // never a program of this environment) describes nothing.
+        if !env_dir.join("exe").join(&key).is_dir() {
+            eprintln!(
+                "Dropping the stored requirements of '{key}': it is not installed in this \
+                 environment."
+            );
+            ctx.remove_named(&key, envstore::Provenance::Installed)?;
+            continue;
+        }
+        let json = ctx.read_installed(&key)?;
+        let (spec, repaired) = installed_spec(env_dir, &key, &json)?;
+        if repaired {
+            ctx.write_spec(&key, envstore::Provenance::Installed, &spec.to_json()?)?;
         }
     }
+    Ok(())
 }
 
 /// Prime the requirements store BEFORE the solve, identically for both backends:
@@ -4842,8 +4815,8 @@ fn prime_requirements_store(
     env_dir: &std::path::Path,
     lang_spec: Option<&envspec::EnvSpec>,
     conda_extras: &[String],
-) {
-    seed_installed_store(env_dir);
+) -> Result<()> {
+    seed_installed_store(env_dir)?;
     let ctx = envstore::EnvContext::new(env_dir);
     if let Some(json) = lang_spec.and_then(|ls| serde_json::to_string(ls).ok()) {
         let _ = ctx.write_toolchain(&json);
@@ -4852,6 +4825,7 @@ fn prime_requirements_store(
     // make-time re-solve (it re-renders from the store, not the manager's config);
     // without this the re-solve prunes them from the pixi prefix.
     let _ = ctx.write_conda_extras(conda_extras);
+    Ok(())
 }
 
 /// Record the shim-ABI pin AFTER the solve (see `envstore::record_abi_lock`),
@@ -4868,66 +4842,23 @@ fn record_abi_lock_or_warn(
     }
 }
 
-fn gather_env_specs(scope: Scope, name: &str) -> Vec<envspec::EnvSpec> {
+/// The world the manager solves for an environment: the requirements store
+/// (installed baseline + scratch builds), brought up to date first
+/// (`seed_installed_store`). A scratch build's Python locals are held back:
+/// their live path is valid only where the build ran (a container's `/work`
+/// mount is not a host path), and the in-env agent re-adds them on the next
+/// `morloc make`.
+fn gather_env_specs(scope: Scope, name: &str) -> Result<Vec<envspec::EnvSpec>> {
     let env_dir = cfg::env_data_dir(scope, name);
+    seed_installed_store(&env_dir)?;
     let ctx = envstore::EnvContext::new(&env_dir);
-    // The requirements store is authoritative; a program it describes is NOT
-    // re-read from its legacy build-dir `envspec.json` (that would double-count
-    // it, and `aggregate` intersects constraints across all specs, so a divergent
-    // stale build-dir copy would yield a phantom empty set). Prefer-store also
-    // ignores a stale build-dir spec left by a failed rebuild.
-    let store_programs: std::collections::HashSet<String> =
-        ctx.program_names().unwrap_or_default().into_iter().collect();
-
-    let mut specs = Vec::new();
-    // Build-dir scan, only for programs the store does not yet describe (an env
-    // whose specs have not been seeded into the store).
-    for path in find_envspec_files(&env_dir) {
-        if build_dir_key(&path).map_or(false, |k| store_programs.contains(&k)) {
-            continue;
-        }
-        let build_dir = path.parent().unwrap_or(&env_dir);
-        match envspec::EnvSpec::read_from_build_dir(build_dir) {
-            Ok(spec) => specs.push(spec),
-            Err(e) => eprintln!("warning: skipping {}: {e}", path.display()),
-        }
+    let mut specs = ctx.gather_installed()?;
+    let mut scratch = ctx.gather_scratch()?;
+    for spec in scratch.iter_mut() {
+        localdeps::strip_py_locals(spec);
     }
-    // The store: installed baseline + scratch builds.
-    match ctx.gather() {
-        Ok(store_specs) => specs.extend(store_specs),
-        Err(e) => eprintln!("warning: reading requirements store: {e}"),
-    }
-    specs
-}
-
-/// Find `envspec.json` files under `root`, skipping large non-source subtrees
-/// (the pixi env, cargo/target dirs) so the scan stays cheap.
-fn find_envspec_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut found = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let skip = matches!(
-                    path.file_name().and_then(|n| n.to_str()),
-                    Some("pixi") | Some(".pixi") | Some("target") | Some("rust") | Some(".cargo")
-                    // Dev-env compiler bin + the image build context.
-                    | Some(DEV_BIN_SUBDIR) | Some(CONTAINER_BUILD_SUBDIR)
-                );
-                if !skip {
-                    stack.push(path);
-                }
-            } else if path.file_name().and_then(|n| n.to_str()) == Some("envspec.json") {
-                found.push(path);
-            }
-        }
-    }
-    found
+    specs.extend(scratch);
+    Ok(specs)
 }
 
 /// The environment name to use when none is given, derived from the requested
@@ -6799,12 +6730,10 @@ fn native_new(
 /// form works identically on both.
 const CONTAINER_BASE_IMAGE: &str = "docker.io/library/debian:bookworm-slim";
 
-// Per-env host-side subdir names shared between the sites that CREATE/mount them
-// and `find_envspec_files`'s skip-list (which must not recurse into these
-// GB-scale artifact trees). Naming them once keeps a rename from silently
-// desyncing the skip-list. `CONTAINER_BUILD_DIR` is the image build context (also
-// the release path's context + the materialized-marker dir); `DEV_BIN_SUBDIR`
-// holds the compiler the developer builds from source (mounted at run time).
+// Per-env host-side subdir names shared between the sites that create and
+// mount them. `CONTAINER_BUILD_SUBDIR` is the image build context (also the
+// release path's context + the materialized-marker dir); `DEV_BIN_SUBDIR` holds
+// the compiler the developer builds from source (mounted at run time).
 const DEV_BIN_SUBDIR: &str = "dev-bin";
 const CONTAINER_BUILD_SUBDIR: &str = "container-build";
 
@@ -6813,41 +6742,6 @@ const CONTAINER_BUILD_SUBDIR: &str = "container-build";
 /// native, in a fresh container of the env image for the container backend) and
 /// capturing its stdout. Running this BEFORE materialize is what lets a module's
 /// package.yaml deps reach pixi ahead of the build.
-/// The host directory an installed program's local-dep paths are resolved against:
-/// the source dir (dir target) or the entry file's parent (file target),
-/// canonicalized. Local deps must live under the current directory -- capture
-/// mounts cwd -> /work, so a source outside cwd is not reachable in the build
-/// container -- so an out-of-cwd source is rejected with an actionable error.
-fn install_module_root(src: &str, is_dir: bool) -> Result<std::path::PathBuf> {
-    let base = if is_dir {
-        std::path::PathBuf::from(src)
-    } else {
-        match std::path::Path::new(src).parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => std::path::PathBuf::from("."),
-        }
-    };
-    let abs = std::fs::canonicalize(&base).map_err(|e| {
-        ManagerError::EnvError(format!("cannot resolve the project directory for '{src}': {e}"))
-    })?;
-    // Canonicalize cwd too: `abs` has symlinks resolved, so comparing against a
-    // raw current_dir() (which may contain a symlinked component, e.g. /tmp ->
-    // /private/tmp) would spuriously reject a legitimately in-cwd project.
-    let cwd = std::env::current_dir()
-        .and_then(std::fs::canonicalize)
-        .map_err(|e| ManagerError::EnvError(format!("cannot resolve current directory: {e}")))?;
-    if !abs.starts_with(&cwd) {
-        return Err(ManagerError::EnvError(format!(
-            "the project directory {} is not under the current directory {} -- run \
-             'mim install' from a directory containing the project so its \
-             local (filesystem-path) dependencies are reachable in the build container.",
-            abs.display(),
-            cwd.display()
-        )));
-    }
-    Ok(abs)
-}
-
 fn capture_envspec(
     target: (String, Scope, EnvironmentConfig),
     envspec_target: &str,
@@ -7341,7 +7235,7 @@ fn rematerialize_env(
 ) -> Result<()> {
     let ec = cfg::read_env_config(scope, name)?;
     let lang_pins = cfg::read_env_inputs(scope, name).lang_pins;
-    let mut specs = gather_env_specs(scope, name);
+    let mut specs = gather_env_specs(scope, name)?;
     specs.extend_from_slice(extra_specs);
 
     // The caller decides the version policy and passes the concrete tag to
@@ -7400,6 +7294,7 @@ fn rematerialize_env(
         let mut ec = ec;
         ec.morloc_version = mver.parse::<Version>().ok();
         cfg::write_env_config(scope, name, &ec)?;
+        forget_agent_solve(scope, name);
         return Ok(());
     }
 
@@ -7412,7 +7307,19 @@ fn rematerialize_env(
     ec.built_image = Some(image_tag);
     ec.morloc_version = mver.parse::<Version>().ok();
     cfg::write_env_config(scope, name, &ec)?;
+    forget_agent_solve(scope, name);
     Ok(())
+}
+
+/// Drop the in-env agent's record of its last solve after the manager has
+/// rebuilt the prefix: the manager's world differs from the agent's (it holds
+/// back scratch builds' local deps), so a matching store digest would let the
+/// agent's next sync fast-path onto a prefix missing what that program needs.
+fn forget_agent_solve(scope: Scope, name: &str) {
+    let ctx = envstore::EnvContext::new(cfg::env_data_dir(scope, name));
+    if let Err(e) = ctx.clear_solve_cache() {
+        eprintln!("Warning: could not reset the in-env solve cache for '{name}': {e}");
+    }
 }
 
 /// Build a requirement-derived container image: render the env's pixi.toml
@@ -7453,7 +7360,7 @@ fn build_requirement_derived_image(
     // the cache-hit early return: the store reflects the env's config/inputs, so a
     // re-run with an unchanged manifest still refreshes it. Idempotent writes; the
     // single writer for both the toolchain pins and the conda extras.
-    prime_requirements_store(&env_dir, req.lang_spec.as_ref(), conda_packages);
+    prime_requirements_store(&env_dir, req.lang_spec.as_ref(), conda_packages)?;
 
     // Solve cache (mirrors the native path): skip the multi-minute solve + image
     // rebuild when the requirements AND the compiler are unchanged and the image
@@ -8099,7 +8006,7 @@ fn build_dev_container_image(
     // so a re-run with an unchanged manifest (e.g. re-adding a conda extra that was
     // already pinned) still refreshes it. Idempotent writes; the single writer for
     // both the toolchain pins and the conda extras.
-    prime_requirements_store(&env_dir, lang_spec.as_ref(), conda_packages);
+    prime_requirements_store(&env_dir, lang_spec.as_ref(), conda_packages)?;
 
     if !(up_to_date && container::image_exists_locally(engine, &image_tag)) {
         pixi::write_manifest(&pixi_host, &manifest)?;
@@ -10054,30 +9961,120 @@ mod tests {
         assert_eq!(v["morloc_version"], "0.98.0");
     }
 
+    fn write_program(env: &std::path::Path, key: &str, spec: &str) {
+        let build = env.join("exe").join(key).join(format!("{key}-build"));
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("envspec.json"), spec).unwrap();
+    }
+
+    fn write_py_pkg(dir: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("pyproject.toml"), "[project]\nname='mylib'\n").unwrap();
+        std::fs::write(dir.join("v.py"), body).unwrap();
+    }
+
+    const RAW_LOCAL: &str = r#"{"envspec_version":2,"morloc_version":"0","packages":{"py":[{"name":"mylib","source":"local","path":"./src/mylib","editable":true}]}}"#;
+    const NO_LOCAL: &str = r#"{"envspec_version":2,"morloc_version":"0","packages":{"py":[{"name":"numpy","source":"pypi","constraint":"*"}]}}"#;
+
+    fn vendored_path(spec: &envspec::EnvSpec) -> String {
+        match &spec.packages["py"][0] {
+            envspec::PackageReq::Vendored { path, .. } => path.clone(),
+            other => panic!("expected Vendored, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn programs_built_since_selects_by_manifest_mtime() {
+    fn installed_build_specs_enumerates_only_exe_program_build_dirs() {
         let env = tempfile::tempdir().unwrap();
-        // "alpha": a fully-built program (envspec.json + manifest.json).
-        let a = env.path().join("exe/alpha/alpha-build");
-        std::fs::create_dir_all(&a).unwrap();
-        std::fs::write(a.join("envspec.json"), "{}").unwrap();
-        std::fs::write(a.join("manifest.json"), "{}").unwrap();
-        // "beta": an envspec.json but no manifest.json -> not a built program.
-        let b = env.path().join("exe/beta/beta-build");
-        std::fs::create_dir_all(&b).unwrap();
-        std::fs::write(b.join("envspec.json"), "{}").unwrap();
+        let root = env.path();
+        write_program(root, "alpha", "{}");
+        // A build dir nested in a program's source mirror is not a program.
+        std::fs::create_dir_all(root.join("exe/alpha/examples/demo-build")).unwrap();
+        std::fs::write(root.join("exe/alpha/examples/demo-build/envspec.json"), "{}").unwrap();
+        // Neither is a scratch build under the env-owned home, nor anything in pixi.
+        std::fs::create_dir_all(root.join("home/work/scratch-build")).unwrap();
+        std::fs::write(root.join("home/work/scratch-build/envspec.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join("pixi/.pixi/envs")).unwrap();
+        std::fs::write(root.join("pixi/.pixi/envs/envspec.json"), "{}").unwrap();
+        // An exe entry with no build dir is skipped.
+        std::fs::create_dir_all(root.join("exe/stub")).unwrap();
+        let found = installed_build_specs(root);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "alpha");
+        assert!(found[0].1.ends_with("exe/alpha/alpha-build/envspec.json"));
+    }
 
-        // Since epoch: alpha (has a manifest) qualifies; beta (no manifest) does not.
-        let keys: Vec<String> = programs_built_since(env.path(), std::time::UNIX_EPOCH)
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect();
-        assert!(keys.contains(&"alpha".to_string()));
-        assert!(!keys.contains(&"beta".to_string()));
+    #[test]
+    fn seed_installed_store_snapshots_a_raw_local_from_the_source_mirror() {
+        // A program the store does not describe yet whose build-dir spec carries
+        // the compiler's module-relative local path: the store entry it seeds
+        // must reference a snapshot under the pixi dir, never the raw path.
+        let env = tempfile::tempdir().unwrap();
+        write_program(env.path(), "prog", RAW_LOCAL);
+        write_py_pkg(&env.path().join("exe/prog/src/mylib"), "V=1\n");
+        write_program(env.path(), "plain", NO_LOCAL);
+        let ctx = envstore::EnvContext::new(env.path());
+        ctx.write_spec("prog", envstore::Provenance::Scratch, NO_LOCAL).unwrap();
+        seed_installed_store(env.path()).unwrap();
 
-        // Since a future instant: nothing was built that recently.
-        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-        assert!(programs_built_since(env.path(), future).is_empty());
+        let ctx = envstore::EnvContext::new(env.path());
+        assert_eq!(ctx.installed_program_names().unwrap(), vec!["plain", "prog"]);
+        // A scratch build of the installed program is superseded.
+        assert_eq!(ctx.program_names().unwrap(), vec!["plain", "prog"]);
+        let stored = envspec::EnvSpec::from_json(&ctx.read_installed("prog").unwrap()).unwrap();
+        let rel = vendored_path(&stored);
+        assert!(rel.starts_with("local/mylib/"), "{rel}");
+        assert!(env.path().join("pixi").join(&rel).join("v.py").exists());
+        assert!(!localdeps::has_py_locals(&stored));
+        // Idempotent: a second pass rewrites nothing.
+        seed_installed_store(env.path()).unwrap();
+        assert_eq!(ctx.read_installed("prog").unwrap(), stored.to_json().unwrap());
+    }
+
+    #[test]
+    fn seed_installed_store_repairs_a_stored_entry_with_an_absolute_path() {
+        // An earlier mim stored the program with its local dep copied under
+        // <env_dir>/local/<key>/<name> and referenced by an absolute path that
+        // only exists inside a container. The copy is what the snapshot is
+        // taken from; the store entry is rewritten.
+        let env = tempfile::tempdir().unwrap();
+        write_program(env.path(), "prog", RAW_LOCAL);
+        write_py_pkg(&env.path().join("local/prog/mylib"), "LEGACY\n");
+        let ctx = envstore::EnvContext::new(env.path());
+        let legacy = r#"{"envspec_version":2,"morloc_version":"0","packages":{"py":[{"name":"mylib","source":"local","path":"/opt/morloc-state/local/prog/mylib","editable":false}]}}"#;
+        ctx.write_spec("prog", envstore::Provenance::Installed, legacy).unwrap();
+        seed_installed_store(env.path()).unwrap();
+        let stored = envspec::EnvSpec::from_json(&ctx.read_installed("prog").unwrap()).unwrap();
+        let rel = vendored_path(&stored);
+        assert_eq!(
+            std::fs::read_to_string(env.path().join("pixi").join(&rel).join("v.py")).unwrap(),
+            "LEGACY\n"
+        );
+    }
+
+    #[test]
+    fn seed_installed_store_drops_an_entry_for_a_program_the_env_does_not_hold() {
+        // A raw spec an earlier mim mirrored from a scratch build dir into the
+        // installed tier: nothing under exe/ is that program, so the entry goes
+        // rather than blocking the solve on a source that was never installed.
+        let env = tempfile::tempdir().unwrap();
+        write_program(env.path(), "prog", NO_LOCAL);
+        let ctx = envstore::EnvContext::new(env.path());
+        ctx.write_spec("stray", envstore::Provenance::Installed, RAW_LOCAL).unwrap();
+        seed_installed_store(env.path()).unwrap();
+        assert_eq!(ctx.installed_program_names().unwrap(), vec!["prog"]);
+    }
+
+    #[test]
+    fn seed_installed_store_refuses_a_local_whose_source_is_gone() {
+        // Neither a legacy copy nor the mirror holds the source: the raw path
+        // must not be stored, and the error names the program.
+        let env = tempfile::tempdir().unwrap();
+        write_program(env.path(), "prog", RAW_LOCAL);
+        let err = seed_installed_store(env.path()).unwrap_err().to_string();
+        assert!(err.contains("'prog'") && err.contains("mylib"), "{err}");
+        let ctx = envstore::EnvContext::new(env.path());
+        assert!(ctx.installed_program_names().unwrap().is_empty());
     }
 
     // ---- CLI shape: --env selector, --env-var rename, shell, no select ----
@@ -12555,21 +12552,6 @@ run:
         // 3.20 is outside morloc's >=3.10,<3.14 support window.
         let err = resolve_lang_pin("py", Some("3.20"), "0.0.0", &s).unwrap_err();
         assert!(err.to_string().contains("no py version"), "{err}");
-    }
-
-    #[test]
-    fn find_envspec_files_scans_and_skips_heavy_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        // A program build dir carries an envspec.json to be collected.
-        std::fs::create_dir_all(root.join("prog-build")).unwrap();
-        std::fs::write(root.join("prog-build/envspec.json"), "{}").unwrap();
-        // A decoy inside the skipped pixi subtree must NOT be collected.
-        std::fs::create_dir_all(root.join("pixi/.pixi/envs")).unwrap();
-        std::fs::write(root.join("pixi/.pixi/envs/envspec.json"), "{}").unwrap();
-        let found = find_envspec_files(root);
-        assert_eq!(found.len(), 1);
-        assert!(found[0].ends_with("prog-build/envspec.json"));
     }
 
     #[test]

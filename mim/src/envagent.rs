@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use morloc_deps::abi;
-use morloc_deps::envspec::{EnvSpec, LocalAnchor};
+use morloc_deps::envspec::EnvSpec;
 use morloc_deps::envstore::{EnvContext, Provenance, SolveInputs};
 use morloc_deps::error::DepsError;
 use morloc_deps::langsupport::LangSupport;
@@ -56,14 +56,29 @@ pub fn sync(
 
     let json = std::fs::read_to_string(spec)
         .map_err(|e| DepsError::Env(format!("cannot read {}: {e}", spec.display())))?;
-    // Resolve local (filesystem-path) deps to their live path (canonical real path
-    // under the project root), keeping them editable, before storing -- so the
-    // stored world spec is location-independent and pixi resolves them correctly.
-    // A spec with no local deps is passed through unchanged.
+    // Local (filesystem-path) deps never reach the store module-relative. An
+    // installed program's Python locals are snapshotted into the pixi project
+    // dir; every other local resolves to its live path (canonical real path
+    // under the project root), keeping it editable. A spec with no local deps
+    // is passed through unchanged.
     let mut es = EnvSpec::from_json(&json)?;
     let resolved = if es.has_local_deps() {
         let root = root.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        es.resolve_local_deps(&LocalAnchor::Live { root: &root })?;
+        if installed && es.has_py_locals() {
+            if env_is_immutable() {
+                return Err(DepsError::Env(format!(
+                    "installing '{name}' needs a snapshot of its local python dependencies \
+                     in the environment, which a served or frozen image cannot take. Install \
+                     it into the environment before serving or freezing."
+                )));
+            }
+            crate::localdeps::vendor_py_locals(&mut es, &root, &ctx.pixi_dir())
+                .map_err(|e| DepsError::Env(e.to_string()))?;
+            // An install supersedes any scratch build of the same program: its
+            // live path must not meet the snapshot in one solve.
+            ctx.remove_named(name, Provenance::Scratch)?;
+        }
+        es.resolve_local_deps(&root)?;
         es.to_json()?
     } else {
         json
@@ -150,6 +165,21 @@ pub fn sync(
         build_new_language_shims(&activation, &home)?;
     }
 
+    // Snapshots no stored spec references any more (a re-install with changed
+    // source, an uninstalled program) are dropped; a failure here leaves only
+    // stale copies behind, so it is a warning.
+    if installed {
+        match ctx
+            .gather()
+            .map_err(|e| e.to_string())
+            .and_then(|specs| {
+                crate::localdeps::sweep_unreferenced_snapshots(&ctx.pixi_dir(), &specs)
+                    .map_err(|e| e.to_string())
+            }) {
+            Ok(_) => {}
+            Err(e) => eprintln!("Warning: could not sweep unreferenced local-dep snapshots: {e}"),
+        }
+    }
     eprintln!("Environment dependencies synced for '{name}'.");
     Ok(())
 }
