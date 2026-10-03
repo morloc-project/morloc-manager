@@ -121,7 +121,33 @@ pub fn reject_whitespace_root(dir: &Path) -> Result<()> {
     )))
 }
 
+/// Test-only replacement for the four scope roots, per thread so parallel tests
+/// cannot see each other's trees. Set with [`test_roots::set`].
+#[cfg(test)]
+pub mod test_roots {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Root every scope under `base`: `<base>/{local,system}/{config,data}`.
+    pub fn set(base: &Path) {
+        ROOT.with(|r| *r.borrow_mut() = Some(base.to_path_buf()));
+    }
+
+    pub(super) fn get(scope: Scope, kind: &str) -> Option<PathBuf> {
+        let tag = match scope { Scope::Local => "local", Scope::System => "system" };
+        ROOT.with(|r| r.borrow().as_ref().map(|b| b.join(tag).join(kind)))
+    }
+}
+
 pub fn config_dir(scope: Scope) -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = test_roots::get(scope, "config") {
+        return p;
+    }
     match scope {
         Scope::Local => user_base(
             std::env::var("XDG_CONFIG_HOME").ok(),
@@ -134,11 +160,32 @@ pub fn config_dir(scope: Scope) -> PathBuf {
     }
 }
 
+/// Whether this process can create files in `dir`, creating `dir` first when
+/// it is missing. Probes by writing, so it answers for the effective user with
+/// every ACL and mount option applied, which permission bits alone do not.
+pub fn dir_writable(dir: &Path) -> bool {
+    if !dir.exists() {
+        return fs::create_dir_all(dir).is_ok();
+    }
+    let probe = dir.join(".write-check");
+    match fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn config_path(scope: Scope) -> PathBuf {
     config_dir(scope).join("config.json")
 }
 
 pub fn data_dir(scope: Scope) -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = test_roots::get(scope, "data") {
+        return p;
+    }
     match scope {
         Scope::Local => user_base(
             std::env::var("XDG_DATA_HOME").ok(),
@@ -152,6 +199,12 @@ pub fn data_dir(scope: Scope) -> PathBuf {
 }
 
 // Environment paths
+
+/// The caller's own `$HOME` for runs in system environment `name`, which they
+/// may use but not write.
+pub fn system_env_user_home(name: &str) -> PathBuf {
+    data_dir(Scope::Local).join("system-homes").join(name)
+}
 
 pub fn env_config_dir(scope: Scope, name: &str) -> PathBuf {
     config_dir(scope).join("environments").join(name)

@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -9,7 +9,11 @@ use crate::error::{ManagerError, Result};
 use crate::types::*;
 
 /// Parts of an environment a deployment artifact cannot do without.
-const REQUIRED_PARTS: [&str; 4] = ["runtime", "exe", "pixi/pixi.toml", "pixi/pixi.lock"];
+const REQUIRED_PARTS: [&str; 3] = ["runtime", "pixi/pixi.toml", "pixi/pixi.lock"];
+
+/// The installed programs. Always travels: an environment with nothing
+/// installed freezes as a base to install into later, and stages it empty.
+const PROGRAMS_PART: &str = "exe";
 
 /// Parts that travel when the environment has them. Module sources and the
 /// install prefix for local native dependencies are on a pool's search path,
@@ -123,13 +127,6 @@ pub fn freeze_environment(
     }
     let modules = scan_modules(&format!("{v_data_dir}/fdb"));
     let programs = scan_programs(&format!("{v_data_dir}/exe"));
-    // An environment with nothing installed still freezes -- as a base to run
-    // programs in later, or to hand someone the toolchain -- once the author
-    // has confirmed that is what they mean. The programs directory has to
-    // exist to be copied, whether or not anything is in it.
-    fs::create_dir_all(Path::new(v_data_dir).join("exe"))
-        .map_err(|e| ManagerError::FreezeError(format!("cannot create the programs directory: {e}")))?;
-
     let exposure = config::read_views(scope, env_name).unwrap_or_default();
     if flavor == Flavor::Slim {
         if let Some(eval) = &exposure.eval {
@@ -160,7 +157,7 @@ pub fn freeze_environment(
     // cannot be handed to the engine as-is: it also holds caches, logs, a build
     // context of its own and the environment's home, all of which would be sent
     // to the daemon and baked into a layer.
-    let context = Path::new(v_data_dir).join(FREEZE_CONTEXT_SUBDIR);
+    let context = context_dir(scope, env_name, Path::new(v_data_dir));
     let _ = fs::remove_dir_all(&context);
     fs::create_dir_all(&context)
         .map_err(|e| ManagerError::FreezeError(format!("cannot create the build context: {e}")))?;
@@ -612,9 +609,29 @@ const FREEZE_CONTEXT_SUBDIR: &str = "freeze-build";
 /// Copy one frozen path into the build context, preserving its shape. A file
 /// keeps its parent directory, so `pixi/pixi.lock` lands at `pixi/pixi.lock`
 /// and the generated `COPY pixi/ ...` finds it.
+/// Where the build context is staged: beside the environment when the caller
+/// can write it, else in the caller's own data tree, so anyone who may use an
+/// environment (a system one, as a user) may also freeze it.
+fn context_dir(scope: Scope, env_name: &str, v_data_dir: &Path) -> PathBuf {
+    if config::dir_writable(v_data_dir) {
+        v_data_dir.join(FREEZE_CONTEXT_SUBDIR)
+    } else {
+        config::data_dir(Scope::Local)
+            .join(FREEZE_CONTEXT_SUBDIR)
+            .join(match scope {
+                Scope::Local => format!("local-{env_name}"),
+                Scope::System => format!("system-{env_name}"),
+            })
+    }
+}
+
 fn stage_into_context(root: &Path, context: &Path, rel: &str) -> Result<()> {
     let from = root.join(rel);
     let to = context.join(rel);
+    if rel == PROGRAMS_PART && !from.exists() {
+        return fs::create_dir_all(&to)
+            .map_err(|e| ManagerError::FreezeError(format!("cannot stage {rel}: {e}")));
+    }
     if from.is_dir() {
         return crate::provision::copy_dir_excluding(&from, &to, &[], false)
             .map_err(|e| ManagerError::FreezeError(format!("cannot stage {rel}: {e}")));
@@ -829,6 +846,7 @@ pub(crate) fn frozen_paths(v_data_dir: &Path) -> Result<Vec<String>> {
             missing.push(rel);
         }
     }
+    paths.push(PROGRAMS_PART.to_string());
     if !missing.is_empty() {
         return Err(ManagerError::FreezeError(format!(
             "environment at '{}' is missing {} a deployment artifact cannot do without:\n  {}\n\
@@ -1399,6 +1417,20 @@ mod tests {
         }
     }
 
+    /// Nothing installed is a valid freeze (a base to install into later), and
+    /// freeze must not create the directory in an environment the caller may
+    /// only read; it is staged empty instead.
+    #[test]
+    fn an_environment_with_no_programs_stages_an_empty_programs_dir() {
+        let env = env_dir(&["runtime", "pixi/pixi.toml", "pixi/pixi.lock"]);
+        let got = frozen_paths(env.path()).unwrap();
+        assert!(got.contains(&"exe".to_string()), "{got:?}");
+        let context = tempfile::tempdir().unwrap();
+        stage_into_context(env.path(), context.path(), "exe").unwrap();
+        assert!(context.path().join("exe").is_dir());
+        assert!(!env.path().join("exe").exists());
+    }
+
     #[test]
     fn a_missing_runtime_is_named_not_skipped() {
         // The old behaviour: absent directories were dropped from the archive
@@ -1420,7 +1452,7 @@ mod tests {
     fn every_missing_part_is_reported_at_once() {
         // One round trip per missing piece is a bad way to learn what an
         // environment lacks.
-        let tmp = env_dir(&["exe"]);
+        let tmp = env_dir(&[]);
         let err = frozen_paths(tmp.path()).unwrap_err().to_string();
         for rel in ["runtime", "pixi/pixi.toml", "pixi/pixi.lock"] {
             assert!(err.contains(rel), "{rel} missing from: {err}");

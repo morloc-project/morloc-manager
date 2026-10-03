@@ -1117,26 +1117,34 @@ fn resolve_scope(system: bool) -> Scope {
     if system { Scope::System } else { Scope::Local }
 }
 
+/// Fail unless this process can write the system scope: both its config tree
+/// and its data tree, since system environments keep state in each.
 fn check_system_write_access() -> Result<()> {
-    let sys_dir = cfg::config_dir(Scope::System);
-    if sys_dir.exists() {
-        let test_path = sys_dir.join(".write-check");
-        match fs::write(&test_path, b"") {
-            Ok(_) => { let _ = fs::remove_file(&test_path); Ok(()) }
-            Err(_) => Err(ManagerError::ConfigPermissionDenied(format!(
+    for dir in [cfg::config_dir(Scope::System), cfg::data_dir(Scope::System)] {
+        if !cfg::dir_writable(&dir) {
+            return Err(ManagerError::ConfigPermissionDenied(format!(
                 "{}. System-scope operations require root. Re-run with sudo",
-                sys_dir.display()
-            )))
-        }
-    } else {
-        match fs::create_dir_all(&sys_dir) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(ManagerError::ConfigPermissionDenied(format!(
-                "{}. System-scope operations require root. Re-run with sudo",
-                sys_dir.display()
-            )))
+                dir.display()
+            )));
         }
     }
+    Ok(())
+}
+
+/// Refuse a command that changes environment `name` in `scope` when the caller
+/// cannot write that scope. Called before any side effect, so a refused command
+/// leaves nothing half-applied. Anyone may use a system environment; only
+/// whoever can write it may change it.
+fn require_env_writable(scope: Scope, name: &str, action: &str) -> Result<()> {
+    if scope == Scope::Local {
+        return Ok(());
+    }
+    check_system_write_access().map_err(|_| {
+        ManagerError::ConfigPermissionDenied(format!(
+            "'{name}' is a system environment; {action} changes it and requires root. \
+             Re-run with sudo, or ask an administrator"
+        ))
+    })
 }
 
 /// Resolve an environment by explicit `--env` name or fall back to the default
@@ -2761,19 +2769,19 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 || cert_bundle.is_some()
                 || no_cert_bundle
                 || base.is_some();
-            if new_name.is_none()
-                && !set_default
-                && !unset_default
-                && !will_rebuild
-                && dotfiles.is_none()
-                && !no_dotfiles
-                && mount_home.is_none()
-                && !no_mount_home
-                && shm_size_change.is_none()
-                && !touches_flags
-                && module_snapshots.is_empty()
-                && no_modules_file.is_empty()
-            {
+            // Everything except the default pointer lives in the environment's
+            // own trees; one list so the scope guard below cannot miss a flag.
+            let changes_env = new_name.is_some()
+                || will_rebuild
+                || dotfiles.is_some()
+                || no_dotfiles
+                || mount_home.is_some()
+                || no_mount_home
+                || shm_size_change.is_some()
+                || touches_flags
+                || !module_snapshots.is_empty()
+                || !no_modules_file.is_empty();
+            if !changes_env && !set_default && !unset_default {
                 return Err(ManagerError::EnvError(
                     "nothing to modify: pass --env-name, --set-default, --unset-default, \
                      --dotfiles, --mount-home, --shm-size, --flagfile, --lang, --cert-bundle, \
@@ -2951,17 +2959,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // package/lang edits + rebuild, pin-file removal) needs root. A
             // personal (local) set-default does not, and is handled in its own
             // block below.
-            if env_scope == Scope::System
-                && (new_name.is_some()
-                    || will_rebuild
-                    || dotfiles.is_some()
-                    || no_dotfiles
-                    || mount_home_change.is_some()
-                    || shm_size_change.is_some()
-                    || touches_flags
-                    || !no_modules_file.is_empty())
-            {
-                check_system_write_access()?;
+            if changes_env {
+                require_env_writable(env_scope, &env_name, "`mim modify`")?;
             }
             // `modify` rebuilds at the environment's CURRENT version, so a rebuild
             // needs one to exist. Resolve it here, before the first side effect.
@@ -3318,6 +3317,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         // ---- start ----
         Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, eval_allow_no_auth, port, env_vars, env_file, engine_arg, flagfile, force } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
+            // The serve record that stop/logs/status find it by lives in the
+            // environment's config tree.
+            require_env_writable(env_scope, &env_name, "`mim start`")?;
             if ec.is_dev() {
                 return Err(ManagerError::EnvError(format!(
                     "environment '{env_name}' is a dev environment; serving one is not yet \
@@ -3401,15 +3403,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             }
             // Record what we launched + how (the handle) so stop/logs/status act
             // on the real target regardless of the env's current backend.
-            let _ = cfg::write_serve_runtime(env_scope, &env_name, &ServeRuntime {
+            // A serve nothing records is one stop/logs/status cannot find, so a
+            // failed write takes the serve down rather than leave it untracked.
+            let record = ServeRuntime {
                 mcp: req.spec.mcp.clone(),
                 api: req.spec.api.clone(),
                 eval: eval_on,
                 host: url_host.clone(),
                 port: host_port,
                 token_required: eff_token.is_some(),
-                handle: Some(handle),
-            });
+                handle: Some(handle.clone()),
+            };
+            if let Err(e) = cfg::write_serve_runtime(env_scope, &env_name, &record) {
+                let _ = stop_by_handle(&handle, verbose);
+                return Err(e);
+            }
             if serves_mcp {
                 // The mcpServers entry name: the one-off program, else the env.
                 let cfg_name = mcp.unwrap_or_else(|| env_name.clone());
@@ -3421,6 +3429,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         // ---- stop ----
         Cmd::Stop { env } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
+            require_env_writable(env_scope, &env_name, "`mim stop`")?;
             // Prefer the stored launch handle: it tears down the right target
             // (native process group or container) regardless of the env's current
             // backend, so migration / dual-backend serve never strands a server.
@@ -3550,6 +3559,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // Resolve the target environment up front so the program's declared
             // dependencies can be provisioned into it BEFORE it is built.
             let (env_name, scope, ec) = resolve_env_or_default(env)?;
+            require_env_writable(scope, &env_name, "`mim install`")?;
 
             // 1. Resolve the program's env requirements without building it
             //    (frontend only). A directory is a package whose entry is its
@@ -3649,6 +3659,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         Cmd::View { action: Some(action), .. } => match action {
             ViewAction::Add { module, protocols, env } => {
                 let (env_name, scope, ec) = resolve_env_or_default(env)?;
+                require_env_writable(scope, &env_name, "`mim view add`")?;
                 // A view shows an INSTALLED program; catch typos early.
                 let launcher =
                     cfg::env_program_launcher(&ec, cfg::env_data_dir(scope, &env_name), &module);
@@ -3671,6 +3682,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             }
             ViewAction::Rm { module, env } => {
                 let (env_name, scope, _ec) = resolve_env_or_default(env)?;
+                require_env_writable(scope, &env_name, "`mim view rm`")?;
                 let mut views = cfg::read_views(scope, &env_name)?;
                 if views.remove(&module) {
                     cfg::write_views(scope, &env_name, &views)?;
@@ -3689,6 +3701,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             }
             ViewAction::Eval { allow, off, env } => {
                 let (env_name, scope, _ec) = resolve_env_or_default(env)?;
+                require_env_writable(scope, &env_name, "`mim view eval`")?;
                 let mut views = cfg::read_views(scope, &env_name)?;
                 if off {
                     views.eval = None;
@@ -6850,10 +6863,7 @@ fn container_capture_env(
     }
     let data_dir = cfg::env_data_dir(scope, name);
     let v_data_dir = data_dir.to_string_lossy().to_string();
-    let cwd = std::env::current_dir()
-        .map_err(|e| ManagerError::EnvError(format!("cannot resolve current directory: {e}")))?
-        .to_string_lossy()
-        .to_string();
+    let cwd = work_mount_dir()?;
     // HOME lives under the mounted state (oci_base_env); make it on the host side
     // so writes do not hit ENOENT.
     let _ = cfg::ensure_env_home(&v_data_dir);
@@ -9010,19 +9020,8 @@ pub(crate) fn container_run_env(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let cwd = std::env::current_dir()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    // Refuse to run from the root directory — container engines cannot
-    // bind-mount "/" and the resulting error is opaque.
-    if !shell && cwd == "/" {
-        return Err(ManagerError::EnvError(
-            "Cannot run from the root directory (/). \
-             Change to a subdirectory first (e.g., cd /tmp).".to_string()
-        ));
-    }
+    let cwd = work_mount_dir()?;
+    let run_home = run_home_mount(env_scope, &env_name, ec, &data_dir, engine)?;
 
     // Materialize flags from env.flags.yaml for the active phase + engine,
     // then append CLI one-shot overrides. The flag-file errors out on the
@@ -9042,7 +9041,7 @@ pub(crate) fn container_run_env(
         run_with_config(
             engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd, suffix,
             shell, args, false, &ec.shm_size, &extra_flags, user_env,
-            bridge_mount.as_deref(), is_dev, ec.mount_home.as_deref(), platform,
+            bridge_mount.as_deref(), is_dev, run_home.as_deref(), platform,
         )
     } else {
         let (cwd_final, skip_work_mount) = if is_home_dir && !suffix.is_empty() && !is_init {
@@ -9056,9 +9055,59 @@ pub(crate) fn container_run_env(
         run_with_config(
             engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd_final, suffix,
             shell, args, is_init || skip_work_mount, &ec.shm_size, &extra_flags, user_env,
-            bridge_mount.as_deref(), is_dev, ec.mount_home.as_deref(), platform,
+            bridge_mount.as_deref(), is_dev, run_home.as_deref(), platform,
         )
     }
+}
+
+/// The host directory a run mounts as the container's `$HOME`, `None` for the
+/// env-owned `<data_dir>/home`. A configured `mount_home` wins. A user who
+/// cannot write the environment (anyone but root, for a system one) gets a
+/// home of their own instead, so tools that write `$HOME` work and nothing
+/// lands in the shared environment. Apptainer mounts the host home itself.
+fn run_home_mount(
+    scope: Scope,
+    name: &str,
+    ec: &EnvironmentConfig,
+    data_dir: &std::path::Path,
+    engine: ContainerEngine,
+) -> Result<Option<String>> {
+    if ec.mount_home.is_some() || !engine.is_oci() || scope == Scope::Local {
+        return Ok(ec.mount_home.clone());
+    }
+    if cfg::dir_writable(data_dir) {
+        return Ok(None);
+    }
+    let home = cfg::system_env_user_home(name);
+    fs::create_dir_all(&home).map_err(|e| {
+        ManagerError::EnvError(format!("cannot create {}: {e}", home.display()))
+    })?;
+    Ok(Some(home.to_string_lossy().to_string()))
+}
+
+/// The current directory, as the host path mounted read-write at the
+/// container's work directory, after [`check_work_dir`].
+fn work_mount_dir() -> Result<String> {
+    let cwd = std::env::current_dir().map_err(|e| {
+        ManagerError::EnvError(format!("cannot resolve the current directory: {e}"))
+    })?;
+    check_work_dir(&cwd)?;
+    Ok(cwd.to_string_lossy().to_string())
+}
+
+/// Refuse a working directory that resolves to `/`: mounting it read-write
+/// would hand the container the whole host filesystem.
+fn check_work_dir(cwd: &std::path::Path) -> Result<()> {
+    let real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    if real == std::path::Path::new("/") {
+        return Err(ManagerError::EnvError(
+            "cannot run from the root directory (/): the working directory is mounted \
+             read-write into the environment, and mounting / would expose the whole \
+             host. Change to a project directory first."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Extra bind mounts for a dev environment, shared by the run/shell and capture
@@ -12624,5 +12673,160 @@ run:
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(ok, "child pool daemon must be terminated by the group kill (not left an orphan)");
+    }
+
+    /// Roots every scope of this thread under a fresh tempdir holding one
+    /// container environment, `sys`, in the system scope. With `locked`, the
+    /// system trees are made read-only, as they are for a non-root user.
+    struct ScopeFixture {
+        tmp: tempfile::TempDir,
+    }
+
+    impl ScopeFixture {
+        fn new(locked: bool) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            cfg::test_roots::set(tmp.path());
+            let ec = EnvironmentConfig::new_backend(
+                "sys".to_string(),
+                Backend::Container(ContainerEngine::Podman),
+                CONTAINER_BASE_IMAGE.to_string(),
+                Some("localhost/morloc-env:sys".to_string()),
+                Some(Version::new(0, 98, 1)),
+                Vec::new(),
+                Vec::new(),
+            );
+            cfg::write_env_config(Scope::System, "sys", &ec).unwrap();
+            fs::create_dir_all(cfg::env_data_dir(Scope::System, "sys")).unwrap();
+            let f = ScopeFixture { tmp };
+            if locked {
+                f.chmod_system(0o555);
+            }
+            f
+        }
+
+        fn chmod_system(&self, mode: u32) {
+            use std::os::unix::fs::PermissionsExt;
+            fn walk(p: &std::path::Path, mode: u32) {
+                if p.is_dir() {
+                    for e in fs::read_dir(p).unwrap() {
+                        walk(&e.unwrap().path(), mode);
+                    }
+                    fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+                }
+            }
+            walk(&self.tmp.path().join("system"), mode);
+        }
+    }
+
+    impl Drop for ScopeFixture {
+        fn drop(&mut self) {
+            self.chmod_system(0o755);
+        }
+    }
+
+    fn running_as_root() -> bool {
+        nix::unistd::getuid().is_root()
+    }
+
+    fn dispatch_args(args: &[&str]) -> Result<()> {
+        let cli = Cli::try_parse_from(args).unwrap();
+        dispatch(false, false, cli.command.unwrap())
+    }
+
+    #[test]
+    fn a_system_environment_is_writable_only_by_who_can_write_its_trees() {
+        if running_as_root() {
+            return;
+        }
+        let _open = ScopeFixture::new(false);
+        assert!(require_env_writable(Scope::System, "sys", "x").is_ok());
+        drop(_open);
+        let _locked = ScopeFixture::new(true);
+        let err = require_env_writable(Scope::System, "sys", "`mim install`").unwrap_err();
+        assert!(err.to_string().contains("system environment"), "{err}");
+        assert!(require_env_writable(Scope::Local, "sys", "x").is_ok());
+    }
+
+    /// The data tree alone being read-only (a config tree a group may write)
+    /// still refuses: system environments keep state in both.
+    #[test]
+    fn a_read_only_system_data_tree_refuses_writes() {
+        if running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let f = ScopeFixture::new(false);
+        let data = f.tmp.path().join("system").join("data");
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(check_system_write_access().is_err());
+    }
+
+    /// Every command that changes an environment refuses a system one the
+    /// caller cannot write, before any side effect.
+    #[test]
+    fn changing_a_system_environment_without_write_access_is_refused() {
+        if running_as_root() {
+            return;
+        }
+        let f = ScopeFixture::new(true);
+        let snap = f.tmp.path().join("pins.txt");
+        fs::write(&snap, "foo abc123\n").unwrap();
+        let snap = snap.to_string_lossy().to_string();
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["mim", "install", "--env", "sys", "x.loc"],
+            vec!["mim", "modify", "--env", "sys", "--modules-file", &snap],
+            vec!["mim", "modify", "--env", "sys", "--shm-size", "4g"],
+            vec!["mim", "view", "eval", "--env", "sys", "--off"],
+            vec!["mim", "view", "rm", "--env", "sys", "foo"],
+            vec!["mim", "start", "--env", "sys"],
+            vec!["mim", "stop", "--env", "sys"],
+        ];
+        for args in cases {
+            let err = dispatch_args(&args).unwrap_err().to_string();
+            assert!(err.contains("system environment") && err.contains("requires root"),
+                "{args:?}: {err}");
+        }
+        assert!(!cfg::env_data_dir(Scope::System, "sys").join("snapshots").exists());
+    }
+
+    #[test]
+    fn the_root_directory_is_never_mounted_as_the_work_dir() {
+        assert!(check_work_dir(std::path::Path::new("/")).is_err());
+        assert!(check_work_dir(std::path::Path::new("//")).is_err());
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("root");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert!(check_work_dir(&link).is_err());
+        assert!(check_work_dir(tmp.path()).is_ok());
+    }
+
+    /// A user who may run a system environment but not write it gets a home
+    /// of their own; the owner keeps the environment's.
+    #[test]
+    fn a_run_in_a_read_only_system_environment_gets_a_private_home() {
+        if running_as_root() {
+            return;
+        }
+        let _f = ScopeFixture::new(true);
+        let ec = cfg::read_env_config(Scope::System, "sys").unwrap();
+        let data = cfg::env_data_dir(Scope::System, "sys");
+        let home = run_home_mount(Scope::System, "sys", &ec, &data, ContainerEngine::Podman)
+            .unwrap()
+            .expect("a private home");
+        assert_eq!(std::path::PathBuf::from(&home), cfg::system_env_user_home("sys"));
+        assert!(std::path::Path::new(&home).is_dir());
+        // Apptainer mounts the host home itself.
+        let none = run_home_mount(Scope::System, "sys", &ec, &data, ContainerEngine::Apptainer)
+            .unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn the_owner_of_an_environment_runs_with_its_own_home() {
+        let _f = ScopeFixture::new(false);
+        let ec = cfg::read_env_config(Scope::System, "sys").unwrap();
+        let data = cfg::env_data_dir(Scope::System, "sys");
+        let home = run_home_mount(Scope::System, "sys", &ec, &data, ContainerEngine::Podman).unwrap();
+        assert!(home.is_none());
     }
 }
