@@ -274,18 +274,6 @@ fn default_backend() -> Backend {
     Backend::Container(ContainerEngine::Podman)
 }
 
-impl Config {
-    /// The container engine of the default backend, or an error if it is native.
-    pub fn engine(&self) -> crate::error::Result<ContainerEngine> {
-        self.backend.container_engine().ok_or_else(|| {
-            crate::error::ManagerError::BackendUnsupported(
-                "the default backend is native; this operation requires a container engine"
-                    .to_string(),
-            )
-        })
-    }
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {

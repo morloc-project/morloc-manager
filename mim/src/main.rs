@@ -350,7 +350,8 @@ Examples:
         /// Remove system-scope environments instead of local (requires root)
         #[arg(long)]
         system: bool,
-        /// Also remove base container images
+        /// Also remove the base container images the removed environments were
+        /// built from, except those a remaining environment still uses
         #[arg(long)]
         images: bool,
         /// Skip confirmation prompt
@@ -1210,11 +1211,43 @@ fn exec_in_env(
     )
 }
 
-fn ensure_engine() -> Result<ContainerEngine> {
-    if let Some(cfg) = cfg::read_active_config() {
-        return cfg.engine();
+/// The container engine a config names, if any. A config whose default
+/// backend is native names none, so a container environment created on a host
+/// that cannot run native ones falls through to auto-detection rather than
+/// failing on the stale default.
+fn configured_container_engine(cfg: Option<Config>) -> Option<ContainerEngine> {
+    cfg.and_then(|c| c.backend.container_engine())
+}
+
+/// The base images `nuke --images` may remove: those of the removed
+/// environments, each in its own engine's store, that no remaining environment
+/// still references. Only the OCI engines keep a store of pulled images.
+fn images_to_remove(
+    removed: &[(ContainerEngine, String)],
+    still_used: &HashSet<String>,
+) -> Vec<(ContainerEngine, String)> {
+    let mut out: Vec<(ContainerEngine, String)> = Vec::new();
+    for (engine, image) in removed {
+        if engine.is_oci() && !still_used.contains(image) && !out.contains(&(*engine, image.clone())) {
+            out.push((*engine, image.clone()));
+        }
     }
-    Err(ManagerError::SetupNotComplete(Scope::Local))
+    out
+}
+
+/// Every image an environment refers to, in every scope this user can read.
+fn images_in_use() -> HashSet<String> {
+    let mut used = HashSet::new();
+    for scope in [Scope::Local, Scope::System] {
+        for name in cfg::list_env_names(scope) {
+            if let Ok(ec) = cfg::read_env_config(scope, &name) {
+                used.insert(ec.base_image.clone());
+                used.extend(ec.original_image.clone());
+                used.extend(ec.built_image.clone());
+            }
+        }
+    }
+    used
 }
 
 fn which(name: &str) -> bool {
@@ -1737,14 +1770,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let eng: ContainerEngine = e.into();
                 check_docker_socket(eng);
                 eng
-            } else if let Some(cfg) = if system {
+            } else if let Some(eng) = configured_container_engine(if system {
                 // System scope: check system config first, then local
                 cfg::read_config::<Config>(&cfg::config_path(Scope::System)).ok()
                     .or_else(|| cfg::read_active_config())
             } else {
                 cfg::read_active_config()
-            } {
-                cfg.engine()?
+            }) {
+                eng
             } else {
                 // No config -- try auto-detection over the shared engine catalog
                 // (Apptainer/Singularity included so HPC-only hosts work out of
@@ -1934,14 +1967,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // Collect env info before removal (configs are deleted during
             // removal). The engine is None for native envs (file-only cleanup).
             let mut env_list: Vec<(String, Option<ContainerEngine>, Option<String>)> = Vec::new();
-            let mut base_images: HashSet<String> = HashSet::new();
+            let mut base_images: Vec<(ContainerEngine, String)> = Vec::new();
 
             for name in cfg::list_env_names(scope) {
                 if let Ok(ec) = cfg::read_env_config(scope, &name) {
-                    if images {
-                        base_images.insert(ec.base_image.clone());
+                    if let (true, Some(engine)) = (images, ec.backend.container_engine()) {
+                        base_images.push((engine, ec.base_image.clone()));
                         if let Some(ref orig) = ec.original_image {
-                            base_images.insert(orig.clone());
+                            base_images.push((engine, orig.clone()));
                         }
                     }
                     env_list.push((name, ec.backend.container_engine(), ec.mount_home.clone()));
@@ -1998,10 +2031,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             }
 
             // Remove base images if --images
-            if images && !base_images.is_empty() {
-                let engine = ensure_engine().unwrap_or(ContainerEngine::Docker);
+            let still_used = images_in_use();
+            let removable = images_to_remove(&base_images, &still_used);
+            let kept: HashSet<&String> =
+                base_images.iter().map(|(_, i)| i).filter(|i| still_used.contains(*i)).collect();
+            for img in kept {
+                eprintln!("Keeping base image {img}: a remaining environment uses it.");
+            }
+            if !removable.is_empty() {
                 eprintln!("Removing base images...");
-                for img in &base_images {
+                for (engine, img) in &removable {
+                    let engine = *engine;
                     if container::image_exists_locally(engine, img) {
                         eprintln!("  Removing image: {img}...");
                         if container::remove_image(engine, img) {
@@ -11360,7 +11400,7 @@ mod tests {
 
     #[test]
     fn default_config_uses_podman() {
-        assert_eq!(Config::default().engine().unwrap(), ContainerEngine::Podman);
+        assert_eq!(Config::default().backend.container_engine().unwrap(), ContainerEngine::Podman);
     }
 
     // ---- Config JSON round-trip tests ----
@@ -11376,7 +11416,7 @@ mod tests {
         cfg::write_config(&path, &cfg).unwrap();
         let cfg2: Config = cfg::read_config(&path).unwrap();
         assert_eq!(cfg2.default_env.as_deref(), Some("ml"));
-        assert_eq!(cfg2.engine().unwrap(), ContainerEngine::Docker);
+        assert_eq!(cfg2.backend.container_engine().unwrap(), ContainerEngine::Docker);
     }
 
     // The Backend abstraction must be on-disk compatible with the historical
@@ -11387,7 +11427,7 @@ mod tests {
     fn backend_reads_legacy_engine_field() {
         let legacy = r#"{"default_env":"ml","engine":"podman"}"#;
         let cfg: Config = serde_json::from_str(legacy).unwrap();
-        assert_eq!(cfg.engine().unwrap(), ContainerEngine::Podman);
+        assert_eq!(cfg.backend.container_engine().unwrap(), ContainerEngine::Podman);
         assert!(matches!(
             cfg.backend,
             Backend::Container(ContainerEngine::Podman)
@@ -11415,8 +11455,7 @@ mod tests {
         assert!(json.contains(r#""engine":"native""#), "got: {json}");
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(back.backend.is_native());
-        // A native backend has no container engine; engine() must be an error.
-        assert!(back.engine().is_err());
+        assert!(back.backend.container_engine().is_none());
     }
 
     #[test]
@@ -13106,5 +13145,38 @@ run:
         let token = interpret_eval_response("e", "HTTP/1.0 401 Unauthorized\r\n\r\n").unwrap_err();
         assert!(token.to_string().contains("rejected the token"), "{token}");
         assert!(interpret_eval_response("e", "garbage").is_err());
+    }
+
+    /// A config left saying `native` from another host names no container
+    /// engine, so creating a container environment auto-detects one instead of
+    /// failing on the stale default.
+    #[test]
+    fn a_native_default_names_no_container_engine() {
+        let native = Config { default_env: None, backend: Backend::Native };
+        assert_eq!(configured_container_engine(Some(native)), None);
+        let podman = Config { default_env: None, backend: Backend::Container(ContainerEngine::Podman) };
+        assert_eq!(configured_container_engine(Some(podman)), Some(ContainerEngine::Podman));
+        assert_eq!(configured_container_engine(None), None);
+    }
+
+    /// A base image a remaining environment uses is kept, each removed one goes
+    /// from its own engine's store, and Apptainer has no store to clean.
+    #[test]
+    fn nuke_removes_only_base_images_nothing_else_uses() {
+        let removed = vec![
+            (ContainerEngine::Docker, "ubuntu:24.04".to_string()),
+            (ContainerEngine::Podman, "debian:bookworm-slim".to_string()),
+            (ContainerEngine::Podman, "debian:bookworm-slim".to_string()),
+            (ContainerEngine::Docker, "shared:1".to_string()),
+            (ContainerEngine::Apptainer, "/sif/base.sif".to_string()),
+        ];
+        let still_used: HashSet<String> = ["shared:1".to_string()].into_iter().collect();
+        assert_eq!(
+            images_to_remove(&removed, &still_used),
+            vec![
+                (ContainerEngine::Docker, "ubuntu:24.04".to_string()),
+                (ContainerEngine::Podman, "debian:bookworm-slim".to_string()),
+            ]
+        );
     }
 }
