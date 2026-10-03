@@ -103,7 +103,7 @@ pub fn serve_environment(
             return Err(ManagerError::EnvError(format!(
                 "{port_hint}\n  \
                  Another container or process is using this port.\n  \
-                 Use '-p <other-port>:8080' to choose a different host port, or\n  \
+                 Use '-p <other-port>' to choose a different port, or\n  \
                  check running containers with 'mim status'."
             )));
         }

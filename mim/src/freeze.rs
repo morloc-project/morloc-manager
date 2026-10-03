@@ -261,7 +261,8 @@ pub fn freeze_environment(
     }
     eprintln!();
     let run_flags = flags.materialize(Phase::Run, engine);
-    for line in run_hints(engine, tag, flavor, &programs, !cmd.is_empty(), shm_size, &run_flags) {
+    let start_flags = flags.materialize(Phase::Start, engine);
+    for line in run_hints(engine, tag, flavor, &programs, !cmd.is_empty(), shm_size, &run_flags, &start_flags) {
         eprintln!("{line}");
     }
     Ok(())
@@ -495,6 +496,7 @@ fn run_hints(
     serves: bool,
     shm_size: &str,
     run_flags: &[String],
+    start_flags: &[String],
 ) -> Vec<String> {
     let exe = engine.name();
     let mut lines = vec![
@@ -528,19 +530,59 @@ fn run_hints(
     }
     if !run_flags.is_empty() {
         let (opts, command) = match programs.first() {
-            Some(first) => ("--rm", format!("{} --help", first.name)),
-            None => ("-it --rm", "/bin/bash".to_string()),
+            Some(first) => ("--rm", format!(" {} --help", first.name)),
+            None => ("-it --rm", " /bin/bash".to_string()),
         };
         lines.push(String::new());
-        lines.push("  As `mim run` launches it, with the run-phase flags from env.flags.yaml:".to_string());
-        lines.push(format!("  {exe} run {opts} \\"));
-        lines.push(format!("    --shm-size {shm_size} \\"));
-        for group in flag_groups(run_flags) {
-            lines.push(format!("    {group} \\"));
-        }
-        lines.push(format!("    {tag} {command}"));
+        lines.push("  With the run-phase engine flags from env.flags.yaml, as `mim run` applies them:".to_string());
+        lines.extend(flagged_command(exe, opts, shm_size, None, run_flags, tag, &command));
+    }
+    if serves && !start_flags.is_empty() {
+        lines.push(String::new());
+        lines.push("  Serving, with the start-phase engine flags from env.flags.yaml, as `mim start` applies them:".to_string());
+        let port = format!("{DEPLOY_HTTP_PORT}:{DEPLOY_HTTP_PORT}");
+        lines.extend(flagged_command(exe, "--rm", shm_size, Some(&port), start_flags, tag, ""));
     }
     lines
+}
+
+/// An engine `run` command spelled one flag per line. The environment's own
+/// flags come last and win, so a default they already set (`--shm-size`) is
+/// left out, and a port is not published into the host network (`-p` is
+/// invalid there).
+fn flagged_command(
+    exe: &str,
+    opts: &str,
+    shm_size: &str,
+    publish: Option<&str>,
+    flags: &[String],
+    tag: &str,
+    command: &str,
+) -> Vec<String> {
+    let mut lines = vec![format!("  {exe} run {opts} \\")];
+    if !sets_flag(flags, "--shm-size") {
+        lines.push(format!("    --shm-size {shm_size} \\"));
+    }
+    if let Some(p) = publish.filter(|_| !uses_host_network(flags)) {
+        lines.push(format!("    -p {p} \\"));
+    }
+    for group in flag_groups(flags) {
+        lines.push(format!("    {group} \\"));
+    }
+    lines.push(format!("    {tag}{command}"));
+    lines
+}
+
+/// Whether `flags` set the long flag `name`, as `name value` or `name=value`.
+fn sets_flag(flags: &[String], name: &str) -> bool {
+    flags.iter().any(|f| f == name || f.strip_prefix(name).is_some_and(|r| r.starts_with('=')))
+}
+
+fn uses_host_network(flags: &[String]) -> bool {
+    ["--network", "--net"].iter().any(|name| {
+        flags.windows(2).any(|w| w[0] == *name && w[1] == "host")
+            || flags.iter().any(|f| *f == format!("{name}=host"))
+    })
 }
 
 /// Regroup a materialized flag list into one shell-ready string per flag: a
@@ -1059,7 +1101,7 @@ mod tests {
         let programs = vec![
             ProgramEntry { name: "pacman".to_string(), commands: vec!["play".to_string()] },
         ];
-        let served = run_hints(ContainerEngine::Podman, "pacman:v1", Flavor::Full, &programs, true, "4g", &[]);
+        let served = run_hints(ContainerEngine::Podman, "pacman:v1", Flavor::Full, &programs, true, "4g", &[], &[]);
         let text = served.join("\n");
         assert!(text.contains("podman run -it --rm pacman:v1 /bin/bash"), "{text}");
         // The serve hint carries the shared-memory size the environment ran
@@ -1074,7 +1116,7 @@ mod tests {
 
         // With nothing exposed the image has no default command, and a hint to
         // serve it would start a container that exits at once.
-        let cli_only = run_hints(ContainerEngine::Docker, "pacman:v1", Flavor::Full, &programs, false, "2g", &[]);
+        let cli_only = run_hints(ContainerEngine::Docker, "pacman:v1", Flavor::Full, &programs, false, "2g", &[], &[]);
         let text = cli_only.join("\n");
         assert!(text.contains("docker run --rm pacman:v1 pacman --help"), "{text}");
         assert!(!text.contains("-p "), "{text}");
@@ -1093,7 +1135,7 @@ mod tests {
         ];
         let flags: Vec<String> = ["--gpus", "all", "-e", "NVIDIA_VISIBLE_DEVICES=all", "--privileged", "-v", "/data/in put:/mnt"]
             .iter().map(|s| s.to_string()).collect();
-        let text = run_hints(ContainerEngine::Podman, "pacman:v1", Flavor::Full, &programs, false, "4g", &flags).join("\n");
+        let text = run_hints(ContainerEngine::Podman, "pacman:v1", Flavor::Full, &programs, false, "4g", &flags, &[]).join("\n");
         let expected = "  podman run --rm \\\n\
                         \x20   --shm-size 4g \\\n\
                         \x20   --gpus all \\\n\
@@ -1105,9 +1147,47 @@ mod tests {
         assert!(text.contains("env.flags.yaml"), "{text}");
 
         // With nothing installed the example opens a shell instead.
-        let text = run_hints(ContainerEngine::Docker, "base:v1", Flavor::Full, &[], false, "2g", &flags).join("\n");
+        let text = run_hints(ContainerEngine::Docker, "base:v1", Flavor::Full, &[], false, "2g", &flags, &[]).join("\n");
         assert!(text.contains("  docker run -it --rm \\\n"), "{text}");
         assert!(text.contains("\n    base:v1 /bin/bash"), "{text}");
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `mim start` launches under the start-phase flags, not the run-phase
+    /// ones, and publishes the port; the serve hint does the same.
+    #[test]
+    fn the_serve_hint_carries_the_start_phase_flags_and_the_port() {
+        let programs = vec![ProgramEntry { name: "dna".to_string(), commands: vec![] }];
+        let run = strings(&["--gpus", "all"]);
+        let start = strings(&["--memory", "8g"]);
+        let text = run_hints(ContainerEngine::Docker, "dna:v1", Flavor::Full, &programs, true, "2g", &run, &start).join("\n");
+        let serve = text.split("start-phase").nth(1).expect("a serve block");
+        assert!(serve.contains("-p 8080:8080") && serve.contains("--memory 8g"), "{serve}");
+        assert!(!serve.contains("--gpus"), "{serve}");
+        // Nothing served, no serve block.
+        let text = run_hints(ContainerEngine::Docker, "dna:v1", Flavor::Full, &programs, false, "2g", &run, &start).join("\n");
+        assert!(!text.contains("start-phase"), "{text}");
+    }
+
+    /// The environment's flags come last and win, so a default they set is
+    /// not printed a second time, and no port is published into the host
+    /// network.
+    #[test]
+    fn a_flag_the_environment_sets_is_not_repeated() {
+        let programs = vec![ProgramEntry { name: "dna".to_string(), commands: vec![] }];
+        let start = strings(&["--shm-size", "8g", "--network", "host"]);
+        let text = run_hints(ContainerEngine::Docker, "dna:v1", Flavor::Full, &programs, true, "2g", &[], &start).join("\n");
+        let serve = text.split("start-phase").nth(1).unwrap();
+        assert_eq!(serve.matches("--shm-size").count(), 1, "{serve}");
+        assert!(serve.contains("--shm-size 8g"), "{serve}");
+        assert!(!serve.contains("-p "), "{serve}");
+        assert!(sets_flag(&strings(&["--shm-size=1g"]), "--shm-size"));
+        assert!(!sets_flag(&strings(&["--shm-sizes"]), "--shm-size"));
+        assert!(uses_host_network(&strings(&["--net=host"])));
+        assert!(!uses_host_network(&strings(&["--network", "bridge"])));
     }
 
     #[test]
@@ -1299,7 +1379,7 @@ mod tests {
     #[test]
     fn slim_hints_read_the_label_instead_of_running_the_compiler() {
         let programs = vec![ProgramEntry { name: "dna".to_string(), commands: vec![] }];
-        let text = run_hints(ContainerEngine::Docker, "dna:v1-slim", Flavor::Slim, &programs, false, "2g", &[]).join("\n");
+        let text = run_hints(ContainerEngine::Docker, "dna:v1-slim", Flavor::Slim, &programs, false, "2g", &[], &[]).join("\n");
         assert!(text.contains("docker inspect -f '{{index .Config.Labels \"morloc.programs\"}}' dna:v1-slim"), "{text}");
         assert!(!text.contains("morloc list"), "{text}");
     }

@@ -610,9 +610,9 @@ what the corresponding flag set:
     #[command(after_help = "\
 Examples:
   mim start                       # serve the default environment's exposed set
-  mim start --env myenv -p 9090:8080
-  mim start --mcp mymodule -p 9000:9000   # serve one module as MCP/HTTP
-  mim start --flagfile alt.yaml -p 9090:8080   # a second instance under other flags")]
+  mim start --env myenv -p 9090
+  mim start --mcp mymodule -p 9000   # serve one module as MCP/HTTP
+  mim start --flagfile alt.yaml -p 9090   # a second instance under other flags")]
     Start {
         /// Environment to serve (default: the default environment)
         #[arg(long)]
@@ -650,9 +650,12 @@ Examples:
         /// already waived for a host-confined endpoint.
         #[arg(long)]
         eval_allow_no_auth: bool,
-        /// Port mapping HOST:CONTAINER (default: 8080:8080, or 9000:9000 with --mcp)
+        /// Port to serve on (default: 9000 when serving MCP or eval, else 8080,
+        /// or the next free port above it). HOST:CONTAINER maps the two where
+        /// the engine publishes ports, which an exposed container serve does;
+        /// a host-network, Apptainer or native serve has no mapping.
         #[arg(short, long, value_parser = parse_port)]
-        port: Vec<(u16, u16)>,
+        port: Option<(u16, u16)>,
         /// Pass environment variable to the container (KEY=VALUE)
         #[arg(long = "env-var")]
         env_vars: Vec<String>,
@@ -671,6 +674,11 @@ Examples:
         /// Replace an already-running serve container
         #[arg(long)]
         force: bool,
+        /// Host name or address clients use to reach this serve, put in the
+        /// printed URLs and MCP client config (default: 127.0.0.1, which only
+        /// a client on this machine can use)
+        #[arg(long, value_name = "HOST")]
+        advertise_host: Option<String>,
     },
     /// Stop a running serve container
     #[command(display_order = 21)]
@@ -995,10 +1003,12 @@ impl From<EngineArg> for ContainerEngine {
     }
 }
 
+/// A `-p` value: `PORT`, or `HOST:CONTAINER` where the serve maps ports.
 fn parse_port(s: &str) -> std::result::Result<(u16, u16), String> {
     let parts: Vec<&str> = s.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        return Err(format!("Expected HOST:CONTAINER format, got: {s}"));
+    if parts.len() == 1 {
+        let port: u16 = s.parse().map_err(|_| format!("Invalid port: {s}"))?;
+        return Ok((port, port));
     }
     let host: u16 = parts[0]
         .parse()
@@ -3317,7 +3327,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         }
 
         // ---- start ----
-        Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, eval_allow_no_auth, port, env_vars, env_file, engine_arg, flagfile, force } => {
+        Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, eval_allow_no_auth, port, env_vars, env_file, engine_arg, flagfile, force, advertise_host } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
             // The serve record that stop/logs/status find it by lives in the
             // environment's config tree.
@@ -3374,14 +3384,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let serves_mcp = !spec.mcp.is_empty() || eval_on;
             let serves_api = !spec.api.is_empty() || eval_on;
             let default_port: u16 = if serves_mcp { 9000 } else { 8080 };
-            let (host_port, container_port) = if port.is_empty() {
-                let p = find_free_host_port(default_port, 100);
-                if p != default_port {
-                    eprintln!("Port {default_port} is in use; serving on {p} instead (override with -p).");
+            let (host_port, container_port) = match port {
+                Some(p) => p,
+                None => {
+                    let bind_ip = if expose { "0.0.0.0" } else { "127.0.0.1" };
+                    let p = find_free_host_port(default_port, 100, bind_ip)?;
+                    if p != default_port {
+                        eprintln!("Port {default_port} is in use; serving on {p} instead (override with -p).");
+                    }
+                    (p, p)
                 }
-                (p, p)
-            } else {
-                port.first().copied().unwrap_or((default_port, default_port))
             };
             let user_env = collect_env_vars(&env_vars, env_file.as_deref())?;
             let token = resolve_mcp_token(auth_token);
@@ -3394,8 +3406,18 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 eval_allow_no_auth, engine_args: engine_arg, flagfile, token, verbose,
             };
             let env = runner::ResolvedEnv { name: env_name.clone(), scope: env_scope, ec };
-            let ServeOutcome { handle, url_host, token: eff_token } =
+            let ServeOutcome { handle, url_host: this_host, token: eff_token } =
                 runner::runner_for(&env.ec).serve(&env, &req)?;
+            // A pasteable URL must work as printed. The machine's own name is
+            // a guess at what an off-box client can resolve (a container ID,
+            // inside a container), so it is offered, never printed as the URL.
+            let url_host = advertise_host.unwrap_or_else(|| "127.0.0.1".to_string());
+            if expose && url_host == "127.0.0.1" {
+                eprintln!(
+                    "  Off this machine, replace 127.0.0.1 with an address of it the client \
+                     can reach (it calls itself '{this_host}'), or pass --advertise-host."
+                );
+            }
 
             if serves_mcp {
                 eprintln!("  MCP:  http://{url_host}:{host_port}/mcp");
@@ -7630,17 +7652,38 @@ fn eval_against_serve(
         .read_to_string(&mut response)
         .map_err(|e| ManagerError::EnvError(format!("failed to read the response: {e}")))?;
 
-    if response.starts_with("HTTP/1.1 401") {
-        return Err(ManagerError::EnvError(format!(
+    println!("{}", interpret_eval_response(env_name, &response)?);
+    Ok(())
+}
+
+/// The body of a successful eval response, or the failure it reports. The
+/// router answers a failed evaluation with a 5xx and a refused one with a 4xx,
+/// each carrying `{"error": ...}`; only a 2xx is a result.
+fn interpret_eval_response(env_name: &str, response: &str) -> Result<String> {
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or((response, ""));
+    let code: Option<u16> = head
+        .lines()
+        .next()
+        .filter(|l| l.starts_with("HTTP/"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok());
+    match code {
+        Some(200..=299) => Ok(body.to_string()),
+        Some(401) => Err(ManagerError::EnvError(format!(
             "the serve for '{env_name}' rejected the token. Supply the one `mim start` \
              printed with --auth-token, or set MORLOC_MCP_TOKEN."
-        )));
+        ))),
+        Some(code) => {
+            let reason = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                .unwrap_or_else(|| body.trim().to_string());
+            Err(ManagerError::EnvError(format!("eval failed (HTTP {code}): {reason}")))
+        }
+        None => Err(ManagerError::EnvError(format!(
+            "the serve for '{env_name}' sent a response that is not HTTP:\n{response}"
+        ))),
     }
-    match response.find("\r\n\r\n") {
-        Some(pos) => println!("{}", &response[pos + 4..]),
-        None => println!("{response}"),
-    }
-    Ok(())
 }
 
 /// The programs installed in an environment, by name, read from the program
@@ -8694,36 +8737,16 @@ fn native_serve(
     expose: bool,
     allow_plaintext: bool,
     allow_no_auth: bool,
+    eval_allow_no_auth: bool,
     token: Option<String>,
 ) -> Result<(ServeHandle, String)> {
-    // Exposing an UNSANDBOXED host process off-loopback reuses the container
+    // Exposing an UNSANDBOXED host process off-loopback passes the container
     // path's gates (plaintext ack + a token) so it can't happen by accident.
-    if expose {
-        if !allow_plaintext {
-            return Err(ManagerError::EnvError(format!(
-                "Refusing to expose off-loopback over plaintext HTTP without --allow-plaintext.\n  \
-                 Prefer the default (loopback) and reach it over an SSH tunnel:\n    \
-                 ssh -N -L {host_port}:127.0.0.1:{host_port} <host>"
-            )));
-        }
-        if token.is_none() && !allow_no_auth {
-            return Err(ManagerError::EnvError(
-                "An exposed endpoint requires a token: set MORLOC_MCP_TOKEN or --auth-token \
-                 (or --allow-no-auth to serve it unauthenticated)."
-                    .to_string(),
-            ));
-        }
-    }
-    let http_host = if expose { "0.0.0.0" } else { "127.0.0.1" };
-    let need_allow_no_auth = http_host == "0.0.0.0" && token.is_none();
-
+    check_expose_gates(expose, allow_plaintext, allow_no_auth, token.is_some(), host_port)?;
     let data_dir = cfg::env_data_dir(scope, env_name);
     let mh = data_dir.to_string_lossy().to_string();
-    // A native serve shares the host's network namespace, so the bind address
-    // really does say who can reach it: loopback is host-confined and eval needs
-    // no token there.
-    let command = build_router_command(
-        &mh, host_port, http_host, spec, need_allow_no_auth, !expose,
+    let command = native_router_command(
+        &mh, host_port, spec, expose, token.is_some(), eval_allow_no_auth,
     );
 
     // The stored activation env-map puts the env's bin (morloc-nexus) + conda
@@ -8814,8 +8837,23 @@ fn native_serve(
     Ok((ServeHandle::Native { pid, pgid: pid }, url_host))
 }
 
-/// Native `start`: serve the environment as a detached host nexus process.
-#[allow(clippy::too_many_arguments)]
+/// The router argv of a native serve. It shares the host's network namespace,
+/// so the bind address really does say who can reach it: loopback is
+/// host-confined and eval needs no token there.
+fn native_router_command(
+    state_dir: &str,
+    port: u16,
+    spec: &ServeSpec,
+    expose: bool,
+    has_token: bool,
+    eval_allow_no_auth: bool,
+) -> Vec<String> {
+    let http_host = if expose { "0.0.0.0" } else { "127.0.0.1" };
+    build_router_command(
+        state_dir, port, http_host, spec, expose && !has_token, eval_allow_no_auth || !expose,
+    )
+}
+
 /// Native-backend serve launch (behind `NativeRunner::serve`). Spawns the
 /// detached host nexus + prints native-specific status; the shared orchestration
 /// (spec/port/token/record/MCP-config) runs in the `start` handler.
@@ -8823,9 +8861,18 @@ pub(crate) fn native_serve_launch(
     env: &runner::ResolvedEnv,
     req: &ServeRequest,
 ) -> Result<ServeOutcome> {
+    // Container-only inputs are refused, as `run` refuses them, not dropped.
+    if !req.engine_args.is_empty() {
+        return Err(engine_arg_not_supported());
+    }
+    if req.flagfile.is_some() {
+        return Err(flagfile_not_supported());
+    }
+    check_port_unmapped(req.host_port, req.container_port, "a native serve")?;
     let (handle, url_host) = native_serve(
         env.scope, &env.name, &req.spec, req.host_port, &req.user_env,
-        req.expose, req.allow_plaintext, req.allow_no_auth, req.token.clone(),
+        req.expose, req.allow_plaintext, req.allow_no_auth, req.eval_allow_no_auth,
+        req.token.clone(),
     )?;
     if req.expose {
         eprintln!(
@@ -9419,13 +9466,62 @@ fn resolve_mcp_token(explicit: Option<String>) -> Option<String> {
 /// `preferred` if none is free (the engine then reports the real conflict). This
 /// is a best-effort predictor -- both host-networking (nexus binds the host
 /// port) and bridge publishing (`-p`) contend for the same host port.
-fn find_free_host_port(preferred: u16, range: u16) -> u16 {
-    for p in preferred..=preferred.saturating_add(range) {
-        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
-            return p;
-        }
+/// The first port from `preferred` up to `preferred + range` that `bind_ip`
+/// can bind: the address the serve will bind, since a port free on loopback
+/// may be taken on another interface.
+fn find_free_host_port(preferred: u16, range: u16, bind_ip: &str) -> Result<u16> {
+    let last = preferred.saturating_add(range);
+    (preferred..=last)
+        .find(|&p| std::net::TcpListener::bind((bind_ip, p)).is_ok())
+        .ok_or_else(|| {
+            ManagerError::EnvError(format!(
+                "no free port on {bind_ip} from {preferred} to {last}; choose one with -p"
+            ))
+        })
+}
+
+/// Refuse `-p HOST:CONTAINER` with differing ports on a serve that shares the
+/// host's network namespace: nothing maps one port to the other there, so the
+/// container port would be dropped without a word.
+fn check_port_unmapped(host_port: u16, container_port: u16, why: &str) -> Result<()> {
+    if host_port == container_port {
+        return Ok(());
     }
-    preferred
+    Err(ManagerError::EnvError(format!(
+        "-p {host_port}:{container_port} maps two ports, but {why} shares the host's \
+         network and maps none. Use -p {host_port}."
+    )))
+}
+
+/// The gates an off-loopback serve must pass, on every backend: an explicit
+/// acknowledgement of plaintext, and a token unless that too is waived.
+fn check_expose_gates(
+    expose: bool,
+    allow_plaintext: bool,
+    allow_no_auth: bool,
+    has_token: bool,
+    host_port: u16,
+) -> Result<()> {
+    if !expose {
+        return Ok(());
+    }
+    if !allow_plaintext {
+        return Err(ManagerError::EnvError(format!(
+            "Refusing to expose off-loopback over plaintext HTTP without \
+             --allow-plaintext.\n  A bearer token over plaintext protects against \
+             scanners, not eavesdroppers. Prefer the default (loopback) and reach \
+             it over an SSH tunnel:\n    ssh -N -L {host_port}:127.0.0.1:{host_port} <host>"
+        )));
+    }
+    if !has_token && !allow_no_auth {
+        return Err(ManagerError::EnvError(
+            "An exposed endpoint requires a token: set MORLOC_MCP_TOKEN or \
+             --auth-token (or --allow-no-auth to serve it unauthenticated, \
+             strongly discouraged)."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// A resolved plan for serving one program as MCP over HTTP: the container
@@ -9526,24 +9622,7 @@ fn serve_plan(
     host_net_usable: bool,
     token: Option<String>,
 ) -> Result<ServePlan> {
-    if expose {
-        if !allow_plaintext {
-            return Err(ManagerError::EnvError(format!(
-                "Refusing to expose MCP off-loopback over plaintext HTTP without \
-                 --allow-plaintext.\n  A bearer token over plaintext protects against \
-                 scanners, not eavesdroppers. Prefer the default (loopback) and reach \
-                 it over an SSH tunnel:\n    ssh -N -L {host_port}:127.0.0.1:{host_port} <host>"
-            )));
-        }
-        if token.is_none() && !allow_no_auth {
-            return Err(ManagerError::EnvError(
-                "An exposed MCP endpoint requires a token: set MORLOC_MCP_TOKEN or \
-                 --auth-token (or --allow-no-auth to serve it unauthenticated, \
-                 strongly discouraged)."
-                    .to_string(),
-            ));
-        }
-    }
+    check_expose_gates(expose, allow_plaintext, allow_no_auth, token.is_some(), host_port)?;
 
     let is_apptainer = matches!(engine, ContainerEngine::Apptainer);
 
@@ -9581,6 +9660,10 @@ fn serve_plan(
     // the client reaches (host_port). On a bridge, it binds the in-container port
     // and `-p` maps host_port -> container_port.
     let host_netns = is_apptainer || network.as_deref() == Some("host");
+    if host_netns {
+        let why = if is_apptainer { "an Apptainer serve" } else { "a loopback serve on Linux" };
+        check_port_unmapped(host_port, container_port, why)?;
+    }
     let bind_port = if host_netns { host_port } else { container_port };
 
     // The nexus refuses a non-loopback bind with no token unless --allow-no-auth.
@@ -11178,7 +11261,7 @@ mod tests {
         // Bind a port, then confirm the picker avoids it and returns a bindable one.
         let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let taken = l.local_addr().unwrap().port();
-        let picked = find_free_host_port(taken, 50);
+        let picked = find_free_host_port(taken, 50, "127.0.0.1").unwrap();
         assert_ne!(picked, taken, "should skip the bound port");
         assert!(std::net::TcpListener::bind(("127.0.0.1", picked)).is_ok());
     }
@@ -12911,5 +12994,117 @@ run:
         assert!(kill_native_group(1).is_err());
         assert!(!native_serve_alive(0));
         assert!(!native_serve_alive(1));
+    }
+
+    #[test]
+    fn a_full_port_range_is_an_error_not_the_taken_port() {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = l.local_addr().unwrap().port();
+        let err = find_free_host_port(taken, 0, "127.0.0.1").unwrap_err().to_string();
+        assert!(err.contains("no free port"), "{err}");
+    }
+
+    /// `-p` takes one port or one mapping, once: a second `-p` was dropped
+    /// without a word.
+    #[test]
+    fn start_takes_a_bare_port_or_a_mapping_once() {
+        let port = |args: &[&str]| match Cli::try_parse_from(args).map(|c| c.command) {
+            Ok(Some(Cmd::Start { port, .. })) => Ok(port),
+            Ok(_) => panic!("expected start"),
+            Err(e) => Err(e),
+        };
+        assert_eq!(port(&["mim", "start", "-p", "8080"]).unwrap(), Some((8080, 8080)));
+        assert_eq!(port(&["mim", "start", "-p", "9090:8080"]).unwrap(), Some((9090, 8080)));
+        assert_eq!(port(&["mim", "start"]).unwrap(), None);
+        assert!(port(&["mim", "start", "-p", "1", "-p", "2"]).is_err());
+        assert!(port(&["mim", "start", "-p", "x"]).is_err());
+        let cli = Cli::try_parse_from(["mim", "start", "--advertise-host", "box.lan"]).unwrap();
+        assert!(matches!(cli.command,
+            Some(Cmd::Start { advertise_host: Some(ref h), .. }) if h == "box.lan"));
+    }
+
+    /// Where the serve shares the host network nothing maps ports, so a
+    /// mapping is refused rather than its container half dropped.
+    #[test]
+    fn a_port_mapping_is_refused_where_nothing_maps_ports() {
+        let spec = ServeSpec { mcp: vec!["dna".to_string()], api: Vec::new(), eval_allow: None };
+        let mapped = |engine, expose, host_net| {
+            serve_plan(engine, &spec, 8080, 9090, expose, true, true, false, false, host_net, None)
+        };
+        let err = mapped(ContainerEngine::Docker, false, true).err().unwrap().to_string();
+        assert!(err.contains("-p 9090:8080") && err.contains("Use -p 9090"), "{err}");
+        assert!(mapped(ContainerEngine::Apptainer, false, false).is_err());
+        // An exposed container serve publishes through a bridge, which maps.
+        let ok = mapped(ContainerEngine::Docker, true, true).unwrap();
+        assert!(ok.command.windows(2).any(|w| w == ["--http-port", "8080"]), "{:?}", ok.command);
+    }
+
+    fn native_request(engine_args: Vec<String>, flagfile: Option<String>, ports: (u16, u16)) -> ServeRequest {
+        ServeRequest {
+            spec: ServeSpec { mcp: vec!["dna".to_string()], api: Vec::new(), eval_allow: None },
+            eval_allow_no_auth: false,
+            host_port: ports.0,
+            container_port: ports.1,
+            user_env: Vec::new(),
+            expose: false,
+            allow_plaintext: false,
+            allow_no_auth: false,
+            unsafe_serve: false,
+            engine_args,
+            flagfile,
+            token: None,
+            verbose: false,
+        }
+    }
+
+    /// Container-only serve inputs are refused by a native serve, as by a
+    /// native run, before anything launches.
+    #[test]
+    fn a_native_serve_refuses_container_only_inputs() {
+        let env = runner::ResolvedEnv {
+            name: "n".to_string(),
+            scope: Scope::Local,
+            ec: EnvironmentConfig::new_backend(
+                "n".to_string(), Backend::Native, String::new(), None, None, Vec::new(), Vec::new(),
+            ),
+        };
+        let x = native_request(vec!["--gpus".to_string()], None, (8080, 8080));
+        assert!(native_serve_launch(&env, &x).err().unwrap().to_string().contains("engine"));
+        let f = native_request(Vec::new(), Some("f.yaml".to_string()), (8080, 8080));
+        assert!(native_serve_launch(&env, &f).err().unwrap().to_string().contains("flagfile"));
+        let p = native_request(Vec::new(), None, (9090, 8080));
+        assert!(native_serve_launch(&env, &p).err().unwrap().to_string().contains("-p 9090:8080"));
+    }
+
+    /// `--eval-allow-no-auth` reaches the router of an exposed native serve, as
+    /// it does a container one.
+    #[test]
+    fn a_native_exposed_serve_honors_eval_allow_no_auth() {
+        let spec = ServeSpec { mcp: Vec::new(), api: Vec::new(), eval_allow: Some("math".to_string()) };
+        let waived = native_router_command("/s", 9000, &spec, true, true, true);
+        assert!(waived.contains(&"--eval-allow-no-auth".to_string()), "{waived:?}");
+        let kept = native_router_command("/s", 9000, &spec, true, true, false);
+        assert!(!kept.contains(&"--eval-allow-no-auth".to_string()), "{kept:?}");
+        let local = native_router_command("/s", 9000, &spec, false, false, false);
+        assert!(local.contains(&"--eval-allow-no-auth".to_string()), "{local:?}");
+        assert!(local.windows(2).any(|w| w == ["--http-host", "127.0.0.1"]), "{local:?}");
+    }
+
+    /// Only a 2xx eval response is a result; a failed or refused evaluation
+    /// exits nonzero with the router's reason.
+    #[test]
+    fn an_eval_error_status_is_an_error() {
+        let ok = interpret_eval_response("e", "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\",\"result\":2}");
+        assert_eq!(ok.unwrap(), "{\"status\":\"ok\",\"result\":2}");
+        let failed = interpret_eval_response("e", "HTTP/1.1 500 Internal Server Error\r\n\r\n{\"status\":\"error\",\"error\":\"type mismatch\"}");
+        let err = failed.unwrap_err().to_string();
+        assert!(err.contains("HTTP 500") && err.contains("type mismatch"), "{err}");
+        for code in ["400 Bad Request", "403 Forbidden", "404 Not Found"] {
+            let r = format!("HTTP/1.1 {code}\r\n\r\n{{\"error\":\"x\"}}");
+            assert!(interpret_eval_response("e", &r).is_err(), "{code}");
+        }
+        let token = interpret_eval_response("e", "HTTP/1.0 401 Unauthorized\r\n\r\n").unwrap_err();
+        assert!(token.to_string().contains("rejected the token"), "{token}");
+        assert!(interpret_eval_response("e", "garbage").is_err());
     }
 }
