@@ -1118,9 +1118,9 @@ mod tests {
     }
 
     #[test]
-    fn a_volume_name_survives_an_environment_name_a_volume_may_not_hold() {
-        // Environment names allow any Unicode alphanumeric; volume names do not.
-        let name = prefix_volume(Path::new("/data/environments/pruebas-nino"));
+    fn a_volume_name_survives_a_data_dir_a_volume_may_not_hold() {
+        // The data dir path, unlike the environment name, may hold anything.
+        let name = prefix_volume(Path::new("/home/ni\u{f1}o/data/environments/pruebas"));
         assert!(name.is_ascii(), "{name}");
     }
 

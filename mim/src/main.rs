@@ -3294,7 +3294,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // A tag that says what it is and does not collide with the
             // environment image it is built on.
             let suffix = if slim { "-slim" } else { "" };
-            let tag = tag.unwrap_or_else(|| format!("morloc-{env_name}:{}{suffix}", ver.show()));
+            let tag = tag.unwrap_or_else(|| {
+                format!("morloc-{}:{}{suffix}", environment::image_repo_component(&env_name), ver.show())
+            });
             let slim_base = slim.then(|| freeze::SlimBase {
                 base_image: &ec.base_image,
                 system_packages: &ec.system_packages,
@@ -7379,7 +7381,7 @@ fn build_requirement_derived_image(
     let env_dir = cfg::env_data_dir(scope, name);
     let context = env_dir.join(CONTAINER_BUILD_SUBDIR);
     let manifest = pixi::render_manifest(&req.requirements);
-    let image_tag = environment::env_image_tag(name);
+    let image_tag = environment::env_image_tag(scope, name);
 
     // Prime the requirements store unconditionally (like the native path), BEFORE
     // the cache-hit early return: the store reflects the env's config/inputs, so a
@@ -7976,7 +7978,7 @@ fn build_dev_container_image(
     let (specs, lang_spec, requirements) =
         build_env_requirements(stdlib_version, &platform, program_specs, lang_pins, conda_packages, &support)?;
     let manifest = pixi::render_manifest(&requirements);
-    let image_tag = environment::env_image_tag(name);
+    let image_tag = environment::env_image_tag(scope, name);
 
     let env_dir = cfg::env_data_dir(scope, name);
     let context = env_dir.join(CONTAINER_BUILD_SUBDIR);

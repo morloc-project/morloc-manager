@@ -550,6 +550,8 @@ pub fn write_views(scope: Scope, name: &str, views: &ViewSet) -> Result<()> {
 
 /// Find which scope an environment lives in. Checks local first, then system.
 pub fn find_env_scope(name: &str) -> Result<Scope> {
+    // The name becomes a path component; `..` or `/` would leave the tree.
+    crate::environment::validate_env_name(name)?;
     let local_path = env_config_path(Scope::Local, name);
     if local_path.is_file() {
         return Ok(Scope::Local);

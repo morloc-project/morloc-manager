@@ -84,18 +84,52 @@ pub fn detect_morloc_version(engine: ContainerEngine, image: &str) -> Result<Ver
 /// Create or update an environment.
 ///
 /// When `is_new` is true: validates name uniqueness, creates data directories.
-/// Validate that an environment name contains only allowed characters.
+/// Longest environment name. It is a path component, part of a container
+/// name and the bulk of an image tag, whose limit is 128 characters.
+pub const MAX_ENV_NAME_LEN: usize = 64;
+
+/// Validate an environment name: ASCII letters, digits, `-`, `_` and `.`,
+/// starting with a letter or digit. Every derived engine name (image tag,
+/// container name, volume) and path then holds it without escaping.
 pub fn validate_env_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
+    let ok = name.len() <= MAX_ENV_NAME_LEN
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    if !ok {
         return Err(ManagerError::EnvError(format!(
-            "Invalid environment name '{name}': must contain only alphanumeric characters, hyphens, underscores, or dots"
+            "Invalid environment name '{name}': use ASCII letters, digits, '-', '_' and '.', \
+             starting with a letter or digit, at most {MAX_ENV_NAME_LEN} characters"
         )));
     }
     Ok(())
+}
+
+/// An environment name as an image repository component, which must be
+/// lowercase with single separators between alphanumeric runs. A name that
+/// needs changing gets a short hash of the original, so `Foo` and `foo` stay
+/// apart.
+pub fn image_repo_component(name: &str) -> String {
+    let mut out = String::new();
+    let mut sep = String::new();
+    for c in name.to_ascii_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            if !out.is_empty() && !sep.is_empty() {
+                let legal = sep.chars().all(|c| c == '-') || matches!(sep.as_str(), "." | "_" | "__");
+                out.push_str(if legal { &sep } else { "-" });
+            }
+            sep.clear();
+            out.push(c);
+        } else {
+            sep.push(c);
+        }
+    }
+    if out == name {
+        return out;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(name.as_bytes());
+    let hash: String = digest.iter().take(3).map(|b| format!("{b:02x}")).collect();
+    if out.is_empty() { hash } else { format!("{out}-{hash}") }
 }
 
 
@@ -114,7 +148,10 @@ pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &
         // Stop and remove any running serve container for this environment
         // before removing its image. If we skipped this, the serve container
         // would keep running and be unreachable through mim.
-        let serve_name = serve::serve_container_name(name);
+        let serve_name = match config::read_serve_runtime(scope, name).and_then(|rt| rt.handle) {
+            Some(ServeHandle::Container { name: recorded, .. }) => recorded,
+            _ => serve::serve_container_name(name),
+        };
         if container::container_exists(engine, &serve_name) {
             let _ = container::container_stop(engine, &serve_name);
             let _ = container::container_remove_quiet(engine, &serve_name);
@@ -173,9 +210,15 @@ pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &
 }
 
 /// The tag of the requirement-derived image an environment builds for itself.
-/// Derived from the name, so a rename re-tags it.
-pub fn env_image_tag(name: &str) -> String {
-    format!("localhost/morloc-env:{name}")
+/// Derived from the name, so a rename re-tags it, and qualified by scope and,
+/// for a personal environment, by uid: an engine store can be shared (docker
+/// has one per host), and environments of the same name in different scopes
+/// or of different users must not overwrite or delete each other's image.
+pub fn env_image_tag(scope: Scope, name: &str) -> String {
+    match scope {
+        Scope::System => format!("localhost/morloc-env:system-{name}"),
+        Scope::Local => format!("localhost/morloc-env:u{}-{name}", nix::unistd::getuid()),
+    }
 }
 
 /// Why an environment cannot be renamed right now, checked before any side
@@ -278,9 +321,9 @@ pub fn rename_environment(
             old_volume = Some(from);
         }
         // Only the name-derived tag follows the name; a custom tag stays valid.
-        if ec.built_image.as_deref() == Some(env_image_tag(old).as_str()) {
-            let from = env_image_tag(old);
-            let to = env_image_tag(new);
+        if ec.built_image.as_deref() == Some(env_image_tag(scope, old).as_str()) {
+            let from = env_image_tag(scope, old);
+            let to = env_image_tag(scope, new);
             if image_exists_locally(engine, &from) {
                 if let Err(msg) = container::tag_image(engine, &from, &to) {
                     return fail(
@@ -547,8 +590,59 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn env_image_tag_is_name_derived() {
-        assert_eq!(env_image_tag("myenv"), "localhost/morloc-env:myenv");
+    fn env_image_tag_is_name_derived_and_scoped() {
+        let uid = nix::unistd::getuid();
+        assert_eq!(env_image_tag(Scope::Local, "myenv"), format!("localhost/morloc-env:u{uid}-myenv"));
+        assert_eq!(env_image_tag(Scope::System, "myenv"), "localhost/morloc-env:system-myenv");
+    }
+
+    #[test]
+    fn env_names_are_ascii_and_start_with_a_letter_or_digit() {
+        for ok in ["foo", "Foo", "v0.98.0", "a-b_c.d", "9", &"a".repeat(MAX_ENV_NAME_LEN)] {
+            assert!(validate_env_name(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "ni\u{f1}o", ".x", "-x", "_x", "a b", "a/b", &"a".repeat(MAX_ENV_NAME_LEN + 1)] {
+            assert!(validate_env_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Docker's repository grammar: lowercase alphanumeric runs joined by one
+    /// of `.`, `_`, `__` or a run of `-`.
+    fn is_repo_component(s: &str) -> bool {
+        let mut prev_alnum = false;
+        let mut sep = String::new();
+        for c in s.chars() {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                if !sep.is_empty() {
+                    let legal = sep.chars().all(|c| c == '-') || matches!(sep.as_str(), "." | "_" | "__");
+                    if !legal || !prev_alnum {
+                        return false;
+                    }
+                    sep.clear();
+                }
+                prev_alnum = true;
+            } else if "-_.".contains(c) {
+                if !prev_alnum && sep.is_empty() {
+                    return false;
+                }
+                sep.push(c);
+            } else {
+                return false;
+            }
+        }
+        prev_alnum && sep.is_empty()
+    }
+
+    #[test]
+    fn every_valid_env_name_makes_a_valid_image_repository() {
+        for name in ["foo", "MyEnv", "a-", "a_.b", "a..b", "a__b", "a---b", "A_", "v0.98.0", "X9"] {
+            assert!(validate_env_name(name).is_ok(), "{name}");
+            let repo = format!("morloc-{}", image_repo_component(name));
+            assert!(is_repo_component(&repo), "{name} -> {repo}");
+        }
+        assert_eq!(image_repo_component("foo"), "foo");
+        assert_ne!(image_repo_component("Foo"), image_repo_component("foo"));
+        assert_ne!(image_repo_component("a-b."), image_repo_component("a-b"));
     }
 
     #[test]
