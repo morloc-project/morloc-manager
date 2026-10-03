@@ -3453,9 +3453,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     return Ok(());
                 }
             }
-            Err(ManagerError::EnvError(
-                format!("No serve running for environment '{env_name}'")
-            ))
+            Err(ManagerError::EnvError(format!(
+                "No serve running for environment '{env_name}'{}",
+                sudo_hint()
+            )))
         }
 
         // ---- logs ----
@@ -3478,11 +3479,20 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let engine = ec.backend.container_engine().ok_or_else(|| {
                     ManagerError::EnvError(format!("No serve running for environment '{n}'"))
                 })?;
-                let cname = serve::serve_container_name(n);
+                // The recorded name, not one derived from the caller: a serve
+                // started by root (a system environment) is named after its
+                // starter.
+                let cname = match cfg::read_serve_runtime(scope, &env_name)
+                    .and_then(|rt| rt.handle)
+                {
+                    Some(ServeHandle::Container { name, .. }) => name,
+                    _ => serve::serve_container_name(n),
+                };
                 if !container::container_exists(engine, &cname) {
-                    return Err(ManagerError::EnvError(
-                        format!("No serve container running for environment '{n}'")
-                    ));
+                    return Err(ManagerError::EnvError(format!(
+                        "No serve container running for environment '{n}'{}",
+                        sudo_hint()
+                    )));
                 }
                 (cname, engine, cfg::env_data_dir(scope, &env_name).join("logs"))
             } else {
@@ -3784,15 +3794,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     c.url = if rt.token_required { format!("{} (token)", rt.url()) } else { rt.url() };
                 }
             }
-            // Native serves (host processes) tracked via per-env serve records.
-            all_containers.extend(native_running_serves());
+            // Serves found through their records: native ones (host processes),
+            // and container ones named after someone else -- a system
+            // environment served by root.
+            for found in recorded_running_serves() {
+                if !all_containers.iter().any(|c| c.name == found.name) {
+                    all_containers.push(found);
+                }
+            }
             if json {
                 #[derive(serde::Serialize)]
                 struct StatusOutput { containers: Vec<serve::ServeContainerInfo> }
                 let output = StatusOutput { containers: all_containers };
                 println!("{}", serde_json::to_string_pretty(&output).unwrap());
             } else if all_containers.is_empty() {
-                println!("No servers running.");
+                println!("No servers running.{}", sudo_hint());
             } else {
                 println!("Running servers:");
                 println!("  {:<16} {:<12} {:<20} {:<32} STATUS", "ENV", "MODE", "MODULES", "URL");
@@ -8481,7 +8497,7 @@ fn container_new_dev(
 fn native_serve_alive(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
-    if kill(Pid::from_raw(pid as i32), None).is_err() {
+    if pid <= 1 || !signal_probe_alive(kill(Pid::from_raw(pid as i32), None)) {
         return false;
     }
     match std::fs::read(format!("/proc/{pid}/cmdline")) {
@@ -8493,24 +8509,61 @@ fn native_serve_alive(pid: u32) -> bool {
     }
 }
 
+/// A hint for a serve not found: one started with sudo is root's, recorded in
+/// root's trees and, under podman, run in root's container store, none of
+/// which this user sees. Empty for root itself.
+fn sudo_hint() -> &'static str {
+    if nix::unistd::geteuid().is_root() {
+        ""
+    } else {
+        ". A serve started with sudo is visible only to sudo"
+    }
+}
+
+/// Whether a signal-0 probe found its target. EPERM means the target exists
+/// but belongs to another user (a serve started with sudo, say), which is
+/// alive, not gone.
+fn signal_probe_alive(probe: nix::Result<()>) -> bool {
+    matches!(probe, Ok(()) | Err(nix::errno::Errno::EPERM))
+}
+
 /// SIGTERM then, after a grace period, SIGKILL a native serve process group (the
-/// nexus + its pool daemons). Best-effort. Killing the GROUP (negative pid) is
-/// what reaps the child pool daemons; SIGTERM first lets the nexus clean its SHM.
-fn kill_native_group(pgid: u32) {
+/// nexus + its pool daemons). Killing the GROUP (negative pid) is what reaps the
+/// child pool daemons; SIGTERM first lets the nexus clean its SHM. A group that
+/// is already gone is not an error; one this user may not signal is.
+fn kill_native_group(pgid: u32) -> Result<()> {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
+    // -0 is our own group and -1 is every process we may signal.
+    if pgid <= 1 {
+        return Err(ManagerError::EnvError(format!(
+            "refusing to signal process group {pgid} from a serve record"
+        )));
+    }
     let group = Pid::from_raw(-(pgid as i32));
-    let _ = kill(group, Signal::SIGTERM);
+    term_outcome(pgid, kill(group, Signal::SIGTERM))?;
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         // Poll the whole GROUP (negative pgid), not just the leader: a pool daemon
         // that ignores SIGTERM and outlives the nexus leader must still gate the
         // early return, or it would be left running (SHM/port leak).
-        if kill(group, None).is_err() {
-            return; // entire group gone
+        if !signal_probe_alive(kill(group, None)) {
+            return Ok(());
         }
     }
     let _ = kill(group, Signal::SIGKILL);
+    Ok(())
+}
+
+/// What a SIGTERM to serve group `pgid` means for `stop`.
+fn term_outcome(pgid: u32, sent: nix::Result<()>) -> Result<()> {
+    match sent {
+        Err(nix::errno::Errno::EPERM) => Err(ManagerError::ConfigPermissionDenied(format!(
+            "the serve (process group {pgid}) belongs to another user; \
+             if it was started with sudo, stop it with `sudo mim stop`"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Is the serve behind this handle still live? (dispatches on the stored handle,
@@ -8541,33 +8594,37 @@ fn env_serve_alive(scope: Scope, name: &str, ec: &EnvironmentConfig) -> bool {
 /// Tear down a running serve by its stored launch handle (backend-independent).
 fn stop_by_handle(handle: &ServeHandle, verbose: bool) -> Result<()> {
     match handle {
-        ServeHandle::Native { pgid, .. } => {
-            kill_native_group(*pgid);
-            Ok(())
-        }
+        ServeHandle::Native { pgid, .. } => kill_native_group(*pgid),
         ServeHandle::Container { engine, name } => {
             serve::stop_serve_container(*engine, verbose, name)
         }
     }
 }
 
-/// Native serves currently running: scanned from each env's serve record with a
-/// live `Native` handle. The native half of `status`/`ls-running` (the container
-/// half comes from `docker ps`); kept a free function so one query covers all envs.
-fn native_running_serves() -> Vec<serve::ServeContainerInfo> {
+/// Serves currently running according to each environment's serve record: every
+/// live native one, and every live container one, including those a name-prefix
+/// query of the engine misses because someone else started them.
+fn recorded_running_serves() -> Vec<serve::ServeContainerInfo> {
     let mut out = Vec::new();
     for scope in [Scope::Local, Scope::System] {
         for env in cfg::list_env_names(scope) {
             let Some(rt) = cfg::read_serve_runtime(scope, &env) else { continue };
-            let Some(ServeHandle::Native { pid, .. }) = &rt.handle else { continue };
-            if !native_serve_alive(*pid) {
-                continue;
-            }
+            let (name, status) = match &rt.handle {
+                Some(ServeHandle::Native { pid, .. }) if native_serve_alive(*pid) => {
+                    (format!("native:{env}"), format!("running (native, pid {pid})"))
+                }
+                Some(ServeHandle::Container { engine, name })
+                    if container::container_exists(*engine, name) =>
+                {
+                    (name.clone(), format!("running ({})", engine.name()))
+                }
+                _ => continue,
+            };
             out.push(serve::ServeContainerInfo {
-                name: format!("native:{env}"),
+                name,
                 env: env.clone(),
                 ports: rt.port.to_string(),
-                status: format!("running (native, pid {pid})"),
+                status,
                 mode: rt.mode(),
                 modules: rt.modules_summary(),
                 url: if rt.token_required {
@@ -12641,7 +12698,7 @@ run:
             "child should be alive before the group kill"
         );
 
-        kill_native_group(leader);
+        kill_native_group(leader).unwrap();
         // In production the nexus is reparented to init and reaped there; in the
         // test WE are the leader's parent, so reap its zombie before asserting.
         let _ = child.wait();
@@ -12828,5 +12885,29 @@ run:
         let data = cfg::env_data_dir(Scope::System, "sys");
         let home = run_home_mount(Scope::System, "sys", &ec, &data, ContainerEngine::Podman).unwrap();
         assert!(home.is_none());
+    }
+
+    /// A serve owned by another user answers a signal probe with EPERM. It is
+    /// alive, and stopping it is an error rather than a reported success.
+    #[test]
+    fn a_serve_owned_by_another_user_is_alive_and_cannot_be_stopped() {
+        use nix::errno::Errno;
+        assert!(signal_probe_alive(Ok(())));
+        assert!(signal_probe_alive(Err(Errno::EPERM)));
+        assert!(!signal_probe_alive(Err(Errno::ESRCH)));
+        let err = term_outcome(4242, Err(Errno::EPERM)).unwrap_err().to_string();
+        assert!(err.contains("another user") && err.contains("sudo mim stop"), "{err}");
+        assert!(term_outcome(4242, Err(Errno::ESRCH)).is_ok());
+        assert!(term_outcome(4242, Ok(())).is_ok());
+    }
+
+    /// Group 0 is our own and -1 addresses every process we may signal; a
+    /// record holding either must never reach kill(2).
+    #[test]
+    fn a_serve_record_cannot_signal_our_group_or_every_process() {
+        assert!(kill_native_group(0).is_err());
+        assert!(kill_native_group(1).is_err());
+        assert!(!native_serve_alive(0));
+        assert!(!native_serve_alive(1));
     }
 }

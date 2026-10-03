@@ -205,11 +205,23 @@ pub fn system_hostname() -> String {
         .unwrap_or_else(|| "localhost".to_string())
 }
 
-/// The current user's login name, for namespacing serve containers.
+/// The current user's login name, for namespacing serve containers. Under
+/// sudo that is the invoking user, so `sudo mim start` names its container
+/// after the person who ran it and their own `mim status` finds it.
 fn current_user() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let sudo_user = nix::unistd::geteuid().is_root().then(|| var("SUDO_USER")).flatten();
+    serve_user_from(sudo_user, var("USER").or_else(|| var("LOGNAME")))
+}
+
+/// The user component of a serve container name: the sudo invoker when there
+/// is one, else the login name, with anything a container name cannot hold
+/// mapped to `_`.
+fn serve_user_from(sudo_user: Option<String>, login: Option<String>) -> String {
+    let user = sudo_user.or(login).unwrap_or_else(|| "unknown".to_string());
+    user.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "_.-".contains(c) { c } else { '_' })
+        .collect()
 }
 
 pub fn serve_container_name(env_name: &str) -> String {
@@ -993,6 +1005,16 @@ pub fn dump_err_files(logs_dir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_serve_container_is_named_after_the_sudo_invoker() {
+        let some = |v: &str| Some(v.to_string());
+        assert_eq!(serve_user_from(some("alice"), some("root")), "alice");
+        assert_eq!(serve_user_from(None, some("bob")), "bob");
+        assert_eq!(serve_user_from(None, None), "unknown");
+        // A container name holds only [a-zA-Z0-9_.-].
+        assert_eq!(serve_user_from(None, some("DOMAIN\\j doe")), "DOMAIN_j_doe");
+    }
     use super::*;
 
     #[test]
