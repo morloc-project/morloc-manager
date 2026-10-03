@@ -132,7 +132,7 @@ pub fn freeze_environment(
         if let Some(eval) = &exposure.eval {
             return Err(ManagerError::FreezeError(format!(
                 "the environment exposes eval ({}), and a slim image cannot evaluate: it \
-                 carries no compiler. Remove the view (`mim view rm --eval`) or freeze \
+                 carries no compiler. Disable it (`mim view eval --off`) or freeze \
                  without --slim.",
                 eval.allow.join(",")
             )));
@@ -177,8 +177,9 @@ pub fn freeze_environment(
         .cloned()
         .collect();
     let labels = deploy_labels(env_name, &ver, flavor, &programs, &modules, &exposure, shm_size);
-    // Podman's OCI output format drops HEALTHCHECK and warns.
-    let healthcheck = engine == ContainerEngine::Docker;
+    // Only an image that serves has an endpoint to probe; a CLI-only one
+    // would be marked unhealthy and restarted by an orchestrator.
+    let healthcheck = !cmd.is_empty();
 
     let dockerfile = context.join("Dockerfile");
     let text = match &slim {
@@ -230,7 +231,7 @@ pub fn freeze_environment(
         context: context.to_string_lossy().to_string(),
         tag: tag.to_string(),
         build_args: Vec::new(),
-        extra_flags: flags.materialize(Phase::Build, engine),
+        extra_flags: deploy_build_flags(engine, flags.materialize(Phase::Build, engine)),
         platform,
     };
     let status = crate::container::container_build_visible(engine, &cfg);
@@ -583,6 +584,18 @@ fn uses_host_network(flags: &[String]) -> bool {
         flags.windows(2).any(|w| w[0] == *name && w[1] == "host")
             || flags.iter().any(|f| *f == format!("{name}=host"))
     })
+}
+
+/// Engine flags for building a deployment image. Podman writes OCI images by
+/// default, a format with no HEALTHCHECK, so it is asked for docker's; the
+/// environment's own build flags follow and may still choose otherwise.
+fn deploy_build_flags(engine: ContainerEngine, env_flags: Vec<String>) -> Vec<String> {
+    let mut flags = Vec::new();
+    if engine == ContainerEngine::Podman {
+        flags.extend(["--format".to_string(), "docker".to_string()]);
+    }
+    flags.extend(env_flags);
+    flags
 }
 
 /// Regroup a materialized flag list into one shell-ready string per flag: a
@@ -1150,6 +1163,16 @@ mod tests {
         let text = run_hints(ContainerEngine::Docker, "base:v1", Flavor::Full, &[], false, "2g", &flags, &[]).join("\n");
         assert!(text.contains("  docker run -it --rm \\\n"), "{text}");
         assert!(text.contains("\n    base:v1 /bin/bash"), "{text}");
+    }
+
+    #[test]
+    fn a_podman_deployment_image_is_built_in_docker_format() {
+        let user = vec!["--pull".to_string()];
+        assert_eq!(
+            deploy_build_flags(ContainerEngine::Podman, user.clone()),
+            ["--format", "docker", "--pull"].map(String::from).to_vec()
+        );
+        assert_eq!(deploy_build_flags(ContainerEngine::Docker, user.clone()), user);
     }
 
     fn strings(v: &[&str]) -> Vec<String> {

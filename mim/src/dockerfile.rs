@@ -74,8 +74,8 @@ pub struct DeployDockerfileInput<'a> {
     /// that has left the manager's world has nothing tracking it, so what it
     /// holds has to travel inside it.
     pub labels: &'a [(String, String)],
-    /// Emit a HEALTHCHECK. Podman's OCI output format drops the instruction and
-    /// warns, so it is Docker-only.
+    /// Emit a HEALTHCHECK: only for an image that serves, since one probing
+    /// an endpoint nothing listens on reports a working CLI image unhealthy.
     pub healthcheck: bool,
 }
 
@@ -199,7 +199,7 @@ pub fn generate_deploy_dockerfile(input: &DeployDockerfileInput) -> String {
 
     if input.cmd.is_empty() {
         out.push_str("# The environment presents no views, so this image is a command line:\n");
-        out.push_str("#   docker run <image> <program> <args>\n");
+        out.push_str("#   docker run <image> <program> <args>   (or podman run)\n");
         out.push_str(&format!("ENTRYPOINT [\"{ACTIVATE_WRAPPER}\"]\n"));
         return out;
     }
@@ -1025,7 +1025,7 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
     }
 
     #[test]
-    fn the_healthcheck_is_docker_only() {
+    fn the_healthcheck_is_emitted_only_when_asked() {
         assert!(deploy(&SERVE_CMD, &[], true).contains("HEALTHCHECK"));
         assert!(!deploy(&SERVE_CMD, &[], false).contains("HEALTHCHECK"));
     }

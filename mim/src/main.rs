@@ -135,7 +135,7 @@ Examples:
   mim new foo --lang py@3.12
   mim new bar --engine podman
   mim new x86 --engine docker --arch x86_64 # an image for x86 deployment hosts
-  mim new baz --morloc-version 0.98.0       # names it `v0.98.0`
+  mim new --morloc-version 0.98.0           # names it `v0.98.0`
   mim new --morloc-version 0.98.0 --set-default
   mim new --wizard                          # prompt for every setting
 
@@ -731,7 +731,7 @@ answers all three.")]
         #[arg(short, long)]
         tag: Option<String>,
         /// Also write the image to a tarball, for a machine with no registry
-        /// between it and this one. Load it there with `docker load -i <path>`.
+        /// between it and this one. Load it there with `docker load -i <path>` (or `podman load`).
         #[arg(long)]
         save: Option<String>,
         /// Build a slim image: the programs and what runs them, without the
@@ -1107,6 +1107,14 @@ fn main() -> ExitCode {
             .ok();
         return ExitCode::from(2);
     };
+    if cli.json && !emits_json(&cmd) {
+        let msg = format!(
+            "--json is not supported by `mim {}`: it has no JSON output",
+            subcommand_name(&cmd)
+        );
+        println!("{}", serde_json::json!({ "error": msg }));
+        return ExitCode::from(2);
+    }
     match dispatch(cli.verbose, cli.json, cmd) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -1121,6 +1129,65 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+/// Whether `cmd` writes JSON under `--json`. A command that does not is refused
+/// rather than run, since output that ignores the flag is not what a caller
+/// asking for JSON can use. Exhaustive, so a new command must decide.
+fn emits_json(cmd: &Cmd) -> bool {
+    match cmd {
+        Cmd::Ls { .. } | Cmd::Info { .. } | Cmd::Doctor { .. } | Cmd::Status => true,
+        Cmd::View { action: None, .. }
+        | Cmd::View { action: Some(ViewAction::List { .. }), .. } => true,
+        Cmd::View { .. } => false,
+        Cmd::New { .. }
+        | Cmd::Run { .. }
+        | Cmd::Shell { .. }
+        | Cmd::Rm { .. }
+        | Cmd::Nuke { .. }
+        | Cmd::Update { .. }
+        | Cmd::Modify { .. }
+        | Cmd::Start { .. }
+        | Cmd::Stop { .. }
+        | Cmd::Logs { .. }
+        | Cmd::Freeze { .. }
+        | Cmd::Eval { .. }
+        | Cmd::Install { .. }
+        | Cmd::Demos { .. }
+        | Cmd::Env { .. }
+        | Cmd::Sync { .. }
+        | Cmd::Clean
+        | Cmd::Spec => false,
+    }
+}
+
+/// The name `cmd` was invoked by, for messages about it.
+fn subcommand_name(cmd: &Cmd) -> &'static str {
+    match cmd {
+        Cmd::New { .. } => "new",
+        Cmd::Run { .. } => "run",
+        Cmd::Shell { .. } => "shell",
+        Cmd::Rm { .. } => "rm",
+        Cmd::Nuke { .. } => "nuke",
+        Cmd::Ls { .. } => "ls",
+        Cmd::Info { .. } => "info",
+        Cmd::Doctor { .. } => "doctor",
+        Cmd::Update { .. } => "update",
+        Cmd::Modify { .. } => "modify",
+        Cmd::Start { .. } => "start",
+        Cmd::Stop { .. } => "stop",
+        Cmd::Logs { .. } => "logs",
+        Cmd::Freeze { .. } => "freeze",
+        Cmd::Eval { .. } => "eval",
+        Cmd::Install { .. } => "install",
+        Cmd::Demos { .. } => "demos",
+        Cmd::View { .. } => "view",
+        Cmd::Env { .. } => "env",
+        Cmd::Status => "status",
+        Cmd::Sync { .. } => "sync",
+        Cmd::Clean => "clean",
+        Cmd::Spec => "spec",
     }
 }
 
@@ -1863,22 +1930,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 return Err(ManagerError::EnvError("No environment names specified".to_string()));
             }
             // Capture current default env for post-removal feedback
-            // Capture the default tag from BOTH scopes: a system-scope default is
-            // otherwise invisible when a local config file exists (read_active_config
-            // returns the local config and never falls through to system).
-            let was_default = cfg::read_active_config()
-                .and_then(|c| c.default_env)
-                .or_else(|| {
-                    cfg::read_config::<Config>(&cfg::config_path(Scope::System))
-                        .ok()
-                        .and_then(|c| c.default_env)
-                });
+            let was_default = environment::effective_default();
             // Attempt each removal; collect failures, continue past errors
             let mut failures: Vec<String> = Vec::new();
             for name in &names {
                 // The closure yields the env's host-mounted home (if any) so the
                 // success message can say what `rm` deliberately did NOT delete.
-                let result: Result<Option<String>> = (|| {
+                let result: Result<(Option<String>, Scope)> = (|| {
                     let scope = if system {
                         Scope::System
                     } else {
@@ -1893,11 +1951,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     // container_engine() is None for native envs, whose removal
                     // is purely file cleanup (no container/image to tear down).
                     environment::remove_environment(ec.backend.container_engine(), scope, name)?;
-                    Ok(ec.mount_home.clone())
+                    Ok((ec.mount_home.clone(), scope))
                 })();
                 match result {
-                    Ok(mount_home) => {
-                        if was_default.as_deref() == Some(name.as_str()) {
+                    Ok((mount_home, scope)) => {
+                        if was_default.as_ref().is_some_and(|(n, s)| n == name && *s == scope) {
                             eprintln!("Removed environment: {name}. It was the default; \
                                        set a new one with: mim modify --env <name> --set-default");
                         } else {
@@ -2075,28 +2133,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
 
         // ---- ls ----
         Cmd::Ls { system, local } => {
-            let default_env = cfg::read_active_config()
-                .and_then(|c| c.default_env);
-            let default_str = default_env.as_deref();
-
-            // Determine which scope effectively owns the default environment.
-            // Local takes priority (same resolution as run).
-            let default_in_local = default_str
-                .map(|name| cfg::env_config_path(Scope::Local, name).is_file())
-                .unwrap_or(false);
-
             let show_local = !system || local;
             let show_system = !local || system;
 
             let local_envs = if show_local {
-                let local_default = if default_in_local { default_str } else { None };
-                environment::list_environments(Scope::Local, local_default)
+                environment::list_environments(Scope::Local, environment::default_in(Scope::Local).as_deref())
             } else {
                 Vec::new()
             };
             let system_envs = if show_system {
-                let system_default = if default_in_local { None } else { default_str };
-                environment::list_environments(Scope::System, system_default)
+                environment::list_environments(Scope::System, environment::default_in(Scope::System).as_deref())
             } else {
                 Vec::new()
             };
@@ -2153,9 +2199,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 };
                 let ec = cfg::read_env_config(scope, &env_name)?;
                 let data_dir = cfg::env_data_dir(scope, &env_name);
-                let is_default = cfg::read_active_config()
-                    .and_then(|c| c.default_env)
-                    .as_deref() == Some(env_name.as_str());
+                let is_default = environment::effective_default() == Some((env_name.clone(), scope));
 
                 let engine = ec.backend.container_engine();
                 let info_arch = ec.oci_arch().ok().flatten();
@@ -2597,7 +2641,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         local: Vec<environment::EnvInfo>,
                         system: Vec<environment::EnvInfo>,
                     }
-                    let default_str = if default_env == "none" { None } else { Some(default_env.as_str()) };
                     let mut directories = std::collections::BTreeMap::new();
                     for (label, path) in [
                         ("config_local", cfg::config_dir(Scope::Local)),
@@ -2616,8 +2659,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         system_engine: system_cfg.as_ref().map(|c| c.backend.label()).unwrap_or("unset").to_string(),
                         selinux: se_str.to_string(),
                         directories,
-                        local: environment::list_environments(Scope::Local, default_str),
-                        system: environment::list_environments(Scope::System, default_str),
+                        local: environment::list_environments(Scope::Local, environment::default_in(Scope::Local).as_deref()),
+                        system: environment::list_environments(Scope::System, environment::default_in(Scope::System).as_deref()),
                     };
                     println!("{}", serde_json::to_string_pretty(&output).unwrap());
                 } else {
@@ -2640,14 +2683,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         println!("  {:<20} {} ({})", label, path.display(), status);
                     }
 
-                    let default_str = if default_env == "none" { None } else { Some(default_env.as_str()) };
-
-                    // Check if the default env lives in local scope (local takes priority)
-                    let default_in_local = default_str
-                        .map(|name| cfg::env_config_path(Scope::Local, name).is_file())
-                        .unwrap_or(false);
-
-                    let local_envs = environment::list_environments(Scope::Local, default_str);
+                    let local_envs = environment::list_environments(
+                        Scope::Local, environment::default_in(Scope::Local).as_deref(),
+                    );
                     println!("\nLocal environments:");
                     if local_envs.is_empty() {
                         println!("  (none)");
@@ -2659,17 +2697,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         }
                     }
 
-                    let system_envs = environment::list_environments(Scope::System, default_str);
+                    let system_envs = environment::list_environments(
+                        Scope::System, environment::default_in(Scope::System).as_deref(),
+                    );
                     if !system_envs.is_empty() {
                         println!("\nSystem environments:");
                         for e in &system_envs {
-                            let default_mark = if e.is_default && default_in_local {
-                                " (default - shadowed)"
-                            } else if e.is_default {
-                                " (default)"
-                            } else {
-                                ""
-                            };
+                            let default_mark = if e.is_default { " (default)" } else { "" };
                             let ver_mark = env_version_marker(e);
                             println!("  {}{}{}", e.name, ver_mark, default_mark);
                         }
@@ -13178,5 +13212,156 @@ run:
                 (ContainerEngine::Podman, "debian:bookworm-slim".to_string()),
             ]
         );
+    }
+
+    fn write_default(scope: Scope, name: Option<&str>) {
+        let cfg_data = Config { default_env: name.map(str::to_string), ..Config::default() };
+        cfg::write_config(&cfg::config_path(scope), &cfg_data).unwrap();
+    }
+
+    fn add_env(scope: Scope, name: &str) {
+        let ec = EnvironmentConfig::new_backend(
+            name.to_string(), Backend::Container(ContainerEngine::Podman),
+            CONTAINER_BASE_IMAGE.to_string(), None, None, Vec::new(), Vec::new(),
+        );
+        cfg::write_env_config(scope, name, &ec).unwrap();
+    }
+
+    /// What `ls` and `info` mark as the default is what a command with no
+    /// --env runs in: a personal config with no default (or a stale one)
+    /// falls through to the machine-wide default.
+    #[test]
+    fn the_displayed_default_is_the_one_commands_use() {
+        let _f = ScopeFixture::new(false);
+        write_default(Scope::System, Some("sys"));
+        write_default(Scope::Local, None);
+        assert_eq!(environment::effective_default(), Some(("sys".to_string(), Scope::System)));
+        assert_eq!(environment::default_in(Scope::System).as_deref(), Some("sys"));
+        assert_eq!(environment::default_in(Scope::Local), None);
+        let (name, scope, _) = environment::resolve_default_environment().unwrap();
+        assert_eq!((name.as_str(), scope), ("sys", Scope::System));
+
+        write_default(Scope::Local, Some("gone"));
+        assert_eq!(environment::effective_default(), Some(("sys".to_string(), Scope::System)));
+
+        // A personal environment of the same name is the one that runs.
+        add_env(Scope::Local, "sys");
+        assert_eq!(environment::effective_default(), Some(("sys".to_string(), Scope::Local)));
+        assert_eq!(environment::default_in(Scope::System), None);
+    }
+
+    /// `--json` is honored or refused, never ignored.
+    #[test]
+    fn json_is_refused_where_a_command_has_none() {
+        let emits = |args: &[&str]| emits_json(&Cli::try_parse_from(args).unwrap().command.unwrap());
+        for args in [
+            &["mim", "--json", "ls"][..],
+            &["mim", "--json", "info"],
+            &["mim", "--json", "status"],
+            &["mim", "--json", "doctor"],
+            &["mim", "--json", "view"],
+            &["mim", "--json", "view", "list"],
+        ] {
+            assert!(emits(args), "{args:?}");
+        }
+        for args in [
+            &["mim", "--json", "freeze"][..],
+            &["mim", "--json", "start"],
+            &["mim", "--json", "eval", "1"],
+            &["mim", "--json", "stop"],
+            &["mim", "--json", "view", "eval", "--off"],
+        ] {
+            assert!(!emits(args), "{args:?}");
+        }
+    }
+
+    /// A `mim ...` command as written in help or a hint, made parseable:
+    /// placeholders (`<env>`, `{name}`) become a word, and a trailing comment,
+    /// ellipsis or shell continuation is dropped. `None` for text that is not
+    /// a command line (prose, alternatives).
+    fn example_argv(text: &str) -> Option<Vec<String>> {
+        let line = text.split(" #").next()?.trim().trim_end_matches('\\').trim();
+        if line.contains('|') || line.contains("...") || line.contains('[') {
+            return None;
+        }
+        // Shell words: quotes group, and are removed.
+        let mut words: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut quote: Option<char> = None;
+        for c in line.chars() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), c) => cur.push(c),
+                (None, '\'' | '"') => quote = Some(c),
+                (None, c) if c.is_whitespace() => {
+                    if !cur.is_empty() {
+                        words.push(std::mem::take(&mut cur));
+                    }
+                }
+                (None, c) => cur.push(c),
+            }
+        }
+        if !cur.is_empty() {
+            words.push(cur);
+        }
+        for w in &mut words {
+            if (w.starts_with('<') && w.ends_with('>')) || (w.starts_with('{') && w.ends_with('}')) {
+                *w = "x".to_string();
+            }
+        }
+        // `mim {}` is a message naming some subcommand, not a command line.
+        let names_a_command = words.get(1).is_some_and(|w| w != "x");
+        (words.first().map(String::as_str) == Some("mim") && names_a_command).then_some(words)
+    }
+
+    fn after_help_examples(cmd: &clap::Command, out: &mut Vec<String>) {
+        if let Some(h) = cmd.get_after_help() {
+            for line in h.to_string().lines() {
+                let t = line.trim();
+                if let Some(ex) = t.strip_prefix("$ ").or(Some(t)).filter(|t| t.starts_with("mim ")) {
+                    out.push(ex.to_string());
+                }
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            after_help_examples(sub, out);
+        }
+    }
+
+    /// Every command the help shows and every `mim ...` a message tells the
+    /// user to run must parse: an example naming a flag that does not exist
+    /// fails the first time anyone follows it.
+    #[test]
+    fn every_documented_mim_command_parses() {
+        let mut found: Vec<(String, String)> = Vec::new();
+        let mut help = Vec::new();
+        after_help_examples(&Cli::command(), &mut help);
+        found.extend(help.into_iter().map(|h| ("help".to_string(), h)));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).unwrap();
+            for (i, piece) in text.split('`').enumerate() {
+                if i % 2 == 1 && piece.starts_with("mim ") && !piece.contains('\n') {
+                    found.push((path.file_name().unwrap().to_string_lossy().to_string(), piece.to_string()));
+                }
+            }
+        }
+        let mut bad = Vec::new();
+        for (origin, ex) in &found {
+            let Some(argv) = example_argv(ex) else { continue };
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                // Prose names a command (`mim install`) without its arguments.
+                use clap::error::ErrorKind;
+                if !matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::MissingRequiredArgument) {
+                    bad.push(format!("{origin}: `{ex}`: {}", e.kind()));
+                }
+            }
+        }
+        assert!(found.len() > 50, "found only {} examples", found.len());
+        assert!(bad.is_empty(), "{} unparseable:\n{}", bad.len(), bad.join("\n"));
     }
 }

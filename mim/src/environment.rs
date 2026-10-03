@@ -188,8 +188,7 @@ pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &
     // If a config's default tag pointed at this name AND no env of that name
     // survives in any scope, clear the tag. The name-still-resolves guard avoids
     // over-clearing when a same-named env remains in the other scope (e.g. a
-    // local `default` is removed while a system `default` — the common case now
-    // that no-name `new` uses the constant name `default` — still exists).
+    // local `latest` is removed while a system `latest` still exists).
     let name_orphaned = config::find_env_scope(name).is_err();
     if name_orphaned {
         for cfg_scope in [Scope::Local, Scope::System] {
@@ -244,7 +243,7 @@ pub fn validate_rename(scope: Scope, old: &str, new: &str, ec: &EnvironmentConfi
             "environment '{old}' uses the native backend, whose toolchain, runtime and \
              installed programs are built at absolute paths that include its name; it \
              cannot be renamed in place. Create the environment again under the new \
-             name with 'mim new {new} --engine native' and reinstall its programs."
+             name with 'mim new {new} --engine none' and reinstall its programs."
         )));
     }
     Ok(())
@@ -544,20 +543,28 @@ pub fn resolve_default_environment() -> Result<(String, Scope, EnvironmentConfig
 /// Resolve just the default environment name from config.
 /// Skips names that don't resolve to an actual environment (e.g., stale
 /// entries from old config formats).
+/// The environment commands use when given no `--env`, and its scope: the
+/// personal default if it names an environment, else the machine-wide one.
+/// A name present in both scopes resolves to the personal environment. Every
+/// display of "the default" reads this, so it shows what commands will use.
+pub fn effective_default() -> Option<(String, Scope)> {
+    [Scope::Local, Scope::System].into_iter().find_map(|cfg_scope| {
+        let name = config::read_config::<Config>(&config::config_path(cfg_scope))
+            .ok()?
+            .default_env?;
+        let scope = config::find_env_scope(&name).ok()?;
+        Some((name, scope))
+    })
+}
+
+/// The effective default's name when it lives in `scope`.
+pub fn default_in(scope: Scope) -> Option<String> {
+    effective_default().filter(|(_, s)| *s == scope).map(|(n, _)| n)
+}
+
 fn resolve_default_env_name() -> Result<String> {
-    if let Ok(cfg) = config::read_config::<Config>(&config::config_path(Scope::Local)) {
-        if let Some(ref name) = cfg.default_env {
-            if config::find_env_scope(name).is_ok() {
-                return Ok(name.clone());
-            }
-        }
-    }
-    if let Ok(cfg) = config::read_config::<Config>(&config::config_path(Scope::System)) {
-        if let Some(ref name) = cfg.default_env {
-            if config::find_env_scope(name).is_ok() {
-                return Ok(name.clone());
-            }
-        }
+    if let Some((name, _)) = effective_default() {
+        return Ok(name);
     }
     // Check if any environments exist to give a better suggestion
     let local_envs = config::list_env_names(Scope::Local);

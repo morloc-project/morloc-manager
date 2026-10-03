@@ -99,7 +99,7 @@ pub fn sync(
              not provide: {}. On-demand language provisioning is only available in a native \
              or pliable (writable) environment; a served or frozen image has a fixed language \
              set baked into its read-only runtime. Rebuild the image with these languages \
-             pinned (e.g. `mim update --lang {}`).",
+             pinned (e.g. `mim modify --lang {}`).",
             missing.join(", "),
             missing.join(" --lang ")
         )));

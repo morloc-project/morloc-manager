@@ -1177,7 +1177,7 @@ fn check_built_image(c: &mut Counts, engine: ContainerEngine, ec: &EnvironmentCo
             } else {
                 c.fail(&format!(
                     "Base .sif {sif} not found on disk\n       \
-                     Run: mim update --image <ref> to repull"
+                     Run: mim update --env {env_name} --reinit to pull it again"
                 ));
             }
         }
@@ -1577,14 +1577,14 @@ fn check_slurm_prereqs(c: &mut Counts, engine: ContainerEngine, ec: &Environment
                 c.pass(&format!("{} has slurm-support: true", build_yaml.display()));
             } else {
                 c.fail(&format!(
-                    "{} missing `slurm-support: true` (run `mim update --reinit --init-arg --slurm`, or `mim run -- morloc init -f --slurm`)",
+                    "{} missing `slurm-support: true` (run `mim run -- morloc init -f --slurm`)",
                     build_yaml.display()
                 ));
             }
         }
         Err(_) => {
             c.fail(&format!(
-                "{} does not exist; run `mim update --reinit --init-arg --slurm`",
+                "{} does not exist; run `mim run -- morloc init -f --slurm`",
                 build_yaml.display()
             ));
         }
