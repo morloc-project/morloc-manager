@@ -93,6 +93,10 @@ pub fn check_engine(engine: ContainerEngine) -> Result<()> {
 /// forks. A slim image (`slim` given) uses that image only as a build stage
 /// and starts its final stage from the environment's base; see
 /// [`crate::dockerfile::generate_slim_dockerfile`].
+///
+/// `flags` is the environment's engine flag configuration: its build phase
+/// goes to the image build, and its run phase is spelled out in the closing
+/// hints so the image can be launched as `mim run` would launch it.
 #[allow(clippy::too_many_arguments)]
 pub fn freeze_environment(
     scope: Scope,
@@ -104,7 +108,7 @@ pub fn freeze_environment(
     tag: &str,
     save_to: Option<&str>,
     slim: Option<SlimBase<'_>>,
-    build_flags: &[String],
+    flags: &FlagConfig,
     shm_size: &str,
     platform: Option<Arch>,
     force: bool,
@@ -229,7 +233,7 @@ pub fn freeze_environment(
         context: context.to_string_lossy().to_string(),
         tag: tag.to_string(),
         build_args: Vec::new(),
-        extra_flags: build_flags.to_vec(),
+        extra_flags: flags.materialize(Phase::Build, engine),
         platform,
     };
     let status = crate::container::container_build_visible(engine, &cfg);
@@ -259,7 +263,8 @@ pub fn freeze_environment(
         eprintln!("Wrote {path} (load it elsewhere with `{} load -i {path}`)", engine.name());
     }
     eprintln!();
-    for line in run_hints(engine, tag, flavor, &programs, !cmd.is_empty(), shm_size) {
+    let run_flags = flags.materialize(Phase::Run, engine);
+    for line in run_hints(engine, tag, flavor, &programs, !cmd.is_empty(), shm_size, &run_flags) {
         eprintln!("{line}");
     }
     Ok(())
@@ -479,6 +484,12 @@ fn check_programs(v_data_dir: &str, programs: &[ProgramEntry], force: bool) -> R
 /// a registry pull, so a tag typed from memory fails in ways that do not
 /// mention the image that exists. Engine flags come before the image, where
 /// an engine reads them; anything after it is the container's command.
+///
+/// `run_flags` are the environment's run-phase engine flags (env.flags.yaml),
+/// already materialized for `engine`. `mim run` applies them on every launch
+/// and the image cannot carry them, so when there are any the hints end with
+/// the full engine command that reproduces a `mim run` launch, one flag per
+/// line.
 fn run_hints(
     engine: ContainerEngine,
     tag: &str,
@@ -486,6 +497,7 @@ fn run_hints(
     programs: &[ProgramEntry],
     serves: bool,
     shm_size: &str,
+    run_flags: &[String],
 ) -> Vec<String> {
     let exe = engine.name();
     let mut lines = vec![
@@ -517,7 +529,51 @@ fn run_hints(
                 .to_string(),
         );
     }
+    if !run_flags.is_empty() {
+        let (opts, command) = match programs.first() {
+            Some(first) => ("--rm", format!("{} --help", first.name)),
+            None => ("-it --rm", "/bin/bash".to_string()),
+        };
+        lines.push(String::new());
+        lines.push("  As `mim run` launches it, with the run-phase flags from env.flags.yaml:".to_string());
+        lines.push(format!("  {exe} run {opts} \\"));
+        lines.push(format!("    --shm-size {shm_size} \\"));
+        for group in flag_groups(run_flags) {
+            lines.push(format!("    {group} \\"));
+        }
+        lines.push(format!("    {tag} {command}"));
+    }
     lines
+}
+
+/// Regroup a materialized flag list into one shell-ready string per flag: a
+/// token beginning with `-` opens a group and the tokens after it, up to the
+/// next such token, are its arguments (`--gpus all`, `-v /a:/b`). A leading
+/// bare token gets a group of its own.
+fn flag_groups(flags: &[String]) -> Vec<String> {
+    let mut groups: Vec<String> = Vec::new();
+    for tok in flags {
+        let word = sh_word(tok);
+        match groups.last_mut() {
+            Some(last) if !tok.starts_with('-') => {
+                last.push(' ');
+                last.push_str(&word);
+            }
+            _ => groups.push(word),
+        }
+    }
+    groups
+}
+
+/// Quote `s` for a POSIX shell only when it needs it: a word of plain
+/// characters is left alone so the command reads like one typed by hand.
+fn sh_word(s: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_-./:=,@%+".contains(c);
+    if !s.is_empty() && s.chars().all(plain) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 /// The default command a deployment image serves under: the router over the
@@ -985,7 +1041,7 @@ mod tests {
         let programs = vec![
             ProgramEntry { name: "pacman".to_string(), commands: vec!["play".to_string()] },
         ];
-        let served = run_hints(ContainerEngine::Podman, "pacman:v1", Flavor::Full, &programs, true, "4g");
+        let served = run_hints(ContainerEngine::Podman, "pacman:v1", Flavor::Full, &programs, true, "4g", &[]);
         let text = served.join("\n");
         assert!(text.contains("podman run -it --rm pacman:v1 /bin/bash"), "{text}");
         // The serve hint carries the shared-memory size the environment ran
@@ -1000,10 +1056,51 @@ mod tests {
 
         // With nothing exposed the image has no default command, and a hint to
         // serve it would start a container that exits at once.
-        let cli_only = run_hints(ContainerEngine::Docker, "pacman:v1", Flavor::Full, &programs, false, "2g");
+        let cli_only = run_hints(ContainerEngine::Docker, "pacman:v1", Flavor::Full, &programs, false, "2g", &[]);
         let text = cli_only.join("\n");
         assert!(text.contains("docker run --rm pacman:v1 pacman --help"), "{text}");
         assert!(!text.contains("-p "), "{text}");
+        // No run-phase flags, no launch example to reproduce.
+        assert!(!text.contains('\\'), "{text}");
+    }
+
+    /// `mim run` launches the environment under its run-phase engine flags,
+    /// which the image cannot carry; the hint spells out the full engine
+    /// command so the frozen image can be run the same way. One flag per
+    /// line, each carrying its own argument.
+    #[test]
+    fn run_hints_reproduce_the_run_phase_flags_one_per_line() {
+        let programs = vec![
+            ProgramEntry { name: "pacman".to_string(), commands: vec!["play".to_string()] },
+        ];
+        let flags: Vec<String> = ["--gpus", "all", "-e", "NVIDIA_VISIBLE_DEVICES=all", "--privileged", "-v", "/data/in put:/mnt"]
+            .iter().map(|s| s.to_string()).collect();
+        let text = run_hints(ContainerEngine::Podman, "pacman:v1", Flavor::Full, &programs, false, "4g", &flags).join("\n");
+        let expected = "  podman run --rm \\\n\
+                        \x20   --shm-size 4g \\\n\
+                        \x20   --gpus all \\\n\
+                        \x20   -e NVIDIA_VISIBLE_DEVICES=all \\\n\
+                        \x20   --privileged \\\n\
+                        \x20   -v '/data/in put:/mnt' \\\n\
+                        \x20   pacman:v1 pacman --help";
+        assert!(text.contains(expected), "expected:\n{expected}\n\ngot:\n{text}");
+        assert!(text.contains("env.flags.yaml"), "{text}");
+
+        // With nothing installed the example opens a shell instead.
+        let text = run_hints(ContainerEngine::Docker, "base:v1", Flavor::Full, &[], false, "2g", &flags).join("\n");
+        assert!(text.contains("  docker run -it --rm \\\n"), "{text}");
+        assert!(text.contains("\n    base:v1 /bin/bash"), "{text}");
+    }
+
+    #[test]
+    fn a_shell_word_is_quoted_only_when_the_shell_would_split_or_expand_it() {
+        assert_eq!(sh_word("--gpus"), "--gpus");
+        assert_eq!(sh_word("/data:/mnt:ro"), "/data:/mnt:ro");
+        assert_eq!(sh_word("A=b,c=d"), "A=b,c=d");
+        assert_eq!(sh_word("a b"), "'a b'");
+        assert_eq!(sh_word("$HOME"), "'$HOME'");
+        assert_eq!(sh_word("it's"), "'it'\\''s'");
+        assert_eq!(sh_word(""), "''");
     }
 
     #[test]
@@ -1184,7 +1281,7 @@ mod tests {
     #[test]
     fn slim_hints_read_the_label_instead_of_running_the_compiler() {
         let programs = vec![ProgramEntry { name: "dna".to_string(), commands: vec![] }];
-        let text = run_hints(ContainerEngine::Docker, "dna:v1-slim", Flavor::Slim, &programs, false, "2g").join("\n");
+        let text = run_hints(ContainerEngine::Docker, "dna:v1-slim", Flavor::Slim, &programs, false, "2g", &[]).join("\n");
         assert!(text.contains("docker inspect -f '{{index .Config.Labels \"morloc.programs\"}}' dna:v1-slim"), "{text}");
         assert!(!text.contains("morloc list"), "{text}");
     }

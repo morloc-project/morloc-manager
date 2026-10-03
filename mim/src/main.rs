@@ -3300,12 +3300,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 base_image: &ec.base_image,
                 system_packages: &ec.system_packages,
             });
-            let build_flags =
-                cfg::read_flag_config(env_scope, &env_name)?.materialize(Phase::Build, engine);
+            let flags = cfg::read_flag_config(env_scope, &env_name)?;
             let platform = ec.oci_arch()?;
             let result = freeze::freeze_environment(
                 env_scope, &env_name, ver.clone(), engine, &image,
-                &data_dir.to_string_lossy(), &tag, save.as_deref(), slim_base, &build_flags,
+                &data_dir.to_string_lossy(), &tag, save.as_deref(), slim_base, &flags,
                 &ec.shm_size, platform, force, verbose,
             );
             if result.is_ok() && ec.morloc_version.as_ref() != Some(&ver) {
