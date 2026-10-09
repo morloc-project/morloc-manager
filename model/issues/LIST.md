@@ -68,9 +68,7 @@ verified: the host pixi binary (mim/provision.rs:754-765), pixi installed in
 images by `curl pixi.sh/install.sh | bash` (mim/dockerfile.rs:560-564),
 `stdlib-snapshot.txt` (mim/provision.rs:173-176), the demos tarball and
 manifest (mim/demos.rs), the ghcup installer in dev images
-(mim/dockerfile.rs:620). `scripts/install.sh` skips its checksum silently
-when the `.sha256` fetch fails or no sha tool exists (scripts/install.sh:
-76-89).
+(mim/dockerfile.rs:620).
 
 ### F12 `abi_version` is parsed and discarded (surveyed)
 Spec: PROV-6 (open). `versions.abi_version` is read into
@@ -116,20 +114,11 @@ network error, falls through to a full `pixi install` that may move
 versions (deps/pixi.rs:705-779). The docs describe the locked path as
 "zero drift".
 
-### F19 `mim spec` does not print what `sync` solves (surveyed)
-`spec` renders `gather()` without the interpreter pin or adopted languages
-(mim/envagent.rs:304-312), so its output can differ from the manifest the
-next sync solves.
-
 ### F20 A re-published tag under the same version is never re-fetched (surveyed)
 Spec: PROV-4. The release store is keyed by the manifest's version and
 gated only by a `.provisioned` stamp (mim/provision.rs:664-694). A moving
 tag such as `dev` re-published with the same version string keeps the old
 compiler forever.
-
-### F21 `freeze` writes the detected version back into the environment (surveyed)
-Spec: FRZ-4. On success `freeze` updates `env.yaml` with the version it
-detected in the image (mim/main.rs:3395-3399).
 
 ### F24 Configuration read-modify-write is unlocked (surveyed)
 Spec: ENV-8. Writes are locked and atomic (mim/config.rs:387-443), but
@@ -181,10 +170,11 @@ or `rm` on a stale record could signal another process group. Records from
 mims before the start time was recorded fall back to the command line,
 which another env's nexus also matches.
 
-### F63 `find_free_host_port_skips_taken` is flaky (reproduced once)
-The test (mim/src/main.rs) picks a free port, then binds it; a test running
-in parallel can take the port in between. Seen once in three full runs.
-`start` has the same pick-then-bind window with other processes.
+### F63 `start` picks a free port, then binds it later (read)
+`find_free_host_port` (mim/src/main.rs) probes by binding and releasing; the
+server binds afterwards, so another process can take the port in between
+and the start fails. Its unit test raced the same way and no longer asserts
+the port is still free.
 
 ## mim: docs
 

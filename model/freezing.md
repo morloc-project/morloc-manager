@@ -24,7 +24,7 @@ lock that does not install fails the freeze.
 
 ### FRZ-4 Freezing does not change the environment
 Intent: proposed
-Code: deviates F21
+Code: unaudited
 
 `freeze` reads the environment and writes only the image (and an archive if
 asked).

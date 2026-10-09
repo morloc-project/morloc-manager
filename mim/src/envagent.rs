@@ -305,13 +305,13 @@ fn invalidate_shim_markers(dropped: &[String]) {
     }
 }
 
-/// `mim spec`: print the merged pixi manifest for the current declared world.
+/// `mim spec`: print the merged pixi manifest the next `sync` solves.
 pub fn spec() -> Result<(), DepsError> {
     let ctx = env_context()?;
     let support = load_lang_support()?;
     let owned = solve_inputs()?;
     let inputs = owned.bind(&support);
-    let specs = ctx.gather()?;
+    let specs = ctx.sync_world()?;
     print!("{}", ctx.rendered_manifest(&specs, &inputs)?);
     Ok(())
 }

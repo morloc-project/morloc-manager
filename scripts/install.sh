@@ -74,20 +74,19 @@ trap 'rm -f "$tmp" "$tmp.sha256"' EXIT
 printf 'mim-install: downloading %s (%s)...\n' "$asset" "$VERSION" >&2
 fetch "${base}/${asset}" "$tmp" || err "download failed: ${base}/${asset}"
 
-# --- verify checksum (best-effort; skip only if sidecar is unavailable) ---
-if fetch "${base}/${asset}.sha256" "$tmp.sha256" 2>/dev/null; then
-  expected="$(awk '{print $1}' "$tmp.sha256")"
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$tmp" | awk '{print $1}')"
-  elif command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 "$tmp" | awk '{print $1}')"
-  else
-    actual=""
-  fi
-  if [ -n "$actual" ] && [ "$actual" != "$expected" ]; then
-    err "checksum mismatch (expected $expected, got $actual)"
-  fi
+# --- verify checksum: an unverified binary is never installed ------------
+fetch "${base}/${asset}.sha256" "$tmp.sha256" \
+  || err "could not fetch the checksum file ${base}/${asset}.sha256"
+expected="$(awk '{print $1}' "$tmp.sha256")"
+[ -n "$expected" ] || err "the checksum file ${asset}.sha256 is empty"
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "$tmp" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  actual="$(shasum -a 256 "$tmp" | awk '{print $1}')"
+else
+  err "need sha256sum or shasum on PATH to verify the download"
 fi
+[ "$actual" = "$expected" ] || err "checksum mismatch (expected $expected, got $actual)"
 
 # --- install --------------------------------------------------------------
 # Resolve to an absolute path so the PATH check below compares like with like.

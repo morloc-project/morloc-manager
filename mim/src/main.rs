@@ -3383,17 +3383,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             });
             let flags = cfg::read_flag_config(env_scope, &env_name)?;
             let platform = ec.oci_arch()?;
-            let result = freeze::freeze_environment(
-                env_scope, &env_name, ver.clone(), engine, &image,
+            // FRZ-4: the environment is only read; the detected version labels
+            // the image and is not written back.
+            freeze::freeze_environment(
+                env_scope, &env_name, ver, engine, &image,
                 &data_dir.to_string_lossy(), &tag, save.as_deref(), slim_base, &flags,
                 &ec.shm_size, platform, force, verbose,
-            );
-            if result.is_ok() && ec.morloc_version.as_ref() != Some(&ver) {
-                let mut updated = ec.clone();
-                updated.morloc_version = Some(ver);
-                let _ = cfg::write_env_config(env_scope, &env_name, &updated);
-            }
-            result
+            )
         }
 
         // ---- start ----
@@ -11486,12 +11482,14 @@ mod tests {
 
     #[test]
     fn find_free_host_port_skips_taken() {
-        // Bind a port, then confirm the picker avoids it and returns a bindable one.
+        // Bind a port, then confirm the picker avoids it and stays in range.
+        // (Whether the picked port is still free afterwards is a race with
+        // every other process, so it is not asserted.)
         let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let taken = l.local_addr().unwrap().port();
         let picked = find_free_host_port(taken, 50, "127.0.0.1").unwrap();
         assert_ne!(picked, taken, "should skip the bound port");
-        assert!(std::net::TcpListener::bind(("127.0.0.1", picked)).is_ok());
+        assert!((taken..=taken.saturating_add(50)).contains(&picked));
     }
 
     // ---- Type tests ----

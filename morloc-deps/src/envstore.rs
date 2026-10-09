@@ -236,6 +236,14 @@ impl EnvContext {
         read_specs(&self.provenance_dir(Provenance::Scratch))
     }
 
+    /// What `sync` solves: the declared world plus the shim-ABI pin. `mim spec`
+    /// renders the same set, so it prints the manifest the next sync solves.
+    pub fn sync_world(&self) -> Result<Vec<EnvSpec>> {
+        let mut specs = self.gather()?;
+        self.append_abi_lock(&mut specs)?;
+        Ok(specs)
+    }
+
     /// The full declared world: the installed baseline then `scratch`, each
     /// ordered by program name. The total order matters: the union feeds a
     /// solve-cache marker compared as text, so a non-deterministic order churns.
@@ -667,8 +675,7 @@ impl EnvContext {
         // through the write/gather/solve/record, released when `_lock` drops.
         let _lock = self.lock_solve()?;
         let slot = self.write_spec(program, provenance, spec_json)?;
-        let mut specs = self.gather()?;
-        self.append_abi_lock(&mut specs)?;
+        let specs = self.sync_world()?;
         // Prefer the manager's tested lock (`--locked`); re-solve only if it cannot
         // satisfy this program's world.
         match self.solve_world(&specs, inputs, true) {
@@ -1121,6 +1128,8 @@ mod tests {
         assert_eq!(solve_set.len(), 2);
         // ...but the pin is NOT a program: never surfaced in conflict attribution.
         assert_eq!(ctx.program_names().unwrap(), vec!["prog".to_string()]);
+        // `mim spec` renders the sync world, pin included.
+        assert_eq!(ctx.sync_world().unwrap().len(), 2);
     }
 
     #[test]
