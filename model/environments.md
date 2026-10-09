@@ -41,6 +41,7 @@ command not listed as backend-specific.
 ### ENV-5 The default environment is one name per scope
 Intent: proposed
 Code: deviates F16
+Tests: removal_clears_only_the_defaults_that_named_the_environment, nuke_keeps_a_default_that_names_another_scope
 
 A command without `--env` acts on the local default if it names an existing
 environment, else on the system default. A system default names a system
@@ -58,6 +59,7 @@ before the command. Rebuilt images and caches may remain.
 ### ENV-7 Removal removes everything mim made for the environment
 Intent: proposed
 Code: deviates F6
+Tests: removal_stops_a_native_server, removal_deletes_read_only_directories_it_owns
 
 `rm` stops the environment's server, then removes its configuration, data,
 image and volumes. It does not touch directories the user supplied (a
@@ -74,7 +76,8 @@ This includes a solve started by the build hook (DEP-4).
 
 ### ENV-9 The Morloc version moves only when asked
 Intent: proposed
-Code: deviates F4
+Code: conforms 2026-10-09
+Tests: install_into_a_version_less_environment_is_refused
 
 An environment records the Morloc version it was provisioned with. Only
 `update --latest` and `update --morloc-version` change it; every other
@@ -90,7 +93,8 @@ Running commands in it and making it a personal default do not.
 
 ### ENV-11 doctor passes on every healthy environment
 Intent: proposed
-Code: deviates F9
+Code: unaudited
+Tests: container_data_dirs_are_checked_under_the_runtime_prefix
 
 `doctor` checks the invariants of this spec that it can observe and exits
 non-zero on any failure (or any warning with `--strict`). A freshly created

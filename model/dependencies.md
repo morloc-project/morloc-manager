@@ -37,7 +37,8 @@ container. Every path that writes the solver's manifest or lock takes it.
 
 ### DEP-5 A failed solve leaves the recorded requirements as they were
 Intent: proposed
-Code: deviates F1, F2
+Code: deviates F2
+Tests: sync_rollback_restores_the_spec_it_replaced
 
 If a sync or clean fails, every spec it added, replaced or removed is
 restored. The solver's own files may be left changed; the next successful

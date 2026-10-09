@@ -12,6 +12,7 @@ server starts.
 ### SERVE-2 A view names only installed modules
 Intent: proposed
 Code: deviates F17
+Tests: remove_clears_the_eval_allow_list
 
 Adding a module to a view or to the eval allow-list requires that it be
 installed, and removing a module from an environment's views removes it from
@@ -19,7 +20,8 @@ the allow-list too.
 
 ### SERVE-3 One server per environment
 Intent: proposed
-Code: deviates F7, F8
+Code: deviates F8
+Tests: stop_clears_a_record_whose_container_is_gone, stop_never_signals_a_process_that_reused_the_server_pid, a_serve_leader_is_judged_by_its_start_time
 
 `start` launches one server and records its handle; it refuses while that
 server is alive unless told to replace it. A handle is judged alive only if

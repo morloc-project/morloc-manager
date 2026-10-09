@@ -154,8 +154,8 @@ pub fn doctor(
     check_built_image(&mut c, engine, ec, scope, env_name);
     check_cert_bundle(&mut c, ec);
     check_mount_home(&mut c, ec);
-    check_data_dirs(&mut c, &data_dir);
-    check_file_readability(&mut c, &data_dir);
+    check_data_dirs(&mut c, ec, &data_dir);
+    check_file_readability(&mut c, ec, &data_dir);
 
     // ==== Manifests ====
     if !json_mode { println!("\nManifests"); }
@@ -251,8 +251,8 @@ pub fn native_doctor(
     let rt = cfg::read_native_runtime(scope, env_name).ok();
 
     c.set_category("prerequisites");
-    check_data_dirs(&mut c, &data_dir);
-    check_file_readability(&mut c, &data_dir);
+    check_data_dirs(&mut c, ec, &data_dir);
+    check_file_readability(&mut c, ec, &data_dir);
     check_cert_bundle(&mut c, ec);
     check_native_runtime(&mut c, env_name, rt.as_ref());
     check_fhs_sandbox(&mut c, rt.as_ref());
@@ -1235,13 +1235,21 @@ fn check_built_image(c: &mut Counts, engine: ContainerEngine, ec: &EnvironmentCo
     }
 }
 
-fn check_data_dirs(c: &mut Counts, data_dir: &Path) {
-    let expected = ["lib", "bin", "opt", "fdb", "src/morloc/plane", "exe"];
+/// The directories `morloc init` leaves behind: the runtime's under the
+/// runtime prefix (`cfg::env_runtime_dir`), the state's under the data dir.
+fn expected_data_dirs(ec: &EnvironmentConfig, data_dir: &Path) -> Vec<PathBuf> {
+    let runtime = cfg::env_runtime_dir(ec, data_dir);
+    let mut dirs: Vec<PathBuf> = ["lib", "bin", "opt"].iter().map(|d| runtime.join(d)).collect();
+    dirs.extend(["fdb", "src/morloc/plane", "exe"].iter().map(|d| data_dir.join(d)));
+    dirs
+}
 
-    let mut missing: Vec<&str> = Vec::new();
-    for dir in &expected {
-        if !data_dir.join(dir).is_dir() {
-            missing.push(dir);
+fn check_data_dirs(c: &mut Counts, ec: &EnvironmentConfig, data_dir: &Path) {
+    let mut missing: Vec<String> = Vec::new();
+    for dir in expected_data_dirs(ec, data_dir) {
+        if !dir.is_dir() {
+            let shown = dir.strip_prefix(data_dir).unwrap_or(&dir);
+            missing.push(shown.display().to_string());
         }
     }
     if missing.is_empty() {
@@ -1257,11 +1265,11 @@ fn check_data_dirs(c: &mut Counts, data_dir: &Path) {
 
 /// Walk exe/ and other data subdirectories, warning about files unreadable
 /// by the current user (which would cause freeze to fail).
-fn check_file_readability(c: &mut Counts, data_dir: &Path) {
-    let dirs_to_check = ["exe", "bin", "lib"];
+fn check_file_readability(c: &mut Counts, ec: &EnvironmentConfig, data_dir: &Path) {
+    let runtime = cfg::env_runtime_dir(ec, data_dir);
+    let dirs_to_check = [data_dir.join("exe"), runtime.join("bin"), runtime.join("lib")];
     let mut unreadable: Vec<String> = Vec::new();
-    for dir in &dirs_to_check {
-        let dir_path = data_dir.join(dir);
+    for dir_path in &dirs_to_check {
         if dir_path.is_dir() {
             collect_unreadable(&dir_path, &mut unreadable);
         }
@@ -1696,6 +1704,29 @@ mod mount_home_tests {
         let msg = &c.checks[0].message;
         assert!(msg.contains("mim modify --env e --no-mount-home"), "{msg}");
         assert!(!msg.contains("--mount-home none"), "{msg}");
+    }
+
+    /// ENV-11: a container env keeps its runtime under `runtime/`, so a
+    /// healthy container layout passes the data-directory check.
+    #[test]
+    fn container_data_dirs_are_checked_under_the_runtime_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        for d in ["runtime/lib", "runtime/bin", "runtime/opt", "fdb", "src/morloc/plane", "exe"] {
+            fs::create_dir_all(data.join(d)).unwrap();
+        }
+        let ec = EnvironmentConfig::new_backend(
+            "e".to_string(),
+            Backend::Container(ContainerEngine::Podman),
+            "ubuntu:24.04".to_string(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut c = Counts::new(true);
+        check_data_dirs(&mut c, &ec, data);
+        assert_eq!((c.ok, c.fail), (1, 0), "{:?}", c.checks.iter().map(|k| &k.message).collect::<Vec<_>>());
     }
 }
 

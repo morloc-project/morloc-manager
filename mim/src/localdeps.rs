@@ -57,12 +57,30 @@ pub fn vendor_py_locals(spec: &mut EnvSpec, root: &Path, pixi_dir: &Path) -> Res
     Ok(())
 }
 
+/// A Python distribution name (PEP 508): ASCII letters and digits, with `.`,
+/// `_` and `-` inside. It is used as a path component, so nothing else passes.
+fn validate_distribution_name(name: &str) -> Result<()> {
+    let edge_ok = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    let ok = edge_ok(name.chars().next())
+        && edge_ok(name.chars().last())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ManagerError::EnvError(format!(
+            "local Python dependency name '{name}' is not a valid distribution name \
+             (letters, digits, and '.', '_' or '-' between them)"
+        )))
+    }
+}
+
 /// Copy the pip-installable source at `src` into
 /// `<pixi_dir>/local/<name>/<hash>/` and return that manifest-relative path.
 /// The copy is built in a sibling temp dir, hashed, and renamed into place, so
 /// a crash never leaves a half-populated snapshot and a snapshot with the same
 /// content (already present, or produced by a concurrent install) is reused.
 pub fn vendor_snapshot(src: &Path, name: &str, pixi_dir: &Path) -> Result<String> {
+    validate_distribution_name(name)?;
     let parent = pixi_dir.join(VENDOR_DIR).join(name);
     std::fs::create_dir_all(&parent)
         .map_err(|e| ManagerError::EnvError(format!("cannot create {}: {e}", parent.display())))?;
@@ -254,6 +272,22 @@ mod tests {
             PackageReq::Vendored { path, .. } => path.clone(),
             other => panic!("expected Vendored, got {other:?}"),
         }
+    }
+
+    /// A package name becomes a directory under the pixi project, so one that
+    /// is not a plain Python distribution name is refused before anything is
+    /// written.
+    #[test]
+    fn vendor_refuses_a_name_that_is_not_a_distribution_name() {
+        let root = tempfile::tempdir().unwrap();
+        let pixi = tempfile::tempdir().unwrap();
+        let pkg = root.path().join("mylib");
+        write_pkg(&pkg, "x = 1\n");
+        for bad in ["../escape", "a/b", "..", ".", "", "-x", "x-", "a b"] {
+            assert!(vendor_snapshot(&pkg, bad, &pixi.path().join("pixi")).is_err(), "{bad:?}");
+        }
+        assert!(!pixi.path().join("pixi").exists());
+        assert!(vendor_snapshot(&pkg, "My_lib.2-x", &pixi.path().join("pixi")).is_ok());
     }
 
     #[test]

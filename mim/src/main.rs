@@ -401,8 +401,8 @@ Examples:
         /// Environment to check (default: the default environment)
         #[arg(long)]
         env: Option<String>,
-        /// Check system-scope environment
-        #[arg(long)]
+        /// Look up --env in the system scope
+        #[arg(long, requires = "env")]
         system: bool,
         /// Run checks inside the container (slower, more thorough)
         #[arg(long)]
@@ -1428,14 +1428,19 @@ fn info_env_exports(
     engine: Option<ContainerEngine>,
 ) -> Vec<(String, String)> {
     match engine {
-        // Native: native_run_env exports MORLOC_HOME, MORLOC_ENV, and (best-effort)
-        // MORLOC_PIXI. It does NOT export MORLOC_STATE (the nexus defaults that to
-        // MORLOC_HOME internally), so it is not listed here.
+        // Native: native_run_env exports MORLOC_HOME, the managed-env trio and
+        // (best-effort) MORLOC_PIXI. It does NOT export MORLOC_STATE (the nexus
+        // defaults that to MORLOC_HOME internally), so it is not listed here.
         None => {
-            let mut v = vec![
-                ("MORLOC_HOME".to_string(), data_dir.display().to_string()),
-                ("MORLOC_ENV".to_string(), name.to_string()),
-            ];
+            let mut v = vec![("MORLOC_HOME".to_string(), data_dir.display().to_string())];
+            let morloc_bin = cfg::read_native_runtime(scope, name)
+                .ok()
+                .and_then(|rt| rt.morloc_bin)
+                .unwrap_or_else(|| std::path::PathBuf::from("morloc"));
+            match provision::mim_agent_for_host(scope) {
+                Ok(hook) => v.extend(managed_env_vars(name, &morloc_bin, &hook)),
+                Err(_) => v.push(("MORLOC_ENV".to_string(), name.to_string())),
+            }
             if let Some(pixi) = locate_pixi(scope) {
                 v.push(("MORLOC_PIXI".to_string(), pixi.display().to_string()));
             }
@@ -2062,16 +2067,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                             eprintln!("  Failed: {name}: {e}");
                             failures.push(format!("{name}: {e}"));
                         }
-                    }
-                }
-
-                // Clear the default env tag in the targeted scope's config
-                let cfg_path = cfg::config_path(scope);
-                if let Ok(cfg_data) = cfg::read_config::<Config>(&cfg_path) {
-                    if cfg_data.default_env.is_some() {
-                        let new_cfg = Config { default_env: None, ..cfg_data };
-                        let _ = cfg::write_config(&cfg_path, &new_cfg);
-                        eprintln!("Cleared the default environment.");
                     }
                 }
 
@@ -2976,7 +2971,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                      remove. {fix}"
                 )))
             };
-            if no_lang && cfg::read_env_inputs(env_scope, &env_name).lang_pins.is_empty() {
+            if no_lang && cfg::read_env_inputs(env_scope, &env_name)?.lang_pins.is_empty() {
                 return nothing_to_remove(
                     "pinned languages",
                     "Its languages are already provisioned on demand at `morloc make`.",
@@ -3232,7 +3227,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    after a successful build.)
             if let Some(keep) = rebuild_version {
                 let prev_ec = ec.clone();
-                let prev_inputs = cfg::read_env_inputs(env_scope, &env_name);
+                let prev_inputs = cfg::read_env_inputs(env_scope, &env_name)?;
                 // Snapshot the requirements-store artifacts the rebuild's prime step
                 // overwrites (toolchain pins + conda extras) BEFORE it runs, so a
                 // failed rebuild restores them exactly -- like the cert snapshot.
@@ -3536,6 +3531,20 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // backend, so migration / dual-backend serve never strands a server.
             if let Some(rt) = cfg::read_serve_runtime(env_scope, &env_name) {
                 if let Some(handle) = &rt.handle {
+                    // SERVE-3: a record whose container the engine reports gone
+                    // is stale; drop it. An engine that cannot answer is not a
+                    // "gone", so that case falls through to the stop, which fails.
+                    let gone = match handle {
+                        ServeHandle::Container { engine, name } if engine.is_oci() => {
+                            container::probe(*engine, "container", name) == container::Probe::Absent
+                        }
+                        _ => false,
+                    };
+                    if gone {
+                        cfg::remove_serve_runtime(env_scope, &env_name);
+                        eprintln!("'{env_name}' was not serving; removed its stale serve record.");
+                        return Ok(());
+                    }
                     stop_by_handle(handle, verbose)?;
                     cfg::remove_serve_runtime(env_scope, &env_name);
                     eprintln!("Stopped serving environment: {env_name}");
@@ -3671,6 +3680,15 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // dependencies can be provisioned into it BEFORE it is built.
             let (env_name, scope, ec) = resolve_env_or_default(env)?;
             require_env_writable(scope, &env_name, "`mim install`")?;
+            // ENV-9: installing keeps the env's morloc version; an env without
+            // one is refused rather than provisioned at the latest release. A
+            // local-runtime env's version is its adopted compiler's, whatever
+            // is requested.
+            let keep_version = if ec.is_local_runtime() {
+                current_version_tag(&ec)
+            } else {
+                Some(require_current_version(&ec, &env_name)?)
+            };
 
             // 1. Resolve the program's env requirements without building it
             //    (frontend only). A directory is a package whose entry is its
@@ -3707,7 +3725,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    envspec.json, which gather_env_specs picks up from then on.
             //    Keep the env's current morloc version -- installing a module must
             //    never bump the toolchain out from under it.
-            rematerialize_env(scope, &env_name, &[dry], current_version_tag(&ec), &[], verbose)?;
+            rematerialize_env(scope, &env_name, &[dry], keep_version.clone(), &[], verbose)?;
 
             // 3. Build + install into the now-complete environment. Step 2 may
             //    have rebuilt the image, so re-read the config.
@@ -3751,8 +3769,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    Re-solve so the manager's world (lock, image, cache marker) carries
             //    them too; the pre-build solve above held them back.
             if has_py_locals {
-                let ec = cfg::read_env_config(scope, &env_name)?;
-                rematerialize_env(scope, &env_name, &[], current_version_tag(&ec), &[], verbose)?;
+                rematerialize_env(scope, &env_name, &[], keep_version, &[], verbose)?;
             }
             Ok(())
         }
@@ -4164,11 +4181,10 @@ pub(crate) fn native_run_env(
     let status = cmd.status().map_err(|e| {
         ManagerError::EnvError(format!("failed to launch command on host: {e}"))
     })?;
-    let code = status.code().unwrap_or(1);
     if status.success() {
         Ok(())
     } else {
-        std::process::exit(code);
+        std::process::exit(command_exit_code(status));
     }
 }
 
@@ -7083,8 +7099,7 @@ fn cache_key(world_digest: &str, morloc_bin: &std::path::Path, system_packages: 
 
 /// The provision tag that keeps an environment at its currently recorded morloc
 /// version: `Some("<version>")`, or `None` if the env has no recorded version
-/// (a legacy or `--no-init` env). `install` uses this directly (a missing
-/// version resolves to latest); callers that must NOT move the version use
+/// (a legacy or `--no-init` env). Callers that must not move the version use
 /// `require_current_version`.
 fn current_version_tag(ec: &EnvironmentConfig) -> Option<String> {
     ec.morloc_version.as_ref().map(|v| v.show())
@@ -7104,15 +7119,17 @@ fn require_current_version(ec: &EnvironmentConfig, env_name: &str) -> Result<Str
 }
 
 /// Resolve the target compiler version of an update to a concrete numeric
-/// string. `requested` follows `Cmd::Update`'s policy: `None` = --latest;
-/// `Some(v)` = an explicit target or the env's recorded version. A literal
-/// "latest" is resolved via the release manifest (a read-only network fetch);
-/// an explicit/recorded version needs no network.
+/// string. `requested` follows `Cmd::Update`'s policy: `None` = --latest,
+/// which, like the rebuild it gates, means `$MORLOC_RELEASE_TAG` or else the
+/// newest release; `Some(v)` = an explicit target or the env's recorded
+/// version. A literal "latest" is resolved via the release manifest (a
+/// read-only network fetch); an explicit/recorded version needs no network.
 fn resolve_target_version(requested: &Option<String>) -> Result<String> {
     match requested {
         Some(v) if !is_latest_spec(v) => Ok(strip_v_prefix(v).to_string()),
         _ => {
-            let tag = provision::resolve_tag(requested.as_deref().unwrap_or("latest"))?;
+            let spec = requested.clone().unwrap_or_else(resolve_release_tag);
+            let tag = provision::resolve_tag(&spec)?;
             Ok(provision::fetch_manifest(&tag)?.version)
         }
     }
@@ -7359,7 +7376,7 @@ fn rematerialize_env(
     verbose: bool,
 ) -> Result<()> {
     let ec = cfg::read_env_config(scope, name)?;
-    let lang_pins = cfg::read_env_inputs(scope, name).lang_pins;
+    let lang_pins = cfg::read_env_inputs(scope, name)?.lang_pins;
     let mut specs = gather_env_specs(scope, name)?;
     specs.extend_from_slice(extra_specs);
 
@@ -7686,6 +7703,20 @@ fn resolve_eval_port(env_name: &str, port: Option<u16>, rt: Option<&ServeRuntime
     })
 }
 
+/// Refuse to evaluate against the env's own server when it was started
+/// without eval, naming the fix, instead of sending a request it will reject.
+/// An explicit `--port` may name another server, so it is not checked.
+fn require_eval_served(env_name: &str, port: Option<u16>, rt: Option<&ServeRuntime>) -> Result<()> {
+    match (port, rt) {
+        (None, Some(r)) if !r.eval => Err(ManagerError::EnvError(format!(
+            "the server for '{env_name}' was started without eval. Enable it with \
+             `mim view eval --env {env_name} --allow <module>...`, then restart with \
+             `mim start --env {env_name} --force`."
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Evaluate an expression against a running serve.
 ///
 /// The port and the token come from the serve itself wherever possible. A serve
@@ -7703,6 +7734,7 @@ fn eval_against_serve(
 ) -> Result<()> {
     use std::io::{Read as IoRead, Write as IoWrite};
 
+    require_eval_served(env_name, port, rt)?;
     let port = resolve_eval_port(env_name, port, rt)?;
     let token = auth_token
         .or_else(|| std::env::var("MORLOC_MCP_TOKEN").ok().filter(|s| !s.is_empty()));
@@ -8611,23 +8643,63 @@ fn container_new_dev(
 // Native serve (detached host nexus)
 // ======================================================================
 
-/// Whether a native serve pid is still our server: alive, and (on Linux) its
-/// cmdline still looks like ours -- a guard against PID reuse. The tracked pid is
-/// the nexus directly, or (on NixOS) the `morloc-fhs` launcher whose command line
-/// embeds the `morloc-nexus` invocation, so either marker confirms it.
-fn native_serve_alive(pid: u32) -> bool {
+/// The leader of a recorded native serve, as the system sees it now.
+#[derive(Debug, PartialEq, Eq)]
+enum ServeLeader {
+    /// No process has this pid.
+    Gone,
+    /// Our leader; a zombie has exited but not been reaped.
+    Ours { zombie: bool },
+    /// The pid now names a different process.
+    Foreign,
+}
+
+/// The state letter and start time (fields 3 and 22) of `/proc/<pid>/stat`.
+fn proc_stat(pid: u32) -> Option<(char, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name (field 2) may hold spaces and parens; fields resume
+    // after its closing paren.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let start = fields.nth(18)?.parse().ok()?;
+    Some((state, start))
+}
+
+/// The leader's start time, recorded in a native serve handle at launch.
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    proc_stat(pid).map(|(_, start)| start)
+}
+
+/// Classify the recorded leader `pid` (with its recorded `start` time, if
+/// any). A start time decides identity; without one (an older record), the
+/// command line must name the nexus, or the `morloc-fhs` launcher that wraps
+/// it on NixOS. Without /proc (macOS) a live pid is trusted.
+fn serve_leader(pid: u32, start: Option<u64>) -> ServeLeader {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
     if pid <= 1 || !signal_probe_alive(kill(Pid::from_raw(pid as i32), None)) {
-        return false;
+        return ServeLeader::Gone;
     }
-    match std::fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(bytes) => {
-            let cmd = String::from_utf8_lossy(&bytes);
-            cmd.contains("morloc-nexus") || cmd.contains("morloc-fhs")
-        }
-        Err(_) => true, // no /proc (e.g. macOS): trust the liveness signal
-    }
+    let Some((state, now_start)) = proc_stat(pid) else {
+        return ServeLeader::Ours { zombie: false };
+    };
+    let zombie = state == 'Z';
+    let ours = match start {
+        Some(recorded) => recorded == now_start,
+        // A zombie's cmdline reads empty; an unreaped leader is still ours.
+        None => zombie
+            || std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|bytes| {
+                let cmd = String::from_utf8_lossy(&bytes);
+                cmd.contains("morloc-nexus") || cmd.contains("morloc-fhs")
+            }),
+    };
+    if ours { ServeLeader::Ours { zombie } } else { ServeLeader::Foreign }
+}
+
+/// Whether a native serve is still running: its leader is ours and not a zombie.
+fn native_serve_alive(pid: u32, start: Option<u64>) -> bool {
+    serve_leader(pid, start) == ServeLeader::Ours { zombie: false }
 }
 
 /// A hint for a serve not found: one started with sudo is root's, recorded in
@@ -8646,6 +8718,18 @@ fn sudo_hint() -> &'static str {
 /// alive, not gone.
 fn signal_probe_alive(probe: nix::Result<()>) -> bool {
     matches!(probe, Ok(()) | Err(nix::errno::Errno::EPERM))
+}
+
+/// SERVE-3: stop the native serve recorded as leader `pid` of group `pgid`,
+/// unless `pid` now names a process that is not ours. Linux allocates no pid
+/// still in use as a process group id, so a reused leader pid means the
+/// recorded group is gone; a dead or zombie leader with a live group is
+/// still ours.
+fn stop_native_serve(pid: u32, pgid: u32, start: Option<u64>) -> Result<()> {
+    match serve_leader(pid, start) {
+        ServeLeader::Foreign => Ok(()),
+        ServeLeader::Gone | ServeLeader::Ours { .. } => kill_native_group(pgid),
+    }
 }
 
 /// SIGTERM then, after a grace period, SIGKILL a native serve process group (the
@@ -8691,7 +8775,7 @@ fn term_outcome(pgid: u32, sent: nix::Result<()>) -> Result<()> {
 /// not the env's current backend).
 fn serve_handle_alive(handle: &ServeHandle) -> bool {
     match handle {
-        ServeHandle::Native { pid, .. } => native_serve_alive(*pid),
+        ServeHandle::Native { pid, start, .. } => native_serve_alive(*pid, *start),
         ServeHandle::Container { engine, name } => container::container_exists(*engine, name),
     }
 }
@@ -8715,7 +8799,7 @@ fn env_serve_alive(scope: Scope, name: &str, ec: &EnvironmentConfig) -> bool {
 /// Tear down a running serve by its stored launch handle (backend-independent).
 fn stop_by_handle(handle: &ServeHandle, verbose: bool) -> Result<()> {
     match handle {
-        ServeHandle::Native { pgid, .. } => kill_native_group(*pgid),
+        ServeHandle::Native { pid, pgid, start } => stop_native_serve(*pid, *pgid, *start),
         ServeHandle::Container { engine, name } => {
             serve::stop_serve_container(*engine, verbose, name)
         }
@@ -8731,7 +8815,7 @@ fn recorded_running_serves() -> Vec<serve::ServeContainerInfo> {
         for env in cfg::list_env_names(scope) {
             let Some(rt) = cfg::read_serve_runtime(scope, &env) else { continue };
             let (name, status) = match &rt.handle {
-                Some(ServeHandle::Native { pid, .. }) if native_serve_alive(*pid) => {
+                Some(ServeHandle::Native { pid, start, .. }) if native_serve_alive(*pid, *start) => {
                     (format!("native:{env}"), format!("running (native, pid {pid})"))
                 }
                 Some(ServeHandle::Container { engine, name })
@@ -8910,7 +8994,7 @@ fn native_serve(
     } else {
         "127.0.0.1".to_string()
     };
-    Ok((ServeHandle::Native { pid, pgid: pid }, url_host))
+    Ok((ServeHandle::Native { pid, pgid: pid, start: process_start_ticks(pid) }, url_host))
 }
 
 /// The router argv of a native serve. It shares the host's network namespace,
@@ -9490,19 +9574,39 @@ fn run_with_config(
     };
 
     let status = container_run_passthrough(engine, verbose, shell, &cfg);
-    let code = status.code().unwrap_or(1);
     if status.success() {
-        Ok(())
-    } else if code >= 125 {
-        // Exit 125+ = container engine error (not the user's program)
-        Err(ManagerError::EngineError {
+        return Ok(());
+    }
+    match container_command_status(engine, status) {
+        Some(code) => std::process::exit(code),
+        None => Err(ManagerError::EngineError {
             engine,
-            code,
+            code: engine_failure_status(engine),
             stderr: "Container engine error".to_string(),
-        })
-    } else {
-        // Exit 1-124 = program exited with non-zero, pass through silently
-        std::process::exit(code);
+        }),
+    }
+}
+
+/// The status `run` uses for a failure of the engine itself: 125 for docker
+/// and podman, 255 for apptainer.
+fn engine_failure_status(engine: ContainerEngine) -> i32 {
+    if engine.is_oci() { 125 } else { 255 }
+}
+
+/// RUN-3: the status a command ended with, in the shell's convention: its
+/// exit code, or 128 + n when signal n killed it.
+fn command_exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+}
+
+/// RUN-3: the status of a command run in a container, or `None` when the
+/// engine itself failed. Every other status, including 126, 127 and 128 + n,
+/// belongs to the command.
+fn container_command_status(engine: ContainerEngine, status: std::process::ExitStatus) -> Option<i32> {
+    match status.code() {
+        Some(c) if c == engine_failure_status(engine) => None,
+        _ => Some(command_exit_code(status)),
     }
 }
 
@@ -13006,6 +13110,147 @@ run:
         assert!(!cfg::env_data_dir(Scope::System, "sys").join("snapshots").exists());
     }
 
+    /// ENV-9: installing into an environment with no recorded version must not
+    /// provision it at the latest release; it fails before any side effect.
+    #[test]
+    fn install_into_a_version_less_environment_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        cfg::test_roots::set(tmp.path());
+        let ec = EnvironmentConfig::new_backend(
+            "nov".to_string(),
+            Backend::Container(ContainerEngine::Podman),
+            CONTAINER_BASE_IMAGE.to_string(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        cfg::write_env_config(Scope::Local, "nov", &ec).unwrap();
+        fs::create_dir_all(cfg::env_data_dir(Scope::Local, "nov")).unwrap();
+        let err = dispatch_args(&["mim", "install", "--env", "nov", "x.loc"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no usable morloc version"), "{err}");
+    }
+
+    /// SERVE-3: a serve record whose container is gone is removed by `stop`,
+    /// not kept failing forever.
+    #[test]
+    fn stop_clears_a_record_whose_container_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        cfg::test_roots::set(tmp.path());
+        let ec = EnvironmentConfig::new_backend(
+            "gone".to_string(),
+            Backend::Container(ContainerEngine::Podman),
+            CONTAINER_BASE_IMAGE.to_string(),
+            None,
+            Some(Version::new(0, 98, 1)),
+            Vec::new(),
+            Vec::new(),
+        );
+        cfg::write_env_config(Scope::Local, "gone", &ec).unwrap();
+        fs::create_dir_all(cfg::env_data_dir(Scope::Local, "gone")).unwrap();
+        let record = ServeRuntime {
+            mcp: vec!["m".to_string()],
+            api: Vec::new(),
+            eval: false,
+            host: "127.0.0.1".to_string(),
+            port: 9000,
+            token_required: false,
+            handle: Some(ServeHandle::Container {
+                engine: ContainerEngine::Podman,
+                name: "morloc-serve-test-no-such-container".to_string(),
+            }),
+        };
+        cfg::write_serve_runtime(Scope::Local, "gone", &record).unwrap();
+        dispatch_args(&["mim", "stop", "--env", "gone"]).unwrap();
+        assert!(cfg::read_serve_runtime(Scope::Local, "gone").is_none());
+    }
+
+    /// RUN-3: only the engine's own failure status is the engine's; a
+    /// command's 126, 127 or signal death passes through as its status.
+    #[test]
+    fn a_command_status_is_never_taken_for_an_engine_error() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+        let exited = |c: i32| ExitStatus::from_raw(c << 8);
+        assert_eq!(container_command_status(ContainerEngine::Podman, exited(1)), Some(1));
+        assert_eq!(container_command_status(ContainerEngine::Podman, exited(126)), Some(126));
+        assert_eq!(container_command_status(ContainerEngine::Podman, exited(127)), Some(127));
+        assert_eq!(container_command_status(ContainerEngine::Podman, exited(130)), Some(130));
+        assert_eq!(container_command_status(ContainerEngine::Podman, exited(141)), Some(141));
+        assert_eq!(container_command_status(ContainerEngine::Podman, exited(125)), None);
+        assert_eq!(command_exit_code(ExitStatus::from_raw(15)), 143);
+        assert_eq!(container_command_status(ContainerEngine::Apptainer, exited(255)), None);
+        assert_eq!(container_command_status(ContainerEngine::Apptainer, exited(125)), Some(125));
+    }
+
+    /// The leader classification behind every native stop: a zombie leader
+    /// is ours, and a recorded start time that differs means a reused pid.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_serve_leader_is_judged_by_its_start_time() {
+        use std::os::unix::process::CommandExt;
+        let mut live = std::process::Command::new("sleep");
+        live.arg("60").process_group(0);
+        let mut live = live.spawn().unwrap();
+        let pid = live.id();
+        let start = process_start_ticks(pid).unwrap();
+        assert_eq!(serve_leader(pid, Some(start)), ServeLeader::Ours { zombie: false });
+        assert_eq!(serve_leader(pid, Some(start + 1)), ServeLeader::Foreign);
+        let _ = live.kill();
+        let _ = live.wait();
+
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let zpid = dead.id();
+        let zstart = process_start_ticks(zpid);
+        for _ in 0..100 {
+            if proc_stat(zpid).is_some_and(|(s, _)| s == 'Z') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(serve_leader(zpid, None), ServeLeader::Ours { zombie: true });
+        assert_eq!(serve_leader(zpid, zstart), ServeLeader::Ours { zombie: true });
+        let _ = dead.wait();
+        assert_eq!(serve_leader(zpid, zstart), ServeLeader::Gone);
+    }
+
+    /// SERVE-3: a native serve record whose pid now names someone else's
+    /// process is never signalled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_never_signals_a_process_that_reused_the_server_pid() {
+        use std::os::unix::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        cfg::test_roots::set(tmp.path());
+        let ec = EnvironmentConfig::new_backend(
+            "n".to_string(), Backend::Native, String::new(), None,
+            Some(Version::new(0, 98, 1)), Vec::new(), Vec::new(),
+        );
+        cfg::write_env_config(Scope::Local, "n", &ec).unwrap();
+        fs::create_dir_all(cfg::env_data_dir(Scope::Local, "n")).unwrap();
+        let mut foreign = std::process::Command::new("sleep");
+        foreign.arg("60").process_group(0);
+        let mut child = foreign.spawn().unwrap();
+        let pid = child.id();
+        let record = ServeRuntime {
+            mcp: Vec::new(),
+            api: vec!["m".to_string()],
+            eval: false,
+            host: "127.0.0.1".to_string(),
+            port: 9000,
+            token_required: false,
+            handle: Some(ServeHandle::Native { pid, pgid: pid, start: None }),
+        };
+        cfg::write_serve_runtime(Scope::Local, "n", &record).unwrap();
+        dispatch_args(&["mim", "stop", "--env", "n"]).unwrap();
+        let still_running = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(still_running, "stop signalled a process that is not the server");
+    }
+
     #[test]
     fn the_root_directory_is_never_mounted_as_the_work_dir() {
         assert!(check_work_dir(std::path::Path::new("/")).is_err());
@@ -13067,8 +13312,8 @@ run:
     fn a_serve_record_cannot_signal_our_group_or_every_process() {
         assert!(kill_native_group(0).is_err());
         assert!(kill_native_group(1).is_err());
-        assert!(!native_serve_alive(0));
-        assert!(!native_serve_alive(1));
+        assert!(!native_serve_alive(0, None));
+        assert!(!native_serve_alive(1, None));
     }
 
     #[test]
@@ -13250,6 +13495,60 @@ run:
         add_env(Scope::Local, "sys");
         assert_eq!(environment::effective_default(), Some(("sys".to_string(), Scope::Local)));
         assert_eq!(environment::default_in(Scope::System), None);
+    }
+
+    /// ENV-5: `nuke` of the personal scope keeps a personal default that
+    /// names a system environment.
+    #[test]
+    fn nuke_keeps_a_default_that_names_another_scope() {
+        let _f = ScopeFixture::new(false);
+        add_env(Scope::Local, "mine");
+        write_default(Scope::Local, Some("sys"));
+        dispatch_args(&["mim", "nuke", "--yes"]).unwrap();
+        assert!(cfg::list_env_names(Scope::Local).is_empty());
+        assert_eq!(environment::effective_default(), Some(("sys".to_string(), Scope::System)));
+        let local = cfg::read_config::<Config>(&cfg::config_path(Scope::Local)).unwrap();
+        assert_eq!(local.default_env.as_deref(), Some("sys"));
+    }
+
+    /// `info` lists every managed-env variable a native run exports.
+    #[test]
+    fn info_lists_the_native_runners_managed_exports() {
+        let tmp = tempfile::tempdir().unwrap();
+        cfg::test_roots::set(tmp.path());
+        let keys: Vec<String> = info_env_exports(Scope::Local, tmp.path(), "n", None)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        for k in ["MORLOC_HOME", "MORLOC_ENV", "MORLOC_BUILD_HOOK", "MORLOC_BIN"] {
+            assert!(keys.iter().any(|x| x == k), "{k} missing from {keys:?}");
+        }
+    }
+
+    /// `mim eval` refuses up front when the env's server has eval off.
+    #[test]
+    fn eval_against_a_server_without_eval_is_refused() {
+        let rt = |eval: bool| ServeRuntime {
+            mcp: Vec::new(),
+            api: vec!["m".to_string()],
+            eval,
+            host: "127.0.0.1".to_string(),
+            port: 9000,
+            token_required: false,
+            handle: None,
+        };
+        let err = require_eval_served("e", None, Some(&rt(false))).unwrap_err().to_string();
+        assert!(err.contains("without eval"), "{err}");
+        assert!(require_eval_served("e", None, Some(&rt(true))).is_ok());
+        assert!(require_eval_served("e", Some(9001), Some(&rt(false))).is_ok());
+        assert!(require_eval_served("e", None, None).is_ok());
+    }
+
+    /// `doctor --system` names a scope for `--env`, so it is refused without one.
+    #[test]
+    fn doctor_system_requires_env() {
+        assert!(Cli::try_parse_from(["mim", "doctor", "--system"]).is_err());
+        assert!(Cli::try_parse_from(["mim", "doctor", "--system", "--env", "e"]).is_ok());
     }
 
     /// `--json` is honored or refused, never ignored.

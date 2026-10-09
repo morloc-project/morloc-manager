@@ -87,9 +87,13 @@ impl Provenance {
 /// the writer can undo precisely the write it made -- and nothing else. The `sync`
 /// rollback needs that precision: sweeping every slot sharing the program's name
 /// would discard a different, still-good declared world built earlier under the
-/// same name.
+/// same name. It also carries what the slot held before, so a rollback puts
+/// back an earlier successful build's spec instead of deleting it.
 #[derive(Debug, Clone)]
-pub struct SpecSlot(PathBuf);
+pub struct SpecSlot {
+    path: PathBuf,
+    previous: Option<Vec<u8>>,
+}
 
 /// The scratch sub-directory for a declared world: the first 16 hex digits of the
 /// SHA-256 of its canonical JSON. Truncated because it only has to separate the
@@ -170,22 +174,26 @@ impl EnvContext {
         std::fs::create_dir_all(&dir)
             .map_err(|e| DepsError::Env(format!("cannot create {}: {e}", dir.display())))?;
         let path = dir.join(format!("{program}.json"));
+        let previous = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(DepsError::Env(format!("cannot read {}: {e}", path.display()))),
+        };
         std::fs::write(&path, json)
             .map_err(|e| DepsError::Env(format!("cannot write {}: {e}", path.display())))?;
-        Ok(SpecSlot(path))
+        Ok(SpecSlot { path, previous })
     }
 
-    /// Remove exactly the spec [`write_spec`](Self::write_spec) wrote, and nothing
-    /// else -- the rollback of a failed `sync`. A missing file is not an error.
-    pub fn remove_spec(&self, slot: &SpecSlot) -> Result<()> {
-        remove_if_present(&slot.0)?;
-        // Reclaim the containing directory once it is empty -- an empty store
-        // directory reads exactly like an absent one everywhere here. Non-empty is
-        // the normal case and fails harmlessly.
-        if let Some(parent) = slot.0.parent() {
-            let _ = std::fs::remove_dir(parent);
+    /// Undo exactly the write [`write_spec`](Self::write_spec) made, and nothing
+    /// else -- the rollback of a failed `sync` (DEP-5): the slot gets back what it
+    /// held before, or is removed if it held nothing.
+    pub fn rollback_spec(&self, slot: &SpecSlot) -> Result<()> {
+        match &slot.previous {
+            Some(bytes) => std::fs::write(&slot.path, bytes).map_err(|e| {
+                DepsError::Env(format!("cannot restore {}: {e}", slot.path.display()))
+            }),
+            None => remove_spec_file(&slot.path),
         }
-        Ok(())
     }
 
     /// Remove EVERY spec stored under `program` in a provenance tier, whichever
@@ -196,7 +204,7 @@ impl EnvContext {
         validate_program_name(program)?;
         for path in json_paths(&self.provenance_dir(provenance))? {
             if path.file_stem().and_then(|s| s.to_str()) == Some(program) {
-                self.remove_spec(&SpecSlot(path))?;
+                remove_spec_file(&path)?;
             }
         }
         Ok(())
@@ -683,7 +691,9 @@ impl EnvContext {
                 Ok(outcome.activation)
             }
             Err(e) => {
-                let _ = self.remove_spec(&slot);
+                if let Err(undo) = self.rollback_spec(&slot) {
+                    return Err(DepsError::Env(format!("{e}; also, {undo}")));
+                }
                 Err(e)
             }
         }
@@ -841,6 +851,17 @@ pub fn adoption_note(langs: &[String]) -> String {
          its morloc binding can be built.",
         names.join(", ")
     )
+}
+
+/// Remove one stored spec file, then its directory once empty -- an empty
+/// store directory reads exactly like an absent one everywhere here. A
+/// missing file is not an error.
+fn remove_spec_file(path: &Path) -> Result<()> {
+    remove_if_present(path)?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    Ok(())
 }
 
 /// Every spec file under `dir`: the name-only slots (`<name>.json`) plus the
@@ -1018,7 +1039,21 @@ mod tests {
         ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
         // A later build whose solve fails: `sync` rolls back exactly its own write.
         let slot = ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
-        ctx.remove_spec(&slot).unwrap();
+        ctx.rollback_spec(&slot).unwrap();
+
+        let all = ctx.gather().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].languages[0].lang, "py");
+    }
+
+    /// DEP-5: a failed re-sync of an installed program restores the spec its
+    /// last successful install recorded, in the same slot.
+    #[test]
+    fn sync_rollback_restores_the_spec_it_replaced() {
+        let (_d, ctx) = ctx();
+        ctx.write_spec("nexus", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
+        let slot = ctx.write_spec("nexus", Provenance::Installed, &spec(r#"{"lang":"r"}"#)).unwrap();
+        ctx.rollback_spec(&slot).unwrap();
 
         let all = ctx.gather().unwrap();
         assert_eq!(all.len(), 1);
@@ -1291,11 +1326,11 @@ mod tests {
         let scratch = ctx.write_spec("p", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
         // promote: write to installed, drop from scratch
         ctx.write_spec("p", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
-        ctx.remove_spec(&scratch).unwrap();
+        ctx.rollback_spec(&scratch).unwrap();
         assert_eq!(ctx.gather().unwrap().len(), 1);
         assert_eq!(ctx.gather_installed().unwrap().len(), 1);
         // removing a missing spec is a no-op
-        ctx.remove_spec(&scratch).unwrap();
+        ctx.rollback_spec(&scratch).unwrap();
         ctx.remove_named("p", Provenance::Scratch).unwrap();
     }
 

@@ -21,6 +21,7 @@ toolchain in step (DEP-1).
 ### RUN-3 The exit status is the command's
 Intent: proposed
 Code: deviates F15
+Tests: a_command_status_is_never_taken_for_an_engine_error
 
 mim exits with the status of the command it ran. A failure of mim or the
 engine before the command starts is reported as such and never confused

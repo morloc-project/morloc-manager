@@ -7,17 +7,6 @@ deleted, so numbers have gaps.
 
 ## mim: behavior
 
-### F1 A failed re-sync deletes the program's previous requirements (verified)
-Spec: DEP-5. `EnvContext::sync` writes the spec to its slot, then on solve
-failure calls `remove_spec(&slot)` (deps/envstore.rs:653-692). The slot for
-an installed program is `requirements/installed/<K>.json`, the same path the
-previous successful install wrote (deps/envstore.rs:158-176), so a failed
-reinstall of `K` deletes `K`'s previous, working spec. The next solve then
-drops `K`'s packages from the world and can break the installed program.
-Same for a scratch rebuild whose world is unchanged (same digest slot). The
-unit test `sync_rollback_removes_only_the_slot_it_wrote` covers only a fresh
-slot. Fix: save the previous file content and restore it.
-
 ### F2 Spec removals happen outside the lock and are never restored (surveyed)
 Spec: DEP-5, DEP-4. `mim sync --installed` with Python local deps calls
 `remove_named(K, Scratch)` and vendors snapshots before taking
@@ -33,14 +22,6 @@ no lock at all. So `mim update` can race `mim run -- morloc make` on
 `pixi.toml`/`pixi.lock`, the image tag, the volume and the build marker; `rm`
 during a `run` deletes the tree under it; two `new X` both pass the
 existence check.
-
-### F4 `mim install` on a version-less environment moves it to the latest release (verified)
-Spec: ENV-9. `install` passes `current_version_tag(&ec)`, which is `None`
-for an environment with no recorded version (`--no-init`, legacy), and
-`None` resolves to latest (mim/main.rs:3700-3707, 7082-7089, 7355-7368). The
-comment at 3705 says installing "must never bump the toolchain"; `update`
-and `modify` use `require_current_version` to refuse this case, `install`
-does not.
 
 ### F5 `new`, `update` and `modify` are not atomic (surveyed)
 Spec: ENV-2, ENV-6.
@@ -58,19 +39,11 @@ Spec: ENV-2, ENV-6.
   a later non-rebuild failure are not restored despite the comment at
   mim/main.rs:3060.
 
-### F6 `rm` swallows every removal error and leaves a native server running (verified for errors, surveyed for serve)
-Spec: ENV-7. `remove_environment` ignores the result of each
-`remove_dir_all` and volume removal with `let _` (mim/environment.rs:
-170-186) and returns success. It stops a container server but never a
-native serve process, which keeps running against deleted files.
-`system-homes/<name>` is also left behind.
-
-### F7 `mim stop` cannot clear a stale container serve record (verified)
-Spec: SERVE-3. If the recorded container is gone, `stop_by_handle` ->
-`stop_serve_container` errors "No serve container running" (mim/serve.rs:
-174-178) and `remove_serve_runtime` is never reached (mim/main.rs:3534-
-3539). The record persists, and every later `stop` fails the same way.
-Native handles avoid this (ESRCH is success).
+### F6 `rm` of a system env leaves each user's `system-homes/<name>` (surveyed)
+Spec: ENV-7. A user's private home for a system environment lives in that
+user's own data dir (mim/config.rs, `system_env_user_home`), which root's
+`rm` cannot see. Needs a ruling: sweep them lazily (a user's next mim
+command notices the env is gone) or accept them as the user's files.
 
 ### F8 The Apptainer backend does not work end to end (surveyed)
 Spec: ENV-4, SERVE-3, SERVE-6, SERVE-7. Already reported in
@@ -89,14 +62,6 @@ plans/env-install-audit (C1, 2026-09-02); still true:
 - `--slurm-bridge` requires Apptainer.
 Apptainer is still offered by `--engine` and the docs (as experimental).
 
-### F9 Container `doctor` checks the wrong directory for the runtime (verified)
-Spec: ENV-11. `check_data_dirs` requires `lib`, `bin`, `opt` directly under
-the data dir (mim/doctor.rs:1238-1255) and the container doctor passes it
-the data dir (mim/doctor.rs:147, 157). Container environments keep the
-runtime under `data_dir/runtime` (mim/config.rs:20-38, whose comment warns
-about exactly this). Expected: every container env fails doctor with
-"Missing directories: lib, bin, opt". Not run.
-
 ### F10 Downloads that are not verified (surveyed)
 Spec: PROV-2. Only the compiler binary and rust source are verified. Not
 verified: the host pixi binary (mim/provision.rs:754-765), pixi installed in
@@ -106,14 +71,6 @@ manifest (mim/demos.rs), the ghcup installer in dev images
 (mim/dockerfile.rs:620). `scripts/install.sh` skips its checksum silently
 when the `.sha256` fetch fails or no sha tool exists (scripts/install.sh:
 76-89).
-
-### F11 The release contract gate admits releases the parsers then reject (surveyed)
-Spec: PROV-3. `check_supported` refuses only versions above mim's
-(mim/provision.rs:75-104), but envspec parsing requires exactly version 2
-(deps/envspec.rs:143-155) and lang-support requires major exactly 1
-(deps/langsupport.rs:112-132). A release declaring envspec 1 or
-lang-support 0.x installs and then fails on every build. The unit test
-sample uses `envspec_version: 1` (mim/provision.rs:914).
 
 ### F12 `abi_version` is parsed and discarded (surveyed)
 Spec: PROV-6 (open). `versions.abi_version` is read into
@@ -137,28 +94,29 @@ mim exports all three variables wherever it launches. The compiler only
 tests non-emptiness, so this is harmless today but the contract is not what
 the README states.
 
-### F15 Exit statuses >= 125 are reported as engine errors (surveyed)
-Spec: RUN-3. mim/main.rs:9494-9504 treats any container exit >= 125 as a
-container engine error, so a program exiting 126, 127, or 128+n (killed by
-a signal, including 130 for Ctrl-C and 141 for a closed pipe) is misreported
-and its status replaced.
+### F15 A command exiting 125 in docker/podman is reported as an engine error (surveyed)
+Spec: RUN-3. docker/podman `run` exit 125 when the engine fails, and a
+command's own 125 is indistinguishable by status (mim/main.rs,
+`container_command_status`). Telling them apart needs the engine's stderr
+or a wrapper inside the container. Apptainer has the same ambiguity at
+255. Statuses 126, 127 and 128+n now pass through.
 
-### F16 Default-environment resolution crosses scopes (surveyed)
-Spec: ENV-5.
-- The default is stored as a bare name. A system default `X` resolves
-  through local-first lookup, so it picks a user's local `X` when one
-  exists (mim/environment.rs:550-558), contradicting the comment at
-  mim/environment.rs:436.
-- `nuke` clears the scope's default unconditionally, even when it named an
-  environment in the other scope (mim/main.rs:2066-2073); `rm` is careful
-  (mim/environment.rs:192-206).
-- `new --system --set-default` writes the system default; `modify
-  --set-default` on a system env writes the local one.
+### F16 A system default can resolve to a local environment (needs a ruling)
+Spec: ENV-5 says a system default names a system environment, but defaults
+are bare names resolved local-first, so a system default `X` runs a user's
+local `X` when one exists; the test
+`the_displayed_default_is_the_one_commands_use` asserts that on purpose.
+Also `new --system --set-default` writes the system default while `modify
+--set-default` on a system env writes the caller's local one. Rule which
+is intended before changing either.
 
-### F17 The eval allow-list is not validated and outlives `view rm` (surveyed)
-Spec: SERVE-2. `view eval --allow` accepts any names; `start` checks only
-the MCP and API views (mim/main.rs:8794). `view rm M` removes `M` from MCP
-and API only (mim/types.rs:771-776).
+### F17 `view eval --allow` accepts any names (needs a ruling)
+Spec: SERVE-2. Nothing checks the allow-list; `start` checks only the MCP
+and API views. Eval imports *modules*, which may be installed libraries
+with no launcher, so "installed" for the allow-list is not the launcher
+test `view add` uses. Rule what counts as installed here (module in the
+plane, or a program) before adding the check. `view rm` now drops the
+module from the allow-list.
 
 ### F18 A failed `--locked` install silently re-solves (surveyed)
 Spec: DEP-7. Any non-zero exit of `pixi install --locked`, including a
@@ -181,17 +139,6 @@ compiler forever.
 Spec: FRZ-4. On success `freeze` updates `env.yaml` with the version it
 detected in the image (mim/main.rs:3395-3399).
 
-### F22 Possible path traversal through a local package name (surveyed)
-`vendor_snapshot` joins the package `name` from the envspec into a path
-under `pixi/local/` without validation (mim/localdeps.rs:66);
-`validate_program_name` guards only the program key. The envspec comes from
-the user's own `package.yaml`, so the impact is a user writing outside the
-env's tree by mistake rather than an attack, but the path is unchecked.
-
-### F23 A corrupt `env-inputs.json` silently drops the language pins (surveyed)
-`read_env_inputs` treats an unreadable file as "no pins" (mim/config.rs:
-514), so the next rebuild drops them without a word.
-
 ### F24 Configuration read-modify-write is unlocked (surveyed)
 Spec: ENV-8. Writes are locked and atomic (mim/config.rs:387-443), but
 reads are not, and read-modify-write sequences (default, rename pointer,
@@ -213,20 +160,12 @@ including `vcpkg` (deps/pixi.rs:482-486); `native_blockers` lowercases
 before comparing (deps/envspec.rs:214) and is called only by the manager.
 
 ### F27 Smaller mim behavior notes (surveyed)
-- `info` omits `MORLOC_BUILD_HOOK` and `MORLOC_BIN` from a native env's
-  exports although it claims to mirror the runner (mim/main.rs:1417-1440).
-- Native `run` may download pixi (`provision_pixi`, mim/main.rs:4153).
-- `mim eval` ignores whether eval is enabled and always uses 127.0.0.1.
-- `doctor --system` without `--env` is silently ignored (mim/main.rs:
-  3925-3931).
-- `demos`: a failed download leaves an empty destination that then needs
-  `--force`; the tarball goes to a predictable `$TMPDIR/morloc-demos-<pid>`;
-  `-local` versions never match (mim/demos.rs:115-198).
-- The cache key for another platform's mim is the crate version, but the
-  download uses `MIM_RELEASE_TAG` (mim/provision.rs:437-458).
-- `update --latest` resolves through the GitHub latest when modules declare
-  a Morloc range, but through `$MORLOC_RELEASE_TAG` otherwise
-  (mim/main.rs:7109-7116 vs 4536-4538).
+- Native `run` may download pixi (`provision_pixi` in the native runner)
+  although its comment says pixi was provisioned at materialize; `locate_pixi`
+  never downloads. Undecided whether `run` may touch the network.
+- `demos`: a `-local` env version never matches a published demos release
+  (mim/demos.rs `resolve_target`), so it always falls back to the latest.
+  Undecided whether a local build should match its base version.
 
 ### F28 The frozen image serves on 8080; `mim start` defaults to 9000 for MCP (surveyed)
 Not a bug, but two defaults for one server. Freeze CMD is fixed at 8080
@@ -242,6 +181,26 @@ supervision.
 `start` checks that each MCP/API module is installed, but a module removed
 after `view add` makes `start` fail rather than the view being cleaned.
 Observation; no item yet.
+
+### F60 Engine helpers exit the process when the engine binary is missing (read)
+`run_process`/`run_process_quiet` (mim/container.rs) call
+`std::process::exit(1)` on a spawn failure instead of returning an error,
+so any caller (cleanup paths included) dies mid-operation. `rm` now probes
+before removing a volume; other callers still exit.
+
+### F61 Other engine checks still read "engine unreachable" as "absent" (read)
+`container_exists`, `image_exists_locally` and `volume_exists`
+(mim/container.rs) return false when the engine cannot answer. `rm` and
+`stop` now use `container::probe`, which separates the cases; `status`,
+`logs`, `start --force` (`serve_handle_alive`, `env_serve_alive`), doctor
+and `rename` still use the boolean forms.
+
+### F62 Off Linux a native serve record cannot tell a reused pid (read)
+Spec: SERVE-3. The leader's start time comes from `/proc/<pid>/stat`; on
+macOS there is none, so a live pid is trusted (`serve_leader`) and `stop`
+or `rm` on a stale record could signal another process group. Records from
+mims before the start time was recorded fall back to the command line,
+which another env's nexus also matches.
 
 ## mim: docs
 

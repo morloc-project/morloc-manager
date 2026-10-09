@@ -508,12 +508,11 @@ pub fn env_inputs_path(scope: Scope, name: &str) -> PathBuf {
 }
 
 /// Read the persisted native inputs; an absent file means no `--lang` pins.
-pub fn read_env_inputs(scope: Scope, name: &str) -> EnvInputs {
+pub fn read_env_inputs(scope: Scope, name: &str) -> Result<EnvInputs> {
     let p = env_inputs_path(scope, name);
-    if p.is_file() {
-        read_config(&p).unwrap_or_default()
-    } else {
-        EnvInputs::default()
+    match fs::symlink_metadata(&p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(EnvInputs::default()),
+        _ => read_config(&p),
     }
 }
 
@@ -1003,5 +1002,22 @@ mod tests {
             Some(crate::types::LocalRuntimeConfig { source: "/rt".to_string() });
         let err = migrate_env_config(ec).expect_err("dev + local_runtime must fail");
         assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    /// An unreadable `env-inputs.json` is an error, not "no pins": treating it
+    /// as empty would drop the env's language pins on the next rebuild.
+    #[test]
+    fn a_corrupt_env_inputs_file_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        test_roots::set(tmp.path());
+        let p = env_inputs_path(Scope::Local, "e");
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, "{ not json").unwrap();
+        assert!(read_env_inputs(Scope::Local, "e").is_err());
+        fs::remove_file(&p).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &p).unwrap();
+        assert!(read_env_inputs(Scope::Local, "e").is_err());
+        fs::remove_file(&p).unwrap();
+        assert!(read_env_inputs(Scope::Local, "e").unwrap().lang_pins.is_empty());
     }
 }

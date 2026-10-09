@@ -1,10 +1,11 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use serde::Serialize;
 
 use crate::config;
-use crate::container::{self, engine_executable, image_exists_locally};
+use crate::container::{self, engine_executable, image_exists_locally, Probe};
 use crate::error::{ManagerError, Result};
 use crate::serve;
 use crate::types::*;
@@ -132,77 +133,138 @@ pub fn image_repo_component(name: &str) -> String {
 
 
 
-/// Remove an environment and all its data. `engine` is the container engine for
-/// container-backed environments, or `None` for native environments (which have
-/// no serve container or image to clean up, only on-disk files).
+/// Remove an environment and all its data (ENV-7). `engine` is the container
+/// engine for container-backed environments, or `None` for native ones. The
+/// server is stopped and the engine's objects (image, prefix volume) are
+/// confirmed gone before any file is deleted; the configuration record goes
+/// last. Any step that fails stops the removal and keeps the record, so `rm`
+/// can be retried.
 pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &str) -> Result<()> {
     let ec = config::read_env_config(scope, name)
         .map_err(|_| ManagerError::EnvironmentNotFound(name.to_string()))?;
 
-    // Stop and remove any running serve container and built image. Native
-    // environments have neither, so this whole block is skipped for them.
+    match config::read_serve_runtime(scope, name).and_then(|rt| rt.handle) {
+        Some(ServeHandle::Native { pid, pgid, start }) => crate::stop_native_serve(pid, pgid, start)?,
+        Some(ServeHandle::Container { engine: e, name: recorded }) => {
+            remove_engine_object(e, "container", &recorded, || {
+                let _ = container::container_stop(e, &recorded);
+                let _ = container::container_remove_quiet(e, &recorded);
+            })?
+        }
+        None => {
+            if let Some(engine) = engine {
+                let cname = serve::serve_container_name(name);
+                remove_engine_object(engine, "container", &cname, || {
+                    let _ = container::container_stop(engine, &cname);
+                    let _ = container::container_remove_quiet(engine, &cname);
+                })?;
+            }
+        }
+    }
+
     if let Some(engine) = engine {
-        // Stop and remove any running serve container for this environment
-        // before removing its image. If we skipped this, the serve container
-        // would keep running and be unreachable through mim.
-        let serve_name = match config::read_serve_runtime(scope, name).and_then(|rt| rt.handle) {
-            Some(ServeHandle::Container { name: recorded, .. }) => recorded,
-            _ => serve::serve_container_name(name),
-        };
-        if container::container_exists(engine, &serve_name) {
-            let _ = container::container_stop(engine, &serve_name);
-            let _ = container::container_remove_quiet(engine, &serve_name);
-        }
-
-        // Remove built Dockerfile layer image
         if let Some(ref img) = ec.built_image {
-            if image_exists_locally(engine, img) {
+            remove_engine_object(engine, "image", img, || {
                 container::remove_image(engine, img);
-            }
+            })?;
         }
-
         // The solved conda prefix lives in an engine volume rather than under the
-        // env data dir, so deleting the directory tree below would leave it
-        // behind -- gigabytes with nothing left to reference them.
-        let _ = container::volume_remove(
-            engine,
-            &serve::prefix_volume(&config::env_data_dir(scope, name)),
-        );
+        // env data dir.
+        let volume = serve::prefix_volume(&config::env_data_dir(scope, name));
+        remove_engine_object(engine, "volume", &volume, || {
+            let _ = container::volume_remove(engine, &volume);
+        })?;
     }
 
-    // Remove config directory
-    let cfg_dir = config::env_config_dir(scope, name);
-    if cfg_dir.is_dir() {
-        let _ = fs::remove_dir_all(&cfg_dir);
-    }
+    remove_tree(&config::env_data_dir(scope, name), name)?;
+    remove_tree(&config::env_config_dir(scope, name), name)?;
 
-    // Remove data directory
-    let data_dir = config::env_data_dir(scope, name);
-    if data_dir.is_dir() {
-        let _ = fs::remove_dir_all(&data_dir);
-    }
-
-    // If a config's default tag pointed at this name AND no env of that name
-    // survives in any scope, clear the tag. The name-still-resolves guard avoids
-    // over-clearing when a same-named env remains in the other scope (e.g. a
-    // local `latest` is removed while a system `latest` still exists).
-    let name_orphaned = config::find_env_scope(name).is_err();
-    if name_orphaned {
-        for cfg_scope in [Scope::Local, Scope::System] {
-            let cfg_path = config::config_path(cfg_scope);
-            if let Ok(cfg) = config::read_config::<Config>(&cfg_path) {
-                if cfg.default_env.as_deref() == Some(name) {
-                    let new_cfg = Config {
-                        default_env: None,
-                        ..cfg
-                    };
-                    let _ = config::write_config(&cfg_path, &new_cfg);
-                }
-            }
-        }
-    }
+    clear_defaults_naming(name);
 
     Ok(())
+}
+
+/// Remove an engine object with `remove` if the engine reports it, and fail
+/// unless the engine then reports it absent. An engine that cannot answer is
+/// a failure, never taken for absence.
+fn remove_engine_object(
+    engine: ContainerEngine,
+    kind: &str,
+    object: &str,
+    remove: impl FnOnce(),
+) -> Result<()> {
+    let unknown = |why: String| {
+        ManagerError::EnvError(format!(
+            "cannot ask {} whether {kind} {object} exists ({why}); nothing more was \
+             removed. Retry where the engine is reachable.",
+            engine.name()
+        ))
+    };
+    match container::probe(engine, kind, object) {
+        Probe::Absent => return Ok(()),
+        Probe::Unknown(why) => return Err(unknown(why)),
+        Probe::Present => remove(),
+    }
+    match container::probe(engine, kind, object) {
+        Probe::Absent => Ok(()),
+        Probe::Unknown(why) => Err(unknown(why)),
+        Probe::Present => Err(ManagerError::EnvError(format!(
+            "could not remove {kind} {object} (is something still using it?); \
+             nothing more was removed. Free it and retry."
+        ))),
+    }
+}
+
+/// Delete a directory tree. A tree with read-only directories of the
+/// caller's own (a Go module cache, say) is made writable and retried.
+fn remove_tree(path: &Path, env: &str) -> Result<()> {
+    if fs::symlink_metadata(path).is_err() {
+        return Ok(());
+    }
+    if fs::remove_dir_all(path).is_ok() {
+        return Ok(());
+    }
+    make_dirs_writable(path);
+    fs::remove_dir_all(path).map_err(|e| {
+        ManagerError::EnvError(format!(
+            "could not remove {} ({e}); some files there are not yours to delete. \
+             Remove the directory by hand, then run `mim rm {env}` again.",
+            path.display()
+        ))
+    })
+}
+
+fn make_dirs_writable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = fs::symlink_metadata(path) else { return };
+    if !meta.is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700));
+    if let Ok(entries) = fs::read_dir(path) {
+        for e in entries.flatten() {
+            make_dirs_writable(&e.path());
+        }
+    }
+}
+
+/// ENV-5: clear every default that named the just-removed environment
+/// `name`. Defaults are bare names resolved local-first, so a default still
+/// names an environment while one of that name survives in either scope.
+fn clear_defaults_naming(name: &str) {
+    if config::find_env_scope(name).is_ok() {
+        return;
+    }
+    for cfg_scope in [Scope::Local, Scope::System] {
+        let cfg_path = config::config_path(cfg_scope);
+        if let Ok(cfg) = config::read_config::<Config>(&cfg_path) {
+            if cfg.default_env.as_deref() == Some(name) {
+                let new_cfg = Config { default_env: None, ..cfg };
+                let _ = config::write_config(&cfg_path, &new_cfg);
+            }
+        }
+    }
 }
 
 /// The tag of the requirement-derived image an environment builds for itself.
@@ -537,13 +599,11 @@ pub fn resolve_default_environment() -> Result<(String, Scope, EnvironmentConfig
     Ok((name, scope, ec))
 }
 
-/// Resolve just the default environment name from config.
-/// Skips names that don't resolve to an actual environment (e.g., stale
-/// entries from old config formats).
 /// The environment commands use when given no `--env`, and its scope: the
 /// personal default if it names an environment, else the machine-wide one.
-/// A name present in both scopes resolves to the personal environment. Every
-/// display of "the default" reads this, so it shows what commands will use.
+/// A name present in both scopes resolves to the personal environment, and a
+/// name naming nothing is skipped. Every display of "the default" reads this,
+/// so it shows what commands will use.
 pub fn effective_default() -> Option<(String, Scope)> {
     [Scope::Local, Scope::System].into_iter().find_map(|cfg_scope| {
         let name = config::read_config::<Config>(&config::config_path(cfg_scope))
@@ -683,5 +743,82 @@ mod tests {
         assert!(default_pointer_follows(Scope::System, Scope::System, true));
         assert!(!default_pointer_follows(Scope::System, Scope::Local, false));
         assert!(!default_pointer_follows(Scope::System, Scope::Local, true));
+    }
+
+    fn make_env(scope: Scope, name: &str) {
+        let ec = EnvironmentConfig::new_backend(
+            name.to_string(), Backend::Native, String::new(), None, None, Vec::new(), Vec::new(),
+        );
+        config::write_env_config(scope, name, &ec).unwrap();
+    }
+
+    fn pointer(scope: Scope) -> Option<String> {
+        config::read_config::<Config>(&config::config_path(scope)).ok()?.default_env
+    }
+
+    /// ENV-5: removing an environment clears only the defaults that named it;
+    /// a local default naming a system environment survives removing (or
+    /// nuking) local ones.
+    #[test]
+    fn removal_clears_only_the_defaults_that_named_the_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::test_roots::set(tmp.path());
+        make_env(Scope::System, "y");
+        set_default_environment("y", Scope::Local).unwrap();
+        make_env(Scope::Local, "z");
+        set_default_environment("z", Scope::System).unwrap();
+        remove_environment(None, Scope::Local, "z").unwrap();
+        assert_eq!(pointer(Scope::Local).as_deref(), Some("y"));
+        assert_eq!(pointer(Scope::System), None);
+        remove_environment(None, Scope::System, "y").unwrap();
+        assert_eq!(pointer(Scope::Local), None);
+    }
+
+    /// ENV-7: removing a native environment stops its server.
+    #[test]
+    fn removal_stops_a_native_server() {
+        use std::os::unix::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        config::test_roots::set(tmp.path());
+        make_env(Scope::Local, "srv");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 60"]).process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        let record = ServeRuntime {
+            mcp: Vec::new(),
+            api: vec!["m".to_string()],
+            eval: false,
+            host: "127.0.0.1".to_string(),
+            port: 9000,
+            token_required: false,
+            handle: Some(ServeHandle::Native {
+                pid,
+                pgid: pid,
+                start: crate::process_start_ticks(pid),
+            }),
+        };
+        config::write_serve_runtime(Scope::Local, "srv", &record).unwrap();
+        remove_environment(None, Scope::Local, "srv").unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        let status = child.wait().unwrap();
+        assert!(status.signal().is_some(), "the server was not stopped: {status}");
+    }
+
+    /// ENV-7: read-only directories of the caller's own (a Go module cache,
+    /// say) do not stop a removal.
+    #[test]
+    fn removal_deletes_read_only_directories_it_owns() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        config::test_roots::set(tmp.path());
+        make_env(Scope::Local, "ro");
+        let locked = config::env_data_dir(Scope::Local, "ro").join("home/go/pkg/mod");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("f"), "").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        remove_environment(None, Scope::Local, "ro").unwrap();
+        assert!(!config::env_data_dir(Scope::Local, "ro").exists());
+        assert!(!config::env_config_path(Scope::Local, "ro").exists());
     }
 }

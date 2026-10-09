@@ -298,6 +298,49 @@ pub fn container_remove_quiet(engine: ContainerEngine, name_or_id: &str) -> Exit
     }
 }
 
+/// What an engine said about whether an object exists. `Unknown` means the
+/// engine could not answer (daemon down, socket permissions, no session), which
+/// must never be read as "absent" by code that deletes or forgets things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    Present,
+    Absent,
+    Unknown(String),
+}
+
+/// Classify an `<engine> <kind> inspect` outcome. Docker says "No such
+/// container/image/volume" or "No such object"; podman says "no such ..." or
+/// "... not known". An engine binary that is not installed holds nothing.
+fn classify_inspect(outcome: io::Result<std::process::Output>) -> Probe {
+    match outcome {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Probe::Absent,
+        Err(e) => Probe::Unknown(e.to_string()),
+        Ok(out) if out.status.success() => Probe::Present,
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+            if err.contains("no such") || err.contains("not known") {
+                Probe::Absent
+            } else {
+                Probe::Unknown(err.trim().to_string())
+            }
+        }
+    }
+}
+
+/// Ask an OCI engine whether an object of `kind` (`container`, `image`,
+/// `volume`) named `name` exists. Apptainer has none of these engine objects.
+pub fn probe(engine: ContainerEngine, kind: &str, name: &str) -> Probe {
+    match argstyle(engine) {
+        ArgStyle::Oci => classify_inspect(
+            Command::new(engine_executable(engine))
+                .args([kind, "inspect", name])
+                .stdin(Stdio::null())
+                .output(),
+        ),
+        ArgStyle::Apptainer => Probe::Absent,
+    }
+}
+
 /// Check whether a container with this name exists (running or stopped).
 pub fn container_exists(engine: ContainerEngine, name: &str) -> bool {
     match argstyle(engine) {
@@ -809,4 +852,39 @@ fn run_process_quiet(exe: &str, args: &[String]) -> (ExitStatus, String, String)
 
 pub fn exit_code_to_int(status: ExitStatus) -> i32 {
     status.code().unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn failed(stderr: &str) -> io::Result<std::process::Output> {
+        Ok(std::process::Output {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        })
+    }
+
+    /// Only an engine's own "no such object" answer means absent; an engine
+    /// that cannot answer is unknown, never absent.
+    #[test]
+    fn an_engine_that_cannot_answer_is_not_taken_for_absence() {
+        assert_eq!(classify_inspect(failed("Error: No such container: x")), Probe::Absent);
+        assert_eq!(classify_inspect(failed("Error: no such volume x")), Probe::Absent);
+        assert_eq!(classify_inspect(failed("Error: x: image not known")), Probe::Absent);
+        assert_eq!(
+            classify_inspect(Err(io::Error::from(io::ErrorKind::NotFound))),
+            Probe::Absent
+        );
+        let down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.";
+        assert!(matches!(classify_inspect(failed(down)), Probe::Unknown(_)));
+        let perm = "permission denied while trying to connect to the Docker daemon socket";
+        assert!(matches!(classify_inspect(failed(perm)), Probe::Unknown(_)));
+        assert!(matches!(
+            classify_inspect(Err(io::Error::from(io::ErrorKind::PermissionDenied))),
+            Probe::Unknown(_)
+        ));
+    }
 }
