@@ -204,7 +204,7 @@ pub fn container_run_passthrough(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .unwrap_or_else(|_| std::process::exit(1))
+        .unwrap_or_else(|e| report_spawn_failure(exe, e))
 }
 
 /// Build a container image with all output (stdout+stderr) redirected to stderr.
@@ -380,24 +380,6 @@ pub fn volume_remove(engine: ContainerEngine, name: &str) -> ExitStatus {
     }
 }
 
-/// Whether an engine-managed volume of this name exists. Apptainer has no
-/// volumes, so nothing ever exists there.
-pub fn volume_exists(engine: ContainerEngine, name: &str) -> bool {
-    match argstyle(engine) {
-        ArgStyle::Oci => {
-            let exe = engine_executable(engine);
-            Command::new(exe)
-                .args(["volume", "inspect", name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        }
-        ArgStyle::Apptainer => false,
-    }
-}
-
 /// Copy the contents of volume `from` into a fresh volume `to`, through a
 /// throwaway container of `image`. Neither engine can rename a volume, so this
 /// is how a volume follows its environment. `to` is mounted at `to_mount`, a
@@ -502,13 +484,10 @@ pub fn remove_image(engine: ContainerEngine, tag: &str) -> bool {
     }
 }
 
-/// Produce a synthetic ExitStatus(0) for engine no-ops. The standard library
-/// does not expose a constructor for ExitStatus, so we run `true` -- a
-/// guaranteed-fast successful no-op available on every POSIX system.
+/// A successful status for engine no-ops.
 fn no_op_exit_status() -> ExitStatus {
-    Command::new("true")
-        .status()
-        .unwrap_or_else(|_| std::process::exit(1))
+    use std::os::unix::process::ExitStatusExt;
+    ExitStatus::from_raw(0)
 }
 
 // ======================================================================
@@ -787,25 +766,30 @@ pub fn build_build_args(cfg: &BuildConfig) -> Vec<String> {
 /// Returns only the exit status. Use for IO () commands where mim's
 /// stdout must stay clean but the user should see all container output.
 fn run_process_to_stderr(exe: &str, args: &[String]) -> ExitStatus {
-    let mut child = Command::new(exe)
+    let mut child = match Command::new(exe)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to execute {exe}: {e}");
-            std::process::exit(1);
-        });
+    {
+        Ok(child) => child,
+        Err(e) => return report_spawn_failure(exe, e),
+    };
     // Pump child stdout -> our stderr
     if let Some(mut child_stdout) = child.stdout.take() {
         let stderr = io::stderr();
         let _ = io::copy(&mut child_stdout, &mut stderr.lock());
     }
-    child.wait().unwrap_or_else(|e| {
-        eprintln!("Failed to wait for {exe}: {e}");
-        std::process::exit(1);
-    })
+    child.wait().unwrap_or_else(|e| report_spawn_failure(exe, e))
+}
+
+/// Print why an engine command could not be run and return the failed status
+/// of `spawn_failure`, for helpers that hand back only a status.
+fn report_spawn_failure(exe: &str, e: io::Error) -> ExitStatus {
+    let (status, _, msg) = spawn_failure(exe, e);
+    eprintln!("{msg}");
+    status
 }
 
 /// Run a process with stderr streamed live to the terminal.
@@ -816,34 +800,37 @@ fn run_process(exe: &str, args: &[String]) -> (ExitStatus, String, String) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .output()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to execute {exe}: {e}");
-            std::process::exit(1);
-        });
-    (
-        output.status,
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::new(),
-    )
+        .output();
+    match output {
+        Ok(output) => (
+            output.status,
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::new(),
+        ),
+        Err(e) => spawn_failure(exe, e),
+    }
+}
+
+/// The outcome reported for an engine command that could not be started: a
+/// failed status (127, the shell's "cannot run") carrying the reason, so the
+/// caller's ordinary failure handling reports it.
+fn spawn_failure(exe: &str, e: io::Error) -> (ExitStatus, String, String) {
+    use std::os::unix::process::ExitStatusExt;
+    (ExitStatus::from_raw(127 << 8), String::new(), format!("failed to execute {exe}: {e}"))
 }
 
 /// Run a process with all output captured (no streaming).
 /// Used when stderr must be parsed (e.g., for error classification).
 fn run_process_quiet(exe: &str, args: &[String]) -> (ExitStatus, String, String) {
-    let output = Command::new(exe)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to execute {exe}: {e}");
-            std::process::exit(1);
-        });
-    (
-        output.status,
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    )
+    let output = Command::new(exe).args(args).stdin(Stdio::null()).output();
+    match output {
+        Ok(output) => (
+            output.status,
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ),
+        Err(e) => spawn_failure(exe, e),
+    }
 }
 
 // ======================================================================
@@ -865,6 +852,17 @@ mod tests {
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
         })
+    }
+
+    /// An engine binary that cannot be started is a failed command, not an
+    /// exit of the whole process.
+    #[test]
+    fn a_missing_engine_binary_is_a_failure_not_an_exit() {
+        let (status, _, err) = run_process_quiet("/nonexistent/podman", &["ps".to_string()]);
+        assert!(!status.success());
+        assert!(err.contains("/nonexistent/podman"), "{err}");
+        let (status, _, _) = run_process("/nonexistent/podman", &["ps".to_string()]);
+        assert!(!status.success());
     }
 
     /// Only an engine's own "no such object" answer means absent; an engine

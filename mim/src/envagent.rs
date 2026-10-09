@@ -252,6 +252,11 @@ fn build_new_language_shims(activation: &[(String, String)], home: &Path) -> Res
     morloc_deps::ambient::scrub(&mut cmd);
     crate::apply_activation(&mut cmd, activation);
     cmd.env("MORLOC_HOME", home);
+    // PROV-5: unless the launcher chose a link dir, link nothing into the
+    // user's own bin directory.
+    if std::env::var_os("MORLOC_BIN_LINK_DIR").is_none() {
+        cmd.env("MORLOC_BIN_LINK_DIR", "");
+    }
     cmd.env(ENV_INIT_INCREMENTAL, "1");
     cmd.env(ENV_STRICT_CONDA, "1");
     let status = cmd

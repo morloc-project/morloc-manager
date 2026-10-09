@@ -351,7 +351,18 @@ pub fn rename_environment(
     let mut old_tag: Option<String> = None;
     if let Some(engine) = engine {
         let from = serve::prefix_volume(&old_data);
-        if container::volume_exists(engine, &from) {
+        let has_volume = match container::probe(engine, "volume", &from) {
+            Probe::Present => true,
+            Probe::Absent => false,
+            Probe::Unknown(why) => {
+                return Err(ManagerError::EnvError(format!(
+                    "cannot ask {} about the conda prefix volume '{from}' ({why}); \
+                     nothing was renamed. Retry where the engine is reachable.",
+                    engine.name()
+                )))
+            }
+        };
+        if has_volume {
             let Some(image) = ec
                 .built_image
                 .as_deref()

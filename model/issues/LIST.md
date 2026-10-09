@@ -78,14 +78,6 @@ Spec: PROV-6 (open). `versions.abi_version` is read into
 referenced nowhere; doctor has no ABI check. Note also that "ABI" means two things in mim: this
 version, and the interpreter-minor pin in deps/abi.rs.
 
-### F13 Native `morloc init` symlinks into the user's `~/.local/bin` (surveyed)
-Spec: PROV-5. Native provisioning runs `morloc init -f` without setting
-`MORLOC_BIN_LINK_DIR` (mim/main.rs:4313-4337), and the compiler then links
-`morloc-nexus` (and `mim`) into `~/.local/bin` when it exists
-(compiler/library/Morloc/CodeGenerator/SystemConfig.hs:214-255). The last
-environment materialized wins the user's global `morloc-nexus`. Container
-materialize does not set it either; only the run path sets `""`.
-
 ### F14 `MORLOC_ENV` holds the literal "container" in OCI containers (verified)
 Spec: RUN-2. Native sets `MORLOC_ENV=<env name>` (mim/main.rs:1411); OCI
 containers set the literal `"container"` (mim/serve.rs:725); Apptainer sets
@@ -182,25 +174,17 @@ supervision.
 after `view add` makes `start` fail rather than the view being cleaned.
 Observation; no item yet.
 
-### F60 Engine helpers exit the process when the engine binary is missing (read)
-`run_process`/`run_process_quiet` (mim/container.rs) call
-`std::process::exit(1)` on a spawn failure instead of returning an error,
-so any caller (cleanup paths included) dies mid-operation. `rm` now probes
-before removing a volume; other callers still exit.
-
-### F61 Other engine checks still read "engine unreachable" as "absent" (read)
-`container_exists`, `image_exists_locally` and `volume_exists`
-(mim/container.rs) return false when the engine cannot answer. `rm` and
-`stop` now use `container::probe`, which separates the cases; `status`,
-`logs`, `start --force` (`serve_handle_alive`, `env_serve_alive`), doctor
-and `rename` still use the boolean forms.
-
 ### F62 Off Linux a native serve record cannot tell a reused pid (read)
 Spec: SERVE-3. The leader's start time comes from `/proc/<pid>/stat`; on
 macOS there is none, so a live pid is trusted (`serve_leader`) and `stop`
 or `rm` on a stale record could signal another process group. Records from
 mims before the start time was recorded fall back to the command line,
 which another env's nexus also matches.
+
+### F63 `find_free_host_port_skips_taken` is flaky (reproduced once)
+The test (mim/src/main.rs) picks a free port, then binds it; a test running
+in parallel can take the port in between. Seen once in three full runs.
+`start` has the same pick-then-bind window with other processes.
 
 ## mim: docs
 

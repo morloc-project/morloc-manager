@@ -2880,12 +2880,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // retires the container name it was launched under.
             if let Some(new) = &new_name {
                 environment::validate_rename(env_scope, &env_name, new, &ec)?;
-                if env_serve_alive(env_scope, &env_name, &ec) {
-                    return Err(ManagerError::EnvError(format!(
-                        "environment '{env_name}' is being served; stop it first with \
-                         'mim stop --env {env_name}', then rename it."
-                    )));
-                }
+                require_not_serving(env_scope, &env_name, &ec, format!(
+                    "environment '{env_name}' is being served; stop it first with \
+                     'mim stop --env {env_name}', then rename it."
+                ))?;
             }
             // Only apt packages are container-only; conda packages land in the
             // pixi solve, which the native backend has too.
@@ -3665,7 +3663,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let (env_name, scope, ec) = resolve_env_or_default(env)?;
             // Backend-neutral: eval is an HTTP client, and a native serve is as
             // valid a target as a container one.
-            if !env_serve_alive(scope, &env_name, &ec) {
+            if env_serve_probe(scope, &env_name, &ec) == container::Probe::Absent {
                 return Err(ManagerError::EnvError(format!(
                     "No server running for '{env_name}'. Start with: mim start --env {env_name}"
                 )));
@@ -4337,6 +4335,26 @@ fn run_native_morloc_init(
     fhs_wrapper: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
+    let mut cmd = native_init_command(morloc_bin, env_dir, runtime_dir, activation, fhs_wrapper, verbose);
+    let status = cmd
+        .status()
+        .map_err(|e| ManagerError::EnvError(format!("could not run morloc init: {e}")))?;
+    if !status.success() {
+        return Err(ManagerError::EnvError(
+            "morloc init failed while provisioning the native environment".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn native_init_command(
+    morloc_bin: &std::path::Path,
+    env_dir: &std::path::Path,
+    runtime_dir: &std::path::Path,
+    activation: &[(String, String)],
+    fhs_wrapper: Option<&str>,
+    verbose: bool,
+) -> Command {
     // init execs the conda toolchain (gcc/cargo/python) to build libmorloc.so +
     // morloc-nexus + shims, so on NixOS it must run inside the FHS sandbox.
     let mut args: Vec<std::ffi::OsString> = vec!["init".into(), "-f".into()];
@@ -4354,15 +4372,10 @@ fn run_native_morloc_init(
     // init builds libmorloc.so + morloc-nexus from source with the env toolchain;
     // point it at the Rust workspace bundled in the provisioned runtime.
     cmd.env("MORLOC_RUST_DIR", provision::runtime_rust_src(runtime_dir));
-    let status = cmd
-        .status()
-        .map_err(|e| ManagerError::EnvError(format!("could not run morloc init: {e}")))?;
-    if !status.success() {
-        return Err(ManagerError::EnvError(
-            "morloc init failed while provisioning the native environment".to_string(),
-        ));
-    }
-    Ok(())
+    // PROV-5: link nothing into the user's own bin directory; the env's bin/
+    // is on PATH in every run.
+    cmd.env("MORLOC_BIN_LINK_DIR", "");
+    cmd
 }
 
 /// Materialize a native environment: solve its pixi toolchain, capture the
@@ -7297,12 +7310,10 @@ fn clear_materialized_marker(scope: Scope, name: &str, ec: &EnvironmentConfig) {
 /// them persistent; a compiled pool built against the previous runtime is
 /// rebuilt by the next `morloc make`, as after any update.
 fn reset_for_reinit(scope: Scope, name: &str, ec: &EnvironmentConfig) -> Result<()> {
-    if env_serve_alive(scope, name, ec) {
-        return Err(ManagerError::EnvError(format!(
-            "environment '{name}' is being served; stop it first with \
-             'mim stop --env {name}', then rebuild it."
-        )));
-    }
+    require_not_serving(scope, name, ec, format!(
+        "environment '{name}' is being served; stop it first with \
+         'mim stop --env {name}', then rebuild it."
+    ))?;
     let data_dir = cfg::env_data_dir(scope, name);
     discard_derived_state(&data_dir, ec.backend.container_engine())?;
     clear_materialized_marker(scope, name, ec);
@@ -7345,9 +7356,18 @@ fn discard_derived_state(data_dir: &std::path::Path, engine: Option<ContainerEng
     // nothing describes a world that no longer exists.
     if let Some(engine) = engine {
         let volume = serve::prefix_volume(data_dir);
-        if container::volume_exists(engine, &volume)
-            && !container::volume_remove(engine, &volume).success()
-        {
+        let present = match container::probe(engine, "volume", &volume) {
+            container::Probe::Present => true,
+            container::Probe::Absent => false,
+            container::Probe::Unknown(why) => {
+                return Err(ManagerError::EnvError(format!(
+                    "cannot ask {} about the conda prefix volume '{volume}' ({why}); \
+                     retry where the engine is reachable.",
+                    engine.name()
+                )))
+            }
+        };
+        if present && !container::volume_remove(engine, &volume).success() {
             return Err(ManagerError::EnvError(format!(
                 "cannot remove the conda prefix volume '{volume}'; is a container of \
                  this environment still running? Stop it and run this again."
@@ -8773,11 +8793,21 @@ fn term_outcome(pgid: u32, sent: nix::Result<()>) -> Result<()> {
 
 /// Is the serve behind this handle still live? (dispatches on the stored handle,
 /// not the env's current backend).
-fn serve_handle_alive(handle: &ServeHandle) -> bool {
+fn serve_handle_probe(handle: &ServeHandle) -> container::Probe {
     match handle {
-        ServeHandle::Native { pid, start, .. } => native_serve_alive(*pid, *start),
-        ServeHandle::Container { engine, name } => container::container_exists(*engine, name),
+        ServeHandle::Native { pid, start, .. } => {
+            if native_serve_alive(*pid, *start) {
+                container::Probe::Present
+            } else {
+                container::Probe::Absent
+            }
+        }
+        ServeHandle::Container { engine, name } => container::probe(*engine, "container", name),
     }
+}
+
+fn serve_handle_alive(handle: &ServeHandle) -> bool {
+    serve_handle_probe(handle) == container::Probe::Present
 }
 
 /// Whether environment `name` currently has a live server, regardless of
@@ -8785,14 +8815,32 @@ fn serve_handle_alive(handle: &ServeHandle) -> bool {
 /// handle-less legacy record falls back to the container-name probe only for
 /// container backends -- native serves always record a handle, so a native env
 /// reaching that fallback simply is not serving.
-fn env_serve_alive(scope: Scope, name: &str, ec: &EnvironmentConfig) -> bool {
-    let Some(rt) = cfg::read_serve_runtime(scope, name) else { return false };
+fn env_serve_probe(scope: Scope, name: &str, ec: &EnvironmentConfig) -> container::Probe {
+    let Some(rt) = cfg::read_serve_runtime(scope, name) else { return container::Probe::Absent };
     if let Some(handle) = &rt.handle {
-        return serve_handle_alive(handle);
+        return serve_handle_probe(handle);
     }
     match ec.backend.container_engine() {
-        Some(engine) => container::container_exists(engine, &serve::serve_container_name(name)),
-        None => false,
+        Some(engine) => container::probe(engine, "container", &serve::serve_container_name(name)),
+        None => container::Probe::Absent,
+    }
+}
+
+/// Fail with `serving` when the env has a live server, and also when the
+/// engine cannot say: the callers are about to move or delete what a server
+/// would be running from.
+fn require_not_serving(scope: Scope, name: &str, ec: &EnvironmentConfig, serving: String) -> Result<()> {
+    refuse_unless_absent(env_serve_probe(scope, name, ec), serving)
+}
+
+fn refuse_unless_absent(probe: container::Probe, present: String) -> Result<()> {
+    match probe {
+        container::Probe::Absent => Ok(()),
+        container::Probe::Present => Err(ManagerError::EnvError(present)),
+        container::Probe::Unknown(why) => Err(ManagerError::EnvError(format!(
+            "cannot tell whether a server is running: the container engine did not \
+             answer ({why}). Retry where the engine is reachable."
+        ))),
     }
 }
 
@@ -13549,6 +13597,30 @@ run:
     fn doctor_system_requires_env() {
         assert!(Cli::try_parse_from(["mim", "doctor", "--system"]).is_err());
         assert!(Cli::try_parse_from(["mim", "doctor", "--system", "--env", "e"]).is_ok());
+    }
+
+    /// PROV-5: the native `morloc init` is told not to link binaries into the
+    /// user's own bin directory (the compiler's default when unset).
+    #[test]
+    fn native_init_links_nothing_outside_the_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = native_init_command(std::path::Path::new("morloc"), tmp.path(), tmp.path(), &[], None, false);
+        let link = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "MORLOC_BIN_LINK_DIR")
+            .and_then(|(_, v)| v.map(|v| v.to_os_string()));
+        assert_eq!(link.as_deref(), Some(std::ffi::OsStr::new("")));
+    }
+
+    /// A guard before moving or deleting an env refuses when the engine
+    /// cannot say whether a server is running.
+    #[test]
+    fn an_unanswered_serve_probe_is_not_taken_for_no_server() {
+        use container::Probe;
+        assert!(refuse_unless_absent(Probe::Absent, "x".into()).is_ok());
+        assert!(refuse_unless_absent(Probe::Present, "x".into()).is_err());
+        let err = refuse_unless_absent(Probe::Unknown("down".into()), "x".into()).unwrap_err();
+        assert!(err.to_string().contains("down"), "{err}");
     }
 
     /// `--json` is honored or refused, never ignored.

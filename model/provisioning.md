@@ -39,7 +39,8 @@ detected rather than served from the stale entry.
 
 ### PROV-5 The runtime is built inside the environment
 Intent: proposed
-Code: deviates F13
+Code: unaudited
+Tests: native_init_links_nothing_outside_the_environment
 
 The runtime library, the nexus and the language bindings are built by
 `morloc init` against the environment's own solved toolchain, not the
