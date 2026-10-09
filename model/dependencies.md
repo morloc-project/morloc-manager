@@ -66,8 +66,8 @@ rebuilt, or refused in an immutable environment.
 Intent: proposed
 Code: unaudited
 
-conda and PyPI packages are solved into the world. Crates and Julia
-packages are left to the language's own build tool. Sources mim does not
+conda and PyPI packages are solved into the world. Crates are left to
+cargo. Sources mim does not
 support are refused, never dropped. Two conflicting declarations of one
 package (two channels, two local paths, a path and a version) are refused.
 

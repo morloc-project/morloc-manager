@@ -106,7 +106,7 @@ fn is_path_list(key: &str) -> bool {
             | "CPLUS_INCLUDE_PATH" | "DYLD_LIBRARY_PATH" | "DYLD_FALLBACK_LIBRARY_PATH"
             | "PYTHONPATH" | "PERL5LIB" | "R_LIBS" | "R_LIBS_USER" | "R_LIBS_SITE"
             | "PKG_CONFIG_PATH" | "PKG_CONFIG_LIBDIR" | "CMAKE_PREFIX_PATH"
-            | "MANPATH" | "INFOPATH" | "JULIA_DEPOT_PATH"
+            | "MANPATH" | "INFOPATH"
     )
 }
 

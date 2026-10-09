@@ -50,8 +50,6 @@ pub enum PackageReq {
     Pypi { name: String, constraint: String },
     /// crates.io (owned by cargo; resolved at pool build).
     Crates { name: String, constraint: String },
-    /// Julia's General registry (owned by Pkg.jl; resolved at pool build).
-    Pkg { name: String, constraint: String },
     /// R CRAN registry (not yet honored natively; the compiler rejects it).
     Cran { name: String, constraint: String },
     /// R Bioconductor registry (not yet honored natively).
@@ -80,7 +78,6 @@ impl PackageReq {
             PackageReq::Conda { name, .. }
             | PackageReq::Pypi { name, .. }
             | PackageReq::Crates { name, .. }
-            | PackageReq::Pkg { name, .. }
             | PackageReq::Cran { name, .. }
             | PackageReq::Bioconductor { name, .. }
             | PackageReq::Local { name, .. }
@@ -112,7 +109,7 @@ pub struct ModuleReq {
 }
 
 /// A program's declared environment requirements. Keys of `packages` are
-/// canonical morloc language names ("py", "r", "cpp", "rust", "julia").
+/// canonical morloc language names ("py", "r", "cpp", "rust").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvSpec {
     pub envspec_version: u32,
@@ -154,27 +151,9 @@ impl EnvSpec {
                 peek.envspec_version, ENVSPEC_VERSION
             )));
         }
-        let mut spec: EnvSpec = serde_json::from_str(text).map_err(|e| {
+        serde_json::from_str(text).map_err(|e| {
             DepsError::Env(format!("Failed to parse envspec.json: {e}"))
-        })?;
-        spec.normalize_language_codes();
-        Ok(spec)
-    }
-
-    /// Canonicalize language codes to the names the rest of the manager keys on.
-    /// The compiler's canonical code for Julia is `jl` (its lang.yaml `name`), but
-    /// the manager's toolchain / runtime / shim-marker tables all key on `julia`
-    /// (the conda package name) -- the same morloc-vs-conda split as `py` vs
-    /// `python`. Map `jl` -> `julia` once at ingestion so every downstream
-    /// consumer (aggregate, abi-lock, shim detection) agrees; the compiler already
-    /// keys its per-language `packages` under `julia`, so only the language list
-    /// carries the short code.
-    fn normalize_language_codes(&mut self) {
-        for l in &mut self.languages {
-            if l.lang == "jl" {
-                l.lang = "julia".to_string();
-            }
-        }
+        })
     }
 
     /// Read and parse the `envspec.json` sitting in a program's build directory.
@@ -300,15 +279,11 @@ mod tests {
     const SAMPLE: &str = r#"{"envspec_version":2,"morloc_version":"0.98.2","languages":[{"lang":"py","constraint":">=3.10"},{"lang":"cpp","std":"c++20"},{"lang":"rust"}],"packages":{"cpp":[{"name":"opencv","constraint":">=4.8","source":"conda"}],"py":[{"name":"numpy","constraint":">=2,<3","source":"conda"},{"name":"requests","constraint":"*","source":"pypi"}],"rust":[{"name":"ndarray","constraint":"0.16","source":"crates"}]},"system":[{"name":"blas","provider":"unspecified"}],"modules":[{"name":"tensor-cpp","git_hash":"abc123"}]}"#;
 
     #[test]
-    fn from_json_normalizes_julia_code_jl_to_julia() {
-        // The compiler's canonical Julia language code is `jl` (lang.yaml name),
-        // but every manager table keys on `julia`; ingestion must bridge them.
-        let s = EnvSpec::from_json(
-            r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"jl"},{"lang":"py"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(s.languages[0].lang, "julia");
-        assert_eq!(s.languages[1].lang, "py"); // others untouched
+    fn rejects_pkg_source() {
+        let r = EnvSpec::from_json(
+            r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"}],"packages":{"py":[{"name":"x","constraint":"*","source":"pkg"}]}}"#,
+        );
+        assert!(r.is_err());
     }
 
     #[test]
