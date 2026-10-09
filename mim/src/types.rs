@@ -115,8 +115,6 @@ impl Backend {
     }
 
     /// True for the native (no-container) backend.
-    // Used by the command-dispatch native branch, wired in the next P2b step.
-    #[allow(dead_code)]
     pub fn is_native(&self) -> bool {
         matches!(self, Backend::Native)
     }
@@ -309,7 +307,8 @@ fn default_env_schema() -> u32 {
 /// prebuilt one).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevConfig {
-    /// Absolute host path to the morloc source repo, bind-mounted into the env.
+    /// Absolute host path to the morloc source repo the dev image is provisioned
+    /// from. It is not mounted.
     pub source: String,
 }
 
@@ -527,7 +526,7 @@ impl EnvironmentConfig {
         }
     }
 
-    /// True iff this is a dev environment (builds morloc from a mounted source
+    /// True iff this is a dev environment (builds morloc from a source
     /// tree). Equivalent to `self.dev.is_some()`.
     pub fn is_dev(&self) -> bool {
         self.dev.is_some()
@@ -802,7 +801,7 @@ fn sorted_union(a: &[String], b: &[String]) -> Vec<String> {
     all
 }
 
-/// Runtime record of what a serve container is ACTUALLY serving, written by
+/// Runtime record of what a server is ACTUALLY serving, written by
 /// `start` and read by `status`. Distinct from `ViewSet` (declared
 /// intent): this reflects the live invocation, including the resolved host/port
 /// and whether a token is required.

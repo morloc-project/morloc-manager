@@ -56,9 +56,8 @@ pub struct TripleAssets {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct MorlocVersions {
     pub morloc_version: String,
-    /// morloc C ABI version. RECORDED (for doctor / frozen-image coherence), not
-    /// gated at install: libmorloc is built from source at `morloc init`, so a
-    /// native runtime is ABI-coherent by construction.
+    /// morloc C ABI version. Not checked: libmorloc is built from source at
+    /// `morloc init`, so a runtime is ABI-coherent by construction.
     pub abi_version: u32,
     /// `envspec.json` schema version (integer).
     pub envspec_version: u32,
@@ -287,7 +286,7 @@ pub fn fetch_latest_tag() -> Result<String> {
 }
 
 /// Resolve a requested release specifier to a concrete GitHub tag. "latest"
-/// queries the API; a bare version like "0.98.3" becomes "v0.98.3"; anything
+/// follows GitHub's releases/latest redirect; a bare version like "0.98.3" becomes "v0.98.3"; anything
 /// else (an explicit tag such as "dev" or "v0.98.3") is used verbatim.
 pub fn resolve_tag(requested: &str) -> Result<String> {
     let requested = requested.trim();

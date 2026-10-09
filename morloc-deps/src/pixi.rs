@@ -8,9 +8,10 @@
 //! Mapping decisions:
 //!   * Language toolchains -> conda `[dependencies]` (py->python, cpp->cxx-compiler,
 //!     rust->rust, r->r-base, julia->julia, futhark->futhark).
-//!   * Python packages: `source` (pure wheels) -> `[pypi-dependencies]` (uv);
-//!     `abi`/`unknown` -> conda `[dependencies]`.
-//!   * R packages -> conda `r-<name>` (conda-forge R feedstocks).
+//!   * Python packages: `pypi` -> `[pypi-dependencies]` (uv), `conda` -> conda
+//!     `[dependencies]`; local and vendored paths -> pypi path entries.
+//!   * R conda packages -> `r-<name>` on conda-forge, the name as written on
+//!     another channel.
 //!   * C++ packages and system libs -> conda `[dependencies]`.
 //!   * Rust and Julia packages are EXCLUDED: cargo (crates.io) and Pkg.jl own
 //!     those, resolved in-world when the pool is built. Only their toolchains
@@ -468,7 +469,7 @@ fn aggregate(
                         other => {
                             return Err(DepsError::Env(format!(
                                 "local dependency '{name}' for language '{other}' cannot be \
-                                 provisioned (local deps are supported for py and rust)."
+                                 provisioned (local deps are supported for py, rust and julia)."
                             )))
                         }
                     },
@@ -738,10 +739,6 @@ pub fn solve(
     Ok(())
 }
 
-/// Produce the `pixi.lock` for the manifest in `env_dir` without installing on
-/// the host. The lock is what a container image reproduces with `pixi install
-/// --locked`, so the container's conda world is pinned to the same solve. A
-/// failure here is phase 2 of the impurity gate (a package conda cannot provide).
 /// Try to materialize the environment from its EXISTING lock WITHOUT re-solving:
 /// `pixi install --locked`. Returns `Ok(true)` when the lock still satisfies the
 /// manifest and the prefix is installed from it (zero version drift); `Ok(false)`
@@ -778,6 +775,10 @@ pub fn install_locked(
     Ok(out.status.success())
 }
 
+/// Produce the `pixi.lock` for the manifest in `env_dir` without installing on
+/// the host. The lock is what a container image reproduces with `pixi install
+/// --locked`, so the container's conda world is pinned to the same solve. A
+/// failure here is phase 2 of the impurity gate (a package conda cannot provide).
 pub fn lock(env_dir: &Path, pixi_bin: &Path, ssl_cert_file: Option<&Path>) -> Result<()> {
     let manifest = env_dir.join("pixi.toml");
     let mut cmd = Command::new(pixi_bin);
@@ -1283,7 +1284,7 @@ platforms = [\"linux-64\"]
     fn py_local_dep_lowers_to_editable_pypi_path() {
         // A python local dep becomes a uv path entry; a rust local crate is owned
         // by cargo at pool build, so it must NOT appear in the pixi manifest. Paths
-        // are already absolute here (mim-env resolves them before this stage).
+        // are already absolute here (`mim sync` resolves them before this stage).
         const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"},{"lang":"rust"}],"packages":{"py":[{"name":"mylib","source":"local","path":"/abs/mylib","editable":true}],"rust":[{"name":"mycrate","source":"local","path":"/abs/mycrate","editable":false}]}}"#;
         let out = render_with(EnvSpec::from_json(S).unwrap());
         assert!(

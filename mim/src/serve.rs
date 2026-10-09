@@ -517,14 +517,13 @@ pub(crate) fn program_help_config(
 // Container constants
 // ======================================================================
 
-/// In-container MORLOC_HOME: the IMMUTABLE runtime prefix (bin/lib/include),
-/// image-baked by `morloc init` and NEVER bind-mounted, so a state mount cannot
-/// shadow it (the mount-shadow bug the three-way split fixes).
+/// In-container MORLOC_HOME: the runtime prefix (bin/lib/include) that
+/// `morloc init` builds into the host's `<data>/runtime`, bind-mounted here
+/// apart from the state mount so neither shadows the other.
 pub const CONTAINER_MORLOC_HOME: &str = "/opt/morloc";
 
-/// In-container MORLOC_STATE: the MUTABLE state root (exe/, fdb/, installed
-/// modules, logs). This is the ONLY thing bind-mounted from the host env dir, so
-/// installs/builds persist without covering the runtime.
+/// In-container MORLOC_STATE: the mutable state root (exe/, fdb/, installed
+/// modules, logs), bind-mounted from the host env's data dir.
 pub const CONTAINER_MORLOC_STATE: &str = "/opt/morloc-state";
 
 /// In-container HOME for docker/podman: an env-owned, base-independent home so

@@ -86,10 +86,10 @@ fn build_help_template() -> String {
   {b}install{r}    Build and install a module into an environment
   {b}view{r}       Choose which installed modules are served (MCP/API/eval)
   {b}start{r}      Serve an environment over the network
-  {b}eval{r}       Evaluate a morloc expression against a serve container
-  {b}status{r}     List running serve containers
-  {b}stop{r}       Stop a running serve container
-  {b}logs{r}       Stream logs from a running serve container
+  {b}eval{r}       Evaluate a morloc expression against a running server
+  {b}status{r}     List running servers
+  {b}stop{r}       Stop a running server
+  {b}logs{r}       Stream logs from a running server
 
 {bu}Deployment{r}
   {b}freeze{r}     Freeze an environment into a deployment image
@@ -101,8 +101,8 @@ fn build_help_template() -> String {
 
 #[derive(Parser)]
 #[command(name = "mim")]
-#[command(about = "container lifecycle manager for Morloc")]
-#[command(long_about = "Manage containerized Morloc installations, dependency layers, and deployments")]
+#[command(about = "environment manager for Morloc")]
+#[command(long_about = "Manage Morloc environments (native or containerized), their dependencies, servers, and deployment images")]
 #[command(disable_version_flag = true)]
 #[command(arg_required_else_help = true)]
 #[command(hide_possible_values = true)]
@@ -161,8 +161,9 @@ environment; pass `--wizard` to be prompted for each one instead.")]
         engine: Option<EngineArg>,
         /// Create a DEV environment from a morloc source tree at this path:
         /// provision the tooling (a container image with a baked ghcup/stack/cargo
-        /// toolchain, plus the pixi env) around the mounted source, which you build
-        /// the compiler + runtime from in the dev shell (no release download).
+        /// toolchain, plus the pixi env) from the source's build files (no release
+        /// download). The source is not mounted: build the compiler + runtime by
+        /// running `mim shell` from inside the source tree.
         /// `--morloc-version` then sets the stdlib base only. Docker/podman + local
         /// scope only.
         #[arg(long, help_heading = "Advanced")]
@@ -672,7 +673,7 @@ Examples:
         /// schema; -x flags are appended after it.
         #[arg(long, value_name = "FILE")]
         flagfile: Option<String>,
-        /// Replace an already-running serve container
+        /// Replace an already-running server
         #[arg(long)]
         force: bool,
         /// Host name or address clients use to reach this serve, put in the
@@ -681,7 +682,7 @@ Examples:
         #[arg(long, value_name = "HOST")]
         advertise_host: Option<String>,
     },
-    /// Stop a running serve container
+    /// Stop a running server
     #[command(display_order = 21)]
     #[command(after_help = "\
 Examples:
@@ -692,11 +693,11 @@ Examples:
         #[arg(long)]
         env: Option<String>,
     },
-    /// Stream logs from a running serve container
+    /// Stream logs from a running server
     #[command(display_order = 22)]
     #[command(after_help = "\
 Examples:
-  mim logs              # logs from only running serve container
+  mim logs              # logs from the only running server
   mim logs --env myenv
   mim logs -f --env myenv     # follow mode")]
     Logs {
@@ -745,7 +746,7 @@ answers all three.")]
         #[arg(long)]
         force: bool,
     },
-    /// Evaluate a morloc expression against a running serve container
+    /// Evaluate a morloc expression against a running server
     #[command(display_order = 25)]
     #[command(after_help = "\
 Examples:
@@ -775,8 +776,10 @@ Examples:
   mim install main.loc              # installs under the module name
   mim install --env dev ./mypkg     # installs a package directory into 'dev'
 
-Sugar for: mim run -- morloc make --install <file>
-       (or: mim run -- morloc install --build <dir> for a directory)")]
+Before the build, mim reads the program's declared dependencies and solves
+them into the environment. The build is then
+  mim run -- morloc make --install <file>
+  (or: mim run -- morloc install --build <dir> for a directory)")]
     Install {
         /// Morloc source file (.loc) or package directory to build and install.
         /// A directory is treated as a package (main.loc + package.yaml). The
@@ -856,7 +859,7 @@ Examples:
         #[command(subcommand)]
         action: EnvAction,
     },
-    /// List running serve containers
+    /// List running servers
     #[command(display_order = 27)]
     #[command(after_help = "\
 Examples:
@@ -2308,8 +2311,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         deffile: Option<String>,
                         flags: FlagConfig,
                     }
-                    // For a dev env, `morloc_version` is the STDLIB BASE; the mounted
-                    // source (the developer builds the compiler from it) is here.
+                    // For a dev env, `morloc_version` is the STDLIB BASE; the
+                    // source tree (the developer builds the compiler from it) is here.
                     #[derive(serde::Serialize)]
                     struct DevInfo {
                         source: String,
@@ -2440,7 +2443,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     }
                     if let Some(ref dev) = ec.dev {
                         // A dev env: the version below is the stdlib base; the compiler
-                        // is built by the developer from the mounted source.
+                        // is built by the developer from the source tree.
                         println!("Mode:      dev (compiler built from source by developer)");
                         println!("  Source:      {}", dev.source);
                     }
@@ -3754,7 +3757,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             Ok(())
         }
 
-        // ---- expose ----
+        // ---- view ----
         // Bare `mim view` shows the views. The word promises a look at something,
         // and the other `view` in this toolchain (`morloc-nexus view`) has
         // already taught that reading, so the two agree rather than compete.
@@ -3783,7 +3786,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 cfg::write_views(scope, &env_name, &views)?;
                 let protos: Vec<&str> = protocols.iter().map(|p| p.as_str()).collect();
                 eprintln!(
-                    "'{module}' is now in the {} view of '{env_name}'. Run 'mim start' to serve.",
+                    "'{module}' is now in the {} view of '{env_name}'. Run 'mim start' to serve \
+                     (--force if it is already serving).",
                     protos.join(" and ")
                 );
                 Ok(())
@@ -3795,7 +3799,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 if views.remove(&module) {
                     cfg::write_views(scope, &env_name, &views)?;
                     eprintln!("Removed '{module}' from the views of '{env_name}'. \
-                               Run 'mim start' to apply.");
+                               Run 'mim start' to apply (--force if it is already serving).");
                 } else {
                     eprintln!("'{module}' was not in any view of '{env_name}'.");
                 }
@@ -3829,7 +3833,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             }
         },
 
-        // ---- status ----
+        // ---- env ----
         Cmd::Env { action } => match action {
             EnvAction::Prefix { env, lang } => {
                 let (env_name, scope, _ec) = resolve_env_or_default(env)?;
@@ -4173,8 +4177,8 @@ pub(crate) fn native_run_env(
 // ======================================================================
 
 /// The release tag to provision the morloc runtime from: `$MORLOC_RELEASE_TAG`
-/// if set (e.g. "dev" or "v0.98.3"), else "latest" (resolved via the releases
-/// API). mim is self-bootstrapping -- it downloads the compiler +
+/// if set (e.g. "dev" or "v0.98.3"), else "latest" (resolved by following GitHub's
+/// releases/latest redirect). mim is self-bootstrapping -- it downloads the compiler +
 /// Rust source (init builds the runtime) rather than requiring a host morloc install.
 fn resolve_release_tag() -> String {
     std::env::var("MORLOC_RELEASE_TAG")
@@ -5529,8 +5533,7 @@ fn backend_options(container_only: bool) -> Vec<BackendOption> {
     }];
     // Container engines follow native, in the shared ContainerEngine::ALL order.
     for eng in ContainerEngine::ALL {
-        // A dev env builds from a mounted source tree, which only docker/podman
-        // support; apptainer is listed but greyed for dev.
+        // A dev env is docker/podman only; apptainer is listed but greyed for dev.
         let disabled = if container_only && !eng.is_oci() {
             Some("not available for a dev environment (docker/podman only)".to_string())
         } else if engine_installed(eng) {
@@ -6324,9 +6327,8 @@ impl EditField {
 }
 
 /// The editable fields for a plan, in display order. Scope and system packages
-/// apply to container backends; the home settings and the dev mim-env to
-/// docker/podman and dev respectively; the dev source and (local-only) scope
-/// shape the dev case.
+/// apply to container backends, the home settings to docker/podman. A dev env
+/// adds its source and drops scope (dev envs are local-only).
 fn confirm_fields(plan: &NewPlan) -> Vec<EditField> {
     let is_container = matches!(plan.backend, Backend::Container(_));
     let is_oci = matches!(plan.backend, Backend::Container(e) if e.is_oci());
@@ -6577,7 +6579,7 @@ fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
         cli_cert_bundle,
     } = input;
 
-    // 0. Dev mode (build from a mounted source tree). A dev env is container-only
+    // 0. Dev mode (build from a source tree). A dev env is container-only
     //    and local-scope; it forces those choices below.
     let dev_source = match cli_dev {
         Some(p) => Some(
@@ -6848,7 +6850,7 @@ fn native_new(
 }
 
 
-/// Slim base image for requirement-derived container builds. Fully qualified
+/// The light (`--base light`) base image for container builds. Fully qualified
 /// (registry + `library/` namespace) so podman resolves it without a
 /// containers-registries.conf: podman refuses to expand a bare short name like
 /// `debian:bookworm-slim` when no unqualified-search-registries config is present
@@ -7367,7 +7369,7 @@ fn rematerialize_env(
     // passes the recorded version.
     let effective_version = requested_version.as_deref();
 
-    // Dev envs mount a source tree the developer builds from: a version change
+    // Dev envs provision tooling for a source tree the developer builds from: a version change
     // re-points the stdlib base (re-solve lib deps) and re-provisions the tooling,
     // but builds NO compiler (that is the developer's, in the dev shell). Route to
     // the dev provisioner, updating the stdlib base.
@@ -7541,9 +7543,9 @@ fn build_requirement_derived_image(
         pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
     }
 
-    // Build the requirement-INDEPENDENT base image (base tools + pixi + the
-    // compiler/rust source). The env-specific pixi solve + `morloc init` run in a
-    // container step below, writing into the host mounts.
+    // Build the env's image (base tools + pixi + the compiler/rust source). The
+    // env-specific pixi solve + `morloc init` run in a container step below,
+    // writing into the host mounts.
     eprintln!("Staging the morloc runtime into the build context...");
     // A container runs Linux at the env's architecture; the staged mim agent must
     // match that platform, not the host's (identical to the triple
@@ -7892,7 +7894,7 @@ fn retire_host_prefix(pixi_dir: &std::path::Path) -> Result<()> {
 ///
 /// `runtime_may_be_empty` covers the two launches that legitimately precede a
 /// runtime: `morloc init` itself, which is what writes it, and a dev env, whose
-/// developer builds it from mounted source.
+/// developer builds it from the source tree.
 fn require_materialized(v_data_dir: &str, runtime_may_be_empty: bool) -> Result<()> {
     let root = std::path::Path::new(v_data_dir);
     let pixi_dir = root.join("pixi");
@@ -7975,7 +7977,7 @@ fn materialize_container_env(
     // Solve /env from its mounted pixi.toml/lock. For a release env, also activate
     // the now-solved toolchain and build libmorloc/nexus into MORLOC_HOME. A dev
     // env skips that: the developer builds the runtime (via `morloc init`) from the
-    // mounted source, so provisioning stops at the pixi env.
+    // source tree, so provisioning stops at the pixi env.
     let mut script = format!("set -e\n{pixi} install --locked\n", pixi = serve::CONTAINER_PIXI_BIN);
     script.push_str(&prefix_postinstall_script());
     if build_runtime {
@@ -8028,12 +8030,12 @@ fn materialize_container_env(
 }
 
 // ======================================================================
-// Dev environments: provision tooling around a mounted source tree
+// Dev environments: provision tooling around a source tree
 //
 // mim builds the image (base + baked ghcup/stack/cargo toolchain) and
 // materializes the pixi env. It does NOT build the morloc compiler or runtime: an
 // in-development source may legally not compile, so the developer builds them in
-// the dev shell, where the toolchain and the mounted source are on PATH.
+// the dev shell, where the toolchain and the working directory are available.
 // ======================================================================
 
 /// First 16 hex chars of the SHA-256 of `data` -- a stable short digest.
@@ -8053,7 +8055,7 @@ fn dev_image_key(world_digest: &str, dockerfile: &str) -> String {
 
 /// Provision a dev environment: build the image (base + baked ghcup/stack/cargo
 /// toolchain) and materialize the pixi env for `source`, returning the image tag.
-/// The compiler + runtime are the developer's to build from the mounted source.
+/// The compiler + runtime are the developer's to build from the source tree.
 /// Sibling of `build_requirement_derived_image`; diverges because there is no
 /// prebuilt compiler to download/stage and the image bakes nothing from the source.
 fn build_dev_container_image(
@@ -8072,7 +8074,7 @@ fn build_dev_container_image(
     let arch::ContainerTarget { engine, arch } = target;
     morloc_deps::layout::validate_source(source).map_err(ManagerError::EnvError)?;
 
-    // Parse the mounted source's YAMLs (no compiler exists yet) for the pixi solve
+    // Parse the source tree's YAMLs (no compiler exists yet) for the pixi solve
     // (pool runtimes + C/Rust toolchain) and the dev-only apt list.
     let support = langsupport::LangSupport::from_source_dir(source, stdlib_version)?;
     // The dev image apt-installs the compiler's build deps (dev-apt from the source)

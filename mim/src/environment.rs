@@ -20,7 +20,7 @@ pub struct EnvInfo {
     pub name: String,
     pub morloc_version: Option<Version>,
     pub is_default: bool,
-    /// A dev environment (built from a mounted source tree). For these the
+    /// A dev environment (built from a source tree). For these the
     /// version above is the stdlib base, not the compiler.
     pub is_dev: bool,
     /// The image architecture of a docker/podman env; `None` for the other
@@ -81,9 +81,6 @@ pub fn detect_morloc_version(engine: ContainerEngine, image: &str) -> Result<Ver
 // Core operations
 // ======================================================================
 
-/// Create or update an environment.
-///
-/// When `is_new` is true: validates name uniqueness, creates data directories.
 /// Longest environment name. It is a path component, part of a container
 /// name and the bulk of an image tag, whose limit is 128 characters.
 pub const MAX_ENV_NAME_LEN: usize = 64;

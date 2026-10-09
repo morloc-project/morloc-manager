@@ -1423,7 +1423,7 @@ fn check_one_manifest(
 }
 
 fn check_morloc_version(c: &mut Counts, engine: ContainerEngine, ec: &EnvironmentConfig) {
-    // A dev env's compiler is built by the developer from the mounted source, so
+    // A dev env's compiler is built by the developer from the source tree, so
     // mim does not track its version (the stdlib base is separate).
     // Report the mode + source; the compiler is the developer's to build/verify.
     if let Some(dev) = &ec.dev {

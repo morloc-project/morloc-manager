@@ -36,7 +36,7 @@ Example:
 
 ```json
 {
-  "envspec_version": 1,
+  "envspec_version": 2,
   "morloc_version": "0.99.0",
   "languages": [ { "lang": "py", "constraint": ">=3.10" }, { "lang": "cpp", "std": "c++20" }, { "lang": "rust" } ],
   "packages": {
@@ -86,12 +86,12 @@ Example:
 A script-provisioned language (e.g. futhark) carries an `install_script` instead
 of a conda `runtime`.
 
-### 3. `morloc-release-manifest.json` — the native-install manifest
+### 3. `morloc-release-manifest.json` — the release manifest
 
  - **Producer:** Morloc's GitHub release CI.
 
  - **Consumer:** `mim` -- fetched to discover, SHA-verify, and download the
-   prebuilt compiler + rust source for a native install.
+   prebuilt compiler + rust source for a native or container environment.
 
  - **Version:** integer `schema`. The compiler's own contract versions are
    inlined under `versions{}` (from `morloc versions`), so `mim` gates on
@@ -104,7 +104,7 @@ Example:
   "schema": 1,
   "version": "0.99.0",
   "rust_src": "morloc-rust-src.tar.gz",
-  "versions": { "morloc_version": "0.99.0", "abi_version": 1, "envspec_version": 1, "lang_support_schema": "1.0" },
+  "versions": { "morloc_version": "0.99.0", "abi_version": 1, "envspec_version": 2, "lang_support_schema": "1.0" },
   "triples": { "linux-x86_64": { "morloc": "morloc-linux-x86_64" } },
   "sha256": { "morloc-linux-x86_64": "<hex>", "morloc-rust-src.tar.gz": "<hex>" }
 }
@@ -113,11 +113,11 @@ Example:
 - `versions` is checked at install time: if any declared contract version *exceeds*
   what this `mim` supports, the install is refused with "upgrade mim".
 
-  `abi_version` is recorded (for doctor / frozen-image coherence), not gated, while
-  libmorloc is built from the compiler's own source.
+  `abi_version` is not checked: libmorloc is built from the compiler's own
+  source.
 
-- `sha256` is **mandatory**: every asset the manager downloads is verified
-  against its digest.
+- `sha256` is **mandatory**: the compiler binary and the rust source are
+  verified against their digests.
 
 
 ### 4. The build-hook CLI — how `morloc make` invokes the provisioner
@@ -126,12 +126,16 @@ During `morloc make`, before compiling pools, the compiler runs an external
 provisioner:
 
 ```
-"$MORLOC_BUILD_HOOK" sync --name <program-key> --spec envspec.json
+"$MORLOC_BUILD_HOOK" sync --name <program-key> --spec envspec.json --root <project-root> [--installed]
 ```
+
+`--root` is the entry module's directory, against which local dependency paths
+resolve; `--installed` marks a `morloc make --install` build, whose spec joins
+the environment's installed baseline rather than its scratch builds.
 
  - **`MORLOC_BUILD_HOOK`** names the provisioner: the `mim` binary, invoked as
    `mim sync ...`. Natively this is the running mim itself; in a container it is the
-   mim staged into the image; a dev env can override it with `MORLOC_MIM_ENV`. If
+   mim staged into the image; `MORLOC_MIM_ENV` overrides it for any env. If
    `MORLOC_ENV` is set but this is unset, `morloc make` **errors** — a managed env
    with no provisioner.
 
@@ -141,8 +145,15 @@ provisioner:
  - **`MORLOC_ENV`** stores a Morloc environment name. The dependency management
    through `mim` only occurs when it is set.
 
-`mim` is the reference hook. It exports all three variables together wherever it
-launches a managed `morloc make`.
+`mim` is the reference hook. It exports all three variables together for
+native and docker/podman environments.
+
+The hook reads its environment from variables set by mim's launcher:
+`MORLOC_HOME` (the runtime, required), `MORLOC_STATE` (the requirements store,
+defaulting to `MORLOC_HOME`), `MORLOC_PIXI` (the pixi binary, defaulting to
+`pixi` on PATH), `MORLOC_PIXI_DIR` (the pixi project, defaulting to
+`<state>/pixi`) and `MORLOC_IMMUTABLE` (non-empty and not `0` refuses
+on-demand language provisioning in a served or frozen environment).
 
 ## History
 

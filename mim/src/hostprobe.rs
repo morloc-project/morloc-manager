@@ -7,7 +7,7 @@
 //! on x86_64), so a host can run them natively only if it is a glibc + FHS
 //! Linux -- or, on NixOS, if we can supply the missing FHS at runtime with a
 //! `nix`-built `buildFHSEnv` sandbox (bubblewrap). NixOS is therefore
-//! native-capable when `nix` is present AND unprivileged user namespaces are
+//! native-capable when `nix-build` is present AND unprivileged user namespaces are
 //! usable (bubblewrap needs them); otherwise it routes to a container. musl
 //! systems (Alpine) route to a container. macOS on Apple Silicon runs pool
 //! processes against the system dyld and is native-capable; Intel macOS routes
@@ -39,7 +39,7 @@ fn glibc_loader_path(arch: &str) -> Option<&'static str> {
 /// Pure classifier: given the observable facts, decide native capability. Kept
 /// separate from the filesystem/env reads in `probe_host` so it is unit-testable.
 /// `fhs_capable` is meaningful only on NixOS: it means a `buildFHSEnv` sandbox
-/// can be built and run here (nix present + unprivileged user namespaces usable).
+/// can be built and run here (`nix-build` present + unprivileged user namespaces usable).
 fn classify(
     os: &str,
     arch: &str,
@@ -69,7 +69,7 @@ fn classify(
             if is_nixos {
                 // NixOS lacks a standard FHS, so conda binaries cannot launch
                 // directly. We supply one at runtime with a nix-built buildFHSEnv
-                // sandbox -- but that needs `nix` (to build it) and unprivileged
+                // sandbox -- but that needs `nix-build` (to build it) and unprivileged
                 // user namespaces (for bubblewrap to enter it).
                 if fhs_capable {
                     HostProfile {
@@ -80,7 +80,7 @@ fn classify(
                 } else {
                     HostProfile {
                         native_capable: false,
-                        reason: "NixOS needs `nix` and unprivileged user namespaces for the \
+                        reason: "NixOS needs `nix-build` and unprivileged user namespaces for the \
                                  native FHS sandbox (enable `security.unprivileged_userns` / \
                                  `boot.kernel.sysctl.\"kernel.unprivileged_userns_clone\"`); \
                                  otherwise use a container backend"

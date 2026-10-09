@@ -394,8 +394,8 @@ impl EnvContext {
 
     /// Record the shim-ABI pin from this env's freshly solved conda prefix: pin
     /// each interpreter (python, r-base) to the MINOR version `morloc init` just
-    /// built its shims against. Folded into every later solve (see
-    /// `gather_installed`), so a dependency that would bump an interpreter minor
+    /// built its shims against. Folded into every later in-env solve (see
+    /// `append_abi_lock`), so a dependency that would bump an interpreter minor
     /// fails the solve legibly rather than silently breaking the shim ABI.
     ///
     /// Called after any solve that (re)built the shims: the manager's provision and
@@ -559,7 +559,7 @@ impl EnvContext {
         let _ = std::fs::remove_file(&cache_path);
         let _ = std::fs::remove_file(&digest_path);
         crate::pixi::write_manifest(&pixi_dir, &crate::pixi::render_manifest(&reqs))?;
-        // In-container path (mim-env): the built image already sets the CA env vars,
+        // In-env agent path (`mim sync`): the built image already sets the CA env vars,
         // which the pixi subprocess inherits, so no override is needed. No FHS
         // wrapping: the in-env agent already runs inside its execution environment.
         let mut solved = if try_locked
@@ -642,9 +642,7 @@ impl EnvContext {
     /// STORE is never left half-applied (the no-mutation rule), and the error is
     /// returned as-is -- `solve_world` failures include setup errors (an
     /// unwritable prefix, a missing pixi, etc.), not only unsatisfiability, so
-    /// they must NOT be blanket-relabeled as a dependency conflict. (A true UNSAT
-    /// is surfaced as `DepsError::Conflict` by the solve layer once it parses the
-    /// solver's output.)
+    /// they must NOT be blanket-relabeled as a dependency conflict.
     ///
     /// The store rollback does NOT undo a partial pixi prefix install (pixi links
     /// into the shared prefix as it solves). A stale `pixi.toml`/`pixi.lock` or a
@@ -820,11 +818,6 @@ fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
-/// Every spec file under `dir`: the name-only slots (`<name>.json`) plus the
-/// world-keyed ones one level down (`<world-digest>/<name>.json`). Sorted by
-/// program name, then by path, so the gather order is deterministic (it feeds the
-/// merged requirement set) and reads in program order. A missing directory yields
-/// an empty list.
 /// A languages-only spec declaring `langs` (morloc short codes) with no version
 /// constraint, so the language clamp bounds each to morloc's supported window
 /// and its binder dependencies join the world. Built for interpreters a solve
@@ -850,6 +843,11 @@ pub fn adoption_note(langs: &[String]) -> String {
     )
 }
 
+/// Every spec file under `dir`: the name-only slots (`<name>.json`) plus the
+/// world-keyed ones one level down (`<world-digest>/<name>.json`). Sorted by
+/// program name, then by path, so the gather order is deterministic (it feeds the
+/// merged requirement set) and reads in program order. A missing directory yields
+/// an empty list.
 fn json_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_json(dir, true, &mut files)?;

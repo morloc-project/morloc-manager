@@ -1,8 +1,9 @@
 # Issue List
 
 F1-F31 are mim behavior against the spec (the `Code: deviates` refs point
-here). F32-F40 are mim docs, help and comment drift. F41-F58 are compiler
-and nexus findings met along the way (out of the mim spec's scope).
+here). F37 is mim docs drift. F38-F59 are compiler and nexus
+findings met along the way (out of the mim spec's scope). Fixed entries are
+deleted, so numbers have gaps.
 
 ## mim: behavior
 
@@ -97,7 +98,7 @@ about exactly this). Expected: every container env fails doctor with
 "Missing directories: lib, bin, opt". Not run.
 
 ### F10 Downloads that are not verified (surveyed)
-Spec: PROV-2. The README says every asset is verified (README.md:119). Not
+Spec: PROV-2. Only the compiler binary and rust source are verified. Not
 verified: the host pixi binary (mim/provision.rs:754-765), pixi installed in
 images by `curl pixi.sh/install.sh | bash` (mim/dockerfile.rs:560-564),
 `stdlib-snapshot.txt` (mim/provision.rs:173-176), the demos tarball and
@@ -116,10 +117,8 @@ sample uses `envspec_version: 1` (mim/provision.rs:914).
 
 ### F12 `abi_version` is parsed and discarded (surveyed)
 Spec: PROV-6 (open). `versions.abi_version` is read into
-`MorlocVersions` and never used; `ABI_VERSION` (deps/version.rs:36) is
-referenced nowhere; doctor has no ABI check. README.md:116-117,
-mim/provision.rs:59-61 and deps/version.rs:31-35 say it is recorded for
-doctor and freeze. Note also that "ABI" means two things in mim: this
+`MorlocVersions` and never used; `ABI_VERSION` (deps/version.rs) is
+referenced nowhere; doctor has no ABI check. Note also that "ABI" means two things in mim: this
 version, and the interpreter-minor pin in deps/abi.rs.
 
 ### F13 Native `morloc init` symlinks into the user's `~/.local/bin` (surveyed)
@@ -180,9 +179,7 @@ compiler forever.
 
 ### F21 `freeze` writes the detected version back into the environment (surveyed)
 Spec: FRZ-4. On success `freeze` updates `env.yaml` with the version it
-detected in the image (mim/main.rs:3395-3399). Also: the Dockerfile is
-called "deterministic for a given input" (mim/dockerfile.rs:106) but its
-labels include `Utc::now()` (mim/freeze.rs:836-837).
+detected in the image (mim/main.rs:3395-3399).
 
 ### F22 Possible path traversal through a local package name (surveyed)
 `vendor_snapshot` joins the package `name` from the envspec into a path
@@ -230,8 +227,6 @@ before comparing (deps/envspec.rs:214) and is called only by the manager.
 - `update --latest` resolves through the GitHub latest when modules declare
   a Morloc range, but through `$MORLOC_RELEASE_TAG` otherwise
   (mim/main.rs:7109-7116 vs 4536-4538).
-- The bookworm-slim mirror note says plain http (mim/dockerfile.rs:488);
-  the default base is ubuntu, not slim.
 
 ### F28 The frozen image serves on 8080; `mim start` defaults to 9000 for MCP (surveyed)
 Not a bug, but two defaults for one server. Freeze CMD is fixed at 8080
@@ -243,86 +238,17 @@ survival (mim/main.rs:8961); a crashed child daemon is restarted only on the
 next request to it (F55). Recorded as an observation; no spec item claims
 supervision.
 
-### F30 Install runs two solves when a program has Python local deps (surveyed)
-`install` solves once before the build without the locals, the build hook
-solves with them, and `install` solves once more after (mim/main.rs:
-3697-3753). Correct but slow; noted for the docs, which say one solve.
-
 ### F31 An installed module list is never validated against the views at start (surveyed)
 `start` checks that each MCP/API module is installed, but a module removed
 after `view add` makes `start` fail rather than the view being cleaned.
 Observation; no item yet.
 
-## mim: docs, help and comments
+## mim: docs
 
-### F32 README contract section is stale
-- envspec and manifest examples show `"envspec_version": 1`; the code
-  requires 2 (README.md:37, 107).
-- The build-hook command omits `--root` and `--installed`, and the agent's
-  environment (`MORLOC_HOME`, `MORLOC_STATE`, `MORLOC_PIXI`,
-  `MORLOC_PIXI_DIR`, `MORLOC_IMMUTABLE`).
-- "every asset is verified" (F10), "abi_version is recorded" (F12),
-  "`MORLOC_MIM_ENV` only for dev envs" (honoured for any env,
-  mim/provision.rs:476-506), "native-install manifest" (also drives
-  containers).
-
-### F33 `tutorial-deployment.asc` in the mim repo is substantially stale
-Uses `mim expose` (now `mim view`), `mim freeze -o` producing
-`state.tar.gz`/`freeze-manifest.json`, and `mim unfreeze` (none exist);
-says `mim eval` defaults to 8080 and eval is capped by RLIMIT_AS.
-
-### F34 Help text
-- `install`: "Sugar for: mim run -- morloc make --install" (mim/main.rs:
-  778) omits the envspec capture and the solves.
-- stop/logs/eval/status say "serve container" but handle native servers.
-- `view add/rm` print "Run 'mim start' to apply", but a running server
-  needs `start --force`.
-- The top-level about text says "containerized"; native is the default.
-- `new --help` says the dev source is mounted; it is not (F35).
-
-### F35 Stale or wrong comments (surveyed unless noted)
-- "latest is resolved via the releases API" (mim/main.rs:4176,
-  mim/provision.rs:290): it follows the web redirect.
-- "slim base" (mim/dockerfile.rs:4, 26-28; mim/main.rs:6851): default base
-  is ubuntu:24.04.
-- "requirement-INDEPENDENT base image" (mim/main.rs:7546): the image is per
-  env.
-- `CONTAINER_MORLOC_HOME` "never bind-mounted" (mim/serve.rs:520-523): it
-  is.
-- `DevConfig` source "bind-mounted into the env" (mim/types.rs:312): not
-  mounted.
-- abi-lock "folded into every later solve (see gather_installed)"
-  (deps/envstore.rs:398-399): it is not.
-- "UNSAT is surfaced as DepsError::Conflict" (deps/envstore.rs:645-647):
-  never constructed.
-- deps/pixi.rs:11-12 describes old Python routing; misplaced doc comments
-  at deps/pixi.rs:741-753, deps/envstore.rs:823-832,
-  mim/environment.rs:84-88.
-- lib.rs:4 and deps/envstore.rs:562 name a non-existent `mim-env` agent.
-- `Backend::is_native` marked dead code but used everywhere
-  (mim/types.rs:118-119).
-- Section banners "expose" and "status" above `View` and `Env`
-  (mim/main.rs:3757, 3832).
-- local-dep error says "py and rust"; julia is accepted too
-  (deps/pixi.rs:467-471).
-- hostprobe says "nix present"; it checks `nix-build` (mim/hostprobe.rs:10).
-
-### F36 User manual (Deployment chapter) vs code
-- deploy-serving: "`/discover` lists every module with its commands"; it
-  lists modules with URLs, commands are under `/discover/<module>`.
-- deploy-serving: a failed call is 500; true, but bad arguments and unknown
-  commands are also 500 (the front end drops the error kind, F52).
-- deploy-eval: "locked eval is refused with 403"; over MCP it is a
-  JSON-RPC -32602 error.
-- deploy-eval: limits list 2 GB and 30 s CPU, omitting the 4x wall limit
-  (120 s) and the +5 s hard CPU limit.
-- deploy-eval: "on the default loopback bind, eval needs no token" holds
-  only because mim passes `--eval-allow-no-auth`; the nexus router alone
-  locks it.
-- deploy-dependencies: install is described as one solve (F30).
-
-### F37 Unknown `MORLOC_ENV` value semantics in docs
-The environment-variable list should say what `MORLOC_ENV` holds (F14).
+### F37 `MORLOC_ENV` value semantics in docs
+The manual's environment-variable list and README.md ("stores a Morloc
+environment name") should say what `MORLOC_ENV` holds; waits on the F14
+ruling.
 
 ## Compiler and nexus (outside the mim spec)
 
@@ -416,7 +342,8 @@ nexus/cli.rs:315-320 and nexus/main.rs:928-929 say the router scans
 programs from `exe/<name>/<name>-build/manifest.json`, over HTTP only.
 Compiler comments on expose targets (State.hs:842-843,
 SystemConfig.hs:182-185) name `$MORLOC_HOME`; the real location is
-`$STATE/modules`.
+`$STATE/modules`. ProgramBuilder/Build.hs:219 names the build hook
+`mim-env`; it is `mim`.
 
 ### F57 `GET /eval` with eval off is 405, not 404 (surveyed)
 Method check precedes the enabled check (nexus/mcp.rs:2053-2056 vs 2307).
@@ -425,12 +352,9 @@ Method check precedes the enabled check (nexus/mcp.rs:2053-2056 vs 2307).
 A module or command name containing `__` that collides after joining
 aborts startup (nexus/mcp.rs:1810-1817).
 
-### F59 Manual says installed modules live in `lib/` (surveyed)
-docs `ecosystem.asc` ("Installing modules") says modules are stored in
-`~/.local/share/morloc/lib/`; the compiler installs them under
-`<state>/src/morloc/plane/<plane>/<name>` (Module.hs:861). The same section
-says `registry` is read from `~/.morloc/config.yaml`, which is never read
-without `--config` (F42).
+### F59 Manual says `registry` is read from `~/.morloc/config.yaml` (surveyed)
+docs `ecosystem.asc` ("Installing modules"); that file is never read
+without `--config` (F42). Fix with F42.
 
 ## Spec questions for a ruling
 
