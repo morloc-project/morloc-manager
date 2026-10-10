@@ -86,10 +86,10 @@ fn build_help_template() -> String {
   {b}install{r}    Build and install a module into an environment
   {b}view{r}       Choose which installed modules are served (MCP/API/eval)
   {b}start{r}      Serve an environment over the network
-  {b}eval{r}       Evaluate a morloc expression against a serve container
-  {b}status{r}     List running serve containers
-  {b}stop{r}       Stop a running serve container
-  {b}logs{r}       Stream logs from a running serve container
+  {b}eval{r}       Evaluate a morloc expression against a running server
+  {b}status{r}     List running servers
+  {b}stop{r}       Stop a running server
+  {b}logs{r}       Stream logs from a running server
 
 {bu}Deployment{r}
   {b}freeze{r}     Freeze an environment into a deployment image
@@ -101,8 +101,8 @@ fn build_help_template() -> String {
 
 #[derive(Parser)]
 #[command(name = "mim")]
-#[command(about = "container lifecycle manager for Morloc")]
-#[command(long_about = "Manage containerized Morloc installations, dependency layers, and deployments")]
+#[command(about = "environment manager for Morloc")]
+#[command(long_about = "Manage Morloc environments (native or containerized), their dependencies, servers, and deployment images")]
 #[command(disable_version_flag = true)]
 #[command(arg_required_else_help = true)]
 #[command(hide_possible_values = true)]
@@ -135,7 +135,7 @@ Examples:
   mim new foo --lang py@3.12
   mim new bar --engine podman
   mim new x86 --engine docker --arch x86_64 # an image for x86 deployment hosts
-  mim new baz --morloc-version 0.98.0       # names it `v0.98.0`
+  mim new --morloc-version 0.98.0           # names it `v0.98.0`
   mim new --morloc-version 0.98.0 --set-default
   mim new --wizard                          # prompt for every setting
 
@@ -161,8 +161,9 @@ environment; pass `--wizard` to be prompted for each one instead.")]
         engine: Option<EngineArg>,
         /// Create a DEV environment from a morloc source tree at this path:
         /// provision the tooling (a container image with a baked ghcup/stack/cargo
-        /// toolchain, plus the pixi env) around the mounted source, which you build
-        /// the compiler + runtime from in the dev shell (no release download).
+        /// toolchain, plus the pixi env) from the source's build files (no release
+        /// download). The source is not mounted: build the compiler + runtime by
+        /// running `mim shell` from inside the source tree.
         /// `--morloc-version` then sets the stdlib base only. Docker/podman + local
         /// scope only.
         #[arg(long, help_heading = "Advanced")]
@@ -350,7 +351,8 @@ Examples:
         /// Remove system-scope environments instead of local (requires root)
         #[arg(long)]
         system: bool,
-        /// Also remove base container images
+        /// Also remove the base container images the removed environments were
+        /// built from, except those a remaining environment still uses
         #[arg(long)]
         images: bool,
         /// Skip confirmation prompt
@@ -399,8 +401,8 @@ Examples:
         /// Environment to check (default: the default environment)
         #[arg(long)]
         env: Option<String>,
-        /// Check system-scope environment
-        #[arg(long)]
+        /// Look up --env in the system scope
+        #[arg(long, requires = "env")]
         system: bool,
         /// Run checks inside the container (slower, more thorough)
         #[arg(long)]
@@ -610,9 +612,9 @@ what the corresponding flag set:
     #[command(after_help = "\
 Examples:
   mim start                       # serve the default environment's exposed set
-  mim start --env myenv -p 9090:8080
-  mim start --mcp mymodule -p 9000:9000   # serve one module as MCP/HTTP
-  mim start --flagfile alt.yaml -p 9090:8080   # a second instance under other flags")]
+  mim start --env myenv -p 9090
+  mim start --mcp mymodule -p 9000   # serve one module as MCP/HTTP
+  mim start --flagfile alt.yaml -p 9090   # a second instance under other flags")]
     Start {
         /// Environment to serve (default: the default environment)
         #[arg(long)]
@@ -650,9 +652,12 @@ Examples:
         /// already waived for a host-confined endpoint.
         #[arg(long)]
         eval_allow_no_auth: bool,
-        /// Port mapping HOST:CONTAINER (default: 8080:8080, or 9000:9000 with --mcp)
+        /// Port to serve on (default: 9000 when serving MCP or eval, else 8080,
+        /// or the next free port above it). HOST:CONTAINER maps the two where
+        /// the engine publishes ports, which an exposed container serve does;
+        /// a host-network, Apptainer or native serve has no mapping.
         #[arg(short, long, value_parser = parse_port)]
-        port: Vec<(u16, u16)>,
+        port: Option<(u16, u16)>,
         /// Pass environment variable to the container (KEY=VALUE)
         #[arg(long = "env-var")]
         env_vars: Vec<String>,
@@ -668,11 +673,16 @@ Examples:
         /// schema; -x flags are appended after it.
         #[arg(long, value_name = "FILE")]
         flagfile: Option<String>,
-        /// Replace an already-running serve container
+        /// Replace an already-running server
         #[arg(long)]
         force: bool,
+        /// Host name or address clients use to reach this serve, put in the
+        /// printed URLs and MCP client config (default: 127.0.0.1, which only
+        /// a client on this machine can use)
+        #[arg(long, value_name = "HOST")]
+        advertise_host: Option<String>,
     },
-    /// Stop a running serve container
+    /// Stop a running server
     #[command(display_order = 21)]
     #[command(after_help = "\
 Examples:
@@ -683,11 +693,11 @@ Examples:
         #[arg(long)]
         env: Option<String>,
     },
-    /// Stream logs from a running serve container
+    /// Stream logs from a running server
     #[command(display_order = 22)]
     #[command(after_help = "\
 Examples:
-  mim logs              # logs from only running serve container
+  mim logs              # logs from the only running server
   mim logs --env myenv
   mim logs -f --env myenv     # follow mode")]
     Logs {
@@ -722,7 +732,7 @@ answers all three.")]
         #[arg(short, long)]
         tag: Option<String>,
         /// Also write the image to a tarball, for a machine with no registry
-        /// between it and this one. Load it there with `docker load -i <path>`.
+        /// between it and this one. Load it there with `docker load -i <path>` (or `podman load`).
         #[arg(long)]
         save: Option<String>,
         /// Build a slim image: the programs and what runs them, without the
@@ -736,7 +746,7 @@ answers all three.")]
         #[arg(long)]
         force: bool,
     },
-    /// Evaluate a morloc expression against a running serve container
+    /// Evaluate a morloc expression against a running server
     #[command(display_order = 25)]
     #[command(after_help = "\
 Examples:
@@ -766,8 +776,10 @@ Examples:
   mim install main.loc              # installs under the module name
   mim install --env dev ./mypkg     # installs a package directory into 'dev'
 
-Sugar for: mim run -- morloc make --install <file>
-       (or: mim run -- morloc install --build <dir> for a directory)")]
+Before the build, mim reads the program's declared dependencies and solves
+them into the environment. The build is then
+  mim run -- morloc make --install <file>
+  (or: mim run -- morloc install --build <dir> for a directory)")]
     Install {
         /// Morloc source file (.loc) or package directory to build and install.
         /// A directory is treated as a package (main.loc + package.yaml). The
@@ -847,7 +859,7 @@ Examples:
         #[command(subcommand)]
         action: EnvAction,
     },
-    /// List running serve containers
+    /// List running servers
     #[command(display_order = 27)]
     #[command(after_help = "\
 Examples:
@@ -995,10 +1007,12 @@ impl From<EngineArg> for ContainerEngine {
     }
 }
 
+/// A `-p` value: `PORT`, or `HOST:CONTAINER` where the serve maps ports.
 fn parse_port(s: &str) -> std::result::Result<(u16, u16), String> {
     let parts: Vec<&str> = s.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        return Err(format!("Expected HOST:CONTAINER format, got: {s}"));
+    if parts.len() == 1 {
+        let port: u16 = s.parse().map_err(|_| format!("Invalid port: {s}"))?;
+        return Ok((port, port));
     }
     let host: u16 = parts[0]
         .parse()
@@ -1096,6 +1110,14 @@ fn main() -> ExitCode {
             .ok();
         return ExitCode::from(2);
     };
+    if cli.json && !emits_json(&cmd) {
+        let msg = format!(
+            "--json is not supported by `mim {}`: it has no JSON output",
+            subcommand_name(&cmd)
+        );
+        println!("{}", serde_json::json!({ "error": msg }));
+        return ExitCode::from(2);
+    }
     match dispatch(cli.verbose, cli.json, cmd) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -1113,30 +1135,97 @@ fn main() -> ExitCode {
     }
 }
 
+/// Whether `cmd` writes JSON under `--json`. A command that does not is refused
+/// rather than run, since output that ignores the flag is not what a caller
+/// asking for JSON can use. Exhaustive, so a new command must decide.
+fn emits_json(cmd: &Cmd) -> bool {
+    match cmd {
+        Cmd::Ls { .. } | Cmd::Info { .. } | Cmd::Doctor { .. } | Cmd::Status => true,
+        Cmd::View { action: None, .. }
+        | Cmd::View { action: Some(ViewAction::List { .. }), .. } => true,
+        Cmd::View { .. } => false,
+        Cmd::New { .. }
+        | Cmd::Run { .. }
+        | Cmd::Shell { .. }
+        | Cmd::Rm { .. }
+        | Cmd::Nuke { .. }
+        | Cmd::Update { .. }
+        | Cmd::Modify { .. }
+        | Cmd::Start { .. }
+        | Cmd::Stop { .. }
+        | Cmd::Logs { .. }
+        | Cmd::Freeze { .. }
+        | Cmd::Eval { .. }
+        | Cmd::Install { .. }
+        | Cmd::Demos { .. }
+        | Cmd::Env { .. }
+        | Cmd::Sync { .. }
+        | Cmd::Clean
+        | Cmd::Spec => false,
+    }
+}
+
+/// The name `cmd` was invoked by, for messages about it.
+fn subcommand_name(cmd: &Cmd) -> &'static str {
+    match cmd {
+        Cmd::New { .. } => "new",
+        Cmd::Run { .. } => "run",
+        Cmd::Shell { .. } => "shell",
+        Cmd::Rm { .. } => "rm",
+        Cmd::Nuke { .. } => "nuke",
+        Cmd::Ls { .. } => "ls",
+        Cmd::Info { .. } => "info",
+        Cmd::Doctor { .. } => "doctor",
+        Cmd::Update { .. } => "update",
+        Cmd::Modify { .. } => "modify",
+        Cmd::Start { .. } => "start",
+        Cmd::Stop { .. } => "stop",
+        Cmd::Logs { .. } => "logs",
+        Cmd::Freeze { .. } => "freeze",
+        Cmd::Eval { .. } => "eval",
+        Cmd::Install { .. } => "install",
+        Cmd::Demos { .. } => "demos",
+        Cmd::View { .. } => "view",
+        Cmd::Env { .. } => "env",
+        Cmd::Status => "status",
+        Cmd::Sync { .. } => "sync",
+        Cmd::Clean => "clean",
+        Cmd::Spec => "spec",
+    }
+}
+
 fn resolve_scope(system: bool) -> Scope {
     if system { Scope::System } else { Scope::Local }
 }
 
+/// Fail unless this process can write the system scope: both its config tree
+/// and its data tree, since system environments keep state in each.
 fn check_system_write_access() -> Result<()> {
-    let sys_dir = cfg::config_dir(Scope::System);
-    if sys_dir.exists() {
-        let test_path = sys_dir.join(".write-check");
-        match fs::write(&test_path, b"") {
-            Ok(_) => { let _ = fs::remove_file(&test_path); Ok(()) }
-            Err(_) => Err(ManagerError::ConfigPermissionDenied(format!(
+    for dir in [cfg::config_dir(Scope::System), cfg::data_dir(Scope::System)] {
+        if !cfg::dir_writable(&dir) {
+            return Err(ManagerError::ConfigPermissionDenied(format!(
                 "{}. System-scope operations require root. Re-run with sudo",
-                sys_dir.display()
-            )))
-        }
-    } else {
-        match fs::create_dir_all(&sys_dir) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(ManagerError::ConfigPermissionDenied(format!(
-                "{}. System-scope operations require root. Re-run with sudo",
-                sys_dir.display()
-            )))
+                dir.display()
+            )));
         }
     }
+    Ok(())
+}
+
+/// Refuse a command that changes environment `name` in `scope` when the caller
+/// cannot write that scope. Called before any side effect, so a refused command
+/// leaves nothing half-applied. Anyone may use a system environment; only
+/// whoever can write it may change it.
+fn require_env_writable(scope: Scope, name: &str, action: &str) -> Result<()> {
+    if scope == Scope::Local {
+        return Ok(());
+    }
+    check_system_write_access().map_err(|_| {
+        ManagerError::ConfigPermissionDenied(format!(
+            "'{name}' is a system environment; {action} changes it and requires root. \
+             Re-run with sudo, or ask an administrator"
+        ))
+    })
 }
 
 /// Resolve an environment by explicit `--env` name or fall back to the default
@@ -1192,11 +1281,43 @@ fn exec_in_env(
     )
 }
 
-fn ensure_engine() -> Result<ContainerEngine> {
-    if let Some(cfg) = cfg::read_active_config() {
-        return cfg.engine();
+/// The container engine a config names, if any. A config whose default
+/// backend is native names none, so a container environment created on a host
+/// that cannot run native ones falls through to auto-detection rather than
+/// failing on the stale default.
+fn configured_container_engine(cfg: Option<Config>) -> Option<ContainerEngine> {
+    cfg.and_then(|c| c.backend.container_engine())
+}
+
+/// The base images `nuke --images` may remove: those of the removed
+/// environments, each in its own engine's store, that no remaining environment
+/// still references. Only the OCI engines keep a store of pulled images.
+fn images_to_remove(
+    removed: &[(ContainerEngine, String)],
+    still_used: &HashSet<String>,
+) -> Vec<(ContainerEngine, String)> {
+    let mut out: Vec<(ContainerEngine, String)> = Vec::new();
+    for (engine, image) in removed {
+        if engine.is_oci() && !still_used.contains(image) && !out.contains(&(*engine, image.clone())) {
+            out.push((*engine, image.clone()));
+        }
     }
-    Err(ManagerError::SetupNotComplete(Scope::Local))
+    out
+}
+
+/// Every image an environment refers to, in every scope this user can read.
+fn images_in_use() -> HashSet<String> {
+    let mut used = HashSet::new();
+    for scope in [Scope::Local, Scope::System] {
+        for name in cfg::list_env_names(scope) {
+            if let Ok(ec) = cfg::read_env_config(scope, &name) {
+                used.insert(ec.base_image.clone());
+                used.extend(ec.original_image.clone());
+                used.extend(ec.built_image.clone());
+            }
+        }
+    }
+    used
 }
 
 fn which(name: &str) -> bool {
@@ -1307,14 +1428,19 @@ fn info_env_exports(
     engine: Option<ContainerEngine>,
 ) -> Vec<(String, String)> {
     match engine {
-        // Native: native_run_env exports MORLOC_HOME, MORLOC_ENV, and (best-effort)
-        // MORLOC_PIXI. It does NOT export MORLOC_STATE (the nexus defaults that to
-        // MORLOC_HOME internally), so it is not listed here.
+        // Native: native_run_env exports MORLOC_HOME, the managed-env trio and
+        // (best-effort) MORLOC_PIXI. It does NOT export MORLOC_STATE (the nexus
+        // defaults that to MORLOC_HOME internally), so it is not listed here.
         None => {
-            let mut v = vec![
-                ("MORLOC_HOME".to_string(), data_dir.display().to_string()),
-                ("MORLOC_ENV".to_string(), name.to_string()),
-            ];
+            let mut v = vec![("MORLOC_HOME".to_string(), data_dir.display().to_string())];
+            let morloc_bin = cfg::read_native_runtime(scope, name)
+                .ok()
+                .and_then(|rt| rt.morloc_bin)
+                .unwrap_or_else(|| std::path::PathBuf::from("morloc"));
+            match provision::mim_agent_for_host(scope) {
+                Ok(hook) => v.extend(managed_env_vars(name, &morloc_bin, &hook)),
+                Err(_) => v.push(("MORLOC_ENV".to_string(), name.to_string())),
+            }
             if let Some(pixi) = locate_pixi(scope) {
                 v.push(("MORLOC_PIXI".to_string(), pixi.display().to_string()));
             }
@@ -1719,14 +1845,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let eng: ContainerEngine = e.into();
                 check_docker_socket(eng);
                 eng
-            } else if let Some(cfg) = if system {
+            } else if let Some(eng) = configured_container_engine(if system {
                 // System scope: check system config first, then local
                 cfg::read_config::<Config>(&cfg::config_path(Scope::System)).ok()
                     .or_else(|| cfg::read_active_config())
             } else {
                 cfg::read_active_config()
-            } {
-                cfg.engine()?
+            }) {
+                eng
             } else {
                 // No config -- try auto-detection over the shared engine catalog
                 // (Apptainer/Singularity included so HPC-only hosts work out of
@@ -1812,22 +1938,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 return Err(ManagerError::EnvError("No environment names specified".to_string()));
             }
             // Capture current default env for post-removal feedback
-            // Capture the default tag from BOTH scopes: a system-scope default is
-            // otherwise invisible when a local config file exists (read_active_config
-            // returns the local config and never falls through to system).
-            let was_default = cfg::read_active_config()
-                .and_then(|c| c.default_env)
-                .or_else(|| {
-                    cfg::read_config::<Config>(&cfg::config_path(Scope::System))
-                        .ok()
-                        .and_then(|c| c.default_env)
-                });
+            let was_default = environment::effective_default();
             // Attempt each removal; collect failures, continue past errors
             let mut failures: Vec<String> = Vec::new();
             for name in &names {
                 // The closure yields the env's host-mounted home (if any) so the
                 // success message can say what `rm` deliberately did NOT delete.
-                let result: Result<Option<String>> = (|| {
+                let result: Result<(Option<String>, Scope)> = (|| {
                     let scope = if system {
                         Scope::System
                     } else {
@@ -1842,11 +1959,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     // container_engine() is None for native envs, whose removal
                     // is purely file cleanup (no container/image to tear down).
                     environment::remove_environment(ec.backend.container_engine(), scope, name)?;
-                    Ok(ec.mount_home.clone())
+                    Ok((ec.mount_home.clone(), scope))
                 })();
                 match result {
-                    Ok(mount_home) => {
-                        if was_default.as_deref() == Some(name.as_str()) {
+                    Ok((mount_home, scope)) => {
+                        if was_default.as_ref().is_some_and(|(n, s)| n == name && *s == scope) {
                             eprintln!("Removed environment: {name}. It was the default; \
                                        set a new one with: mim modify --env <name> --set-default");
                         } else {
@@ -1916,14 +2033,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // Collect env info before removal (configs are deleted during
             // removal). The engine is None for native envs (file-only cleanup).
             let mut env_list: Vec<(String, Option<ContainerEngine>, Option<String>)> = Vec::new();
-            let mut base_images: HashSet<String> = HashSet::new();
+            let mut base_images: Vec<(ContainerEngine, String)> = Vec::new();
 
             for name in cfg::list_env_names(scope) {
                 if let Ok(ec) = cfg::read_env_config(scope, &name) {
-                    if images {
-                        base_images.insert(ec.base_image.clone());
+                    if let (true, Some(engine)) = (images, ec.backend.container_engine()) {
+                        base_images.push((engine, ec.base_image.clone()));
                         if let Some(ref orig) = ec.original_image {
-                            base_images.insert(orig.clone());
+                            base_images.push((engine, orig.clone()));
                         }
                     }
                     env_list.push((name, ec.backend.container_engine(), ec.mount_home.clone()));
@@ -1953,16 +2070,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     }
                 }
 
-                // Clear the default env tag in the targeted scope's config
-                let cfg_path = cfg::config_path(scope);
-                if let Ok(cfg_data) = cfg::read_config::<Config>(&cfg_path) {
-                    if cfg_data.default_env.is_some() {
-                        let new_cfg = Config { default_env: None, ..cfg_data };
-                        let _ = cfg::write_config(&cfg_path, &new_cfg);
-                        eprintln!("Cleared the default environment.");
-                    }
-                }
-
                 eprintln!("Removed {removed} environment(s).");
 
                 if !failures.is_empty() {
@@ -1980,10 +2087,17 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             }
 
             // Remove base images if --images
-            if images && !base_images.is_empty() {
-                let engine = ensure_engine().unwrap_or(ContainerEngine::Docker);
+            let still_used = images_in_use();
+            let removable = images_to_remove(&base_images, &still_used);
+            let kept: HashSet<&String> =
+                base_images.iter().map(|(_, i)| i).filter(|i| still_used.contains(*i)).collect();
+            for img in kept {
+                eprintln!("Keeping base image {img}: a remaining environment uses it.");
+            }
+            if !removable.is_empty() {
                 eprintln!("Removing base images...");
-                for img in &base_images {
+                for (engine, img) in &removable {
+                    let engine = *engine;
                     if container::image_exists_locally(engine, img) {
                         eprintln!("  Removing image: {img}...");
                         if container::remove_image(engine, img) {
@@ -2017,28 +2131,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
 
         // ---- ls ----
         Cmd::Ls { system, local } => {
-            let default_env = cfg::read_active_config()
-                .and_then(|c| c.default_env);
-            let default_str = default_env.as_deref();
-
-            // Determine which scope effectively owns the default environment.
-            // Local takes priority (same resolution as run).
-            let default_in_local = default_str
-                .map(|name| cfg::env_config_path(Scope::Local, name).is_file())
-                .unwrap_or(false);
-
             let show_local = !system || local;
             let show_system = !local || system;
 
             let local_envs = if show_local {
-                let local_default = if default_in_local { default_str } else { None };
-                environment::list_environments(Scope::Local, local_default)
+                environment::list_environments(Scope::Local, environment::default_in(Scope::Local).as_deref())
             } else {
                 Vec::new()
             };
             let system_envs = if show_system {
-                let system_default = if default_in_local { None } else { default_str };
-                environment::list_environments(Scope::System, system_default)
+                environment::list_environments(Scope::System, environment::default_in(Scope::System).as_deref())
             } else {
                 Vec::new()
             };
@@ -2095,9 +2197,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 };
                 let ec = cfg::read_env_config(scope, &env_name)?;
                 let data_dir = cfg::env_data_dir(scope, &env_name);
-                let is_default = cfg::read_active_config()
-                    .and_then(|c| c.default_env)
-                    .as_deref() == Some(env_name.as_str());
+                let is_default = environment::effective_default() == Some((env_name.clone(), scope));
 
                 let engine = ec.backend.container_engine();
                 let info_arch = ec.oci_arch().ok().flatten();
@@ -2206,8 +2306,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         deffile: Option<String>,
                         flags: FlagConfig,
                     }
-                    // For a dev env, `morloc_version` is the STDLIB BASE; the mounted
-                    // source (the developer builds the compiler from it) is here.
+                    // For a dev env, `morloc_version` is the STDLIB BASE; the
+                    // source tree (the developer builds the compiler from it) is here.
                     #[derive(serde::Serialize)]
                     struct DevInfo {
                         source: String,
@@ -2338,7 +2438,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     }
                     if let Some(ref dev) = ec.dev {
                         // A dev env: the version below is the stdlib base; the compiler
-                        // is built by the developer from the mounted source.
+                        // is built by the developer from the source tree.
                         println!("Mode:      dev (compiler built from source by developer)");
                         println!("  Source:      {}", dev.source);
                     }
@@ -2539,7 +2639,6 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         local: Vec<environment::EnvInfo>,
                         system: Vec<environment::EnvInfo>,
                     }
-                    let default_str = if default_env == "none" { None } else { Some(default_env.as_str()) };
                     let mut directories = std::collections::BTreeMap::new();
                     for (label, path) in [
                         ("config_local", cfg::config_dir(Scope::Local)),
@@ -2558,8 +2657,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         system_engine: system_cfg.as_ref().map(|c| c.backend.label()).unwrap_or("unset").to_string(),
                         selinux: se_str.to_string(),
                         directories,
-                        local: environment::list_environments(Scope::Local, default_str),
-                        system: environment::list_environments(Scope::System, default_str),
+                        local: environment::list_environments(Scope::Local, environment::default_in(Scope::Local).as_deref()),
+                        system: environment::list_environments(Scope::System, environment::default_in(Scope::System).as_deref()),
                     };
                     println!("{}", serde_json::to_string_pretty(&output).unwrap());
                 } else {
@@ -2582,14 +2681,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         println!("  {:<20} {} ({})", label, path.display(), status);
                     }
 
-                    let default_str = if default_env == "none" { None } else { Some(default_env.as_str()) };
-
-                    // Check if the default env lives in local scope (local takes priority)
-                    let default_in_local = default_str
-                        .map(|name| cfg::env_config_path(Scope::Local, name).is_file())
-                        .unwrap_or(false);
-
-                    let local_envs = environment::list_environments(Scope::Local, default_str);
+                    let local_envs = environment::list_environments(
+                        Scope::Local, environment::default_in(Scope::Local).as_deref(),
+                    );
                     println!("\nLocal environments:");
                     if local_envs.is_empty() {
                         println!("  (none)");
@@ -2601,17 +2695,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         }
                     }
 
-                    let system_envs = environment::list_environments(Scope::System, default_str);
+                    let system_envs = environment::list_environments(
+                        Scope::System, environment::default_in(Scope::System).as_deref(),
+                    );
                     if !system_envs.is_empty() {
                         println!("\nSystem environments:");
                         for e in &system_envs {
-                            let default_mark = if e.is_default && default_in_local {
-                                " (default - shadowed)"
-                            } else if e.is_default {
-                                " (default)"
-                            } else {
-                                ""
-                            };
+                            let default_mark = if e.is_default { " (default)" } else { "" };
                             let ver_mark = env_version_marker(e);
                             println!("  {}{}{}", e.name, ver_mark, default_mark);
                         }
@@ -2761,19 +2851,19 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 || cert_bundle.is_some()
                 || no_cert_bundle
                 || base.is_some();
-            if new_name.is_none()
-                && !set_default
-                && !unset_default
-                && !will_rebuild
-                && dotfiles.is_none()
-                && !no_dotfiles
-                && mount_home.is_none()
-                && !no_mount_home
-                && shm_size_change.is_none()
-                && !touches_flags
-                && module_snapshots.is_empty()
-                && no_modules_file.is_empty()
-            {
+            // Everything except the default pointer lives in the environment's
+            // own trees; one list so the scope guard below cannot miss a flag.
+            let changes_env = new_name.is_some()
+                || will_rebuild
+                || dotfiles.is_some()
+                || no_dotfiles
+                || mount_home.is_some()
+                || no_mount_home
+                || shm_size_change.is_some()
+                || touches_flags
+                || !module_snapshots.is_empty()
+                || !no_modules_file.is_empty();
+            if !changes_env && !set_default && !unset_default {
                 return Err(ManagerError::EnvError(
                     "nothing to modify: pass --env-name, --set-default, --unset-default, \
                      --dotfiles, --mount-home, --shm-size, --flagfile, --lang, --cert-bundle, \
@@ -2790,12 +2880,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // retires the container name it was launched under.
             if let Some(new) = &new_name {
                 environment::validate_rename(env_scope, &env_name, new, &ec)?;
-                if env_serve_alive(env_scope, &env_name, &ec) {
-                    return Err(ManagerError::EnvError(format!(
-                        "environment '{env_name}' is being served; stop it first with \
-                         'mim stop --env {env_name}', then rename it."
-                    )));
-                }
+                require_not_serving(env_scope, &env_name, &ec, format!(
+                    "environment '{env_name}' is being served; stop it first with \
+                     'mim stop --env {env_name}', then rename it."
+                ))?;
             }
             // Only apt packages are container-only; conda packages land in the
             // pixi solve, which the native backend has too.
@@ -2881,7 +2969,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                      remove. {fix}"
                 )))
             };
-            if no_lang && cfg::read_env_inputs(env_scope, &env_name).lang_pins.is_empty() {
+            if no_lang && cfg::read_env_inputs(env_scope, &env_name)?.lang_pins.is_empty() {
                 return nothing_to_remove(
                     "pinned languages",
                     "Its languages are already provisioned on demand at `morloc make`.",
@@ -2951,17 +3039,8 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // package/lang edits + rebuild, pin-file removal) needs root. A
             // personal (local) set-default does not, and is handled in its own
             // block below.
-            if env_scope == Scope::System
-                && (new_name.is_some()
-                    || will_rebuild
-                    || dotfiles.is_some()
-                    || no_dotfiles
-                    || mount_home_change.is_some()
-                    || shm_size_change.is_some()
-                    || touches_flags
-                    || !no_modules_file.is_empty())
-            {
-                check_system_write_access()?;
+            if changes_env {
+                require_env_writable(env_scope, &env_name, "`mim modify`")?;
             }
             // `modify` rebuilds at the environment's CURRENT version, so a rebuild
             // needs one to exist. Resolve it here, before the first side effect.
@@ -3146,7 +3225,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    after a successful build.)
             if let Some(keep) = rebuild_version {
                 let prev_ec = ec.clone();
-                let prev_inputs = cfg::read_env_inputs(env_scope, &env_name);
+                let prev_inputs = cfg::read_env_inputs(env_scope, &env_name)?;
                 // Snapshot the requirements-store artifacts the rebuild's prime step
                 // overwrites (toolchain pins + conda extras) BEFORE it runs, so a
                 // failed rebuild restores them exactly -- like the cert snapshot.
@@ -3295,30 +3374,30 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // A tag that says what it is and does not collide with the
             // environment image it is built on.
             let suffix = if slim { "-slim" } else { "" };
-            let tag = tag.unwrap_or_else(|| format!("morloc-{env_name}:{}{suffix}", ver.show()));
+            let tag = tag.unwrap_or_else(|| {
+                format!("morloc-{}:{}{suffix}", environment::image_repo_component(&env_name), ver.show())
+            });
             let slim_base = slim.then(|| freeze::SlimBase {
                 base_image: &ec.base_image,
                 system_packages: &ec.system_packages,
             });
-            let build_flags =
-                cfg::read_flag_config(env_scope, &env_name)?.materialize(Phase::Build, engine);
+            let flags = cfg::read_flag_config(env_scope, &env_name)?;
             let platform = ec.oci_arch()?;
-            let result = freeze::freeze_environment(
-                env_scope, &env_name, ver.clone(), engine, &image,
-                &data_dir.to_string_lossy(), &tag, save.as_deref(), slim_base, &build_flags,
+            // FRZ-4: the environment is only read; the detected version labels
+            // the image and is not written back.
+            freeze::freeze_environment(
+                env_scope, &env_name, ver, engine, &image,
+                &data_dir.to_string_lossy(), &tag, save.as_deref(), slim_base, &flags,
                 &ec.shm_size, platform, force, verbose,
-            );
-            if result.is_ok() && ec.morloc_version.as_ref() != Some(&ver) {
-                let mut updated = ec.clone();
-                updated.morloc_version = Some(ver);
-                let _ = cfg::write_env_config(env_scope, &env_name, &updated);
-            }
-            result
+            )
         }
 
         // ---- start ----
-        Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, eval_allow_no_auth, port, env_vars, env_file, engine_arg, flagfile, force } => {
+        Cmd::Start { env, mcp, auth_token, expose, allow_plaintext, allow_no_auth, unsafe_serve, eval_allow_no_auth, port, env_vars, env_file, engine_arg, flagfile, force, advertise_host } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
+            // The serve record that stop/logs/status find it by lives in the
+            // environment's config tree.
+            require_env_writable(env_scope, &env_name, "`mim start`")?;
             if ec.is_dev() {
                 return Err(ManagerError::EnvError(format!(
                     "environment '{env_name}' is a dev environment; serving one is not yet \
@@ -3371,14 +3450,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let serves_mcp = !spec.mcp.is_empty() || eval_on;
             let serves_api = !spec.api.is_empty() || eval_on;
             let default_port: u16 = if serves_mcp { 9000 } else { 8080 };
-            let (host_port, container_port) = if port.is_empty() {
-                let p = find_free_host_port(default_port, 100);
-                if p != default_port {
-                    eprintln!("Port {default_port} is in use; serving on {p} instead (override with -p).");
+            let (host_port, container_port) = match port {
+                Some(p) => p,
+                None => {
+                    let bind_ip = if expose { "0.0.0.0" } else { "127.0.0.1" };
+                    let p = find_free_host_port(default_port, 100, bind_ip)?;
+                    if p != default_port {
+                        eprintln!("Port {default_port} is in use; serving on {p} instead (override with -p).");
+                    }
+                    (p, p)
                 }
-                (p, p)
-            } else {
-                port.first().copied().unwrap_or((default_port, default_port))
             };
             let user_env = collect_env_vars(&env_vars, env_file.as_deref())?;
             let token = resolve_mcp_token(auth_token);
@@ -3391,8 +3472,18 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 eval_allow_no_auth, engine_args: engine_arg, flagfile, token, verbose,
             };
             let env = runner::ResolvedEnv { name: env_name.clone(), scope: env_scope, ec };
-            let ServeOutcome { handle, url_host, token: eff_token } =
+            let ServeOutcome { handle, url_host: this_host, token: eff_token } =
                 runner::runner_for(&env.ec).serve(&env, &req)?;
+            // A pasteable URL must work as printed. The machine's own name is
+            // a guess at what an off-box client can resolve (a container ID,
+            // inside a container), so it is offered, never printed as the URL.
+            let url_host = advertise_host.unwrap_or_else(|| "127.0.0.1".to_string());
+            if expose && url_host == "127.0.0.1" {
+                eprintln!(
+                    "  Off this machine, replace 127.0.0.1 with an address of it the client \
+                     can reach (it calls itself '{this_host}'), or pass --advertise-host."
+                );
+            }
 
             if serves_mcp {
                 eprintln!("  MCP:  http://{url_host}:{host_port}/mcp");
@@ -3402,15 +3493,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             }
             // Record what we launched + how (the handle) so stop/logs/status act
             // on the real target regardless of the env's current backend.
-            let _ = cfg::write_serve_runtime(env_scope, &env_name, &ServeRuntime {
+            // A serve nothing records is one stop/logs/status cannot find, so a
+            // failed write takes the serve down rather than leave it untracked.
+            let record = ServeRuntime {
                 mcp: req.spec.mcp.clone(),
                 api: req.spec.api.clone(),
                 eval: eval_on,
                 host: url_host.clone(),
                 port: host_port,
                 token_required: eff_token.is_some(),
-                handle: Some(handle),
-            });
+                handle: Some(handle.clone()),
+            };
+            if let Err(e) = cfg::write_serve_runtime(env_scope, &env_name, &record) {
+                let _ = stop_by_handle(&handle, verbose);
+                return Err(e);
+            }
             if serves_mcp {
                 // The mcpServers entry name: the one-off program, else the env.
                 let cfg_name = mcp.unwrap_or_else(|| env_name.clone());
@@ -3422,11 +3519,26 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         // ---- stop ----
         Cmd::Stop { env } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
+            require_env_writable(env_scope, &env_name, "`mim stop`")?;
             // Prefer the stored launch handle: it tears down the right target
             // (native process group or container) regardless of the env's current
             // backend, so migration / dual-backend serve never strands a server.
             if let Some(rt) = cfg::read_serve_runtime(env_scope, &env_name) {
                 if let Some(handle) = &rt.handle {
+                    // SERVE-3: a record whose container the engine reports gone
+                    // is stale; drop it. An engine that cannot answer is not a
+                    // "gone", so that case falls through to the stop, which fails.
+                    let gone = match handle {
+                        ServeHandle::Container { engine, name } if engine.is_oci() => {
+                            container::probe(*engine, "container", name) == container::Probe::Absent
+                        }
+                        _ => false,
+                    };
+                    if gone {
+                        cfg::remove_serve_runtime(env_scope, &env_name);
+                        eprintln!("'{env_name}' was not serving; removed its stale serve record.");
+                        return Ok(());
+                    }
                     stop_by_handle(handle, verbose)?;
                     cfg::remove_serve_runtime(env_scope, &env_name);
                     eprintln!("Stopped serving environment: {env_name}");
@@ -3445,9 +3557,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     return Ok(());
                 }
             }
-            Err(ManagerError::EnvError(
-                format!("No serve running for environment '{env_name}'")
-            ))
+            Err(ManagerError::EnvError(format!(
+                "No serve running for environment '{env_name}'{}",
+                sudo_hint()
+            )))
         }
 
         // ---- logs ----
@@ -3470,11 +3583,20 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 let engine = ec.backend.container_engine().ok_or_else(|| {
                     ManagerError::EnvError(format!("No serve running for environment '{n}'"))
                 })?;
-                let cname = serve::serve_container_name(n);
+                // The recorded name, not one derived from the caller: a serve
+                // started by root (a system environment) is named after its
+                // starter.
+                let cname = match cfg::read_serve_runtime(scope, &env_name)
+                    .and_then(|rt| rt.handle)
+                {
+                    Some(ServeHandle::Container { name, .. }) => name,
+                    _ => serve::serve_container_name(n),
+                };
                 if !container::container_exists(engine, &cname) {
-                    return Err(ManagerError::EnvError(
-                        format!("No serve container running for environment '{n}'")
-                    ));
+                    return Err(ManagerError::EnvError(format!(
+                        "No serve container running for environment '{n}'{}",
+                        sudo_hint()
+                    )));
                 }
                 (cname, engine, cfg::env_data_dir(scope, &env_name).join("logs"))
             } else {
@@ -3537,7 +3659,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             let (env_name, scope, ec) = resolve_env_or_default(env)?;
             // Backend-neutral: eval is an HTTP client, and a native serve is as
             // valid a target as a container one.
-            if !env_serve_alive(scope, &env_name, &ec) {
+            if env_serve_probe(scope, &env_name, &ec) == container::Probe::Absent {
                 return Err(ManagerError::EnvError(format!(
                     "No server running for '{env_name}'. Start with: mim start --env {env_name}"
                 )));
@@ -3551,6 +3673,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // Resolve the target environment up front so the program's declared
             // dependencies can be provisioned into it BEFORE it is built.
             let (env_name, scope, ec) = resolve_env_or_default(env)?;
+            require_env_writable(scope, &env_name, "`mim install`")?;
+            // ENV-9: installing keeps the env's morloc version; an env without
+            // one is refused rather than provisioned at the latest release. A
+            // local-runtime env's version is its adopted compiler's, whatever
+            // is requested.
+            let keep_version = if ec.is_local_runtime() {
+                current_version_tag(&ec)
+            } else {
+                Some(require_current_version(&ec, &env_name)?)
+            };
 
             // 1. Resolve the program's env requirements without building it
             //    (frontend only). A directory is a package whose entry is its
@@ -3587,7 +3719,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    envspec.json, which gather_env_specs picks up from then on.
             //    Keep the env's current morloc version -- installing a module must
             //    never bump the toolchain out from under it.
-            rematerialize_env(scope, &env_name, &[dry], current_version_tag(&ec), &[], verbose)?;
+            rematerialize_env(scope, &env_name, &[dry], keep_version.clone(), &[], verbose)?;
 
             // 3. Build + install into the now-complete environment. Step 2 may
             //    have rebuilt the image, so re-read the config.
@@ -3631,13 +3763,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    Re-solve so the manager's world (lock, image, cache marker) carries
             //    them too; the pre-build solve above held them back.
             if has_py_locals {
-                let ec = cfg::read_env_config(scope, &env_name)?;
-                rematerialize_env(scope, &env_name, &[], current_version_tag(&ec), &[], verbose)?;
+                rematerialize_env(scope, &env_name, &[], keep_version, &[], verbose)?;
             }
             Ok(())
         }
 
-        // ---- expose ----
+        // ---- view ----
         // Bare `mim view` shows the views. The word promises a look at something,
         // and the other `view` in this toolchain (`morloc-nexus view`) has
         // already taught that reading, so the two agree rather than compete.
@@ -3650,6 +3781,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         Cmd::View { action: Some(action), .. } => match action {
             ViewAction::Add { module, protocols, env } => {
                 let (env_name, scope, ec) = resolve_env_or_default(env)?;
+                require_env_writable(scope, &env_name, "`mim view add`")?;
                 // A view shows an INSTALLED program; catch typos early.
                 let launcher =
                     cfg::env_program_launcher(&ec, cfg::env_data_dir(scope, &env_name), &module);
@@ -3665,18 +3797,20 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 cfg::write_views(scope, &env_name, &views)?;
                 let protos: Vec<&str> = protocols.iter().map(|p| p.as_str()).collect();
                 eprintln!(
-                    "'{module}' is now in the {} view of '{env_name}'. Run 'mim start' to serve.",
+                    "'{module}' is now in the {} view of '{env_name}'. Run 'mim start' to serve \
+                     (--force if it is already serving).",
                     protos.join(" and ")
                 );
                 Ok(())
             }
             ViewAction::Rm { module, env } => {
                 let (env_name, scope, _ec) = resolve_env_or_default(env)?;
+                require_env_writable(scope, &env_name, "`mim view rm`")?;
                 let mut views = cfg::read_views(scope, &env_name)?;
                 if views.remove(&module) {
                     cfg::write_views(scope, &env_name, &views)?;
                     eprintln!("Removed '{module}' from the views of '{env_name}'. \
-                               Run 'mim start' to apply.");
+                               Run 'mim start' to apply (--force if it is already serving).");
                 } else {
                     eprintln!("'{module}' was not in any view of '{env_name}'.");
                 }
@@ -3690,6 +3824,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             }
             ViewAction::Eval { allow, off, env } => {
                 let (env_name, scope, _ec) = resolve_env_or_default(env)?;
+                require_env_writable(scope, &env_name, "`mim view eval`")?;
                 let mut views = cfg::read_views(scope, &env_name)?;
                 if off {
                     views.eval = None;
@@ -3709,7 +3844,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             }
         },
 
-        // ---- status ----
+        // ---- env ----
         Cmd::Env { action } => match action {
             EnvAction::Prefix { env, lang } => {
                 let (env_name, scope, _ec) = resolve_env_or_default(env)?;
@@ -3772,15 +3907,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                     c.url = if rt.token_required { format!("{} (token)", rt.url()) } else { rt.url() };
                 }
             }
-            // Native serves (host processes) tracked via per-env serve records.
-            all_containers.extend(native_running_serves());
+            // Serves found through their records: native ones (host processes),
+            // and container ones named after someone else -- a system
+            // environment served by root.
+            for found in recorded_running_serves() {
+                if !all_containers.iter().any(|c| c.name == found.name) {
+                    all_containers.push(found);
+                }
+            }
             if json {
                 #[derive(serde::Serialize)]
                 struct StatusOutput { containers: Vec<serve::ServeContainerInfo> }
                 let output = StatusOutput { containers: all_containers };
                 println!("{}", serde_json::to_string_pretty(&output).unwrap());
             } else if all_containers.is_empty() {
-                println!("No servers running.");
+                println!("No servers running.{}", sudo_hint());
             } else {
                 println!("Running servers:");
                 println!("  {:<16} {:<12} {:<20} {:<32} STATUS", "ENV", "MODE", "MODULES", "URL");
@@ -4034,11 +4175,10 @@ pub(crate) fn native_run_env(
     let status = cmd.status().map_err(|e| {
         ManagerError::EnvError(format!("failed to launch command on host: {e}"))
     })?;
-    let code = status.code().unwrap_or(1);
     if status.success() {
         Ok(())
     } else {
-        std::process::exit(code);
+        std::process::exit(command_exit_code(status));
     }
 }
 
@@ -4047,8 +4187,8 @@ pub(crate) fn native_run_env(
 // ======================================================================
 
 /// The release tag to provision the morloc runtime from: `$MORLOC_RELEASE_TAG`
-/// if set (e.g. "dev" or "v0.98.3"), else "latest" (resolved via the releases
-/// API). mim is self-bootstrapping -- it downloads the compiler +
+/// if set (e.g. "dev" or "v0.98.3"), else "latest" (resolved by following GitHub's
+/// releases/latest redirect). mim is self-bootstrapping -- it downloads the compiler +
 /// Rust source (init builds the runtime) rather than requiring a host morloc install.
 fn resolve_release_tag() -> String {
     std::env::var("MORLOC_RELEASE_TAG")
@@ -4191,6 +4331,26 @@ fn run_native_morloc_init(
     fhs_wrapper: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
+    let mut cmd = native_init_command(morloc_bin, env_dir, runtime_dir, activation, fhs_wrapper, verbose);
+    let status = cmd
+        .status()
+        .map_err(|e| ManagerError::EnvError(format!("could not run morloc init: {e}")))?;
+    if !status.success() {
+        return Err(ManagerError::EnvError(
+            "morloc init failed while provisioning the native environment".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn native_init_command(
+    morloc_bin: &std::path::Path,
+    env_dir: &std::path::Path,
+    runtime_dir: &std::path::Path,
+    activation: &[(String, String)],
+    fhs_wrapper: Option<&str>,
+    verbose: bool,
+) -> Command {
     // init execs the conda toolchain (gcc/cargo/python) to build libmorloc.so +
     // morloc-nexus + shims, so on NixOS it must run inside the FHS sandbox.
     let mut args: Vec<std::ffi::OsString> = vec!["init".into(), "-f".into()];
@@ -4208,15 +4368,10 @@ fn run_native_morloc_init(
     // init builds libmorloc.so + morloc-nexus from source with the env toolchain;
     // point it at the Rust workspace bundled in the provisioned runtime.
     cmd.env("MORLOC_RUST_DIR", provision::runtime_rust_src(runtime_dir));
-    let status = cmd
-        .status()
-        .map_err(|e| ManagerError::EnvError(format!("could not run morloc init: {e}")))?;
-    if !status.success() {
-        return Err(ManagerError::EnvError(
-            "morloc init failed while provisioning the native environment".to_string(),
-        ));
-    }
-    Ok(())
+    // PROV-5: link nothing into the user's own bin directory; the env's bin/
+    // is on PATH in every run.
+    cmd.env("MORLOC_BIN_LINK_DIR", "");
+    cmd
 }
 
 /// Materialize a native environment: solve its pixi toolchain, capture the
@@ -5403,8 +5558,7 @@ fn backend_options(container_only: bool) -> Vec<BackendOption> {
     }];
     // Container engines follow native, in the shared ContainerEngine::ALL order.
     for eng in ContainerEngine::ALL {
-        // A dev env builds from a mounted source tree, which only docker/podman
-        // support; apptainer is listed but greyed for dev.
+        // A dev env is docker/podman only; apptainer is listed but greyed for dev.
         let disabled = if container_only && !eng.is_oci() {
             Some("not available for a dev environment (docker/podman only)".to_string())
         } else if engine_installed(eng) {
@@ -6198,9 +6352,8 @@ impl EditField {
 }
 
 /// The editable fields for a plan, in display order. Scope and system packages
-/// apply to container backends; the home settings and the dev mim-env to
-/// docker/podman and dev respectively; the dev source and (local-only) scope
-/// shape the dev case.
+/// apply to container backends, the home settings to docker/podman. A dev env
+/// adds its source and drops scope (dev envs are local-only).
 fn confirm_fields(plan: &NewPlan) -> Vec<EditField> {
     let is_container = matches!(plan.backend, Backend::Container(_));
     let is_oci = matches!(plan.backend, Backend::Container(e) if e.is_oci());
@@ -6451,7 +6604,7 @@ fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
         cli_cert_bundle,
     } = input;
 
-    // 0. Dev mode (build from a mounted source tree). A dev env is container-only
+    // 0. Dev mode (build from a source tree). A dev env is container-only
     //    and local-scope; it forces those choices below.
     let dev_source = match cli_dev {
         Some(p) => Some(
@@ -6722,7 +6875,7 @@ fn native_new(
 }
 
 
-/// Slim base image for requirement-derived container builds. Fully qualified
+/// The light (`--base light`) base image for container builds. Fully qualified
 /// (registry + `library/` namespace) so podman resolves it without a
 /// containers-registries.conf: podman refuses to expand a bare short name like
 /// `debian:bookworm-slim` when no unqualified-search-registries config is present
@@ -6851,10 +7004,7 @@ fn container_capture_env(
     }
     let data_dir = cfg::env_data_dir(scope, name);
     let v_data_dir = data_dir.to_string_lossy().to_string();
-    let cwd = std::env::current_dir()
-        .map_err(|e| ManagerError::EnvError(format!("cannot resolve current directory: {e}")))?
-        .to_string_lossy()
-        .to_string();
+    let cwd = work_mount_dir()?;
     // HOME lives under the mounted state (oci_base_env); make it on the host side
     // so writes do not hit ENOENT.
     let _ = cfg::ensure_env_home(&v_data_dir);
@@ -6958,8 +7108,7 @@ fn cache_key(world_digest: &str, morloc_bin: &std::path::Path, system_packages: 
 
 /// The provision tag that keeps an environment at its currently recorded morloc
 /// version: `Some("<version>")`, or `None` if the env has no recorded version
-/// (a legacy or `--no-init` env). `install` uses this directly (a missing
-/// version resolves to latest); callers that must NOT move the version use
+/// (a legacy or `--no-init` env). Callers that must not move the version use
 /// `require_current_version`.
 fn current_version_tag(ec: &EnvironmentConfig) -> Option<String> {
     ec.morloc_version.as_ref().map(|v| v.show())
@@ -6979,15 +7128,17 @@ fn require_current_version(ec: &EnvironmentConfig, env_name: &str) -> Result<Str
 }
 
 /// Resolve the target compiler version of an update to a concrete numeric
-/// string. `requested` follows `Cmd::Update`'s policy: `None` = --latest;
-/// `Some(v)` = an explicit target or the env's recorded version. A literal
-/// "latest" is resolved via the release manifest (a read-only network fetch);
-/// an explicit/recorded version needs no network.
+/// string. `requested` follows `Cmd::Update`'s policy: `None` = --latest,
+/// which, like the rebuild it gates, means `$MORLOC_RELEASE_TAG` or else the
+/// newest release; `Some(v)` = an explicit target or the env's recorded
+/// version. A literal "latest" is resolved via the release manifest (a
+/// read-only network fetch); an explicit/recorded version needs no network.
 fn resolve_target_version(requested: &Option<String>) -> Result<String> {
     match requested {
         Some(v) if !is_latest_spec(v) => Ok(strip_v_prefix(v).to_string()),
         _ => {
-            let tag = provision::resolve_tag(requested.as_deref().unwrap_or("latest"))?;
+            let spec = requested.clone().unwrap_or_else(resolve_release_tag);
+            let tag = provision::resolve_tag(&spec)?;
             Ok(provision::fetch_manifest(&tag)?.version)
         }
     }
@@ -7155,12 +7306,10 @@ fn clear_materialized_marker(scope: Scope, name: &str, ec: &EnvironmentConfig) {
 /// them persistent; a compiled pool built against the previous runtime is
 /// rebuilt by the next `morloc make`, as after any update.
 fn reset_for_reinit(scope: Scope, name: &str, ec: &EnvironmentConfig) -> Result<()> {
-    if env_serve_alive(scope, name, ec) {
-        return Err(ManagerError::EnvError(format!(
-            "environment '{name}' is being served; stop it first with \
-             'mim stop --env {name}', then rebuild it."
-        )));
-    }
+    require_not_serving(scope, name, ec, format!(
+        "environment '{name}' is being served; stop it first with \
+         'mim stop --env {name}', then rebuild it."
+    ))?;
     let data_dir = cfg::env_data_dir(scope, name);
     discard_derived_state(&data_dir, ec.backend.container_engine())?;
     clear_materialized_marker(scope, name, ec);
@@ -7203,9 +7352,18 @@ fn discard_derived_state(data_dir: &std::path::Path, engine: Option<ContainerEng
     // nothing describes a world that no longer exists.
     if let Some(engine) = engine {
         let volume = serve::prefix_volume(data_dir);
-        if container::volume_exists(engine, &volume)
-            && !container::volume_remove(engine, &volume).success()
-        {
+        let present = match container::probe(engine, "volume", &volume) {
+            container::Probe::Present => true,
+            container::Probe::Absent => false,
+            container::Probe::Unknown(why) => {
+                return Err(ManagerError::EnvError(format!(
+                    "cannot ask {} about the conda prefix volume '{volume}' ({why}); \
+                     retry where the engine is reachable.",
+                    engine.name()
+                )))
+            }
+        };
+        if present && !container::volume_remove(engine, &volume).success() {
             return Err(ManagerError::EnvError(format!(
                 "cannot remove the conda prefix volume '{volume}'; is a container of \
                  this environment still running? Stop it and run this again."
@@ -7234,7 +7392,7 @@ fn rematerialize_env(
     verbose: bool,
 ) -> Result<()> {
     let ec = cfg::read_env_config(scope, name)?;
-    let lang_pins = cfg::read_env_inputs(scope, name).lang_pins;
+    let lang_pins = cfg::read_env_inputs(scope, name)?.lang_pins;
     let mut specs = gather_env_specs(scope, name)?;
     specs.extend_from_slice(extra_specs);
 
@@ -7244,7 +7402,7 @@ fn rematerialize_env(
     // passes the recorded version.
     let effective_version = requested_version.as_deref();
 
-    // Dev envs mount a source tree the developer builds from: a version change
+    // Dev envs provision tooling for a source tree the developer builds from: a version change
     // re-points the stdlib base (re-solve lib deps) and re-provisions the tooling,
     // but builds NO compiler (that is the developer's, in the dev shell). Route to
     // the dev provisioner, updating the stdlib base.
@@ -7354,7 +7512,7 @@ fn build_requirement_derived_image(
     let env_dir = cfg::env_data_dir(scope, name);
     let context = env_dir.join(CONTAINER_BUILD_SUBDIR);
     let manifest = pixi::render_manifest(&req.requirements);
-    let image_tag = environment::env_image_tag(name);
+    let image_tag = environment::env_image_tag(scope, name);
 
     // Prime the requirements store unconditionally (like the native path), BEFORE
     // the cache-hit early return: the store reflects the env's config/inputs, so a
@@ -7418,9 +7576,9 @@ fn build_requirement_derived_image(
         pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
     }
 
-    // Build the requirement-INDEPENDENT base image (base tools + pixi + the
-    // compiler/rust source). The env-specific pixi solve + `morloc init` run in a
-    // container step below, writing into the host mounts.
+    // Build the env's image (base tools + pixi + the compiler/rust source). The
+    // env-specific pixi solve + `morloc init` run in a container step below,
+    // writing into the host mounts.
     eprintln!("Staging the morloc runtime into the build context...");
     // A container runs Linux at the env's architecture; the staged mim agent must
     // match that platform, not the host's (identical to the triple
@@ -7561,6 +7719,20 @@ fn resolve_eval_port(env_name: &str, port: Option<u16>, rt: Option<&ServeRuntime
     })
 }
 
+/// Refuse to evaluate against the env's own server when it was started
+/// without eval, naming the fix, instead of sending a request it will reject.
+/// An explicit `--port` may name another server, so it is not checked.
+fn require_eval_served(env_name: &str, port: Option<u16>, rt: Option<&ServeRuntime>) -> Result<()> {
+    match (port, rt) {
+        (None, Some(r)) if !r.eval => Err(ManagerError::EnvError(format!(
+            "the server for '{env_name}' was started without eval. Enable it with \
+             `mim view eval --env {env_name} --allow <module>...`, then restart with \
+             `mim start --env {env_name} --force`."
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Evaluate an expression against a running serve.
 ///
 /// The port and the token come from the serve itself wherever possible. A serve
@@ -7578,6 +7750,7 @@ fn eval_against_serve(
 ) -> Result<()> {
     use std::io::{Read as IoRead, Write as IoWrite};
 
+    require_eval_served(env_name, port, rt)?;
     let port = resolve_eval_port(env_name, port, rt)?;
     let token = auth_token
         .or_else(|| std::env::var("MORLOC_MCP_TOKEN").ok().filter(|s| !s.is_empty()));
@@ -7603,17 +7776,38 @@ fn eval_against_serve(
         .read_to_string(&mut response)
         .map_err(|e| ManagerError::EnvError(format!("failed to read the response: {e}")))?;
 
-    if response.starts_with("HTTP/1.1 401") {
-        return Err(ManagerError::EnvError(format!(
+    println!("{}", interpret_eval_response(env_name, &response)?);
+    Ok(())
+}
+
+/// The body of a successful eval response, or the failure it reports. The
+/// router answers a failed evaluation with a 5xx and a refused one with a 4xx,
+/// each carrying `{"error": ...}`; only a 2xx is a result.
+fn interpret_eval_response(env_name: &str, response: &str) -> Result<String> {
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or((response, ""));
+    let code: Option<u16> = head
+        .lines()
+        .next()
+        .filter(|l| l.starts_with("HTTP/"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok());
+    match code {
+        Some(200..=299) => Ok(body.to_string()),
+        Some(401) => Err(ManagerError::EnvError(format!(
             "the serve for '{env_name}' rejected the token. Supply the one `mim start` \
              printed with --auth-token, or set MORLOC_MCP_TOKEN."
-        )));
+        ))),
+        Some(code) => {
+            let reason = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                .unwrap_or_else(|| body.trim().to_string());
+            Err(ManagerError::EnvError(format!("eval failed (HTTP {code}): {reason}")))
+        }
+        None => Err(ManagerError::EnvError(format!(
+            "the serve for '{env_name}' sent a response that is not HTTP:\n{response}"
+        ))),
     }
-    match response.find("\r\n\r\n") {
-        Some(pos) => println!("{}", &response[pos + 4..]),
-        None => println!("{response}"),
-    }
-    Ok(())
 }
 
 /// The programs installed in an environment, by name, read from the program
@@ -7748,7 +7942,7 @@ fn retire_host_prefix(pixi_dir: &std::path::Path) -> Result<()> {
 ///
 /// `runtime_may_be_empty` covers the two launches that legitimately precede a
 /// runtime: `morloc init` itself, which is what writes it, and a dev env, whose
-/// developer builds it from mounted source.
+/// developer builds it from the source tree.
 fn require_materialized(v_data_dir: &str, runtime_may_be_empty: bool) -> Result<()> {
     let root = std::path::Path::new(v_data_dir);
     let pixi_dir = root.join("pixi");
@@ -7831,7 +8025,7 @@ fn materialize_container_env(
     // Solve /env from its mounted pixi.toml/lock. For a release env, also activate
     // the now-solved toolchain and build libmorloc/nexus into MORLOC_HOME. A dev
     // env skips that: the developer builds the runtime (via `morloc init`) from the
-    // mounted source, so provisioning stops at the pixi env.
+    // source tree, so provisioning stops at the pixi env.
     let mut script = format!("set -e\n{pixi} install --locked\n", pixi = serve::CONTAINER_PIXI_BIN);
     script.push_str(&prefix_postinstall_script());
     if build_runtime {
@@ -7884,12 +8078,12 @@ fn materialize_container_env(
 }
 
 // ======================================================================
-// Dev environments: provision tooling around a mounted source tree
+// Dev environments: provision tooling around a source tree
 //
 // mim builds the image (base + baked ghcup/stack/cargo toolchain) and
 // materializes the pixi env. It does NOT build the morloc compiler or runtime: an
 // in-development source may legally not compile, so the developer builds them in
-// the dev shell, where the toolchain and the mounted source are on PATH.
+// the dev shell, where the toolchain and the working directory are available.
 // ======================================================================
 
 /// First 16 hex chars of the SHA-256 of `data` -- a stable short digest.
@@ -7909,7 +8103,7 @@ fn dev_image_key(world_digest: &str, dockerfile: &str) -> String {
 
 /// Provision a dev environment: build the image (base + baked ghcup/stack/cargo
 /// toolchain) and materialize the pixi env for `source`, returning the image tag.
-/// The compiler + runtime are the developer's to build from the mounted source.
+/// The compiler + runtime are the developer's to build from the source tree.
 /// Sibling of `build_requirement_derived_image`; diverges because there is no
 /// prebuilt compiler to download/stage and the image bakes nothing from the source.
 fn build_dev_container_image(
@@ -7928,7 +8122,7 @@ fn build_dev_container_image(
     let arch::ContainerTarget { engine, arch } = target;
     morloc_deps::layout::validate_source(source).map_err(ManagerError::EnvError)?;
 
-    // Parse the mounted source's YAMLs (no compiler exists yet) for the pixi solve
+    // Parse the source tree's YAMLs (no compiler exists yet) for the pixi solve
     // (pool runtimes + C/Rust toolchain) and the dev-only apt list.
     let support = langsupport::LangSupport::from_source_dir(source, stdlib_version)?;
     // The dev image apt-installs the compiler's build deps (dev-apt from the source)
@@ -7951,7 +8145,7 @@ fn build_dev_container_image(
     let (specs, lang_spec, requirements) =
         build_env_requirements(stdlib_version, &platform, program_specs, lang_pins, conda_packages, &support)?;
     let manifest = pixi::render_manifest(&requirements);
-    let image_tag = environment::env_image_tag(name);
+    let image_tag = environment::env_image_tag(scope, name);
 
     let env_dir = cfg::env_data_dir(scope, name);
     let context = env_dir.join(CONTAINER_BUILD_SUBDIR);
@@ -8465,52 +8659,151 @@ fn container_new_dev(
 // Native serve (detached host nexus)
 // ======================================================================
 
-/// Whether a native serve pid is still our server: alive, and (on Linux) its
-/// cmdline still looks like ours -- a guard against PID reuse. The tracked pid is
-/// the nexus directly, or (on NixOS) the `morloc-fhs` launcher whose command line
-/// embeds the `morloc-nexus` invocation, so either marker confirms it.
-fn native_serve_alive(pid: u32) -> bool {
+/// The leader of a recorded native serve, as the system sees it now.
+#[derive(Debug, PartialEq, Eq)]
+enum ServeLeader {
+    /// No process has this pid.
+    Gone,
+    /// Our leader; a zombie has exited but not been reaped.
+    Ours { zombie: bool },
+    /// The pid now names a different process.
+    Foreign,
+}
+
+/// The state letter and start time (fields 3 and 22) of `/proc/<pid>/stat`.
+fn proc_stat(pid: u32) -> Option<(char, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name (field 2) may hold spaces and parens; fields resume
+    // after its closing paren.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let start = fields.nth(18)?.parse().ok()?;
+    Some((state, start))
+}
+
+/// The leader's start time, recorded in a native serve handle at launch.
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    proc_stat(pid).map(|(_, start)| start)
+}
+
+/// Classify the recorded leader `pid` (with its recorded `start` time, if
+/// any). A start time decides identity; without one (an older record), the
+/// command line must name the nexus, or the `morloc-fhs` launcher that wraps
+/// it on NixOS. Without /proc (macOS) a live pid is trusted.
+fn serve_leader(pid: u32, start: Option<u64>) -> ServeLeader {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
-    if kill(Pid::from_raw(pid as i32), None).is_err() {
-        return false;
+    if pid <= 1 || !signal_probe_alive(kill(Pid::from_raw(pid as i32), None)) {
+        return ServeLeader::Gone;
     }
-    match std::fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(bytes) => {
-            let cmd = String::from_utf8_lossy(&bytes);
-            cmd.contains("morloc-nexus") || cmd.contains("morloc-fhs")
-        }
-        Err(_) => true, // no /proc (e.g. macOS): trust the liveness signal
+    let Some((state, now_start)) = proc_stat(pid) else {
+        return ServeLeader::Ours { zombie: false };
+    };
+    let zombie = state == 'Z';
+    let ours = match start {
+        Some(recorded) => recorded == now_start,
+        // A zombie's cmdline reads empty; an unreaped leader is still ours.
+        None => zombie
+            || std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|bytes| {
+                let cmd = String::from_utf8_lossy(&bytes);
+                cmd.contains("morloc-nexus") || cmd.contains("morloc-fhs")
+            }),
+    };
+    if ours { ServeLeader::Ours { zombie } } else { ServeLeader::Foreign }
+}
+
+/// Whether a native serve is still running: its leader is ours and not a zombie.
+fn native_serve_alive(pid: u32, start: Option<u64>) -> bool {
+    serve_leader(pid, start) == ServeLeader::Ours { zombie: false }
+}
+
+/// A hint for a serve not found: one started with sudo is root's, recorded in
+/// root's trees and, under podman, run in root's container store, none of
+/// which this user sees. Empty for root itself.
+fn sudo_hint() -> &'static str {
+    if nix::unistd::geteuid().is_root() {
+        ""
+    } else {
+        ". A serve started with sudo is visible only to sudo"
+    }
+}
+
+/// Whether a signal-0 probe found its target. EPERM means the target exists
+/// but belongs to another user (a serve started with sudo, say), which is
+/// alive, not gone.
+fn signal_probe_alive(probe: nix::Result<()>) -> bool {
+    matches!(probe, Ok(()) | Err(nix::errno::Errno::EPERM))
+}
+
+/// SERVE-3: stop the native serve recorded as leader `pid` of group `pgid`,
+/// unless `pid` now names a process that is not ours. Linux allocates no pid
+/// still in use as a process group id, so a reused leader pid means the
+/// recorded group is gone; a dead or zombie leader with a live group is
+/// still ours.
+fn stop_native_serve(pid: u32, pgid: u32, start: Option<u64>) -> Result<()> {
+    match serve_leader(pid, start) {
+        ServeLeader::Foreign => Ok(()),
+        ServeLeader::Gone | ServeLeader::Ours { .. } => kill_native_group(pgid),
     }
 }
 
 /// SIGTERM then, after a grace period, SIGKILL a native serve process group (the
-/// nexus + its pool daemons). Best-effort. Killing the GROUP (negative pid) is
-/// what reaps the child pool daemons; SIGTERM first lets the nexus clean its SHM.
-fn kill_native_group(pgid: u32) {
+/// nexus + its pool daemons). Killing the GROUP (negative pid) is what reaps the
+/// child pool daemons; SIGTERM first lets the nexus clean its SHM. A group that
+/// is already gone is not an error; one this user may not signal is.
+fn kill_native_group(pgid: u32) -> Result<()> {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
+    // -0 is our own group and -1 is every process we may signal.
+    if pgid <= 1 {
+        return Err(ManagerError::EnvError(format!(
+            "refusing to signal process group {pgid} from a serve record"
+        )));
+    }
     let group = Pid::from_raw(-(pgid as i32));
-    let _ = kill(group, Signal::SIGTERM);
+    term_outcome(pgid, kill(group, Signal::SIGTERM))?;
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         // Poll the whole GROUP (negative pgid), not just the leader: a pool daemon
         // that ignores SIGTERM and outlives the nexus leader must still gate the
         // early return, or it would be left running (SHM/port leak).
-        if kill(group, None).is_err() {
-            return; // entire group gone
+        if !signal_probe_alive(kill(group, None)) {
+            return Ok(());
         }
     }
     let _ = kill(group, Signal::SIGKILL);
+    Ok(())
+}
+
+/// What a SIGTERM to serve group `pgid` means for `stop`.
+fn term_outcome(pgid: u32, sent: nix::Result<()>) -> Result<()> {
+    match sent {
+        Err(nix::errno::Errno::EPERM) => Err(ManagerError::ConfigPermissionDenied(format!(
+            "the serve (process group {pgid}) belongs to another user; \
+             if it was started with sudo, stop it with `sudo mim stop`"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Is the serve behind this handle still live? (dispatches on the stored handle,
 /// not the env's current backend).
-fn serve_handle_alive(handle: &ServeHandle) -> bool {
+fn serve_handle_probe(handle: &ServeHandle) -> container::Probe {
     match handle {
-        ServeHandle::Native { pid, .. } => native_serve_alive(*pid),
-        ServeHandle::Container { engine, name } => container::container_exists(*engine, name),
+        ServeHandle::Native { pid, start, .. } => {
+            if native_serve_alive(*pid, *start) {
+                container::Probe::Present
+            } else {
+                container::Probe::Absent
+            }
+        }
+        ServeHandle::Container { engine, name } => container::probe(*engine, "container", name),
     }
+}
+
+fn serve_handle_alive(handle: &ServeHandle) -> bool {
+    serve_handle_probe(handle) == container::Probe::Present
 }
 
 /// Whether environment `name` currently has a live server, regardless of
@@ -8518,47 +8811,69 @@ fn serve_handle_alive(handle: &ServeHandle) -> bool {
 /// handle-less legacy record falls back to the container-name probe only for
 /// container backends -- native serves always record a handle, so a native env
 /// reaching that fallback simply is not serving.
-fn env_serve_alive(scope: Scope, name: &str, ec: &EnvironmentConfig) -> bool {
-    let Some(rt) = cfg::read_serve_runtime(scope, name) else { return false };
+fn env_serve_probe(scope: Scope, name: &str, ec: &EnvironmentConfig) -> container::Probe {
+    let Some(rt) = cfg::read_serve_runtime(scope, name) else { return container::Probe::Absent };
     if let Some(handle) = &rt.handle {
-        return serve_handle_alive(handle);
+        return serve_handle_probe(handle);
     }
     match ec.backend.container_engine() {
-        Some(engine) => container::container_exists(engine, &serve::serve_container_name(name)),
-        None => false,
+        Some(engine) => container::probe(engine, "container", &serve::serve_container_name(name)),
+        None => container::Probe::Absent,
+    }
+}
+
+/// Fail with `serving` when the env has a live server, and also when the
+/// engine cannot say: the callers are about to move or delete what a server
+/// would be running from.
+fn require_not_serving(scope: Scope, name: &str, ec: &EnvironmentConfig, serving: String) -> Result<()> {
+    refuse_unless_absent(env_serve_probe(scope, name, ec), serving)
+}
+
+fn refuse_unless_absent(probe: container::Probe, present: String) -> Result<()> {
+    match probe {
+        container::Probe::Absent => Ok(()),
+        container::Probe::Present => Err(ManagerError::EnvError(present)),
+        container::Probe::Unknown(why) => Err(ManagerError::EnvError(format!(
+            "cannot tell whether a server is running: the container engine did not \
+             answer ({why}). Retry where the engine is reachable."
+        ))),
     }
 }
 
 /// Tear down a running serve by its stored launch handle (backend-independent).
 fn stop_by_handle(handle: &ServeHandle, verbose: bool) -> Result<()> {
     match handle {
-        ServeHandle::Native { pgid, .. } => {
-            kill_native_group(*pgid);
-            Ok(())
-        }
+        ServeHandle::Native { pid, pgid, start } => stop_native_serve(*pid, *pgid, *start),
         ServeHandle::Container { engine, name } => {
             serve::stop_serve_container(*engine, verbose, name)
         }
     }
 }
 
-/// Native serves currently running: scanned from each env's serve record with a
-/// live `Native` handle. The native half of `status`/`ls-running` (the container
-/// half comes from `docker ps`); kept a free function so one query covers all envs.
-fn native_running_serves() -> Vec<serve::ServeContainerInfo> {
+/// Serves currently running according to each environment's serve record: every
+/// live native one, and every live container one, including those a name-prefix
+/// query of the engine misses because someone else started them.
+fn recorded_running_serves() -> Vec<serve::ServeContainerInfo> {
     let mut out = Vec::new();
     for scope in [Scope::Local, Scope::System] {
         for env in cfg::list_env_names(scope) {
             let Some(rt) = cfg::read_serve_runtime(scope, &env) else { continue };
-            let Some(ServeHandle::Native { pid, .. }) = &rt.handle else { continue };
-            if !native_serve_alive(*pid) {
-                continue;
-            }
+            let (name, status) = match &rt.handle {
+                Some(ServeHandle::Native { pid, start, .. }) if native_serve_alive(*pid, *start) => {
+                    (format!("native:{env}"), format!("running (native, pid {pid})"))
+                }
+                Some(ServeHandle::Container { engine, name })
+                    if container::container_exists(*engine, name) =>
+                {
+                    (name.clone(), format!("running ({})", engine.name()))
+                }
+                _ => continue,
+            };
             out.push(serve::ServeContainerInfo {
-                name: format!("native:{env}"),
+                name,
                 env: env.clone(),
                 ports: rt.port.to_string(),
-                status: format!("running (native, pid {pid})"),
+                status,
                 mode: rt.mode(),
                 modules: rt.modules_summary(),
                 url: if rt.token_required {
@@ -8626,36 +8941,16 @@ fn native_serve(
     expose: bool,
     allow_plaintext: bool,
     allow_no_auth: bool,
+    eval_allow_no_auth: bool,
     token: Option<String>,
 ) -> Result<(ServeHandle, String)> {
-    // Exposing an UNSANDBOXED host process off-loopback reuses the container
+    // Exposing an UNSANDBOXED host process off-loopback passes the container
     // path's gates (plaintext ack + a token) so it can't happen by accident.
-    if expose {
-        if !allow_plaintext {
-            return Err(ManagerError::EnvError(format!(
-                "Refusing to expose off-loopback over plaintext HTTP without --allow-plaintext.\n  \
-                 Prefer the default (loopback) and reach it over an SSH tunnel:\n    \
-                 ssh -N -L {host_port}:127.0.0.1:{host_port} <host>"
-            )));
-        }
-        if token.is_none() && !allow_no_auth {
-            return Err(ManagerError::EnvError(
-                "An exposed endpoint requires a token: set MORLOC_MCP_TOKEN or --auth-token \
-                 (or --allow-no-auth to serve it unauthenticated)."
-                    .to_string(),
-            ));
-        }
-    }
-    let http_host = if expose { "0.0.0.0" } else { "127.0.0.1" };
-    let need_allow_no_auth = http_host == "0.0.0.0" && token.is_none();
-
+    check_expose_gates(expose, allow_plaintext, allow_no_auth, token.is_some(), host_port)?;
     let data_dir = cfg::env_data_dir(scope, env_name);
     let mh = data_dir.to_string_lossy().to_string();
-    // A native serve shares the host's network namespace, so the bind address
-    // really does say who can reach it: loopback is host-confined and eval needs
-    // no token there.
-    let command = build_router_command(
-        &mh, host_port, http_host, spec, need_allow_no_auth, !expose,
+    let command = native_router_command(
+        &mh, host_port, spec, expose, token.is_some(), eval_allow_no_auth,
     );
 
     // The stored activation env-map puts the env's bin (morloc-nexus) + conda
@@ -8743,11 +9038,26 @@ fn native_serve(
     } else {
         "127.0.0.1".to_string()
     };
-    Ok((ServeHandle::Native { pid, pgid: pid }, url_host))
+    Ok((ServeHandle::Native { pid, pgid: pid, start: process_start_ticks(pid) }, url_host))
 }
 
-/// Native `start`: serve the environment as a detached host nexus process.
-#[allow(clippy::too_many_arguments)]
+/// The router argv of a native serve. It shares the host's network namespace,
+/// so the bind address really does say who can reach it: loopback is
+/// host-confined and eval needs no token there.
+fn native_router_command(
+    state_dir: &str,
+    port: u16,
+    spec: &ServeSpec,
+    expose: bool,
+    has_token: bool,
+    eval_allow_no_auth: bool,
+) -> Vec<String> {
+    let http_host = if expose { "0.0.0.0" } else { "127.0.0.1" };
+    build_router_command(
+        state_dir, port, http_host, spec, expose && !has_token, eval_allow_no_auth || !expose,
+    )
+}
+
 /// Native-backend serve launch (behind `NativeRunner::serve`). Spawns the
 /// detached host nexus + prints native-specific status; the shared orchestration
 /// (spec/port/token/record/MCP-config) runs in the `start` handler.
@@ -8755,9 +9065,18 @@ pub(crate) fn native_serve_launch(
     env: &runner::ResolvedEnv,
     req: &ServeRequest,
 ) -> Result<ServeOutcome> {
+    // Container-only inputs are refused, as `run` refuses them, not dropped.
+    if !req.engine_args.is_empty() {
+        return Err(engine_arg_not_supported());
+    }
+    if req.flagfile.is_some() {
+        return Err(flagfile_not_supported());
+    }
+    check_port_unmapped(req.host_port, req.container_port, "a native serve")?;
     let (handle, url_host) = native_serve(
         env.scope, &env.name, &req.spec, req.host_port, &req.user_env,
-        req.expose, req.allow_plaintext, req.allow_no_auth, req.token.clone(),
+        req.expose, req.allow_plaintext, req.allow_no_auth, req.eval_allow_no_auth,
+        req.token.clone(),
     )?;
     if req.expose {
         eprintln!(
@@ -9011,19 +9330,8 @@ pub(crate) fn container_run_env(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let cwd = std::env::current_dir()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    // Refuse to run from the root directory — container engines cannot
-    // bind-mount "/" and the resulting error is opaque.
-    if !shell && cwd == "/" {
-        return Err(ManagerError::EnvError(
-            "Cannot run from the root directory (/). \
-             Change to a subdirectory first (e.g., cd /tmp).".to_string()
-        ));
-    }
+    let cwd = work_mount_dir()?;
+    let run_home = run_home_mount(env_scope, &env_name, ec, &data_dir, engine)?;
 
     // Materialize flags from env.flags.yaml for the active phase + engine,
     // then append CLI one-shot overrides. The flag-file errors out on the
@@ -9043,7 +9351,7 @@ pub(crate) fn container_run_env(
         run_with_config(
             engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd, suffix,
             shell, args, false, &ec.shm_size, &extra_flags, user_env,
-            bridge_mount.as_deref(), is_dev, ec.mount_home.as_deref(), platform,
+            bridge_mount.as_deref(), is_dev, run_home.as_deref(), platform,
         )
     } else {
         let (cwd_final, skip_work_mount) = if is_home_dir && !suffix.is_empty() && !is_init {
@@ -9057,9 +9365,59 @@ pub(crate) fn container_run_env(
         run_with_config(
             engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd_final, suffix,
             shell, args, is_init || skip_work_mount, &ec.shm_size, &extra_flags, user_env,
-            bridge_mount.as_deref(), is_dev, ec.mount_home.as_deref(), platform,
+            bridge_mount.as_deref(), is_dev, run_home.as_deref(), platform,
         )
     }
+}
+
+/// The host directory a run mounts as the container's `$HOME`, `None` for the
+/// env-owned `<data_dir>/home`. A configured `mount_home` wins. A user who
+/// cannot write the environment (anyone but root, for a system one) gets a
+/// home of their own instead, so tools that write `$HOME` work and nothing
+/// lands in the shared environment. Apptainer mounts the host home itself.
+fn run_home_mount(
+    scope: Scope,
+    name: &str,
+    ec: &EnvironmentConfig,
+    data_dir: &std::path::Path,
+    engine: ContainerEngine,
+) -> Result<Option<String>> {
+    if ec.mount_home.is_some() || !engine.is_oci() || scope == Scope::Local {
+        return Ok(ec.mount_home.clone());
+    }
+    if cfg::dir_writable(data_dir) {
+        return Ok(None);
+    }
+    let home = cfg::system_env_user_home(name);
+    fs::create_dir_all(&home).map_err(|e| {
+        ManagerError::EnvError(format!("cannot create {}: {e}", home.display()))
+    })?;
+    Ok(Some(home.to_string_lossy().to_string()))
+}
+
+/// The current directory, as the host path mounted read-write at the
+/// container's work directory, after [`check_work_dir`].
+fn work_mount_dir() -> Result<String> {
+    let cwd = std::env::current_dir().map_err(|e| {
+        ManagerError::EnvError(format!("cannot resolve the current directory: {e}"))
+    })?;
+    check_work_dir(&cwd)?;
+    Ok(cwd.to_string_lossy().to_string())
+}
+
+/// Refuse a working directory that resolves to `/`: mounting it read-write
+/// would hand the container the whole host filesystem.
+fn check_work_dir(cwd: &std::path::Path) -> Result<()> {
+    let real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    if real == std::path::Path::new("/") {
+        return Err(ManagerError::EnvError(
+            "cannot run from the root directory (/): the working directory is mounted \
+             read-write into the environment, and mounting / would expose the whole \
+             host. Change to a project directory first."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Extra bind mounts for a dev environment, shared by the run/shell and capture
@@ -9260,19 +9618,39 @@ fn run_with_config(
     };
 
     let status = container_run_passthrough(engine, verbose, shell, &cfg);
-    let code = status.code().unwrap_or(1);
     if status.success() {
-        Ok(())
-    } else if code >= 125 {
-        // Exit 125+ = container engine error (not the user's program)
-        Err(ManagerError::EngineError {
+        return Ok(());
+    }
+    match container_command_status(engine, status) {
+        Some(code) => std::process::exit(code),
+        None => Err(ManagerError::EngineError {
             engine,
-            code,
+            code: engine_failure_status(engine),
             stderr: "Container engine error".to_string(),
-        })
-    } else {
-        // Exit 1-124 = program exited with non-zero, pass through silently
-        std::process::exit(code);
+        }),
+    }
+}
+
+/// The status `run` uses for a failure of the engine itself: 125 for docker
+/// and podman, 255 for apptainer.
+fn engine_failure_status(engine: ContainerEngine) -> i32 {
+    if engine.is_oci() { 125 } else { 255 }
+}
+
+/// RUN-3: the status a command ended with, in the shell's convention: its
+/// exit code, or 128 + n when signal n killed it.
+fn command_exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+}
+
+/// RUN-3: the status of a command run in a container, or `None` when the
+/// engine itself failed. Every other status, including 126, 127 and 128 + n,
+/// belongs to the command.
+fn container_command_status(engine: ContainerEngine, status: std::process::ExitStatus) -> Option<i32> {
+    match status.code() {
+        Some(c) if c == engine_failure_status(engine) => None,
+        _ => Some(command_exit_code(status)),
     }
 }
 
@@ -9312,13 +9690,62 @@ fn resolve_mcp_token(explicit: Option<String>) -> Option<String> {
 /// `preferred` if none is free (the engine then reports the real conflict). This
 /// is a best-effort predictor -- both host-networking (nexus binds the host
 /// port) and bridge publishing (`-p`) contend for the same host port.
-fn find_free_host_port(preferred: u16, range: u16) -> u16 {
-    for p in preferred..=preferred.saturating_add(range) {
-        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
-            return p;
-        }
+/// The first port from `preferred` up to `preferred + range` that `bind_ip`
+/// can bind: the address the serve will bind, since a port free on loopback
+/// may be taken on another interface.
+fn find_free_host_port(preferred: u16, range: u16, bind_ip: &str) -> Result<u16> {
+    let last = preferred.saturating_add(range);
+    (preferred..=last)
+        .find(|&p| std::net::TcpListener::bind((bind_ip, p)).is_ok())
+        .ok_or_else(|| {
+            ManagerError::EnvError(format!(
+                "no free port on {bind_ip} from {preferred} to {last}; choose one with -p"
+            ))
+        })
+}
+
+/// Refuse `-p HOST:CONTAINER` with differing ports on a serve that shares the
+/// host's network namespace: nothing maps one port to the other there, so the
+/// container port would be dropped without a word.
+fn check_port_unmapped(host_port: u16, container_port: u16, why: &str) -> Result<()> {
+    if host_port == container_port {
+        return Ok(());
     }
-    preferred
+    Err(ManagerError::EnvError(format!(
+        "-p {host_port}:{container_port} maps two ports, but {why} shares the host's \
+         network and maps none. Use -p {host_port}."
+    )))
+}
+
+/// The gates an off-loopback serve must pass, on every backend: an explicit
+/// acknowledgement of plaintext, and a token unless that too is waived.
+fn check_expose_gates(
+    expose: bool,
+    allow_plaintext: bool,
+    allow_no_auth: bool,
+    has_token: bool,
+    host_port: u16,
+) -> Result<()> {
+    if !expose {
+        return Ok(());
+    }
+    if !allow_plaintext {
+        return Err(ManagerError::EnvError(format!(
+            "Refusing to expose off-loopback over plaintext HTTP without \
+             --allow-plaintext.\n  A bearer token over plaintext protects against \
+             scanners, not eavesdroppers. Prefer the default (loopback) and reach \
+             it over an SSH tunnel:\n    ssh -N -L {host_port}:127.0.0.1:{host_port} <host>"
+        )));
+    }
+    if !has_token && !allow_no_auth {
+        return Err(ManagerError::EnvError(
+            "An exposed endpoint requires a token: set MORLOC_MCP_TOKEN or \
+             --auth-token (or --allow-no-auth to serve it unauthenticated, \
+             strongly discouraged)."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// A resolved plan for serving one program as MCP over HTTP: the container
@@ -9419,24 +9846,7 @@ fn serve_plan(
     host_net_usable: bool,
     token: Option<String>,
 ) -> Result<ServePlan> {
-    if expose {
-        if !allow_plaintext {
-            return Err(ManagerError::EnvError(format!(
-                "Refusing to expose MCP off-loopback over plaintext HTTP without \
-                 --allow-plaintext.\n  A bearer token over plaintext protects against \
-                 scanners, not eavesdroppers. Prefer the default (loopback) and reach \
-                 it over an SSH tunnel:\n    ssh -N -L {host_port}:127.0.0.1:{host_port} <host>"
-            )));
-        }
-        if token.is_none() && !allow_no_auth {
-            return Err(ManagerError::EnvError(
-                "An exposed MCP endpoint requires a token: set MORLOC_MCP_TOKEN or \
-                 --auth-token (or --allow-no-auth to serve it unauthenticated, \
-                 strongly discouraged)."
-                    .to_string(),
-            ));
-        }
-    }
+    check_expose_gates(expose, allow_plaintext, allow_no_auth, token.is_some(), host_port)?;
 
     let is_apptainer = matches!(engine, ContainerEngine::Apptainer);
 
@@ -9474,6 +9884,10 @@ fn serve_plan(
     // the client reaches (host_port). On a bridge, it binds the in-container port
     // and `-p` maps host_port -> container_port.
     let host_netns = is_apptainer || network.as_deref() == Some("host");
+    if host_netns {
+        let why = if is_apptainer { "an Apptainer serve" } else { "a loopback serve on Linux" };
+        check_port_unmapped(host_port, container_port, why)?;
+    }
     let bind_port = if host_netns { host_port } else { container_port };
 
     // The nexus refuses a non-loopback bind with no token unless --allow-no-auth.
@@ -11068,12 +11482,14 @@ mod tests {
 
     #[test]
     fn find_free_host_port_skips_taken() {
-        // Bind a port, then confirm the picker avoids it and returns a bindable one.
+        // Bind a port, then confirm the picker avoids it and stays in range.
+        // (Whether the picked port is still free afterwards is a race with
+        // every other process, so it is not asserted.)
         let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let taken = l.local_addr().unwrap().port();
-        let picked = find_free_host_port(taken, 50);
+        let picked = find_free_host_port(taken, 50, "127.0.0.1").unwrap();
         assert_ne!(picked, taken, "should skip the bound port");
-        assert!(std::net::TcpListener::bind(("127.0.0.1", picked)).is_ok());
+        assert!((taken..=taken.saturating_add(50)).contains(&picked));
     }
 
     // ---- Type tests ----
@@ -11170,7 +11586,7 @@ mod tests {
 
     #[test]
     fn default_config_uses_podman() {
-        assert_eq!(Config::default().engine().unwrap(), ContainerEngine::Podman);
+        assert_eq!(Config::default().backend.container_engine().unwrap(), ContainerEngine::Podman);
     }
 
     // ---- Config JSON round-trip tests ----
@@ -11186,7 +11602,7 @@ mod tests {
         cfg::write_config(&path, &cfg).unwrap();
         let cfg2: Config = cfg::read_config(&path).unwrap();
         assert_eq!(cfg2.default_env.as_deref(), Some("ml"));
-        assert_eq!(cfg2.engine().unwrap(), ContainerEngine::Docker);
+        assert_eq!(cfg2.backend.container_engine().unwrap(), ContainerEngine::Docker);
     }
 
     // The Backend abstraction must be on-disk compatible with the historical
@@ -11197,7 +11613,7 @@ mod tests {
     fn backend_reads_legacy_engine_field() {
         let legacy = r#"{"default_env":"ml","engine":"podman"}"#;
         let cfg: Config = serde_json::from_str(legacy).unwrap();
-        assert_eq!(cfg.engine().unwrap(), ContainerEngine::Podman);
+        assert_eq!(cfg.backend.container_engine().unwrap(), ContainerEngine::Podman);
         assert!(matches!(
             cfg.backend,
             Backend::Container(ContainerEngine::Podman)
@@ -11225,8 +11641,7 @@ mod tests {
         assert!(json.contains(r#""engine":"native""#), "got: {json}");
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(back.backend.is_native());
-        // A native backend has no container engine; engine() must be an error.
-        assert!(back.engine().is_err());
+        assert!(back.backend.container_engine().is_none());
     }
 
     #[test]
@@ -12593,7 +13008,7 @@ run:
             "child should be alive before the group kill"
         );
 
-        kill_native_group(leader);
+        kill_native_group(leader).unwrap();
         // In production the nexus is reparented to init and reaped there; in the
         // test WE are the leader's parent, so reap its zombie before asserting.
         let _ = child.wait();
@@ -12625,5 +13040,699 @@ run:
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(ok, "child pool daemon must be terminated by the group kill (not left an orphan)");
+    }
+
+    /// Roots every scope of this thread under a fresh tempdir holding one
+    /// container environment, `sys`, in the system scope. With `locked`, the
+    /// system trees are made read-only, as they are for a non-root user.
+    struct ScopeFixture {
+        tmp: tempfile::TempDir,
+    }
+
+    impl ScopeFixture {
+        fn new(locked: bool) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            cfg::test_roots::set(tmp.path());
+            let ec = EnvironmentConfig::new_backend(
+                "sys".to_string(),
+                Backend::Container(ContainerEngine::Podman),
+                CONTAINER_BASE_IMAGE.to_string(),
+                Some("localhost/morloc-env:sys".to_string()),
+                Some(Version::new(0, 98, 1)),
+                Vec::new(),
+                Vec::new(),
+            );
+            cfg::write_env_config(Scope::System, "sys", &ec).unwrap();
+            fs::create_dir_all(cfg::env_data_dir(Scope::System, "sys")).unwrap();
+            let f = ScopeFixture { tmp };
+            if locked {
+                f.chmod_system(0o555);
+            }
+            f
+        }
+
+        fn chmod_system(&self, mode: u32) {
+            use std::os::unix::fs::PermissionsExt;
+            fn walk(p: &std::path::Path, mode: u32) {
+                if p.is_dir() {
+                    for e in fs::read_dir(p).unwrap() {
+                        walk(&e.unwrap().path(), mode);
+                    }
+                    fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+                }
+            }
+            walk(&self.tmp.path().join("system"), mode);
+        }
+    }
+
+    impl Drop for ScopeFixture {
+        fn drop(&mut self) {
+            self.chmod_system(0o755);
+        }
+    }
+
+    fn running_as_root() -> bool {
+        nix::unistd::getuid().is_root()
+    }
+
+    fn dispatch_args(args: &[&str]) -> Result<()> {
+        let cli = Cli::try_parse_from(args).unwrap();
+        dispatch(false, false, cli.command.unwrap())
+    }
+
+    #[test]
+    fn a_system_environment_is_writable_only_by_who_can_write_its_trees() {
+        if running_as_root() {
+            return;
+        }
+        let _open = ScopeFixture::new(false);
+        assert!(require_env_writable(Scope::System, "sys", "x").is_ok());
+        drop(_open);
+        let _locked = ScopeFixture::new(true);
+        let err = require_env_writable(Scope::System, "sys", "`mim install`").unwrap_err();
+        assert!(err.to_string().contains("system environment"), "{err}");
+        assert!(require_env_writable(Scope::Local, "sys", "x").is_ok());
+    }
+
+    /// The data tree alone being read-only (a config tree a group may write)
+    /// still refuses: system environments keep state in both.
+    #[test]
+    fn a_read_only_system_data_tree_refuses_writes() {
+        if running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let f = ScopeFixture::new(false);
+        let data = f.tmp.path().join("system").join("data");
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(check_system_write_access().is_err());
+    }
+
+    /// Every command that changes an environment refuses a system one the
+    /// caller cannot write, before any side effect.
+    #[test]
+    fn changing_a_system_environment_without_write_access_is_refused() {
+        if running_as_root() {
+            return;
+        }
+        let f = ScopeFixture::new(true);
+        let snap = f.tmp.path().join("pins.txt");
+        fs::write(&snap, "foo abc123\n").unwrap();
+        let snap = snap.to_string_lossy().to_string();
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["mim", "install", "--env", "sys", "x.loc"],
+            vec!["mim", "modify", "--env", "sys", "--modules-file", &snap],
+            vec!["mim", "modify", "--env", "sys", "--shm-size", "4g"],
+            vec!["mim", "view", "eval", "--env", "sys", "--off"],
+            vec!["mim", "view", "rm", "--env", "sys", "foo"],
+            vec!["mim", "start", "--env", "sys"],
+            vec!["mim", "stop", "--env", "sys"],
+        ];
+        for args in cases {
+            let err = dispatch_args(&args).unwrap_err().to_string();
+            assert!(err.contains("system environment") && err.contains("requires root"),
+                "{args:?}: {err}");
+        }
+        assert!(!cfg::env_data_dir(Scope::System, "sys").join("snapshots").exists());
+    }
+
+    /// ENV-9: installing into an environment with no recorded version must not
+    /// provision it at the latest release; it fails before any side effect.
+    #[test]
+    fn install_into_a_version_less_environment_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        cfg::test_roots::set(tmp.path());
+        let ec = EnvironmentConfig::new_backend(
+            "nov".to_string(),
+            Backend::Container(ContainerEngine::Podman),
+            CONTAINER_BASE_IMAGE.to_string(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        cfg::write_env_config(Scope::Local, "nov", &ec).unwrap();
+        fs::create_dir_all(cfg::env_data_dir(Scope::Local, "nov")).unwrap();
+        let err = dispatch_args(&["mim", "install", "--env", "nov", "x.loc"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no usable morloc version"), "{err}");
+    }
+
+    /// SERVE-3: a serve record whose container is gone is removed by `stop`,
+    /// not kept failing forever.
+    #[test]
+    fn stop_clears_a_record_whose_container_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        cfg::test_roots::set(tmp.path());
+        let ec = EnvironmentConfig::new_backend(
+            "gone".to_string(),
+            Backend::Container(ContainerEngine::Podman),
+            CONTAINER_BASE_IMAGE.to_string(),
+            None,
+            Some(Version::new(0, 98, 1)),
+            Vec::new(),
+            Vec::new(),
+        );
+        cfg::write_env_config(Scope::Local, "gone", &ec).unwrap();
+        fs::create_dir_all(cfg::env_data_dir(Scope::Local, "gone")).unwrap();
+        let record = ServeRuntime {
+            mcp: vec!["m".to_string()],
+            api: Vec::new(),
+            eval: false,
+            host: "127.0.0.1".to_string(),
+            port: 9000,
+            token_required: false,
+            handle: Some(ServeHandle::Container {
+                engine: ContainerEngine::Podman,
+                name: "morloc-serve-test-no-such-container".to_string(),
+            }),
+        };
+        cfg::write_serve_runtime(Scope::Local, "gone", &record).unwrap();
+        dispatch_args(&["mim", "stop", "--env", "gone"]).unwrap();
+        assert!(cfg::read_serve_runtime(Scope::Local, "gone").is_none());
+    }
+
+    /// RUN-3: only the engine's own failure status is the engine's; a
+    /// command's 126, 127 or signal death passes through as its status.
+    #[test]
+    fn a_command_status_is_never_taken_for_an_engine_error() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+        let exited = |c: i32| ExitStatus::from_raw(c << 8);
+        assert_eq!(container_command_status(ContainerEngine::Podman, exited(1)), Some(1));
+        assert_eq!(container_command_status(ContainerEngine::Podman, exited(126)), Some(126));
+        assert_eq!(container_command_status(ContainerEngine::Podman, exited(127)), Some(127));
+        assert_eq!(container_command_status(ContainerEngine::Podman, exited(130)), Some(130));
+        assert_eq!(container_command_status(ContainerEngine::Podman, exited(141)), Some(141));
+        assert_eq!(container_command_status(ContainerEngine::Podman, exited(125)), None);
+        assert_eq!(command_exit_code(ExitStatus::from_raw(15)), 143);
+        assert_eq!(container_command_status(ContainerEngine::Apptainer, exited(255)), None);
+        assert_eq!(container_command_status(ContainerEngine::Apptainer, exited(125)), Some(125));
+    }
+
+    /// The leader classification behind every native stop: a zombie leader
+    /// is ours, and a recorded start time that differs means a reused pid.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_serve_leader_is_judged_by_its_start_time() {
+        use std::os::unix::process::CommandExt;
+        let mut live = std::process::Command::new("sleep");
+        live.arg("60").process_group(0);
+        let mut live = live.spawn().unwrap();
+        let pid = live.id();
+        let start = process_start_ticks(pid).unwrap();
+        assert_eq!(serve_leader(pid, Some(start)), ServeLeader::Ours { zombie: false });
+        assert_eq!(serve_leader(pid, Some(start + 1)), ServeLeader::Foreign);
+        let _ = live.kill();
+        let _ = live.wait();
+
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let zpid = dead.id();
+        let zstart = process_start_ticks(zpid);
+        for _ in 0..100 {
+            if proc_stat(zpid).is_some_and(|(s, _)| s == 'Z') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(serve_leader(zpid, None), ServeLeader::Ours { zombie: true });
+        assert_eq!(serve_leader(zpid, zstart), ServeLeader::Ours { zombie: true });
+        let _ = dead.wait();
+        assert_eq!(serve_leader(zpid, zstart), ServeLeader::Gone);
+    }
+
+    /// SERVE-3: a native serve record whose pid now names someone else's
+    /// process is never signalled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_never_signals_a_process_that_reused_the_server_pid() {
+        use std::os::unix::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        cfg::test_roots::set(tmp.path());
+        let ec = EnvironmentConfig::new_backend(
+            "n".to_string(), Backend::Native, String::new(), None,
+            Some(Version::new(0, 98, 1)), Vec::new(), Vec::new(),
+        );
+        cfg::write_env_config(Scope::Local, "n", &ec).unwrap();
+        fs::create_dir_all(cfg::env_data_dir(Scope::Local, "n")).unwrap();
+        let mut foreign = std::process::Command::new("sleep");
+        foreign.arg("60").process_group(0);
+        let mut child = foreign.spawn().unwrap();
+        let pid = child.id();
+        let record = ServeRuntime {
+            mcp: Vec::new(),
+            api: vec!["m".to_string()],
+            eval: false,
+            host: "127.0.0.1".to_string(),
+            port: 9000,
+            token_required: false,
+            handle: Some(ServeHandle::Native { pid, pgid: pid, start: None }),
+        };
+        cfg::write_serve_runtime(Scope::Local, "n", &record).unwrap();
+        dispatch_args(&["mim", "stop", "--env", "n"]).unwrap();
+        let still_running = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(still_running, "stop signalled a process that is not the server");
+    }
+
+    #[test]
+    fn the_root_directory_is_never_mounted_as_the_work_dir() {
+        assert!(check_work_dir(std::path::Path::new("/")).is_err());
+        assert!(check_work_dir(std::path::Path::new("//")).is_err());
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("root");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert!(check_work_dir(&link).is_err());
+        assert!(check_work_dir(tmp.path()).is_ok());
+    }
+
+    /// A user who may run a system environment but not write it gets a home
+    /// of their own; the owner keeps the environment's.
+    #[test]
+    fn a_run_in_a_read_only_system_environment_gets_a_private_home() {
+        if running_as_root() {
+            return;
+        }
+        let _f = ScopeFixture::new(true);
+        let ec = cfg::read_env_config(Scope::System, "sys").unwrap();
+        let data = cfg::env_data_dir(Scope::System, "sys");
+        let home = run_home_mount(Scope::System, "sys", &ec, &data, ContainerEngine::Podman)
+            .unwrap()
+            .expect("a private home");
+        assert_eq!(std::path::PathBuf::from(&home), cfg::system_env_user_home("sys"));
+        assert!(std::path::Path::new(&home).is_dir());
+        // Apptainer mounts the host home itself.
+        let none = run_home_mount(Scope::System, "sys", &ec, &data, ContainerEngine::Apptainer)
+            .unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn the_owner_of_an_environment_runs_with_its_own_home() {
+        let _f = ScopeFixture::new(false);
+        let ec = cfg::read_env_config(Scope::System, "sys").unwrap();
+        let data = cfg::env_data_dir(Scope::System, "sys");
+        let home = run_home_mount(Scope::System, "sys", &ec, &data, ContainerEngine::Podman).unwrap();
+        assert!(home.is_none());
+    }
+
+    /// A serve owned by another user answers a signal probe with EPERM. It is
+    /// alive, and stopping it is an error rather than a reported success.
+    #[test]
+    fn a_serve_owned_by_another_user_is_alive_and_cannot_be_stopped() {
+        use nix::errno::Errno;
+        assert!(signal_probe_alive(Ok(())));
+        assert!(signal_probe_alive(Err(Errno::EPERM)));
+        assert!(!signal_probe_alive(Err(Errno::ESRCH)));
+        let err = term_outcome(4242, Err(Errno::EPERM)).unwrap_err().to_string();
+        assert!(err.contains("another user") && err.contains("sudo mim stop"), "{err}");
+        assert!(term_outcome(4242, Err(Errno::ESRCH)).is_ok());
+        assert!(term_outcome(4242, Ok(())).is_ok());
+    }
+
+    /// Group 0 is our own and -1 addresses every process we may signal; a
+    /// record holding either must never reach kill(2).
+    #[test]
+    fn a_serve_record_cannot_signal_our_group_or_every_process() {
+        assert!(kill_native_group(0).is_err());
+        assert!(kill_native_group(1).is_err());
+        assert!(!native_serve_alive(0, None));
+        assert!(!native_serve_alive(1, None));
+    }
+
+    #[test]
+    fn a_full_port_range_is_an_error_not_the_taken_port() {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = l.local_addr().unwrap().port();
+        let err = find_free_host_port(taken, 0, "127.0.0.1").unwrap_err().to_string();
+        assert!(err.contains("no free port"), "{err}");
+    }
+
+    /// `-p` takes one port or one mapping, once: a second `-p` was dropped
+    /// without a word.
+    #[test]
+    fn start_takes_a_bare_port_or_a_mapping_once() {
+        let port = |args: &[&str]| match Cli::try_parse_from(args).map(|c| c.command) {
+            Ok(Some(Cmd::Start { port, .. })) => Ok(port),
+            Ok(_) => panic!("expected start"),
+            Err(e) => Err(e),
+        };
+        assert_eq!(port(&["mim", "start", "-p", "8080"]).unwrap(), Some((8080, 8080)));
+        assert_eq!(port(&["mim", "start", "-p", "9090:8080"]).unwrap(), Some((9090, 8080)));
+        assert_eq!(port(&["mim", "start"]).unwrap(), None);
+        assert!(port(&["mim", "start", "-p", "1", "-p", "2"]).is_err());
+        assert!(port(&["mim", "start", "-p", "x"]).is_err());
+        let cli = Cli::try_parse_from(["mim", "start", "--advertise-host", "box.lan"]).unwrap();
+        assert!(matches!(cli.command,
+            Some(Cmd::Start { advertise_host: Some(ref h), .. }) if h == "box.lan"));
+    }
+
+    /// Where the serve shares the host network nothing maps ports, so a
+    /// mapping is refused rather than its container half dropped.
+    #[test]
+    fn a_port_mapping_is_refused_where_nothing_maps_ports() {
+        let spec = ServeSpec { mcp: vec!["dna".to_string()], api: Vec::new(), eval_allow: None };
+        let mapped = |engine, expose, host_net| {
+            serve_plan(engine, &spec, 8080, 9090, expose, true, true, false, false, host_net, None)
+        };
+        let err = mapped(ContainerEngine::Docker, false, true).err().unwrap().to_string();
+        assert!(err.contains("-p 9090:8080") && err.contains("Use -p 9090"), "{err}");
+        assert!(mapped(ContainerEngine::Apptainer, false, false).is_err());
+        // An exposed container serve publishes through a bridge, which maps.
+        let ok = mapped(ContainerEngine::Docker, true, true).unwrap();
+        assert!(ok.command.windows(2).any(|w| w == ["--http-port", "8080"]), "{:?}", ok.command);
+    }
+
+    fn native_request(engine_args: Vec<String>, flagfile: Option<String>, ports: (u16, u16)) -> ServeRequest {
+        ServeRequest {
+            spec: ServeSpec { mcp: vec!["dna".to_string()], api: Vec::new(), eval_allow: None },
+            eval_allow_no_auth: false,
+            host_port: ports.0,
+            container_port: ports.1,
+            user_env: Vec::new(),
+            expose: false,
+            allow_plaintext: false,
+            allow_no_auth: false,
+            unsafe_serve: false,
+            engine_args,
+            flagfile,
+            token: None,
+            verbose: false,
+        }
+    }
+
+    /// Container-only serve inputs are refused by a native serve, as by a
+    /// native run, before anything launches.
+    #[test]
+    fn a_native_serve_refuses_container_only_inputs() {
+        let env = runner::ResolvedEnv {
+            name: "n".to_string(),
+            scope: Scope::Local,
+            ec: EnvironmentConfig::new_backend(
+                "n".to_string(), Backend::Native, String::new(), None, None, Vec::new(), Vec::new(),
+            ),
+        };
+        let x = native_request(vec!["--gpus".to_string()], None, (8080, 8080));
+        assert!(native_serve_launch(&env, &x).err().unwrap().to_string().contains("engine"));
+        let f = native_request(Vec::new(), Some("f.yaml".to_string()), (8080, 8080));
+        assert!(native_serve_launch(&env, &f).err().unwrap().to_string().contains("flagfile"));
+        let p = native_request(Vec::new(), None, (9090, 8080));
+        assert!(native_serve_launch(&env, &p).err().unwrap().to_string().contains("-p 9090:8080"));
+    }
+
+    /// `--eval-allow-no-auth` reaches the router of an exposed native serve, as
+    /// it does a container one.
+    #[test]
+    fn a_native_exposed_serve_honors_eval_allow_no_auth() {
+        let spec = ServeSpec { mcp: Vec::new(), api: Vec::new(), eval_allow: Some("math".to_string()) };
+        let waived = native_router_command("/s", 9000, &spec, true, true, true);
+        assert!(waived.contains(&"--eval-allow-no-auth".to_string()), "{waived:?}");
+        let kept = native_router_command("/s", 9000, &spec, true, true, false);
+        assert!(!kept.contains(&"--eval-allow-no-auth".to_string()), "{kept:?}");
+        let local = native_router_command("/s", 9000, &spec, false, false, false);
+        assert!(local.contains(&"--eval-allow-no-auth".to_string()), "{local:?}");
+        assert!(local.windows(2).any(|w| w == ["--http-host", "127.0.0.1"]), "{local:?}");
+    }
+
+    /// Only a 2xx eval response is a result; a failed or refused evaluation
+    /// exits nonzero with the router's reason.
+    #[test]
+    fn an_eval_error_status_is_an_error() {
+        let ok = interpret_eval_response("e", "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\",\"result\":2}");
+        assert_eq!(ok.unwrap(), "{\"status\":\"ok\",\"result\":2}");
+        let failed = interpret_eval_response("e", "HTTP/1.1 500 Internal Server Error\r\n\r\n{\"status\":\"error\",\"error\":\"type mismatch\"}");
+        let err = failed.unwrap_err().to_string();
+        assert!(err.contains("HTTP 500") && err.contains("type mismatch"), "{err}");
+        for code in ["400 Bad Request", "403 Forbidden", "404 Not Found"] {
+            let r = format!("HTTP/1.1 {code}\r\n\r\n{{\"error\":\"x\"}}");
+            assert!(interpret_eval_response("e", &r).is_err(), "{code}");
+        }
+        let token = interpret_eval_response("e", "HTTP/1.0 401 Unauthorized\r\n\r\n").unwrap_err();
+        assert!(token.to_string().contains("rejected the token"), "{token}");
+        assert!(interpret_eval_response("e", "garbage").is_err());
+    }
+
+    /// A config left saying `native` from another host names no container
+    /// engine, so creating a container environment auto-detects one instead of
+    /// failing on the stale default.
+    #[test]
+    fn a_native_default_names_no_container_engine() {
+        let native = Config { default_env: None, backend: Backend::Native };
+        assert_eq!(configured_container_engine(Some(native)), None);
+        let podman = Config { default_env: None, backend: Backend::Container(ContainerEngine::Podman) };
+        assert_eq!(configured_container_engine(Some(podman)), Some(ContainerEngine::Podman));
+        assert_eq!(configured_container_engine(None), None);
+    }
+
+    /// A base image a remaining environment uses is kept, each removed one goes
+    /// from its own engine's store, and Apptainer has no store to clean.
+    #[test]
+    fn nuke_removes_only_base_images_nothing_else_uses() {
+        let removed = vec![
+            (ContainerEngine::Docker, "ubuntu:24.04".to_string()),
+            (ContainerEngine::Podman, "debian:bookworm-slim".to_string()),
+            (ContainerEngine::Podman, "debian:bookworm-slim".to_string()),
+            (ContainerEngine::Docker, "shared:1".to_string()),
+            (ContainerEngine::Apptainer, "/sif/base.sif".to_string()),
+        ];
+        let still_used: HashSet<String> = ["shared:1".to_string()].into_iter().collect();
+        assert_eq!(
+            images_to_remove(&removed, &still_used),
+            vec![
+                (ContainerEngine::Docker, "ubuntu:24.04".to_string()),
+                (ContainerEngine::Podman, "debian:bookworm-slim".to_string()),
+            ]
+        );
+    }
+
+    fn write_default(scope: Scope, name: Option<&str>) {
+        let cfg_data = Config { default_env: name.map(str::to_string), ..Config::default() };
+        cfg::write_config(&cfg::config_path(scope), &cfg_data).unwrap();
+    }
+
+    fn add_env(scope: Scope, name: &str) {
+        let ec = EnvironmentConfig::new_backend(
+            name.to_string(), Backend::Container(ContainerEngine::Podman),
+            CONTAINER_BASE_IMAGE.to_string(), None, None, Vec::new(), Vec::new(),
+        );
+        cfg::write_env_config(scope, name, &ec).unwrap();
+    }
+
+    /// What `ls` and `info` mark as the default is what a command with no
+    /// --env runs in: a personal config with no default (or a stale one)
+    /// falls through to the machine-wide default.
+    #[test]
+    fn the_displayed_default_is_the_one_commands_use() {
+        let _f = ScopeFixture::new(false);
+        write_default(Scope::System, Some("sys"));
+        write_default(Scope::Local, None);
+        assert_eq!(environment::effective_default(), Some(("sys".to_string(), Scope::System)));
+        assert_eq!(environment::default_in(Scope::System).as_deref(), Some("sys"));
+        assert_eq!(environment::default_in(Scope::Local), None);
+        let (name, scope, _) = environment::resolve_default_environment().unwrap();
+        assert_eq!((name.as_str(), scope), ("sys", Scope::System));
+
+        write_default(Scope::Local, Some("gone"));
+        assert_eq!(environment::effective_default(), Some(("sys".to_string(), Scope::System)));
+
+        // A personal environment of the same name is the one that runs.
+        add_env(Scope::Local, "sys");
+        assert_eq!(environment::effective_default(), Some(("sys".to_string(), Scope::Local)));
+        assert_eq!(environment::default_in(Scope::System), None);
+    }
+
+    /// ENV-5: `nuke` of the personal scope keeps a personal default that
+    /// names a system environment.
+    #[test]
+    fn nuke_keeps_a_default_that_names_another_scope() {
+        let _f = ScopeFixture::new(false);
+        add_env(Scope::Local, "mine");
+        write_default(Scope::Local, Some("sys"));
+        dispatch_args(&["mim", "nuke", "--yes"]).unwrap();
+        assert!(cfg::list_env_names(Scope::Local).is_empty());
+        assert_eq!(environment::effective_default(), Some(("sys".to_string(), Scope::System)));
+        let local = cfg::read_config::<Config>(&cfg::config_path(Scope::Local)).unwrap();
+        assert_eq!(local.default_env.as_deref(), Some("sys"));
+    }
+
+    /// `info` lists every managed-env variable a native run exports.
+    #[test]
+    fn info_lists_the_native_runners_managed_exports() {
+        let tmp = tempfile::tempdir().unwrap();
+        cfg::test_roots::set(tmp.path());
+        let keys: Vec<String> = info_env_exports(Scope::Local, tmp.path(), "n", None)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        for k in ["MORLOC_HOME", "MORLOC_ENV", "MORLOC_BUILD_HOOK", "MORLOC_BIN"] {
+            assert!(keys.iter().any(|x| x == k), "{k} missing from {keys:?}");
+        }
+    }
+
+    /// `mim eval` refuses up front when the env's server has eval off.
+    #[test]
+    fn eval_against_a_server_without_eval_is_refused() {
+        let rt = |eval: bool| ServeRuntime {
+            mcp: Vec::new(),
+            api: vec!["m".to_string()],
+            eval,
+            host: "127.0.0.1".to_string(),
+            port: 9000,
+            token_required: false,
+            handle: None,
+        };
+        let err = require_eval_served("e", None, Some(&rt(false))).unwrap_err().to_string();
+        assert!(err.contains("without eval"), "{err}");
+        assert!(require_eval_served("e", None, Some(&rt(true))).is_ok());
+        assert!(require_eval_served("e", Some(9001), Some(&rt(false))).is_ok());
+        assert!(require_eval_served("e", None, None).is_ok());
+    }
+
+    /// `doctor --system` names a scope for `--env`, so it is refused without one.
+    #[test]
+    fn doctor_system_requires_env() {
+        assert!(Cli::try_parse_from(["mim", "doctor", "--system"]).is_err());
+        assert!(Cli::try_parse_from(["mim", "doctor", "--system", "--env", "e"]).is_ok());
+    }
+
+    /// PROV-5: the native `morloc init` is told not to link binaries into the
+    /// user's own bin directory (the compiler's default when unset).
+    #[test]
+    fn native_init_links_nothing_outside_the_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = native_init_command(std::path::Path::new("morloc"), tmp.path(), tmp.path(), &[], None, false);
+        let link = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "MORLOC_BIN_LINK_DIR")
+            .and_then(|(_, v)| v.map(|v| v.to_os_string()));
+        assert_eq!(link.as_deref(), Some(std::ffi::OsStr::new("")));
+    }
+
+    /// A guard before moving or deleting an env refuses when the engine
+    /// cannot say whether a server is running.
+    #[test]
+    fn an_unanswered_serve_probe_is_not_taken_for_no_server() {
+        use container::Probe;
+        assert!(refuse_unless_absent(Probe::Absent, "x".into()).is_ok());
+        assert!(refuse_unless_absent(Probe::Present, "x".into()).is_err());
+        let err = refuse_unless_absent(Probe::Unknown("down".into()), "x".into()).unwrap_err();
+        assert!(err.to_string().contains("down"), "{err}");
+    }
+
+    /// `--json` is honored or refused, never ignored.
+    #[test]
+    fn json_is_refused_where_a_command_has_none() {
+        let emits = |args: &[&str]| emits_json(&Cli::try_parse_from(args).unwrap().command.unwrap());
+        for args in [
+            &["mim", "--json", "ls"][..],
+            &["mim", "--json", "info"],
+            &["mim", "--json", "status"],
+            &["mim", "--json", "doctor"],
+            &["mim", "--json", "view"],
+            &["mim", "--json", "view", "list"],
+        ] {
+            assert!(emits(args), "{args:?}");
+        }
+        for args in [
+            &["mim", "--json", "freeze"][..],
+            &["mim", "--json", "start"],
+            &["mim", "--json", "eval", "1"],
+            &["mim", "--json", "stop"],
+            &["mim", "--json", "view", "eval", "--off"],
+        ] {
+            assert!(!emits(args), "{args:?}");
+        }
+    }
+
+    /// A `mim ...` command as written in help or a hint, made parseable:
+    /// placeholders (`<env>`, `{name}`) become a word, and a trailing comment,
+    /// ellipsis or shell continuation is dropped. `None` for text that is not
+    /// a command line (prose, alternatives).
+    fn example_argv(text: &str) -> Option<Vec<String>> {
+        let line = text.split(" #").next()?.trim().trim_end_matches('\\').trim();
+        if line.contains('|') || line.contains("...") || line.contains('[') {
+            return None;
+        }
+        // Shell words: quotes group, and are removed.
+        let mut words: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut quote: Option<char> = None;
+        for c in line.chars() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), c) => cur.push(c),
+                (None, '\'' | '"') => quote = Some(c),
+                (None, c) if c.is_whitespace() => {
+                    if !cur.is_empty() {
+                        words.push(std::mem::take(&mut cur));
+                    }
+                }
+                (None, c) => cur.push(c),
+            }
+        }
+        if !cur.is_empty() {
+            words.push(cur);
+        }
+        for w in &mut words {
+            if (w.starts_with('<') && w.ends_with('>')) || (w.starts_with('{') && w.ends_with('}')) {
+                *w = "x".to_string();
+            }
+        }
+        // `mim {}` is a message naming some subcommand, not a command line.
+        let names_a_command = words.get(1).is_some_and(|w| w != "x");
+        (words.first().map(String::as_str) == Some("mim") && names_a_command).then_some(words)
+    }
+
+    fn after_help_examples(cmd: &clap::Command, out: &mut Vec<String>) {
+        if let Some(h) = cmd.get_after_help() {
+            for line in h.to_string().lines() {
+                let t = line.trim();
+                if let Some(ex) = t.strip_prefix("$ ").or(Some(t)).filter(|t| t.starts_with("mim ")) {
+                    out.push(ex.to_string());
+                }
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            after_help_examples(sub, out);
+        }
+    }
+
+    /// Every command the help shows and every `mim ...` a message tells the
+    /// user to run must parse: an example naming a flag that does not exist
+    /// fails the first time anyone follows it.
+    #[test]
+    fn every_documented_mim_command_parses() {
+        let mut found: Vec<(String, String)> = Vec::new();
+        let mut help = Vec::new();
+        after_help_examples(&Cli::command(), &mut help);
+        found.extend(help.into_iter().map(|h| ("help".to_string(), h)));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).unwrap();
+            for (i, piece) in text.split('`').enumerate() {
+                if i % 2 == 1 && piece.starts_with("mim ") && !piece.contains('\n') {
+                    found.push((path.file_name().unwrap().to_string_lossy().to_string(), piece.to_string()));
+                }
+            }
+        }
+        let mut bad = Vec::new();
+        for (origin, ex) in &found {
+            let Some(argv) = example_argv(ex) else { continue };
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                // Prose names a command (`mim install`) without its arguments.
+                use clap::error::ErrorKind;
+                if !matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::MissingRequiredArgument) {
+                    bad.push(format!("{origin}: `{ex}`: {}", e.kind()));
+                }
+            }
+        }
+        assert!(found.len() > 50, "found only {} examples", found.len());
+        assert!(bad.is_empty(), "{} unparseable:\n{}", bad.len(), bad.join("\n"));
     }
 }

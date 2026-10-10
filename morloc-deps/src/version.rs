@@ -28,9 +28,7 @@ pub fn lang_schema_version() -> String {
 /// this build understands.
 pub const MANIFEST_SCHEMA: u32 = 1;
 
-/// The morloc C ABI version this build expects. Today libmorloc is built from the
-/// compiler's own source at `morloc init`, so a native runtime is ABI-coherent by
-/// construction -- this is RECORDED (for doctor / frozen-image coherence), not a
-/// hard install gate. It becomes a live gate when libmorloc ships as a standalone
-/// artifact that can pair with a mismatched compiler.
+/// The morloc C ABI version this build expects. Not checked: libmorloc is built
+/// from the compiler's own source at `morloc init`, so a runtime is
+/// ABI-coherent by construction.
 pub const ABI_VERSION: u32 = 1;

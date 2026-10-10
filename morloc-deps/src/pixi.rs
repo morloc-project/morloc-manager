@@ -7,14 +7,14 @@
 //!
 //! Mapping decisions:
 //!   * Language toolchains -> conda `[dependencies]` (py->python, cpp->cxx-compiler,
-//!     rust->rust, r->r-base, julia->julia, futhark->futhark).
-//!   * Python packages: `source` (pure wheels) -> `[pypi-dependencies]` (uv);
-//!     `abi`/`unknown` -> conda `[dependencies]`.
-//!   * R packages -> conda `r-<name>` (conda-forge R feedstocks).
+//!     rust->rust, r->r-base, futhark->futhark).
+//!   * Python packages: `pypi` -> `[pypi-dependencies]` (uv), `conda` -> conda
+//!     `[dependencies]`; local and vendored paths -> pypi path entries.
+//!   * R conda packages -> `r-<name>` on conda-forge, the name as written on
+//!     another channel.
 //!   * C++ packages and system libs -> conda `[dependencies]`.
-//!   * Rust and Julia packages are EXCLUDED: cargo (crates.io) and Pkg.jl own
-//!     those, resolved in-world when the pool is built. Only their toolchains
-//!     appear here.
+//!   * Rust packages are EXCLUDED: cargo (crates.io) owns them, resolved
+//!     in-world when the pool is built. Only the toolchain appears here.
 //!   * Package names are used as-is (no conda-name-mapping table yet); an
 //!     unresolvable name surfaces at solve time as an impurity/escalation.
 
@@ -61,19 +61,6 @@ pub struct PixiManifestInput<'a> {
     /// toolchain, per-language binder requirements, and supported runtime version
     /// ranges. Injected into, and clamps, the manifest.
     pub lang_support: &'a LangSupport,
-}
-
-/// Toolchain package for a language morloc has NO requirements.yaml entry for
-/// (julia) -- the escape hatch until it gains a table entry. Languages in the
-/// support table get their toolchain from `runtime.package` and `requires`
-/// instead; those are NOT duplicated here (a second copy would silently diverge).
-/// Script-provisioned languages (futhark) are NOT here: they carry an empty
-/// support entry (with an `install_script`) and are installed outside conda.
-fn lang_toolchain(lang: &str) -> Option<&'static str> {
-    match lang {
-        "julia" => Some("julia"),
-        _ => None,
-    }
 }
 
 /// The conda package name for a dependency. On conda-forge (the default channel)
@@ -359,9 +346,7 @@ fn aggregate(
     }
 
     // For each language a program uses: clamp its runtime version against
-    // morloc's supported range and inject morloc's binder requirements. A
-    // language morloc has no support entry for (e.g. futhark) falls back to the
-    // toolchain map with only the author's constraint.
+    // morloc's supported range and inject morloc's binder requirements.
     for (lang, author_c) in &lang_author {
         match support.languages.get(lang) {
             Some(entry) => {
@@ -391,21 +376,17 @@ fn aggregate(
                     }
                 }
             }
-            None => match lang_toolchain(lang) {
-                Some(tc) => insert_merged_conda(&mut conda, tc, author_c, None)?,
-                // Coverage check: a language a program requires that the
-                // language-support table does not describe (and that has no
-                // built-in toolchain fallback) cannot have its toolchain
-                // provisioned. Fail closed rather than silently omitting it -- e.g.
-                // a lang-support table from a morloc that predates this language.
-                None => {
-                    return Err(DepsError::Env(format!(
-                        "program requires language '{lang}', which the current morloc \
-                         language-support table does not describe; its toolchain cannot \
-                         be provisioned. Upgrade morloc/mim to one that supports '{lang}'."
-                    )))
-                }
-            },
+            // Coverage check: a language a program requires that the
+            // language-support table does not describe cannot have its toolchain
+            // provisioned. Fail closed rather than silently omitting it -- e.g. a
+            // lang-support table from a morloc that predates this language.
+            None => {
+                return Err(DepsError::Env(format!(
+                    "program requires language '{lang}', which the current morloc \
+                     language-support table does not describe; its toolchain cannot \
+                     be provisioned. Upgrade morloc/mim to one that supports '{lang}'."
+                )))
+            }
         }
     }
 
@@ -424,8 +405,8 @@ fn aggregate(
                     PackageReq::Pypi { name, constraint } => {
                         insert_pypi(&mut pypi, name, PypiReq::Version(constraint.clone()))?
                     }
-                    // cargo and Pkg.jl own these; resolved in-world at pool build.
-                    PackageReq::Crates { .. } | PackageReq::Pkg { .. } => {}
+                    // cargo owns these; resolved in-world at pool build.
+                    PackageReq::Crates { .. } => {}
                     // R CRAN/Bioconductor sources are not yet provisioned. Fail
                     // closed with an actionable message: an envspec carrying a
                     // source this build cannot lower (e.g. one written by a newer
@@ -454,9 +435,8 @@ fn aggregate(
                         }
                     },
                     // Local (filesystem-path) deps. Python lowers to a pixi
-                    // editable/plain path entry; Rust and Julia local crates are
-                    // owned by cargo / Pkg.jl at pool build (like Crates/Pkg), so
-                    // they are dropped here. The path is already the real source
+                    // editable/plain path entry; Rust local crates are owned by
+                    // cargo at pool build (like Crates), so they are dropped here. The path is already the real source
                     // dir (resolved by the caller against the project root).
                     PackageReq::Local { name, path, editable } => match lang.as_str() {
                         "py" => insert_pypi(
@@ -464,7 +444,7 @@ fn aggregate(
                             name,
                             PypiReq::Local { path: path.clone(), editable: *editable },
                         )?,
-                        "rust" | "julia" => {}
+                        "rust" => {}
                         other => {
                             return Err(DepsError::Env(format!(
                                 "local dependency '{name}' for language '{other}' cannot be \
@@ -738,10 +718,6 @@ pub fn solve(
     Ok(())
 }
 
-/// Produce the `pixi.lock` for the manifest in `env_dir` without installing on
-/// the host. The lock is what a container image reproduces with `pixi install
-/// --locked`, so the container's conda world is pinned to the same solve. A
-/// failure here is phase 2 of the impurity gate (a package conda cannot provide).
 /// Try to materialize the environment from its EXISTING lock WITHOUT re-solving:
 /// `pixi install --locked`. Returns `Ok(true)` when the lock still satisfies the
 /// manifest and the prefix is installed from it (zero version drift); `Ok(false)`
@@ -778,6 +754,10 @@ pub fn install_locked(
     Ok(out.status.success())
 }
 
+/// Produce the `pixi.lock` for the manifest in `env_dir` without installing on
+/// the host. The lock is what a container image reproduces with `pixi install
+/// --locked`, so the container's conda world is pinned to the same solve. A
+/// failure here is phase 2 of the impurity gate (a package conda cannot provide).
 pub fn lock(env_dir: &Path, pixi_bin: &Path, ssl_cert_file: Option<&Path>) -> Result<()> {
     let manifest = env_dir.join("pixi.toml");
     let mut cmd = Command::new(pixi_bin);
@@ -936,7 +916,6 @@ pub fn runtime_languages(locked: &[LockedPackage]) -> Vec<(&'static str, String)
         ("python", "python"),
         ("rust", "rust"),
         ("r-base", "r"),
-        ("julia", "julia"),
     ];
     RUNTIMES
         .iter()
@@ -1254,7 +1233,7 @@ platforms = [\"linux-64\"]
     }
 
     #[test]
-    fn rust_and_julia_packages_are_excluded_but_toolchains_kept() {
+    fn rust_packages_are_excluded_but_toolchain_kept() {
         let spec = sample_spec();
         let support = sample_support();
         let (conda, pypi) = aggregate(std::slice::from_ref(&spec), &support).unwrap();
@@ -1283,7 +1262,7 @@ platforms = [\"linux-64\"]
     fn py_local_dep_lowers_to_editable_pypi_path() {
         // A python local dep becomes a uv path entry; a rust local crate is owned
         // by cargo at pool build, so it must NOT appear in the pixi manifest. Paths
-        // are already absolute here (mim-env resolves them before this stage).
+        // are already absolute here (`mim sync` resolves them before this stage).
         const S: &str = r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"},{"lang":"rust"}],"packages":{"py":[{"name":"mylib","source":"local","path":"/abs/mylib","editable":true}],"rust":[{"name":"mycrate","source":"local","path":"/abs/mycrate","editable":false}]}}"#;
         let out = render_with(EnvSpec::from_json(S).unwrap());
         assert!(

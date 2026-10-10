@@ -2,7 +2,7 @@
 # mim installer -- fetch the right prebuilt binary for this system into a
 # user-owned bin directory.
 #
-#   curl -fsSL https://raw.githubusercontent.com/morloc-project/morloc-manager/main/scripts/install.sh | sh
+#   curl -fsSL https://morloc.io/install.sh | sh
 #
 # The installer never edits shell startup files. If the destination is not on
 # PATH it prints the command to add it and leaves the decision to the user.
@@ -11,6 +11,10 @@
 #   MIM_VERSION   git tag to install (default: latest release)
 #   MIM_DEST      directory to install into
 #                 (default: $XDG_BIN_HOME, else ~/.local/bin)
+
+# Under `curl | sh` a dropped connection hands sh a prefix of this file. The
+# whole body is one function called on the last line, so a prefix runs nothing.
+main() {
 set -eu
 
 REPO="morloc-project/morloc-manager"
@@ -74,20 +78,19 @@ trap 'rm -f "$tmp" "$tmp.sha256"' EXIT
 printf 'mim-install: downloading %s (%s)...\n' "$asset" "$VERSION" >&2
 fetch "${base}/${asset}" "$tmp" || err "download failed: ${base}/${asset}"
 
-# --- verify checksum (best-effort; skip only if sidecar is unavailable) ---
-if fetch "${base}/${asset}.sha256" "$tmp.sha256" 2>/dev/null; then
-  expected="$(awk '{print $1}' "$tmp.sha256")"
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$tmp" | awk '{print $1}')"
-  elif command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 "$tmp" | awk '{print $1}')"
-  else
-    actual=""
-  fi
-  if [ -n "$actual" ] && [ "$actual" != "$expected" ]; then
-    err "checksum mismatch (expected $expected, got $actual)"
-  fi
+# --- verify checksum: an unverified binary is never installed ------------
+fetch "${base}/${asset}.sha256" "$tmp.sha256" \
+  || err "could not fetch the checksum file ${base}/${asset}.sha256"
+expected="$(awk '{print $1}' "$tmp.sha256")"
+[ -n "$expected" ] || err "the checksum file ${asset}.sha256 is empty"
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "$tmp" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  actual="$(shasum -a 256 "$tmp" | awk '{print $1}')"
+else
+  err "need sha256sum or shasum on PATH to verify the download"
 fi
+[ "$actual" = "$expected" ] || err "checksum mismatch (expected $expected, got $actual)"
 
 # --- install --------------------------------------------------------------
 # Resolve to an absolute path so the PATH check below compares like with like.
@@ -143,3 +146,6 @@ if [ -n "$rc" ]; then
 fi
 printf '    %s\n\n' "$add" >&2
 printf 'Or skip PATH entirely and run it by full path: %s --help\n' "$out" >&2
+}
+
+main "$@"

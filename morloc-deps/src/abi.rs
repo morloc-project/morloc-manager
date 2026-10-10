@@ -24,8 +24,8 @@ use crate::envspec::{EnvSpec, LangReq};
 /// This is the complete set of ABI-minor-sensitive shims today (python + R). It
 /// is a SAFETY list: a shim language missing from it is silently unprotected -- a
 /// dependency could bump its interpreter minor and break the shim with no error.
-/// Any future shim that bakes an interpreter minor into its artifact (e.g. a
-/// Julia binder, whose embedding C-API is minor-sensitive) MUST be added here. Do
+/// Any future shim that bakes an interpreter minor into its artifact MUST be
+/// added here. Do
 /// not derive this from "has a versioned runtime": Rust has a runtime entry but is
 /// C-ABI to libmorloc and NOT minor-sensitive, so that would over-pin it.
 const ABI_PACKAGES: &[(&str, &str)] = &[("python", "py"), ("r-base", "r")];
@@ -266,14 +266,12 @@ pub fn undeclared_shim_runtimes(
 
 /// The shim-marker filename `morloc init` writes for a morloc language code
 /// (the compiler's `DF.lsName`). `rust` has no langSetup shim (its marshaller is
-/// a cargo build), so it maps to nothing. `julia` is normalized from the
-/// compiler's `jl` at `EnvSpec` ingestion, so it arrives here as `julia`.
+/// a cargo build), so it maps to nothing.
 pub fn shim_marker_name(lang: &str) -> Option<&'static str> {
     match lang {
         "py" => Some("python"),
         "r" => Some("R"),
         "cpp" => Some("C++"),
-        "julia" => Some("Julia"),
         _ => None,
     }
 }
@@ -285,7 +283,6 @@ pub fn runtime_to_morloc_lang(runtime: &str) -> Option<&'static str> {
     match runtime {
         "python" => Some("py"),
         "r" => Some("r"),
-        "julia" => Some("julia"),
         _ => None,
     }
 }
@@ -348,7 +345,6 @@ pub fn language_display(lang: &str) -> &'static str {
     match lang {
         "py" => "python",
         "r" => "R",
-        "julia" => "julia",
         _ => "the interpreter",
     }
 }
@@ -699,7 +695,6 @@ mod tests {
         assert_eq!(shim_marker_name("py"), Some("python"));
         assert_eq!(shim_marker_name("r"), Some("R"));
         assert_eq!(shim_marker_name("cpp"), Some("C++"));
-        assert_eq!(shim_marker_name("julia"), Some("Julia"));
         // rust has no langSetup shim; an unknown code maps to nothing.
         assert_eq!(shim_marker_name("rust"), None);
         assert_eq!(shim_marker_name("nope"), None);

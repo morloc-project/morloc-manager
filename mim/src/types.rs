@@ -115,8 +115,6 @@ impl Backend {
     }
 
     /// True for the native (no-container) backend.
-    // Used by the command-dispatch native branch, wired in the next P2b step.
-    #[allow(dead_code)]
     pub fn is_native(&self) -> bool {
         matches!(self, Backend::Native)
     }
@@ -274,18 +272,6 @@ fn default_backend() -> Backend {
     Backend::Container(ContainerEngine::Podman)
 }
 
-impl Config {
-    /// The container engine of the default backend, or an error if it is native.
-    pub fn engine(&self) -> crate::error::Result<ContainerEngine> {
-        self.backend.container_engine().ok_or_else(|| {
-            crate::error::ManagerError::BackendUnsupported(
-                "the default backend is native; this operation requires a container engine"
-                    .to_string(),
-            )
-        })
-    }
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -321,7 +307,8 @@ fn default_env_schema() -> u32 {
 /// prebuilt one).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevConfig {
-    /// Absolute host path to the morloc source repo, bind-mounted into the env.
+    /// Absolute host path to the morloc source repo the dev image is provisioned
+    /// from. It is not mounted.
     pub source: String,
 }
 
@@ -539,7 +526,7 @@ impl EnvironmentConfig {
         }
     }
 
-    /// True iff this is a dev environment (builds morloc from a mounted source
+    /// True iff this is a dev environment (builds morloc from a source
     /// tree). Equivalent to `self.dev.is_some()`.
     pub fn is_dev(&self) -> bool {
         self.dev.is_some()
@@ -779,12 +766,19 @@ impl ViewSet {
         }
     }
 
-    /// Remove `module` from all protocol sets. Returns true if anything changed.
+    /// Remove `module` from all protocol sets and from the eval allow-list
+    /// (SERVE-2). Returns true if anything changed.
     pub fn remove(&mut self, module: &str) -> bool {
-        let before = self.mcp.len() + self.api.len();
+        let count = |v: &ViewSet| {
+            v.mcp.len() + v.api.len() + v.eval.as_ref().map_or(0, |e| e.allow.len())
+        };
+        let before = count(self);
         self.mcp.retain(|m| m != module);
         self.api.retain(|m| m != module);
-        before != self.mcp.len() + self.api.len()
+        if let Some(e) = self.eval.as_mut() {
+            e.allow.retain(|m| m != module);
+        }
+        before != count(self)
     }
 
     /// The adapters a given module answers on (for display).
@@ -814,7 +808,7 @@ fn sorted_union(a: &[String], b: &[String]) -> Vec<String> {
     all
 }
 
-/// Runtime record of what a serve container is ACTUALLY serving, written by
+/// Runtime record of what a server is ACTUALLY serving, written by
 /// `start` and read by `status`. Distinct from `ViewSet` (declared
 /// intent): this reflects the live invocation, including the resolved host/port
 /// and whether a token is required.
@@ -868,8 +862,16 @@ pub struct EnvInputs {
 pub enum ServeHandle {
     /// A container/apptainer instance, torn down by engine + name.
     Container { engine: ContainerEngine, name: String },
-    /// A detached host process group (native backend), torn down by killing pgid.
-    Native { pid: u32, pgid: u32 },
+    /// A detached host process group (native backend), torn down by killing
+    /// pgid. `start` is the leader's start time (clock ticks since boot, from
+    /// `/proc/<pid>/stat`), which tells our leader from a later process that
+    /// reused its pid; absent on records from older mims and off Linux.
+    Native {
+        pid: u32,
+        pgid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -937,6 +939,17 @@ mod exposure_tests {
         assert!(ex.remove("util"));
         assert!(ex.mcp.is_empty() && ex.api.is_empty());
         assert!(!ex.remove("util")); // no-op second time
+    }
+
+    /// SERVE-2: removing a module from the views removes it from the eval
+    /// allow-list too, leaving eval itself enabled.
+    #[test]
+    fn remove_clears_the_eval_allow_list() {
+        let mut ex = ViewSet::default();
+        ex.eval = Some(EvalCapability { allow: vec!["dna".to_string(), "util".to_string()] });
+        assert!(ex.remove("util"));
+        assert_eq!(ex.eval.as_ref().unwrap().allow, vec!["dna".to_string()]);
+        assert!(!ex.remove("util"));
     }
 
     #[test]

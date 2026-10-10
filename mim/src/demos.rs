@@ -177,49 +177,80 @@ fn print_list(version: &str, tag: Option<&str>, demos: &[&Demo]) {
 }
 
 /// Download the bundle and extract the selected demos into
-/// `examples-<tag>-<version>/` in the current directory.
-fn pull(base: &str, version: &str, tag: Option<&str>, demos: &[&Demo], force: bool) -> Result<()> {
+/// `<into>/examples-<tag>-<version>/`. Everything is staged in a fresh
+/// directory beside the destination and renamed into place, so a failed
+/// download or extraction leaves no destination behind.
+fn pull(
+    base: &str,
+    version: &str,
+    tag: Option<&str>,
+    demos: &[&Demo],
+    force: bool,
+    into: &std::path::Path,
+) -> Result<()> {
     let dir_tag = tag.unwrap_or("all");
-    let dest = std::path::PathBuf::from(format!("examples-{dir_tag}-{version}"));
-    if dest.exists() {
-        if !force {
-            return Err(ManagerError::EnvError(format!(
-                "{}/ already exists (pass --force to overwrite)",
-                dest.display()
-            )));
-        }
-        std::fs::remove_dir_all(&dest)
-            .map_err(|e| ManagerError::EnvError(format!("could not remove {}: {e}", dest.display())))?;
+    let dest_name = format!("examples-{dir_tag}-{version}");
+    let dest = into.join(&dest_name);
+    if dest.exists() && !force {
+        return Err(ManagerError::EnvError(format!(
+            "{}/ already exists (pass --force to overwrite)",
+            dest.display()
+        )));
     }
-    std::fs::create_dir_all(&dest)
-        .map_err(|e| ManagerError::EnvError(format!("could not create {}: {e}", dest.display())))?;
+    let stage = into.join(format!(".{dest_name}.partial-{}", std::process::id()));
+    std::fs::create_dir(&stage)
+        .map_err(|e| ManagerError::EnvError(format!("could not create {}: {e}", stage.display())))?;
+    let staged = stage_demos(base, version, demos, &stage);
+    let result = staged.and_then(|out| {
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest).map_err(|e| {
+                ManagerError::EnvError(format!("could not remove {}: {e}", dest.display()))
+            })?;
+        }
+        std::fs::rename(&out, &dest).map_err(|e| {
+            ManagerError::EnvError(format!("could not move the demos to {}: {e}", dest.display()))
+        })
+    });
+    let _ = std::fs::remove_dir_all(&stage);
+    result?;
+    println!("Extracted {} demo(s) into {}/", demos.len(), dest.display());
+    Ok(())
+}
 
-    let tmp = std::env::temp_dir().join(format!("morloc-demos-{}.tar.gz", std::process::id()));
-    curl_download(&asset_url(base, version, "demos.tar.gz"), &tmp)?;
+/// Download the bundle into `stage` and extract the selected demos to
+/// `<stage>/out`, which is returned.
+fn stage_demos(
+    base: &str,
+    version: &str,
+    demos: &[&Demo],
+    stage: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let tarball = stage.join("demos.tar.gz");
+    curl_download(&asset_url(base, version, "demos.tar.gz"), &tarball)?;
+    let out = stage.join("out");
+    std::fs::create_dir(&out)
+        .map_err(|e| ManagerError::EnvError(format!("could not create {}: {e}", out.display())))?;
 
     // Extract only the selected members. The tarball lays them out under
     // `demos/<repo>/...`; --strip-components=1 drops that prefix so each demo
-    // lands at <dest>/<repo>/. Every selected repo is listed in the manifest,
+    // lands at <out>/<repo>/. Every selected repo is listed in the manifest,
     // hence present in the tarball.
     let mut cmd = Command::new("tar");
-    cmd.arg("-xzf").arg(&tmp)
-        .arg("-C").arg(&dest)
+    cmd.arg("-xzf").arg(&tarball)
+        .arg("-C").arg(&out)
         .arg("--strip-components=1");
     for d in demos {
         cmd.arg(format!("demos/{}", d.repo));
     }
     let status = cmd.status().map_err(|e| {
         ManagerError::EnvError(format!("could not run tar (is it installed?): {e}"))
-    });
-    let _ = std::fs::remove_file(&tmp);
-    if !status?.success() {
+    })?;
+    if !status.success() {
         return Err(ManagerError::EnvError(
             "could not extract the demos bundle".to_string(),
         ));
     }
-
-    println!("Extracted {} demo(s) into {}/", demos.len(), dest.display());
-    Ok(())
+    Ok(out)
 }
 
 /// Entry point for `mim demos`.
@@ -237,7 +268,9 @@ pub fn run(list: bool, tag: Option<String>, morloc_version: Option<String>, forc
         return Ok(());
     }
     ensure_tar()?;
-    pull(&base, &version, tag, &selected, force)
+    let cwd = std::env::current_dir()
+        .map_err(|e| ManagerError::EnvError(format!("cannot read the current directory: {e}")))?;
+    pull(&base, &version, tag, &selected, force, &cwd)
 }
 
 fn ensure_tar() -> Result<()> {
@@ -259,6 +292,22 @@ mod tests {
         assert_eq!(bare_version("v0.98.2"), "0.98.2");
         assert_eq!(bare_version("0.98.2"), "0.98.2");
         assert_eq!(bare_version("  v1.2.3 "), "1.2.3");
+    }
+
+    /// A failed download leaves neither the destination nor a staging
+    /// directory behind, so a retry needs no --force.
+    #[test]
+    fn a_failed_pull_leaves_nothing_behind() {
+        let into = tempfile::tempdir().unwrap();
+        let demo = Demo {
+            repo: "r".to_string(),
+            hash: "h".to_string(),
+            tags: Vec::new(),
+            synopsis: String::new(),
+        };
+        let err = pull("file:///nonexistent", "0.0.0", None, &[&demo], false, into.path());
+        assert!(err.is_err());
+        assert_eq!(std::fs::read_dir(into.path()).unwrap().count(), 0);
     }
 
     #[test]

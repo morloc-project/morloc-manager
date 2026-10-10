@@ -87,9 +87,13 @@ impl Provenance {
 /// the writer can undo precisely the write it made -- and nothing else. The `sync`
 /// rollback needs that precision: sweeping every slot sharing the program's name
 /// would discard a different, still-good declared world built earlier under the
-/// same name.
+/// same name. It also carries what the slot held before, so a rollback puts
+/// back an earlier successful build's spec instead of deleting it.
 #[derive(Debug, Clone)]
-pub struct SpecSlot(PathBuf);
+pub struct SpecSlot {
+    path: PathBuf,
+    previous: Option<Vec<u8>>,
+}
 
 /// The scratch sub-directory for a declared world: the first 16 hex digits of the
 /// SHA-256 of its canonical JSON. Truncated because it only has to separate the
@@ -170,22 +174,26 @@ impl EnvContext {
         std::fs::create_dir_all(&dir)
             .map_err(|e| DepsError::Env(format!("cannot create {}: {e}", dir.display())))?;
         let path = dir.join(format!("{program}.json"));
+        let previous = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(DepsError::Env(format!("cannot read {}: {e}", path.display()))),
+        };
         std::fs::write(&path, json)
             .map_err(|e| DepsError::Env(format!("cannot write {}: {e}", path.display())))?;
-        Ok(SpecSlot(path))
+        Ok(SpecSlot { path, previous })
     }
 
-    /// Remove exactly the spec [`write_spec`](Self::write_spec) wrote, and nothing
-    /// else -- the rollback of a failed `sync`. A missing file is not an error.
-    pub fn remove_spec(&self, slot: &SpecSlot) -> Result<()> {
-        remove_if_present(&slot.0)?;
-        // Reclaim the containing directory once it is empty -- an empty store
-        // directory reads exactly like an absent one everywhere here. Non-empty is
-        // the normal case and fails harmlessly.
-        if let Some(parent) = slot.0.parent() {
-            let _ = std::fs::remove_dir(parent);
+    /// Undo exactly the write [`write_spec`](Self::write_spec) made, and nothing
+    /// else -- the rollback of a failed `sync` (DEP-5): the slot gets back what it
+    /// held before, or is removed if it held nothing.
+    pub fn rollback_spec(&self, slot: &SpecSlot) -> Result<()> {
+        match &slot.previous {
+            Some(bytes) => std::fs::write(&slot.path, bytes).map_err(|e| {
+                DepsError::Env(format!("cannot restore {}: {e}", slot.path.display()))
+            }),
+            None => remove_spec_file(&slot.path),
         }
-        Ok(())
     }
 
     /// Remove EVERY spec stored under `program` in a provenance tier, whichever
@@ -196,7 +204,7 @@ impl EnvContext {
         validate_program_name(program)?;
         for path in json_paths(&self.provenance_dir(provenance))? {
             if path.file_stem().and_then(|s| s.to_str()) == Some(program) {
-                self.remove_spec(&SpecSlot(path))?;
+                remove_spec_file(&path)?;
             }
         }
         Ok(())
@@ -226,6 +234,14 @@ impl EnvContext {
     /// The scratch builds' specs, ordered by slot.
     pub fn gather_scratch(&self) -> Result<Vec<EnvSpec>> {
         read_specs(&self.provenance_dir(Provenance::Scratch))
+    }
+
+    /// What `sync` solves: the declared world plus the shim-ABI pin. `mim spec`
+    /// renders the same set, so it prints the manifest the next sync solves.
+    pub fn sync_world(&self) -> Result<Vec<EnvSpec>> {
+        let mut specs = self.gather()?;
+        self.append_abi_lock(&mut specs)?;
+        Ok(specs)
     }
 
     /// The full declared world: the installed baseline then `scratch`, each
@@ -394,8 +410,8 @@ impl EnvContext {
 
     /// Record the shim-ABI pin from this env's freshly solved conda prefix: pin
     /// each interpreter (python, r-base) to the MINOR version `morloc init` just
-    /// built its shims against. Folded into every later solve (see
-    /// `gather_installed`), so a dependency that would bump an interpreter minor
+    /// built its shims against. Folded into every later in-env solve (see
+    /// `append_abi_lock`), so a dependency that would bump an interpreter minor
     /// fails the solve legibly rather than silently breaking the shim ABI.
     ///
     /// Called after any solve that (re)built the shims: the manager's provision and
@@ -559,7 +575,7 @@ impl EnvContext {
         let _ = std::fs::remove_file(&cache_path);
         let _ = std::fs::remove_file(&digest_path);
         crate::pixi::write_manifest(&pixi_dir, &crate::pixi::render_manifest(&reqs))?;
-        // In-container path (mim-env): the built image already sets the CA env vars,
+        // In-env agent path (`mim sync`): the built image already sets the CA env vars,
         // which the pixi subprocess inherits, so no override is needed. No FHS
         // wrapping: the in-env agent already runs inside its execution environment.
         let mut solved = if try_locked
@@ -642,9 +658,7 @@ impl EnvContext {
     /// STORE is never left half-applied (the no-mutation rule), and the error is
     /// returned as-is -- `solve_world` failures include setup errors (an
     /// unwritable prefix, a missing pixi, etc.), not only unsatisfiability, so
-    /// they must NOT be blanket-relabeled as a dependency conflict. (A true UNSAT
-    /// is surfaced as `DepsError::Conflict` by the solve layer once it parses the
-    /// solver's output.)
+    /// they must NOT be blanket-relabeled as a dependency conflict.
     ///
     /// The store rollback does NOT undo a partial pixi prefix install (pixi links
     /// into the shared prefix as it solves). A stale `pixi.toml`/`pixi.lock` or a
@@ -661,8 +675,7 @@ impl EnvContext {
         // through the write/gather/solve/record, released when `_lock` drops.
         let _lock = self.lock_solve()?;
         let slot = self.write_spec(program, provenance, spec_json)?;
-        let mut specs = self.gather()?;
-        self.append_abi_lock(&mut specs)?;
+        let specs = self.sync_world()?;
         // Prefer the manager's tested lock (`--locked`); re-solve only if it cannot
         // satisfy this program's world.
         match self.solve_world(&specs, inputs, true) {
@@ -685,7 +698,9 @@ impl EnvContext {
                 Ok(outcome.activation)
             }
             Err(e) => {
-                let _ = self.remove_spec(&slot);
+                if let Err(undo) = self.rollback_spec(&slot) {
+                    return Err(DepsError::Env(format!("{e}; also, {undo}")));
+                }
                 Err(e)
             }
         }
@@ -820,11 +835,6 @@ fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
-/// Every spec file under `dir`: the name-only slots (`<name>.json`) plus the
-/// world-keyed ones one level down (`<world-digest>/<name>.json`). Sorted by
-/// program name, then by path, so the gather order is deterministic (it feeds the
-/// merged requirement set) and reads in program order. A missing directory yields
-/// an empty list.
 /// A languages-only spec declaring `langs` (morloc short codes) with no version
 /// constraint, so the language clamp bounds each to morloc's supported window
 /// and its binder dependencies join the world. Built for interpreters a solve
@@ -850,6 +860,22 @@ pub fn adoption_note(langs: &[String]) -> String {
     )
 }
 
+/// Remove one stored spec file, then its directory once empty -- an empty
+/// store directory reads exactly like an absent one everywhere here. A
+/// missing file is not an error.
+fn remove_spec_file(path: &Path) -> Result<()> {
+    remove_if_present(path)?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    Ok(())
+}
+
+/// Every spec file under `dir`: the name-only slots (`<name>.json`) plus the
+/// world-keyed ones one level down (`<world-digest>/<name>.json`). Sorted by
+/// program name, then by path, so the gather order is deterministic (it feeds the
+/// merged requirement set) and reads in program order. A missing directory yields
+/// an empty list.
 fn json_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_json(dir, true, &mut files)?;
@@ -1020,7 +1046,21 @@ mod tests {
         ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
         // A later build whose solve fails: `sync` rolls back exactly its own write.
         let slot = ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
-        ctx.remove_spec(&slot).unwrap();
+        ctx.rollback_spec(&slot).unwrap();
+
+        let all = ctx.gather().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].languages[0].lang, "py");
+    }
+
+    /// DEP-5: a failed re-sync of an installed program restores the spec its
+    /// last successful install recorded, in the same slot.
+    #[test]
+    fn sync_rollback_restores_the_spec_it_replaced() {
+        let (_d, ctx) = ctx();
+        ctx.write_spec("nexus", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
+        let slot = ctx.write_spec("nexus", Provenance::Installed, &spec(r#"{"lang":"r"}"#)).unwrap();
+        ctx.rollback_spec(&slot).unwrap();
 
         let all = ctx.gather().unwrap();
         assert_eq!(all.len(), 1);
@@ -1088,6 +1128,8 @@ mod tests {
         assert_eq!(solve_set.len(), 2);
         // ...but the pin is NOT a program: never surfaced in conflict attribution.
         assert_eq!(ctx.program_names().unwrap(), vec!["prog".to_string()]);
+        // `mim spec` renders the sync world, pin included.
+        assert_eq!(ctx.sync_world().unwrap().len(), 2);
     }
 
     #[test]
@@ -1293,11 +1335,11 @@ mod tests {
         let scratch = ctx.write_spec("p", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
         // promote: write to installed, drop from scratch
         ctx.write_spec("p", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
-        ctx.remove_spec(&scratch).unwrap();
+        ctx.rollback_spec(&scratch).unwrap();
         assert_eq!(ctx.gather().unwrap().len(), 1);
         assert_eq!(ctx.gather_installed().unwrap().len(), 1);
         // removing a missing spec is a no-op
-        ctx.remove_spec(&scratch).unwrap();
+        ctx.rollback_spec(&scratch).unwrap();
         ctx.remove_named("p", Provenance::Scratch).unwrap();
     }
 

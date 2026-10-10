@@ -121,7 +121,33 @@ pub fn reject_whitespace_root(dir: &Path) -> Result<()> {
     )))
 }
 
+/// Test-only replacement for the four scope roots, per thread so parallel tests
+/// cannot see each other's trees. Set with [`test_roots::set`].
+#[cfg(test)]
+pub mod test_roots {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Root every scope under `base`: `<base>/{local,system}/{config,data}`.
+    pub fn set(base: &Path) {
+        ROOT.with(|r| *r.borrow_mut() = Some(base.to_path_buf()));
+    }
+
+    pub(super) fn get(scope: Scope, kind: &str) -> Option<PathBuf> {
+        let tag = match scope { Scope::Local => "local", Scope::System => "system" };
+        ROOT.with(|r| r.borrow().as_ref().map(|b| b.join(tag).join(kind)))
+    }
+}
+
 pub fn config_dir(scope: Scope) -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = test_roots::get(scope, "config") {
+        return p;
+    }
     match scope {
         Scope::Local => user_base(
             std::env::var("XDG_CONFIG_HOME").ok(),
@@ -134,11 +160,32 @@ pub fn config_dir(scope: Scope) -> PathBuf {
     }
 }
 
+/// Whether this process can create files in `dir`, creating `dir` first when
+/// it is missing. Probes by writing, so it answers for the effective user with
+/// every ACL and mount option applied, which permission bits alone do not.
+pub fn dir_writable(dir: &Path) -> bool {
+    if !dir.exists() {
+        return fs::create_dir_all(dir).is_ok();
+    }
+    let probe = dir.join(".write-check");
+    match fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn config_path(scope: Scope) -> PathBuf {
     config_dir(scope).join("config.json")
 }
 
 pub fn data_dir(scope: Scope) -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = test_roots::get(scope, "data") {
+        return p;
+    }
     match scope {
         Scope::Local => user_base(
             std::env::var("XDG_DATA_HOME").ok(),
@@ -152,6 +199,12 @@ pub fn data_dir(scope: Scope) -> PathBuf {
 }
 
 // Environment paths
+
+/// The caller's own `$HOME` for runs in system environment `name`, which they
+/// may use but not write.
+pub fn system_env_user_home(name: &str) -> PathBuf {
+    data_dir(Scope::Local).join("system-homes").join(name)
+}
 
 pub fn env_config_dir(scope: Scope, name: &str) -> PathBuf {
     config_dir(scope).join("environments").join(name)
@@ -455,12 +508,11 @@ pub fn env_inputs_path(scope: Scope, name: &str) -> PathBuf {
 }
 
 /// Read the persisted native inputs; an absent file means no `--lang` pins.
-pub fn read_env_inputs(scope: Scope, name: &str) -> EnvInputs {
+pub fn read_env_inputs(scope: Scope, name: &str) -> Result<EnvInputs> {
     let p = env_inputs_path(scope, name);
-    if p.is_file() {
-        read_config(&p).unwrap_or_default()
-    } else {
-        EnvInputs::default()
+    match fs::symlink_metadata(&p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(EnvInputs::default()),
+        _ => read_config(&p),
     }
 }
 
@@ -497,6 +549,8 @@ pub fn write_views(scope: Scope, name: &str, views: &ViewSet) -> Result<()> {
 
 /// Find which scope an environment lives in. Checks local first, then system.
 pub fn find_env_scope(name: &str) -> Result<Scope> {
+    // The name becomes a path component; `..` or `/` would leave the tree.
+    crate::environment::validate_env_name(name)?;
     let local_path = env_config_path(Scope::Local, name);
     if local_path.is_file() {
         return Ok(Scope::Local);
@@ -948,5 +1002,22 @@ mod tests {
             Some(crate::types::LocalRuntimeConfig { source: "/rt".to_string() });
         let err = migrate_env_config(ec).expect_err("dev + local_runtime must fail");
         assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    /// An unreadable `env-inputs.json` is an error, not "no pins": treating it
+    /// as empty would drop the env's language pins on the next rebuild.
+    #[test]
+    fn a_corrupt_env_inputs_file_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        test_roots::set(tmp.path());
+        let p = env_inputs_path(Scope::Local, "e");
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, "{ not json").unwrap();
+        assert!(read_env_inputs(Scope::Local, "e").is_err());
+        fs::remove_file(&p).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &p).unwrap();
+        assert!(read_env_inputs(Scope::Local, "e").is_err());
+        fs::remove_file(&p).unwrap();
+        assert!(read_env_inputs(Scope::Local, "e").unwrap().lang_pins.is_empty());
     }
 }

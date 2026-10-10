@@ -204,7 +204,7 @@ pub fn container_run_passthrough(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .unwrap_or_else(|_| std::process::exit(1))
+        .unwrap_or_else(|e| report_spawn_failure(exe, e))
 }
 
 /// Build a container image with all output (stdout+stderr) redirected to stderr.
@@ -298,6 +298,49 @@ pub fn container_remove_quiet(engine: ContainerEngine, name_or_id: &str) -> Exit
     }
 }
 
+/// What an engine said about whether an object exists. `Unknown` means the
+/// engine could not answer (daemon down, socket permissions, no session), which
+/// must never be read as "absent" by code that deletes or forgets things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    Present,
+    Absent,
+    Unknown(String),
+}
+
+/// Classify an `<engine> <kind> inspect` outcome. Docker says "No such
+/// container/image/volume" or "No such object"; podman says "no such ..." or
+/// "... not known". An engine binary that is not installed holds nothing.
+fn classify_inspect(outcome: io::Result<std::process::Output>) -> Probe {
+    match outcome {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Probe::Absent,
+        Err(e) => Probe::Unknown(e.to_string()),
+        Ok(out) if out.status.success() => Probe::Present,
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+            if err.contains("no such") || err.contains("not known") {
+                Probe::Absent
+            } else {
+                Probe::Unknown(err.trim().to_string())
+            }
+        }
+    }
+}
+
+/// Ask an OCI engine whether an object of `kind` (`container`, `image`,
+/// `volume`) named `name` exists. Apptainer has none of these engine objects.
+pub fn probe(engine: ContainerEngine, kind: &str, name: &str) -> Probe {
+    match argstyle(engine) {
+        ArgStyle::Oci => classify_inspect(
+            Command::new(engine_executable(engine))
+                .args([kind, "inspect", name])
+                .stdin(Stdio::null())
+                .output(),
+        ),
+        ArgStyle::Apptainer => Probe::Absent,
+    }
+}
+
 /// Check whether a container with this name exists (running or stopped).
 pub fn container_exists(engine: ContainerEngine, name: &str) -> bool {
     match argstyle(engine) {
@@ -334,24 +377,6 @@ pub fn volume_remove(engine: ContainerEngine, name: &str) -> ExitStatus {
             code
         }
         ArgStyle::Apptainer => no_op_exit_status(),
-    }
-}
-
-/// Whether an engine-managed volume of this name exists. Apptainer has no
-/// volumes, so nothing ever exists there.
-pub fn volume_exists(engine: ContainerEngine, name: &str) -> bool {
-    match argstyle(engine) {
-        ArgStyle::Oci => {
-            let exe = engine_executable(engine);
-            Command::new(exe)
-                .args(["volume", "inspect", name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        }
-        ArgStyle::Apptainer => false,
     }
 }
 
@@ -459,13 +484,10 @@ pub fn remove_image(engine: ContainerEngine, tag: &str) -> bool {
     }
 }
 
-/// Produce a synthetic ExitStatus(0) for engine no-ops. The standard library
-/// does not expose a constructor for ExitStatus, so we run `true` -- a
-/// guaranteed-fast successful no-op available on every POSIX system.
+/// A successful status for engine no-ops.
 fn no_op_exit_status() -> ExitStatus {
-    Command::new("true")
-        .status()
-        .unwrap_or_else(|_| std::process::exit(1))
+    use std::os::unix::process::ExitStatusExt;
+    ExitStatus::from_raw(0)
 }
 
 // ======================================================================
@@ -744,25 +766,30 @@ pub fn build_build_args(cfg: &BuildConfig) -> Vec<String> {
 /// Returns only the exit status. Use for IO () commands where mim's
 /// stdout must stay clean but the user should see all container output.
 fn run_process_to_stderr(exe: &str, args: &[String]) -> ExitStatus {
-    let mut child = Command::new(exe)
+    let mut child = match Command::new(exe)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to execute {exe}: {e}");
-            std::process::exit(1);
-        });
+    {
+        Ok(child) => child,
+        Err(e) => return report_spawn_failure(exe, e),
+    };
     // Pump child stdout -> our stderr
     if let Some(mut child_stdout) = child.stdout.take() {
         let stderr = io::stderr();
         let _ = io::copy(&mut child_stdout, &mut stderr.lock());
     }
-    child.wait().unwrap_or_else(|e| {
-        eprintln!("Failed to wait for {exe}: {e}");
-        std::process::exit(1);
-    })
+    child.wait().unwrap_or_else(|e| report_spawn_failure(exe, e))
+}
+
+/// Print why an engine command could not be run and return the failed status
+/// of `spawn_failure`, for helpers that hand back only a status.
+fn report_spawn_failure(exe: &str, e: io::Error) -> ExitStatus {
+    let (status, _, msg) = spawn_failure(exe, e);
+    eprintln!("{msg}");
+    status
 }
 
 /// Run a process with stderr streamed live to the terminal.
@@ -773,34 +800,37 @@ fn run_process(exe: &str, args: &[String]) -> (ExitStatus, String, String) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .output()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to execute {exe}: {e}");
-            std::process::exit(1);
-        });
-    (
-        output.status,
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::new(),
-    )
+        .output();
+    match output {
+        Ok(output) => (
+            output.status,
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::new(),
+        ),
+        Err(e) => spawn_failure(exe, e),
+    }
+}
+
+/// The outcome reported for an engine command that could not be started: a
+/// failed status (127, the shell's "cannot run") carrying the reason, so the
+/// caller's ordinary failure handling reports it.
+fn spawn_failure(exe: &str, e: io::Error) -> (ExitStatus, String, String) {
+    use std::os::unix::process::ExitStatusExt;
+    (ExitStatus::from_raw(127 << 8), String::new(), format!("failed to execute {exe}: {e}"))
 }
 
 /// Run a process with all output captured (no streaming).
 /// Used when stderr must be parsed (e.g., for error classification).
 fn run_process_quiet(exe: &str, args: &[String]) -> (ExitStatus, String, String) {
-    let output = Command::new(exe)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to execute {exe}: {e}");
-            std::process::exit(1);
-        });
-    (
-        output.status,
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    )
+    let output = Command::new(exe).args(args).stdin(Stdio::null()).output();
+    match output {
+        Ok(output) => (
+            output.status,
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ),
+        Err(e) => spawn_failure(exe, e),
+    }
 }
 
 // ======================================================================
@@ -809,4 +839,50 @@ fn run_process_quiet(exe: &str, args: &[String]) -> (ExitStatus, String, String)
 
 pub fn exit_code_to_int(status: ExitStatus) -> i32 {
     status.code().unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn failed(stderr: &str) -> io::Result<std::process::Output> {
+        Ok(std::process::Output {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        })
+    }
+
+    /// An engine binary that cannot be started is a failed command, not an
+    /// exit of the whole process.
+    #[test]
+    fn a_missing_engine_binary_is_a_failure_not_an_exit() {
+        let (status, _, err) = run_process_quiet("/nonexistent/podman", &["ps".to_string()]);
+        assert!(!status.success());
+        assert!(err.contains("/nonexistent/podman"), "{err}");
+        let (status, _, _) = run_process("/nonexistent/podman", &["ps".to_string()]);
+        assert!(!status.success());
+    }
+
+    /// Only an engine's own "no such object" answer means absent; an engine
+    /// that cannot answer is unknown, never absent.
+    #[test]
+    fn an_engine_that_cannot_answer_is_not_taken_for_absence() {
+        assert_eq!(classify_inspect(failed("Error: No such container: x")), Probe::Absent);
+        assert_eq!(classify_inspect(failed("Error: no such volume x")), Probe::Absent);
+        assert_eq!(classify_inspect(failed("Error: x: image not known")), Probe::Absent);
+        assert_eq!(
+            classify_inspect(Err(io::Error::from(io::ErrorKind::NotFound))),
+            Probe::Absent
+        );
+        let down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.";
+        assert!(matches!(classify_inspect(failed(down)), Probe::Unknown(_)));
+        let perm = "permission denied while trying to connect to the Docker daemon socket";
+        assert!(matches!(classify_inspect(failed(perm)), Probe::Unknown(_)));
+        assert!(matches!(
+            classify_inspect(Err(io::Error::from(io::ErrorKind::PermissionDenied))),
+            Probe::Unknown(_)
+        ));
+    }
 }

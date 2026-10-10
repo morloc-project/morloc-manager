@@ -107,11 +107,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: 'mim-*'
           merge-multiple: true
           path: dist
+
+      # https://morloc.io/install.sh redirects to this asset of the latest
+      # release, so the installer users run is the one that was released.
+      - name: Stage installer
+        run: cp scripts/install.sh dist/install.sh
 
       - name: List assets
         run: ls -lh dist
@@ -121,4 +128,5 @@ jobs:
         with:
           files: |
             dist/mim-*
+            dist/install.sh
           generate_release_notes: true

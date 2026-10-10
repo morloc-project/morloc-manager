@@ -1,7 +1,7 @@
 //! Generate a Dockerfile that builds a morloc environment image from the SAME
 //! requirement->pixi lowering the native backend uses.
 //!
-//! The image is requirement-derived, not hand-authored: a slim base, a pinned
+//! The image is requirement-derived, not hand-authored: a base image, a pinned
 //! pixi, the environment's `pixi.toml`/`pixi.lock`, the pinned morloc compiler +
 //! Rust source, and `morloc init` run against the pixi toolchain (which builds
 //! libmorloc.so + morloc-nexus from that source). Container and native thus
@@ -23,9 +23,9 @@ pub struct BuildExtras {
 /// build context (COPY-ed in), not here; this struct carries only the
 /// image-shape parameters.
 pub struct DockerfileInput<'a> {
-    /// Slim base image (glibc + a Debian-family package manager), fully
+    /// Base image (glibc + a Debian-family package manager), fully
     /// qualified so podman needs no short-name registry config,
-    /// e.g. "docker.io/library/debian:bookworm-slim".
+    /// e.g. "docker.io/library/ubuntu:24.04".
     pub base_image: &'a str,
     /// Pinned pixi version without a leading 'v', e.g. "0.76.2".
     pub pixi_version: &'a str,
@@ -38,7 +38,7 @@ pub struct DockerfileInput<'a> {
     /// in and run at image build. OCI-only (only the Dockerfile path supports it).
     pub lang_installs: &'a [String],
     /// Dev environment: the compiler + Rust source are NOT baked in (they are
-    /// built from a mounted source tree at materialize time), so the
+    /// built from a source tree at materialize time), so the
     /// `COPY runtime/` step and the baked `MORLOC_RUST_DIR` are omitted;
     /// `CONTAINER_RUNTIME_BIN` becomes a mount target instead.
     pub dev: bool,
@@ -74,8 +74,8 @@ pub struct DeployDockerfileInput<'a> {
     /// that has left the manager's world has nothing tracking it, so what it
     /// holds has to travel inside it.
     pub labels: &'a [(String, String)],
-    /// Emit a HEALTHCHECK. Podman's OCI output format drops the instruction and
-    /// warns, so it is Docker-only.
+    /// Emit a HEALTHCHECK: only for an image that serves, since one probing
+    /// an endpoint nothing listens on reports a working CLI image unhealthy.
     pub healthcheck: bool,
 }
 
@@ -199,7 +199,7 @@ pub fn generate_deploy_dockerfile(input: &DeployDockerfileInput) -> String {
 
     if input.cmd.is_empty() {
         out.push_str("# The environment presents no views, so this image is a command line:\n");
-        out.push_str("#   docker run <image> <program> <args>\n");
+        out.push_str("#   docker run <image> <program> <args>   (or podman run)\n");
         out.push_str(&format!("ENTRYPOINT [\"{ACTIVATE_WRAPPER}\"]\n"));
         return out;
     }
@@ -485,8 +485,8 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     out.push('\n');
 
     // Copy the corporate CA in before any network RUN; it is registered into the
-    // trust store at the apt step below. (The bookworm-slim apt mirror is plain
-    // http, so apt-get update itself needs no CA.)
+    // trust store at the apt step below. (Both tested bases' apt mirrors are
+    // plain http, so apt-get update itself needs no CA.)
     if let Some(cert_file) = input.cert_file {
         out.push_str("# Corporate CA bundle (trusted before any network fetch)\n");
         out.push_str(&format!(
@@ -577,7 +577,7 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     // the built compiler is found.
     let runtime_bin = crate::serve::CONTAINER_RUNTIME_BIN;
     if input.dev {
-        out.push_str("# morloc compiler + rust source are built from a mounted source tree\n");
+        out.push_str("# morloc compiler + rust source are built from a source tree\n");
     } else {
         out.push_str("# morloc compiler + rust source (from the build context)\n");
         out.push_str(&format!("COPY runtime/ {runtime_bin}/\n"));
@@ -1025,7 +1025,7 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
     }
 
     #[test]
-    fn the_healthcheck_is_docker_only() {
+    fn the_healthcheck_is_emitted_only_when_asked() {
         assert!(deploy(&SERVE_CMD, &[], true).contains("HEALTHCHECK"));
         assert!(!deploy(&SERVE_CMD, &[], false).contains("HEALTHCHECK"));
     }
@@ -1129,7 +1129,7 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
             cert_file: None,
         };
         let got = generate_dockerfile(&input);
-        // Nothing is baked in: the compiler is built from a mounted source tree.
+        // Nothing is baked in: the compiler is built from a source tree.
         assert!(!got.contains("COPY runtime/"));
         assert!(!got.contains("ENV MORLOC_RUST_DIR="));
         // But CONTAINER_RUNTIME_BIN (a mount target) is still on PATH.

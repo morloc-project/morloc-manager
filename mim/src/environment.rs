@@ -1,10 +1,11 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use serde::Serialize;
 
 use crate::config;
-use crate::container::{self, engine_executable, image_exists_locally};
+use crate::container::{self, engine_executable, image_exists_locally, Probe};
 use crate::error::{ManagerError, Result};
 use crate::serve;
 use crate::types::*;
@@ -20,7 +21,7 @@ pub struct EnvInfo {
     pub name: String,
     pub morloc_version: Option<Version>,
     pub is_default: bool,
-    /// A dev environment (built from a mounted source tree). For these the
+    /// A dev environment (built from a source tree). For these the
     /// version above is the stdlib base, not the compiler.
     pub is_dev: bool,
     /// The image architecture of a docker/podman env; `None` for the other
@@ -81,101 +82,201 @@ pub fn detect_morloc_version(engine: ContainerEngine, image: &str) -> Result<Ver
 // Core operations
 // ======================================================================
 
-/// Create or update an environment.
-///
-/// When `is_new` is true: validates name uniqueness, creates data directories.
-/// Validate that an environment name contains only allowed characters.
+/// Longest environment name. It is a path component, part of a container
+/// name and the bulk of an image tag, whose limit is 128 characters.
+pub const MAX_ENV_NAME_LEN: usize = 64;
+
+/// Validate an environment name: ASCII letters, digits, `-`, `_` and `.`,
+/// starting with a letter or digit. Every derived engine name (image tag,
+/// container name, volume) and path then holds it without escaping.
 pub fn validate_env_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
+    let ok = name.len() <= MAX_ENV_NAME_LEN
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    if !ok {
         return Err(ManagerError::EnvError(format!(
-            "Invalid environment name '{name}': must contain only alphanumeric characters, hyphens, underscores, or dots"
+            "Invalid environment name '{name}': use ASCII letters, digits, '-', '_' and '.', \
+             starting with a letter or digit, at most {MAX_ENV_NAME_LEN} characters"
         )));
     }
     Ok(())
 }
 
+/// An environment name as an image repository component, which must be
+/// lowercase with single separators between alphanumeric runs. A name that
+/// needs changing gets a short hash of the original, so `Foo` and `foo` stay
+/// apart.
+pub fn image_repo_component(name: &str) -> String {
+    let mut out = String::new();
+    let mut sep = String::new();
+    for c in name.to_ascii_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            if !out.is_empty() && !sep.is_empty() {
+                let legal = sep.chars().all(|c| c == '-') || matches!(sep.as_str(), "." | "_" | "__");
+                out.push_str(if legal { &sep } else { "-" });
+            }
+            sep.clear();
+            out.push(c);
+        } else {
+            sep.push(c);
+        }
+    }
+    if out == name {
+        return out;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(name.as_bytes());
+    let hash: String = digest.iter().take(3).map(|b| format!("{b:02x}")).collect();
+    if out.is_empty() { hash } else { format!("{out}-{hash}") }
+}
 
 
 
-/// Remove an environment and all its data. `engine` is the container engine for
-/// container-backed environments, or `None` for native environments (which have
-/// no serve container or image to clean up, only on-disk files).
+
+/// Remove an environment and all its data (ENV-7). `engine` is the container
+/// engine for container-backed environments, or `None` for native ones. The
+/// server is stopped and the engine's objects (image, prefix volume) are
+/// confirmed gone before any file is deleted; the configuration record goes
+/// last. Any step that fails stops the removal and keeps the record, so `rm`
+/// can be retried.
 pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &str) -> Result<()> {
     let ec = config::read_env_config(scope, name)
         .map_err(|_| ManagerError::EnvironmentNotFound(name.to_string()))?;
 
-    // Stop and remove any running serve container and built image. Native
-    // environments have neither, so this whole block is skipped for them.
+    match config::read_serve_runtime(scope, name).and_then(|rt| rt.handle) {
+        Some(ServeHandle::Native { pid, pgid, start }) => crate::stop_native_serve(pid, pgid, start)?,
+        Some(ServeHandle::Container { engine: e, name: recorded }) => {
+            remove_engine_object(e, "container", &recorded, || {
+                let _ = container::container_stop(e, &recorded);
+                let _ = container::container_remove_quiet(e, &recorded);
+            })?
+        }
+        None => {
+            if let Some(engine) = engine {
+                let cname = serve::serve_container_name(name);
+                remove_engine_object(engine, "container", &cname, || {
+                    let _ = container::container_stop(engine, &cname);
+                    let _ = container::container_remove_quiet(engine, &cname);
+                })?;
+            }
+        }
+    }
+
     if let Some(engine) = engine {
-        // Stop and remove any running serve container for this environment
-        // before removing its image. If we skipped this, the serve container
-        // would keep running and be unreachable through mim.
-        let serve_name = serve::serve_container_name(name);
-        if container::container_exists(engine, &serve_name) {
-            let _ = container::container_stop(engine, &serve_name);
-            let _ = container::container_remove_quiet(engine, &serve_name);
-        }
-
-        // Remove built Dockerfile layer image
         if let Some(ref img) = ec.built_image {
-            if image_exists_locally(engine, img) {
+            remove_engine_object(engine, "image", img, || {
                 container::remove_image(engine, img);
-            }
+            })?;
         }
-
         // The solved conda prefix lives in an engine volume rather than under the
-        // env data dir, so deleting the directory tree below would leave it
-        // behind -- gigabytes with nothing left to reference them.
-        let _ = container::volume_remove(
-            engine,
-            &serve::prefix_volume(&config::env_data_dir(scope, name)),
-        );
+        // env data dir.
+        let volume = serve::prefix_volume(&config::env_data_dir(scope, name));
+        remove_engine_object(engine, "volume", &volume, || {
+            let _ = container::volume_remove(engine, &volume);
+        })?;
     }
 
-    // Remove config directory
-    let cfg_dir = config::env_config_dir(scope, name);
-    if cfg_dir.is_dir() {
-        let _ = fs::remove_dir_all(&cfg_dir);
-    }
+    remove_tree(&config::env_data_dir(scope, name), name)?;
+    remove_tree(&config::env_config_dir(scope, name), name)?;
 
-    // Remove data directory
-    let data_dir = config::env_data_dir(scope, name);
-    if data_dir.is_dir() {
-        let _ = fs::remove_dir_all(&data_dir);
-    }
-
-    // If a config's default tag pointed at this name AND no env of that name
-    // survives in any scope, clear the tag. The name-still-resolves guard avoids
-    // over-clearing when a same-named env remains in the other scope (e.g. a
-    // local `default` is removed while a system `default` — the common case now
-    // that no-name `new` uses the constant name `default` — still exists).
-    let name_orphaned = config::find_env_scope(name).is_err();
-    if name_orphaned {
-        for cfg_scope in [Scope::Local, Scope::System] {
-            let cfg_path = config::config_path(cfg_scope);
-            if let Ok(cfg) = config::read_config::<Config>(&cfg_path) {
-                if cfg.default_env.as_deref() == Some(name) {
-                    let new_cfg = Config {
-                        default_env: None,
-                        ..cfg
-                    };
-                    let _ = config::write_config(&cfg_path, &new_cfg);
-                }
-            }
-        }
-    }
+    clear_defaults_naming(name);
 
     Ok(())
 }
 
+/// Remove an engine object with `remove` if the engine reports it, and fail
+/// unless the engine then reports it absent. An engine that cannot answer is
+/// a failure, never taken for absence.
+fn remove_engine_object(
+    engine: ContainerEngine,
+    kind: &str,
+    object: &str,
+    remove: impl FnOnce(),
+) -> Result<()> {
+    let unknown = |why: String| {
+        ManagerError::EnvError(format!(
+            "cannot ask {} whether {kind} {object} exists ({why}); nothing more was \
+             removed. Retry where the engine is reachable.",
+            engine.name()
+        ))
+    };
+    match container::probe(engine, kind, object) {
+        Probe::Absent => return Ok(()),
+        Probe::Unknown(why) => return Err(unknown(why)),
+        Probe::Present => remove(),
+    }
+    match container::probe(engine, kind, object) {
+        Probe::Absent => Ok(()),
+        Probe::Unknown(why) => Err(unknown(why)),
+        Probe::Present => Err(ManagerError::EnvError(format!(
+            "could not remove {kind} {object} (is something still using it?); \
+             nothing more was removed. Free it and retry."
+        ))),
+    }
+}
+
+/// Delete a directory tree. A tree with read-only directories of the
+/// caller's own (a Go module cache, say) is made writable and retried.
+fn remove_tree(path: &Path, env: &str) -> Result<()> {
+    if fs::symlink_metadata(path).is_err() {
+        return Ok(());
+    }
+    if fs::remove_dir_all(path).is_ok() {
+        return Ok(());
+    }
+    make_dirs_writable(path);
+    fs::remove_dir_all(path).map_err(|e| {
+        ManagerError::EnvError(format!(
+            "could not remove {} ({e}); some files there are not yours to delete. \
+             Remove the directory by hand, then run `mim rm {env}` again.",
+            path.display()
+        ))
+    })
+}
+
+fn make_dirs_writable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = fs::symlink_metadata(path) else { return };
+    if !meta.is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700));
+    if let Ok(entries) = fs::read_dir(path) {
+        for e in entries.flatten() {
+            make_dirs_writable(&e.path());
+        }
+    }
+}
+
+/// ENV-5: clear every default that named the just-removed environment
+/// `name`. Defaults are bare names resolved local-first, so a default still
+/// names an environment while one of that name survives in either scope.
+fn clear_defaults_naming(name: &str) {
+    if config::find_env_scope(name).is_ok() {
+        return;
+    }
+    for cfg_scope in [Scope::Local, Scope::System] {
+        let cfg_path = config::config_path(cfg_scope);
+        if let Ok(cfg) = config::read_config::<Config>(&cfg_path) {
+            if cfg.default_env.as_deref() == Some(name) {
+                let new_cfg = Config { default_env: None, ..cfg };
+                let _ = config::write_config(&cfg_path, &new_cfg);
+            }
+        }
+    }
+}
+
 /// The tag of the requirement-derived image an environment builds for itself.
-/// Derived from the name, so a rename re-tags it.
-pub fn env_image_tag(name: &str) -> String {
-    format!("localhost/morloc-env:{name}")
+/// Derived from the name, so a rename re-tags it, and qualified by scope and,
+/// for a personal environment, by uid: an engine store can be shared (docker
+/// has one per host), and environments of the same name in different scopes
+/// or of different users must not overwrite or delete each other's image.
+pub fn env_image_tag(scope: Scope, name: &str) -> String {
+    match scope {
+        Scope::System => format!("localhost/morloc-env:system-{name}"),
+        Scope::Local => format!("localhost/morloc-env:u{}-{name}", nix::unistd::getuid()),
+    }
 }
 
 /// Why an environment cannot be renamed right now, checked before any side
@@ -201,7 +302,7 @@ pub fn validate_rename(scope: Scope, old: &str, new: &str, ec: &EnvironmentConfi
             "environment '{old}' uses the native backend, whose toolchain, runtime and \
              installed programs are built at absolute paths that include its name; it \
              cannot be renamed in place. Create the environment again under the new \
-             name with 'mim new {new} --engine native' and reinstall its programs."
+             name with 'mim new {new} --engine none' and reinstall its programs."
         )));
     }
     Ok(())
@@ -250,7 +351,18 @@ pub fn rename_environment(
     let mut old_tag: Option<String> = None;
     if let Some(engine) = engine {
         let from = serve::prefix_volume(&old_data);
-        if container::volume_exists(engine, &from) {
+        let has_volume = match container::probe(engine, "volume", &from) {
+            Probe::Present => true,
+            Probe::Absent => false,
+            Probe::Unknown(why) => {
+                return Err(ManagerError::EnvError(format!(
+                    "cannot ask {} about the conda prefix volume '{from}' ({why}); \
+                     nothing was renamed. Retry where the engine is reachable.",
+                    engine.name()
+                )))
+            }
+        };
+        if has_volume {
             let Some(image) = ec
                 .built_image
                 .as_deref()
@@ -278,9 +390,9 @@ pub fn rename_environment(
             old_volume = Some(from);
         }
         // Only the name-derived tag follows the name; a custom tag stays valid.
-        if ec.built_image.as_deref() == Some(env_image_tag(old).as_str()) {
-            let from = env_image_tag(old);
-            let to = env_image_tag(new);
+        if ec.built_image.as_deref() == Some(env_image_tag(scope, old).as_str()) {
+            let from = env_image_tag(scope, old);
+            let to = env_image_tag(scope, new);
             if image_exists_locally(engine, &from) {
                 if let Err(msg) = container::tag_image(engine, &from, &to) {
                     return fail(
@@ -498,23 +610,29 @@ pub fn resolve_default_environment() -> Result<(String, Scope, EnvironmentConfig
     Ok((name, scope, ec))
 }
 
-/// Resolve just the default environment name from config.
-/// Skips names that don't resolve to an actual environment (e.g., stale
-/// entries from old config formats).
+/// The environment commands use when given no `--env`, and its scope: the
+/// personal default if it names an environment, else the machine-wide one.
+/// A name present in both scopes resolves to the personal environment, and a
+/// name naming nothing is skipped. Every display of "the default" reads this,
+/// so it shows what commands will use.
+pub fn effective_default() -> Option<(String, Scope)> {
+    [Scope::Local, Scope::System].into_iter().find_map(|cfg_scope| {
+        let name = config::read_config::<Config>(&config::config_path(cfg_scope))
+            .ok()?
+            .default_env?;
+        let scope = config::find_env_scope(&name).ok()?;
+        Some((name, scope))
+    })
+}
+
+/// The effective default's name when it lives in `scope`.
+pub fn default_in(scope: Scope) -> Option<String> {
+    effective_default().filter(|(_, s)| *s == scope).map(|(n, _)| n)
+}
+
 fn resolve_default_env_name() -> Result<String> {
-    if let Ok(cfg) = config::read_config::<Config>(&config::config_path(Scope::Local)) {
-        if let Some(ref name) = cfg.default_env {
-            if config::find_env_scope(name).is_ok() {
-                return Ok(name.clone());
-            }
-        }
-    }
-    if let Ok(cfg) = config::read_config::<Config>(&config::config_path(Scope::System)) {
-        if let Some(ref name) = cfg.default_env {
-            if config::find_env_scope(name).is_ok() {
-                return Ok(name.clone());
-            }
-        }
+    if let Some((name, _)) = effective_default() {
+        return Ok(name);
     }
     // Check if any environments exist to give a better suggestion
     let local_envs = config::list_env_names(Scope::Local);
@@ -547,8 +665,59 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn env_image_tag_is_name_derived() {
-        assert_eq!(env_image_tag("myenv"), "localhost/morloc-env:myenv");
+    fn env_image_tag_is_name_derived_and_scoped() {
+        let uid = nix::unistd::getuid();
+        assert_eq!(env_image_tag(Scope::Local, "myenv"), format!("localhost/morloc-env:u{uid}-myenv"));
+        assert_eq!(env_image_tag(Scope::System, "myenv"), "localhost/morloc-env:system-myenv");
+    }
+
+    #[test]
+    fn env_names_are_ascii_and_start_with_a_letter_or_digit() {
+        for ok in ["foo", "Foo", "v0.98.0", "a-b_c.d", "9", &"a".repeat(MAX_ENV_NAME_LEN)] {
+            assert!(validate_env_name(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "ni\u{f1}o", ".x", "-x", "_x", "a b", "a/b", &"a".repeat(MAX_ENV_NAME_LEN + 1)] {
+            assert!(validate_env_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Docker's repository grammar: lowercase alphanumeric runs joined by one
+    /// of `.`, `_`, `__` or a run of `-`.
+    fn is_repo_component(s: &str) -> bool {
+        let mut prev_alnum = false;
+        let mut sep = String::new();
+        for c in s.chars() {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                if !sep.is_empty() {
+                    let legal = sep.chars().all(|c| c == '-') || matches!(sep.as_str(), "." | "_" | "__");
+                    if !legal || !prev_alnum {
+                        return false;
+                    }
+                    sep.clear();
+                }
+                prev_alnum = true;
+            } else if "-_.".contains(c) {
+                if !prev_alnum && sep.is_empty() {
+                    return false;
+                }
+                sep.push(c);
+            } else {
+                return false;
+            }
+        }
+        prev_alnum && sep.is_empty()
+    }
+
+    #[test]
+    fn every_valid_env_name_makes_a_valid_image_repository() {
+        for name in ["foo", "MyEnv", "a-", "a_.b", "a..b", "a__b", "a---b", "A_", "v0.98.0", "X9"] {
+            assert!(validate_env_name(name).is_ok(), "{name}");
+            let repo = format!("morloc-{}", image_repo_component(name));
+            assert!(is_repo_component(&repo), "{name} -> {repo}");
+        }
+        assert_eq!(image_repo_component("foo"), "foo");
+        assert_ne!(image_repo_component("Foo"), image_repo_component("foo"));
+        assert_ne!(image_repo_component("a-b."), image_repo_component("a-b"));
     }
 
     #[test]
@@ -585,5 +754,82 @@ mod tests {
         assert!(default_pointer_follows(Scope::System, Scope::System, true));
         assert!(!default_pointer_follows(Scope::System, Scope::Local, false));
         assert!(!default_pointer_follows(Scope::System, Scope::Local, true));
+    }
+
+    fn make_env(scope: Scope, name: &str) {
+        let ec = EnvironmentConfig::new_backend(
+            name.to_string(), Backend::Native, String::new(), None, None, Vec::new(), Vec::new(),
+        );
+        config::write_env_config(scope, name, &ec).unwrap();
+    }
+
+    fn pointer(scope: Scope) -> Option<String> {
+        config::read_config::<Config>(&config::config_path(scope)).ok()?.default_env
+    }
+
+    /// ENV-5: removing an environment clears only the defaults that named it;
+    /// a local default naming a system environment survives removing (or
+    /// nuking) local ones.
+    #[test]
+    fn removal_clears_only_the_defaults_that_named_the_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::test_roots::set(tmp.path());
+        make_env(Scope::System, "y");
+        set_default_environment("y", Scope::Local).unwrap();
+        make_env(Scope::Local, "z");
+        set_default_environment("z", Scope::System).unwrap();
+        remove_environment(None, Scope::Local, "z").unwrap();
+        assert_eq!(pointer(Scope::Local).as_deref(), Some("y"));
+        assert_eq!(pointer(Scope::System), None);
+        remove_environment(None, Scope::System, "y").unwrap();
+        assert_eq!(pointer(Scope::Local), None);
+    }
+
+    /// ENV-7: removing a native environment stops its server.
+    #[test]
+    fn removal_stops_a_native_server() {
+        use std::os::unix::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        config::test_roots::set(tmp.path());
+        make_env(Scope::Local, "srv");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 60"]).process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        let record = ServeRuntime {
+            mcp: Vec::new(),
+            api: vec!["m".to_string()],
+            eval: false,
+            host: "127.0.0.1".to_string(),
+            port: 9000,
+            token_required: false,
+            handle: Some(ServeHandle::Native {
+                pid,
+                pgid: pid,
+                start: crate::process_start_ticks(pid),
+            }),
+        };
+        config::write_serve_runtime(Scope::Local, "srv", &record).unwrap();
+        remove_environment(None, Scope::Local, "srv").unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        let status = child.wait().unwrap();
+        assert!(status.signal().is_some(), "the server was not stopped: {status}");
+    }
+
+    /// ENV-7: read-only directories of the caller's own (a Go module cache,
+    /// say) do not stop a removal.
+    #[test]
+    fn removal_deletes_read_only_directories_it_owns() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        config::test_roots::set(tmp.path());
+        make_env(Scope::Local, "ro");
+        let locked = config::env_data_dir(Scope::Local, "ro").join("home/go/pkg/mod");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("f"), "").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        remove_environment(None, Scope::Local, "ro").unwrap();
+        assert!(!config::env_data_dir(Scope::Local, "ro").exists());
+        assert!(!config::env_config_path(Scope::Local, "ro").exists());
     }
 }

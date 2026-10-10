@@ -99,7 +99,7 @@ pub fn sync(
              not provide: {}. On-demand language provisioning is only available in a native \
              or pliable (writable) environment; a served or frozen image has a fixed language \
              set baked into its read-only runtime. Rebuild the image with these languages \
-             pinned (e.g. `mim update --lang {}`).",
+             pinned (e.g. `mim modify --lang {}`).",
             missing.join(", "),
             missing.join(" --lang ")
         )));
@@ -190,7 +190,7 @@ pub fn sync(
 /// the solved pixi.lock, so a python/r-base pulled in transitively by a dependency
 /// (with no py/r pool) never triggers a build or refusal. Reflects SHIM state, so
 /// a failed build or an immutable-env refusal is re-detected on every retry.
-/// Returns morloc short codes (py/r/cpp/julia), which are also valid `--lang` pins.
+/// Returns morloc short codes (py/r/cpp), which are also valid `--lang` pins.
 fn declared_langs_missing_shims(es: &EnvSpec, home: &Path) -> Vec<String> {
     let marker_dir = abi::lang_marker_dir(home);
     es.languages
@@ -252,6 +252,11 @@ fn build_new_language_shims(activation: &[(String, String)], home: &Path) -> Res
     morloc_deps::ambient::scrub(&mut cmd);
     crate::apply_activation(&mut cmd, activation);
     cmd.env("MORLOC_HOME", home);
+    // PROV-5: unless the launcher chose a link dir, link nothing into the
+    // user's own bin directory.
+    if std::env::var_os("MORLOC_BIN_LINK_DIR").is_none() {
+        cmd.env("MORLOC_BIN_LINK_DIR", "");
+    }
     cmd.env(ENV_INIT_INCREMENTAL, "1");
     cmd.env(ENV_STRICT_CONDA, "1");
     let status = cmd
@@ -288,7 +293,7 @@ pub fn clean() -> Result<(), DepsError> {
 /// Remove ONLY the dropped languages' shim markers under `<home>/opt/
 /// lang-configured/`, so the next on-demand re-add rebuilds them against the
 /// freshly solved interpreter while every still-present language keeps its valid
-/// shim. `dropped` are runtime codes (python/r/julia). Best-effort. A missing
+/// shim. `dropped` are runtime codes (python/r). Best-effort. A missing
 /// `MORLOC_HOME` (e.g. `mim clean` run outside an env) simply skips this.
 fn invalidate_shim_markers(dropped: &[String]) {
     let Ok(home) = morloc_home() else { return };
@@ -300,13 +305,13 @@ fn invalidate_shim_markers(dropped: &[String]) {
     }
 }
 
-/// `mim spec`: print the merged pixi manifest for the current declared world.
+/// `mim spec`: print the merged pixi manifest the next `sync` solves.
 pub fn spec() -> Result<(), DepsError> {
     let ctx = env_context()?;
     let support = load_lang_support()?;
     let owned = solve_inputs()?;
     let inputs = owned.bind(&support);
-    let specs = ctx.gather()?;
+    let specs = ctx.sync_world()?;
     print!("{}", ctx.rendered_manifest(&specs, &inputs)?);
     Ok(())
 }
@@ -401,16 +406,16 @@ mod tests {
         std::fs::create_dir_all(&markers).unwrap();
         std::fs::write(markers.join("python"), "").unwrap();
 
-        // A program declaring py + r + cpp + rust + julia (jl normalized to julia).
+        // A program declaring py + r + cpp + rust.
         let es = EnvSpec::from_json(
-            r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"},{"lang":"r"},{"lang":"cpp"},{"lang":"rust"},{"lang":"jl"}]}"#,
+            r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"},{"lang":"r"},{"lang":"cpp"},{"lang":"rust"}]}"#,
         )
         .unwrap();
 
-        // py is built (skipped); rust has no shim (skipped); r/cpp/julia are missing.
+        // py is built (skipped); rust has no shim (skipped); r/cpp are missing.
         assert_eq!(
             declared_langs_missing_shims(&es, home.path()),
-            vec!["r".to_string(), "cpp".to_string(), "julia".to_string()]
+            vec!["r".to_string(), "cpp".to_string()]
         );
     }
 

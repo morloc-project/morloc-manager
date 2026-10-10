@@ -1,7 +1,7 @@
 use std::fmt;
 use thiserror::Error;
 
-use crate::types::{ContainerEngine, Scope, Version};
+use crate::types::{ContainerEngine, Version};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ManagerError {
@@ -48,12 +48,6 @@ pub enum ManagerError {
 
     #[error("Doctor found {0} error(s)")]
     DoctorFailed(u32),
-
-    #[error("{}", match .0 {
-        Scope::Local => "No local configuration found. Run: mim new",
-        Scope::System => "No system configuration found. Run: sudo mim new --system",
-    })]
-    SetupNotComplete(Scope),
 }
 
 impl fmt::Display for Version {

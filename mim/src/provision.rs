@@ -56,9 +56,8 @@ pub struct TripleAssets {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct MorlocVersions {
     pub morloc_version: String,
-    /// morloc C ABI version. RECORDED (for doctor / frozen-image coherence), not
-    /// gated at install: libmorloc is built from source at `morloc init`, so a
-    /// native runtime is ABI-coherent by construction.
+    /// morloc C ABI version. Not checked: libmorloc is built from source at
+    /// `morloc init`, so a runtime is ABI-coherent by construction.
     pub abi_version: u32,
     /// `envspec.json` schema version (integer).
     pub envspec_version: u32,
@@ -67,18 +66,31 @@ pub struct MorlocVersions {
 }
 
 impl MorlocVersions {
-    /// Reject a release whose contract versions exceed what this manager
-    /// understands, so the failure surfaces as an actionable "upgrade mim" at
-    /// install time rather than an opaque parse error mid-build. The comparison is
-    /// `declared > supported` (never equality): the manager versions independently
-    /// of the compiler, so a matched pair is the common -- not the required -- case.
+    /// PROV-3: reject a release whose contract versions this manager cannot
+    /// read -- newer or older -- so the failure surfaces at install time with
+    /// the direction of the fix, rather than as a parse error mid-build. The
+    /// accepted set is exactly what the parsers accept: envspec
+    /// `ENVSPEC_VERSION`, and lang-support major `LANG_SCHEMA_MAJOR` with any
+    /// minor.
     pub fn check_supported(&self) -> Result<()> {
-        if self.envspec_version > ENVSPEC_VERSION {
-            return Err(ManagerError::EnvError(format!(
-                "this morloc release writes envspec_version {} but this mim understands \
-                 up to {}; upgrade mim.",
-                self.envspec_version, ENVSPEC_VERSION
-            )));
+        let refuse = |what: &str, declared: &str, readable: &str, newer: bool| {
+            let fix = if newer {
+                "upgrade mim"
+            } else {
+                "pick a newer morloc release"
+            };
+            Err(ManagerError::EnvError(format!(
+                "this morloc release writes {what} {declared} but this mim reads only \
+                 {readable}; {fix}."
+            )))
+        };
+        if self.envspec_version != ENVSPEC_VERSION {
+            return refuse(
+                "envspec_version",
+                &self.envspec_version.to_string(),
+                &ENVSPEC_VERSION.to_string(),
+                self.envspec_version > ENVSPEC_VERSION,
+            );
         }
         let lang_major = self
             .lang_support_schema
@@ -91,12 +103,13 @@ impl MorlocVersions {
                     self.lang_support_schema
                 ))
             })?;
-        if lang_major > LANG_SCHEMA_MAJOR {
-            return Err(ManagerError::EnvError(format!(
-                "this morloc release writes lang-support schema {} but this mim understands \
-                 major {}.x; upgrade mim.",
-                self.lang_support_schema, LANG_SCHEMA_MAJOR
-            )));
+        if lang_major != LANG_SCHEMA_MAJOR {
+            return refuse(
+                "lang-support schema",
+                &self.lang_support_schema,
+                &format!("{LANG_SCHEMA_MAJOR}.x"),
+                lang_major > LANG_SCHEMA_MAJOR,
+            );
         }
         Ok(())
     }
@@ -287,7 +300,7 @@ pub fn fetch_latest_tag() -> Result<String> {
 }
 
 /// Resolve a requested release specifier to a concrete GitHub tag. "latest"
-/// queries the API; a bare version like "0.98.3" becomes "v0.98.3"; anything
+/// follows GitHub's releases/latest redirect; a bare version like "0.98.3" becomes "v0.98.3"; anything
 /// else (an explicit tag such as "dev" or "v0.98.3") is used verbatim.
 pub fn resolve_tag(requested: &str) -> Result<String> {
     let requested = requested.trim();
@@ -446,13 +459,14 @@ pub fn runtime_mim_bin(dir: &Path) -> PathBuf {
     dir.join("mim")
 }
 
-/// The version+triple-keyed cache for a downloaded foreign-platform `mim`. Keyed
-/// by this mim's version so a mim upgrade re-fetches; keyed by triple so a host
-/// can cache both its own and a container platform's binary.
+/// The tag+triple-keyed cache for a downloaded foreign-platform `mim`. Keyed
+/// by the release tag `download_mim` fetches from, so the cache holds exactly
+/// what that tag served; keyed by triple so a host can cache both its own and
+/// a container platform's binary.
 pub fn mim_cache_bin(scope: Scope, triple: &str) -> PathBuf {
     config::data_dir(scope)
         .join("mim")
-        .join(env!("CARGO_PKG_VERSION"))
+        .join(mim_release_tag())
         .join(triple)
         .join("mim")
 }
@@ -911,7 +925,7 @@ mod tests {
       "versions": {
         "morloc_version": "0.98.3",
         "abi_version": 1,
-        "envspec_version": 1,
+        "envspec_version": 2,
         "lang_support_schema": "1.0"
       },
       "triples": {
@@ -925,6 +939,37 @@ mod tests {
       }
     }"#;
 
+    /// PROV-3: a contract version this mim cannot read, older or newer, is
+    /// refused before anything is installed, naming the fix.
+    #[test]
+    fn the_gate_refuses_every_contract_version_the_parsers_reject() {
+        let v = |envspec: u32, lang: &str| MorlocVersions {
+            morloc_version: "0.99.0".to_string(),
+            abi_version: 1,
+            envspec_version: envspec,
+            lang_support_schema: lang.to_string(),
+        };
+        let cur = ENVSPEC_VERSION;
+        let major = LANG_SCHEMA_MAJOR;
+        assert!(v(cur, &format!("{major}.0")).check_supported().is_ok());
+        assert!(v(cur, &format!("{major}.99")).check_supported().is_ok());
+        let older = v(cur - 1, &format!("{major}.0")).check_supported().unwrap_err().to_string();
+        assert!(older.contains("newer morloc release"), "{older}");
+        let newer = v(cur + 1, &format!("{major}.0")).check_supported().unwrap_err().to_string();
+        assert!(newer.contains("upgrade mim"), "{newer}");
+        let lang_old = v(cur, &format!("{}.5", major - 1)).check_supported().unwrap_err().to_string();
+        assert!(lang_old.contains("newer morloc release"), "{lang_old}");
+        let lang_new = v(cur, &format!("{}.0", major + 1)).check_supported().unwrap_err().to_string();
+        assert!(lang_new.contains("upgrade mim"), "{lang_new}");
+    }
+
+    /// The foreign-platform mim cache is keyed by the tag it is downloaded from.
+    #[test]
+    fn the_mim_cache_is_keyed_by_the_download_tag() {
+        let p = mim_cache_bin(Scope::Local, "linux-arm64");
+        assert!(p.components().any(|c| c.as_os_str() == mim_release_tag().as_str()), "{}", p.display());
+    }
+
     #[test]
     fn parses_manifest() {
         let m = ReleaseManifest::from_json(SAMPLE).unwrap();
@@ -932,7 +977,7 @@ mod tests {
         assert_eq!(m.rust_src, "morloc-rust-src.tar.gz");
         let a = m.assets_for("linux-x86_64").unwrap();
         assert_eq!(a.morloc, "morloc-linux-x86_64");
-        assert_eq!(m.versions.envspec_version, 1);
+        assert_eq!(m.versions.envspec_version, 2);
         assert_eq!(m.versions.lang_support_schema, "1.0");
         // A triple with no published runtime is absent.
         assert!(m.assets_for("macos-arm64").is_none());
@@ -941,7 +986,7 @@ mod tests {
     #[test]
     fn rejects_future_schema() {
         let j = r#"{"schema":999,"version":"9.9.9","rust_src":"x",
-          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":1,"lang_support_schema":"1.0"},
+          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":2,"lang_support_schema":"1.0"},
           "triples":{},"sha256":{}}"#;
         assert!(ReleaseManifest::from_json(j).is_err());
     }
@@ -956,7 +1001,7 @@ mod tests {
         assert!(ReleaseManifest::from_json(j).is_err());
         // A newer lang-support MAJOR is likewise refused.
         let k = r#"{"schema":1,"version":"9.9.9","rust_src":"x",
-          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":1,"lang_support_schema":"2.0"},
+          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":2,"lang_support_schema":"2.0"},
           "triples":{},"sha256":{}}"#;
         assert!(ReleaseManifest::from_json(k).is_err());
     }
@@ -1044,7 +1089,7 @@ mod tests {
 
     #[test]
     fn manifest_requires_sha256() {
-        let vers = r#""versions":{"morloc_version":"1","abi_version":1,"envspec_version":1,"lang_support_schema":"1.0"}"#;
+        let vers = r#""versions":{"morloc_version":"1","abi_version":1,"envspec_version":2,"lang_support_schema":"1.0"}"#;
         let j = format!(
             r#"{{"schema":1,"version":"1.0.0","rust_src":"r",{vers},"triples":{{}},
           "sha256":{{"morloc-linux-x86_64":"abc123"}}}}"#
