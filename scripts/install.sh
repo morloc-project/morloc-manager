@@ -2,7 +2,7 @@
 # mim installer -- fetch the right prebuilt binary for this system into a
 # user-owned bin directory.
 #
-#   curl -fsSL https://raw.githubusercontent.com/morloc-project/morloc-manager/main/scripts/install.sh | sh
+#   curl -fsSL https://morloc.io/install.sh | sh
 #
 # The installer never edits shell startup files. If the destination is not on
 # PATH it prints the command to add it and leaves the decision to the user.
@@ -11,6 +11,10 @@
 #   MIM_VERSION   git tag to install (default: latest release)
 #   MIM_DEST      directory to install into
 #                 (default: $XDG_BIN_HOME, else ~/.local/bin)
+
+# Under `curl | sh` a dropped connection hands sh a prefix of this file. The
+# whole body is one function called on the last line, so a prefix runs nothing.
+main() {
 set -eu
 
 REPO="morloc-project/morloc-manager"
@@ -142,3 +146,6 @@ if [ -n "$rc" ]; then
 fi
 printf '    %s\n\n' "$add" >&2
 printf 'Or skip PATH entirely and run it by full path: %s --help\n' "$out" >&2
+}
+
+main "$@"
