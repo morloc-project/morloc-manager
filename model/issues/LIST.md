@@ -5,6 +5,14 @@ items cite these as `Code: deviates F<n>`.
 
 ## Needs a ruling
 
+### F64 Bridge resources encode "unset" as a sentinel
+`submit.resources` fields are required `i32`s, and the morloc runtime sends
+-1 for a resource the label leaves out. The meaning of each value is spread
+across two copies of the flag rules (`bridge.rs::resource_args`, runtime
+`slurm_ffi.rs::sbatch_resource_args`), and a client that omits a field fails
+to decode. Optional fields (absent = unset) would state it in the wire
+format; that changes the bridge protocol, so it needs a ruling.
+
 ### F6 System-env `rm` leaves each user's `system-homes/<name>`
 ENV-7. The private home lives in each user's own data dir
 (`config::system_env_user_home`), which root's `rm` cannot reach. Sweep

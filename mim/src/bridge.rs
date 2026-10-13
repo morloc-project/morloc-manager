@@ -40,10 +40,10 @@
 //! ```json
 //! {
 //!   "op": "submit",
-//!   "inner_argv": ["<nexus>", "--call-packet", "<pkt>",
+//!   "inner_argv": ["<nexus>", "run", "--call-packet", "<pkt>",
 //!                   "--socket-base", "<base>",
 //!                   "--output-file", "<res>",
-//!                   "--output-form", "packet"],
+//!                   "--output-form", "packet", "<manifest>"],
 //!   "stdout":   "<string>",
 //!   "stderr":   "<string>",
 //!   "resources": {
@@ -59,8 +59,8 @@
 //!
 //! * `inner_argv` - the logical command to run on the compute node,
 //!   expressed as an argv list (one shell token per element). The
-//!   bridge prepends `["<mim>", "run", "--slurm-bridge",
-//!   "--"]` then shell-escapes the whole vector into a single string
+//!   bridge prepends `["<mim>", "run", "--env", "<name>",
+//!   "--slurm-bridge", "--"]` then shell-escapes the whole vector into a single string
 //!   for sbatch --wrap. /bin/sh on the compute node parses the
 //!   quoted tokens back into argv, mim hands everything
 //!   after `--` to the in-container nexus. The runtime never
@@ -69,16 +69,16 @@
 //!   remote dispatch from compute-node pools.
 //! * `stdout`, `stderr` - absolute paths the bridge passes to sbatch
 //!   as `-o <stdout> -e <stderr>`.
-//! * `resources.mem_gb` - requested memory in GiB. Becomes
-//!   `--mem=<N>G`.
-//! * `resources.time_s` - wall time in seconds. Bridge formats as
-//!   `D-HH:MM:SS` for `--time=`.
-//! * `resources.cpus` - becomes `--cpus-per-task=<N>`. Floor of 1
-//!   (a request for 0 cpus is reinterpreted as 1).
-//! * `resources.gpus` - becomes `--gres=gpu:<N>` when `N > 0`. Zero
-//!   omits the flag entirely; many SLURM installs reject
-//!   `--gres=gpu:0` as an unknown resource when no gpu gres is
-//!   defined on the cluster.
+//! * `resources.mem_gb` - requested memory in GiB, `--mem=<N>G` when
+//!   0 or more (SLURM reads 0 as all of a node's memory).
+//! * `resources.time_s` - wall time in seconds, `--time=D-HH:MM:SS`
+//!   when 0 or more (SLURM reads 0 as no limit).
+//! * `resources.cpus` - `--cpus-per-task=<N>` when 1 or more.
+//! * `resources.gpus` - `--gres=gpu:<N>` when 1 or more. Many SLURM
+//!   installs reject `--gres=gpu:0` when no gpu gres is defined.
+//!
+//! A resource outside those ranges is unset (the client sends -1): its
+//! flag is omitted, so the cluster's default applies.
 //!
 //! Reply (success):
 //!
@@ -149,7 +149,7 @@
 //! ## End-to-end example
 //!
 //! ```text
-//! C -> {"op":"submit","inner_argv":["/opt/morloc/bin/nexus","--call-packet","/h/u/p/.morloc-cache/a8d-call.dat","--socket-base","py-pipe","--output-file","/h/u/p/.morloc-cache/a8d.dat","--output-form","packet"],"stdout":"/h/u/p/.morloc-cache/a8d.out","stderr":"/h/u/p/.morloc-cache/a8d.err","resources":{"mem_gb":32,"time_s":3600,"cpus":8,"gpus":0}}
+//! C -> {"op":"submit","inner_argv":["/opt/morloc/bin/nexus","run","--call-packet","/h/u/.cache/morloc/cache/_remote/n1-42-0-17/call.dat","--socket-base","py-pipe","--output-file","/h/u/.cache/morloc/cache/_remote/n1-42-0-17/result.dat","--output-form","packet","/h/u/p/manifest.json"],"stdout":"/h/u/.cache/morloc/cache/_remote/n1-42-0-17/job.out","stderr":"/h/u/.cache/morloc/cache/_remote/n1-42-0-17/job.err","resources":{"mem_gb":32,"time_s":3600,"cpus":8,"gpus":0}}
 //! S <- {"job_id":12345678}
 //! ```
 //!
@@ -157,10 +157,10 @@
 //!
 //! ```sh
 //! sbatch --parsable \
-//!   -o /h/u/p/.morloc-cache/a8d.out \
-//!   -e /h/u/p/.morloc-cache/a8d.err \
+//!   -o /h/u/.cache/morloc/cache/_remote/n1-42-0-17/job.out \
+//!   -e /h/u/.cache/morloc/cache/_remote/n1-42-0-17/job.err \
 //!   --mem=32G --time=0-01:00:00 --cpus-per-task=8 \
-//!   --wrap="'/home/u/.local/bin/mim' 'run' '--slurm-bridge' '--' '/opt/morloc/bin/nexus' '--call-packet' '/h/u/p/.morloc-cache/a8d-call.dat' '--socket-base' 'py-pipe' '--output-file' '/h/u/p/.morloc-cache/a8d.dat' '--output-form' 'packet'"
+//!   --wrap="'/home/u/.local/bin/mim' 'run' '--env' 'hpc' '--slurm-bridge' '--' '/opt/morloc/bin/nexus' 'run' '--call-packet' '/h/u/.cache/morloc/cache/_remote/n1-42-0-17/call.dat' '--socket-base' 'py-pipe' '--output-file' '/h/u/.cache/morloc/cache/_remote/n1-42-0-17/result.dat' '--output-form' 'packet' '/h/u/p/manifest.json'"
 //! ```
 //!
 //! Status polling:
@@ -424,25 +424,15 @@ fn handle_submit(
         .collect::<Vec<_>>()
         .join(" ");
 
-    let time_arg = format!("--time={}", format_slurm_time(res.time_s));
-    let mem_arg = format!("--mem={}G", res.mem_gb);
-    let cpus_arg = format!("--cpus-per-task={}", res.cpus.max(1));
     let wrap_arg = format!("--wrap={}", inner);
 
     let mut cmd = Command::new("sbatch");
     cmd.arg("--parsable")
         .arg("-o").arg(stdout)
         .arg("-e").arg(stderr)
-        .arg(&mem_arg)
-        .arg(&time_arg)
-        .arg(&cpus_arg);
-    // Skip --gres=gpu:0 on clusters without any gpu gres definition;
-    // many SLURM installs reject "gpu:0" as an unknown resource. A
-    // request with no --gres flag means "no GPU allocation".
-    if res.gpus > 0 {
-        cmd.arg(format!("--gres=gpu:{}", res.gpus));
-    }
-    cmd.arg(&wrap_arg).stdin(Stdio::null());
+        .args(resource_args(res))
+        .arg(&wrap_arg)
+        .stdin(Stdio::null());
     let output = cmd.output();
 
     let output = match output {
@@ -546,16 +536,35 @@ fn shell_arg(s: &str) -> String {
     out
 }
 
-/// Format seconds as SLURM's D-HH:MM:SS walltime. Mirrors
-/// libmorloc::write_slurm_time so the bridge stays a thin shell over
-/// host sbatch without re-exporting C ABI.
+/// SLURM's `D-HH:MM:SS` for a walltime in seconds.
 fn format_slurm_time(seconds: i32) -> String {
-    let mut rem = seconds.max(0);
-    let days = rem / (60 * 60 * 24);
-    rem -= days * 60 * 60 * 24;
-    let hours = rem / (60 * 60);
-    rem -= hours * 60 * 60;
-    let minutes = rem / 60;
-    rem -= minutes * 60;
-    format!("{}-{:02}:{:02}:{:02}", days, hours, minutes, rem)
+    let (d, rem) = (seconds / 86400, seconds % 86400);
+    format!("{}-{:02}:{:02}:{:02}", d, rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// The sbatch flags for a job's resources, omitting every unset one. The
+/// morloc runtime's `sbatch_resource_args` builds the same flags for a
+/// direct submission.
+fn resource_args(res: &ResourceSpec) -> Vec<String> {
+    let mut args = Vec::new();
+    if res.mem_gb >= 0 { args.push(format!("--mem={}G", res.mem_gb)); }
+    if res.time_s >= 0 { args.push(format!("--time={}", format_slurm_time(res.time_s))); }
+    if res.cpus > 0 { args.push(format!("--cpus-per-task={}", res.cpus)); }
+    if res.gpus > 0 { args.push(format!("--gres=gpu:{}", res.gpus)); }
+    args
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn an_unset_resource_is_left_to_the_cluster_default() {
+        let none = ResourceSpec { mem_gb: -1, time_s: -1, cpus: -1, gpus: 0 };
+        assert!(resource_args(&none).is_empty());
+        let zero = ResourceSpec { mem_gb: 0, time_s: 0, cpus: 0, gpus: 0 };
+        assert_eq!(resource_args(&zero), ["--mem=0G", "--time=0-00:00:00"]);
+        let all = ResourceSpec { mem_gb: 32, time_s: 90061, cpus: 8, gpus: 2 };
+        assert_eq!(resource_args(&all), ["--mem=32G", "--time=1-01:01:01", "--cpus-per-task=8", "--gres=gpu:2"]);
+    }
 }
