@@ -87,6 +87,15 @@ default, dotfiles, home, shm, flag file, pins, certificates) stay.
 ENV-8. Writes are locked and atomic, reads are not, so default, rename and
 `modify` updates can be lost; `install_flag_file` copies non-atomically.
 
+### F65 Crates are outside the environment's solve
+DEP-3, DEP-7, DEP-8. Ruled 2026-10-14: crates join the one solved
+environment. One cargo lock per environment, resolved over a workspace of
+the runtime crates and every program's rust-deps; pools build against it
+and the compiler's per-pool lock merge goes. A crate has one version per
+semver-compatible line (cargo links several major lines into one binary,
+and the ecosystem depends on it). Compiler side and evidence:
+compiler model/runtime/issues/build-and-text.md.
+
 ## Other
 
 ### F10 Unverified downloads
