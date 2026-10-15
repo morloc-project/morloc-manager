@@ -735,6 +735,19 @@ fn write_prune_lists(v_data_dir: &Path, context: &Path) -> Result<morloc_deps::p
     let manifest = fs::read_to_string(pixi_dir.join("pixi.toml"))
         .map_err(|e| ManagerError::FreezeError(format!("cannot read pixi.toml: {e}")))?;
     let roots = prune::manifest_dependencies(&manifest);
+    let specs = morloc_deps::envstore::EnvContext::new(v_data_dir)
+        .gather()
+        .map_err(|e| ManagerError::FreezeError(format!("cannot read the environment's specs: {e}")))?;
+    let mut tools: Vec<String> = specs
+        .iter()
+        .flat_map(|s| s.tools.iter())
+        .filter_map(|r| match r {
+            morloc_deps::envspec::PackageReq::Conda { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    tools.sort();
+    tools.dedup();
     let meta_dir = morloc_deps::abi::meta_dir(&pixi_dir);
     let records = prune::read_records(&meta_dir);
     if records.is_empty() {
@@ -744,7 +757,7 @@ fn write_prune_lists(v_data_dir: &Path, context: &Path) -> Result<morloc_deps::p
             meta_dir.display()
         )));
     }
-    let plan = prune::plan_prune(&roots, &records).map_err(ManagerError::FreezeError)?;
+    let plan = prune::plan_prune(&roots, &tools, &records).map_err(ManagerError::FreezeError)?;
     let mut files = Vec::new();
     for f in &plan.removed_files {
         files.extend_from_slice(f.as_bytes());

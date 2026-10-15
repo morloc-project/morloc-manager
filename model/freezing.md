@@ -59,5 +59,6 @@ Intent: proposed
 Code: unaudited
 
 A slim image drops compilers, the solver, the Morloc compiler and build-only
-packages. It is refused when eval is enabled, and after it is built every
+packages, except a tool a program declares and everything that tool depends
+on, which stay whatever their names. It is refused when eval is enabled, and after it is built every
 program is started and every runtime library's linkage is checked inside it.

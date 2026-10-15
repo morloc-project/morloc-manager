@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DepsError, Result};
-use crate::version::ENVSPEC_VERSION;
+use crate::version::{ENVSPEC_MIN_VERSION, ENVSPEC_VERSION};
 
 /// The pixi-manifest-relative directory under which installed local Python
 /// dependencies are snapshotted: `local/<name>/<content hash>`. Inside the pixi
@@ -109,7 +109,8 @@ pub struct ModuleReq {
 }
 
 /// A program's declared environment requirements. Keys of `packages` are
-/// canonical morloc language names ("py", "r", "cpp", "rust").
+/// canonical morloc language names ("py", "r", "cpp", "rust"); `tools` are the
+/// conda packages whose executables the program runs, whatever its languages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvSpec {
     pub envspec_version: u32,
@@ -118,6 +119,8 @@ pub struct EnvSpec {
     pub languages: Vec<LangReq>,
     #[serde(default)]
     pub packages: std::collections::BTreeMap<String, Vec<PackageReq>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<PackageReq>,
     #[serde(default)]
     pub system: Vec<SystemReq>,
     #[serde(default)]
@@ -137,11 +140,11 @@ impl EnvSpec {
         let peek: VersionPeek = serde_json::from_str(text).map_err(|e| {
             DepsError::Env(format!("Failed to parse envspec.json: {e}"))
         })?;
-        if peek.envspec_version < ENVSPEC_VERSION {
+        if peek.envspec_version < ENVSPEC_MIN_VERSION {
             return Err(DepsError::Env(format!(
-                "envspec.json is version {} but this mim requires version {}. \
+                "envspec.json is version {} but this mim requires version {} to {}. \
                  Rebuild the program with a current morloc (morloc make).",
-                peek.envspec_version, ENVSPEC_VERSION
+                peek.envspec_version, ENVSPEC_MIN_VERSION, ENVSPEC_VERSION
             )));
         }
         if peek.envspec_version > ENVSPEC_VERSION {
@@ -174,6 +177,7 @@ impl EnvSpec {
             morloc_version: morloc_version.to_string(),
             languages,
             packages: std::collections::BTreeMap::new(),
+            tools: Vec::new(),
             system: Vec::new(),
             modules: Vec::new(),
         }

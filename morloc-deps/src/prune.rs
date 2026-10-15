@@ -158,16 +158,38 @@ pub struct PrunePlan {
 }
 
 /// Compute the prune: keep what `roots` reach without crossing a build-only
-/// package, remove the rest. A root that is itself build-only is dropped
-/// silently, since the manifest names the toolchain and that is the point. A
-/// root the records do not know is an error: the manifest and the prefix
-/// disagree, and a plan built on that would delete something the manifest
-/// still wants.
-pub fn plan_prune(roots: &[String], records: &[CondaRecord]) -> Result<PrunePlan, String> {
+/// package, and everything `tools` reach, and remove the rest. A root that is
+/// itself build-only is dropped silently, since the manifest names the
+/// toolchain and that is the point; a tool is a program run at run time, so
+/// it and all it depends on stay whatever their names. A root or tool the
+/// records do not know is an error: the manifest and the prefix disagree, and
+/// a plan built on that would delete something the manifest still wants.
+pub fn plan_prune(roots: &[String], tools: &[String], records: &[CondaRecord]) -> Result<PrunePlan, String> {
     let by_name: BTreeMap<&str, &CondaRecord> =
         records.iter().map(|r| (r.name.as_str(), r)).collect();
     let mut keep: BTreeSet<&str> = BTreeSet::new();
     let mut todo: Vec<&str> = Vec::new();
+    for tool in tools {
+        if !by_name.contains_key(tool.as_str()) {
+            return Err(format!(
+                "a program runs the tool '{tool}' but the prefix has no record of it; \
+                 the environment's toolchain does not match its lock"
+            ));
+        }
+        todo.push(tool.as_str());
+    }
+    while let Some(name) = todo.pop() {
+        if !keep.insert(name) {
+            continue;
+        }
+        if let Some(rec) = by_name.get(name) {
+            for dep in &rec.depends {
+                if by_name.contains_key(dep.as_str()) {
+                    todo.push(dep.as_str());
+                }
+            }
+        }
+    }
     for root in roots {
         if is_build_only(root) {
             continue;
@@ -261,7 +283,7 @@ mod tests {
     /// the runtime libraries the toolchain shares with r-base stay.
     #[test]
     fn the_compiler_chain_behind_r_base_is_cut_but_its_runtime_libs_stay() {
-        let plan = plan_prune(&roots(&["r-base", "python", "numpy", "rust", "c-compiler", "git"]), &prefix()).unwrap();
+        let plan = plan_prune(&roots(&["r-base", "python", "numpy", "rust", "c-compiler", "git"]), &[], &prefix()).unwrap();
         assert_eq!(
             plan.kept,
             vec!["ld_impl_linux-64", "libgcc", "libgfortran5", "libstdcxx", "numpy", "python", "r-base"]
@@ -279,7 +301,7 @@ mod tests {
     /// else depends on it either.
     #[test]
     fn an_orphan_of_the_toolchain_is_removed() {
-        let plan = plan_prune(&roots(&["python"]), &prefix()).unwrap();
+        let plan = plan_prune(&roots(&["python"]), &[], &prefix()).unwrap();
         assert!(plan.removed.contains(&"libsanitizer".to_string()));
         assert!(plan.removed.contains(&"perl".to_string()));
         assert_eq!(plan.kept, vec!["ld_impl_linux-64", "libgcc", "python"]);
@@ -287,8 +309,24 @@ mod tests {
 
     #[test]
     fn a_root_the_prefix_lacks_is_an_error() {
-        let err = plan_prune(&roots(&["python", "opencv"]), &prefix()).unwrap_err();
+        let err = plan_prune(&roots(&["python", "opencv"]), &[], &prefix()).unwrap_err();
         assert!(err.contains("opencv"), "{err}");
+    }
+
+    /// A tool keeps itself and everything it runs on, even a name on the
+    /// build-only list.
+    #[test]
+    fn a_tool_on_the_build_only_list_stays_with_what_it_needs() {
+        let plan = plan_prune(&roots(&["python", "git"]), &roots(&["git"]), &prefix()).unwrap();
+        assert_eq!(plan.kept, vec!["git", "ld_impl_linux-64", "libgcc", "perl", "python"]);
+        let plan = plan_prune(&roots(&["c-compiler"]), &roots(&["c-compiler"]), &prefix()).unwrap();
+        assert!(plan.kept.contains(&"binutils_impl_linux-64".to_string()), "{:?}", plan.kept);
+    }
+
+    #[test]
+    fn a_tool_the_prefix_lacks_is_an_error() {
+        let err = plan_prune(&roots(&["python"]), &roots(&["STAR"]), &prefix()).unwrap_err();
+        assert!(err.contains("STAR"), "{err}");
     }
 
     #[test]

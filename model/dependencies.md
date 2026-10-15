@@ -14,8 +14,9 @@ to standard error.
 Intent: proposed
 Code: unaudited
 
-The envspec and lang-support documents carry versions. mim accepts exactly
-the envspec version it reads and any lang-support schema of the same major
+The envspec and lang-support documents carry versions. mim accepts the
+envspec versions it reads (2, and 3, which adds tools; a version 2 spec
+reads as one with no tools) and any lang-support schema of the same major
 version, and refuses others with "rebuild the program" or "upgrade mim".
 
 ### DEP-3 One solved world per environment
@@ -66,7 +67,8 @@ rebuilt, or refused in an immutable environment.
 Intent: proposed
 Code: unaudited
 
-conda and PyPI packages are solved into the world. Crates are left to
+conda and PyPI packages are solved into the world, and so are tools, the
+conda packages whose executables a program runs. Crates are left to
 cargo. Sources mim does not
 support are refused, never dropped. Two conflicting declarations of one
 package (two channels, two local paths, a path and a version) are refused.

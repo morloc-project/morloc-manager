@@ -30,13 +30,16 @@ versions are set in the Morloc repo and here in `morloc-deps::version`.
   (`EnvSpec::from_languages`) for `--lang` pins during bootstrap.
 - **Consumer:** `morloc-deps`, lowered to a pixi manifest by `pixi.rs`.
 - **Transport:** a JSON file in the program's build dir, handed to the build hook.
-- **Version:** integer `envspec_version`.
+- **Version:** integer `envspec_version`; mim reads 2 and 3 (3 adds `tools`).
+
+`packages` is keyed by language. `tools` lists the conda packages whose
+executables the program runs (a module's `tool-deps`), whatever its languages.
 
 Example:
 
 ```json
 {
-  "envspec_version": 2,
+  "envspec_version": 3,
   "morloc_version": "0.99.0",
   "languages": [ { "lang": "py", "constraint": ">=3.10" }, { "lang": "cpp", "std": "c++20" }, { "lang": "rust" } ],
   "packages": {
@@ -45,6 +48,7 @@ Example:
     "cpp":  [ { "name": "opencv", "constraint": ">=4.8", "source": "conda" } ],
     "rust": [ { "name": "ndarray", "constraint": "0.16", "source": "crates" } ]
   },
+  "tools":   [ { "name": "star", "constraint": "2.7.11b", "source": "conda", "channel": "bioconda" } ],
   "system":  [ { "name": "blas", "provider": "unspecified" } ],
   "modules": [ { "name": "tensor-cpp", "git_hash": "abc123" } ]
 }
@@ -104,7 +108,7 @@ Example:
   "schema": 1,
   "version": "0.99.0",
   "rust_src": "morloc-rust-src.tar.gz",
-  "versions": { "morloc_version": "0.99.0", "abi_version": 1, "envspec_version": 2, "lang_support_schema": "1.0" },
+  "versions": { "morloc_version": "0.99.0", "abi_version": 1, "envspec_version": 3, "lang_support_schema": "1.0" },
   "triples": { "linux-x86_64": { "morloc": "morloc-linux-x86_64" } },
   "sha256": { "morloc-linux-x86_64": "<hex>", "morloc-rust-src.tar.gz": "<hex>" }
 }

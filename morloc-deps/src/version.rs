@@ -5,11 +5,16 @@
 //! and a check. The morloc compiler holds the matching values in `Morloc.Version`;
 //! the conformance test guards the two sides against drift.
 
-/// `envspec.json` `envspec_version` (integer): the single schema version this
-/// build produces (via `EnvSpec::from_languages`) and accepts (via
+/// `envspec.json` `envspec_version` (integer): the schema version this build
+/// produces (via `EnvSpec::from_languages`) and the newest it accepts (via
 /// `EnvSpec::from_json`). v2 adds the `local` package source (local
-/// filesystem-path dependencies) and makes `source` a discriminated tag.
-pub const ENVSPEC_VERSION: u32 = 2;
+/// filesystem-path dependencies) and makes `source` a discriminated tag. v3
+/// adds `tools`, the conda packages whose executables a program runs.
+pub const ENVSPEC_VERSION: u32 = 3;
+
+/// The oldest `envspec_version` this build accepts. A v2 spec reads as a v3
+/// spec with no tools, so environments holding v2 specs keep solving.
+pub const ENVSPEC_MIN_VERSION: u32 = 2;
 
 /// `morloc lang-support` `schema_version` major/minor (semver "MAJOR.MINOR").
 /// A new language or field is a MINOR bump (older consumers ignore what they do

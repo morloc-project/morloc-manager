@@ -391,6 +391,19 @@ fn aggregate(
     }
 
     for spec in specs {
+        for r in &spec.tools {
+            match r {
+                PackageReq::Conda { name, constraint, channel } => {
+                    insert_merged_conda(&mut conda, name, constraint, channel.as_deref())?
+                }
+                other => {
+                    return Err(DepsError::Env(format!(
+                        "tool dependency {other:?} is not a conda package; tools are \
+                         provided only from conda channels."
+                    )))
+                }
+            }
+        }
         for (lang, reqs) in &spec.packages {
             for r in reqs {
                 match r {
@@ -1368,6 +1381,25 @@ platforms = [\"linux-64\"]
         // flat form (`= "`), not an inline table (`= {`), and no channel key.
         assert!(manifest.contains("\"numpy\" = \""), "{manifest}");
         assert!(!manifest.contains("channel ="), "{manifest}");
+    }
+
+    #[test]
+    fn tools_are_solved_as_conda_packages_from_their_channel() {
+        const S: &str = r#"{"envspec_version":3,"morloc_version":"0","languages":[{"lang":"rust"}],"packages":{},"tools":[{"name":"star","constraint":"2.7.11b","source":"conda","channel":"bioconda"},{"name":"pigz","constraint":"*","source":"conda"}]}"#;
+        let manifest = render_with(EnvSpec::from_json(S).unwrap());
+        assert!(manifest.contains("channels = [\"conda-forge\", \"bioconda\"]"), "{manifest}");
+        assert!(
+            manifest.contains("\"star\" = { version = \"2.7.11b\", channel = \"bioconda\" }"),
+            "{manifest}"
+        );
+        assert!(manifest.contains("\"pigz\" = \"*\""), "{manifest}");
+    }
+
+    #[test]
+    fn a_tool_from_pypi_is_refused() {
+        const S: &str = r#"{"envspec_version":3,"morloc_version":"0","tools":[{"name":"x","constraint":"*","source":"pypi"}]}"#;
+        let spec = EnvSpec::from_json(S).unwrap();
+        assert!(aggregate(&[spec], &sample_support()).is_err());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use morloc_deps::version::{ENVSPEC_VERSION, LANG_SCHEMA_MAJOR, MANIFEST_SCHEMA};
+use morloc_deps::version::{ENVSPEC_MIN_VERSION, ENVSPEC_VERSION, LANG_SCHEMA_MAJOR, MANIFEST_SCHEMA};
 
 use crate::config;
 use crate::error::{ManagerError, Result};
@@ -70,8 +70,8 @@ impl MorlocVersions {
     /// read -- newer or older -- so the failure surfaces at install time with
     /// the direction of the fix, rather than as a parse error mid-build. The
     /// accepted set is exactly what the parsers accept: envspec
-    /// `ENVSPEC_VERSION`, and lang-support major `LANG_SCHEMA_MAJOR` with any
-    /// minor.
+    /// `ENVSPEC_MIN_VERSION` to `ENVSPEC_VERSION`, and lang-support major
+    /// `LANG_SCHEMA_MAJOR` with any minor.
     pub fn check_supported(&self) -> Result<()> {
         let refuse = |what: &str, declared: &str, readable: &str, newer: bool| {
             let fix = if newer {
@@ -84,11 +84,11 @@ impl MorlocVersions {
                  {readable}; {fix}."
             )))
         };
-        if self.envspec_version != ENVSPEC_VERSION {
+        if !(ENVSPEC_MIN_VERSION..=ENVSPEC_VERSION).contains(&self.envspec_version) {
             return refuse(
                 "envspec_version",
                 &self.envspec_version.to_string(),
-                &ENVSPEC_VERSION.to_string(),
+                &format!("{ENVSPEC_MIN_VERSION} to {ENVSPEC_VERSION}"),
                 self.envspec_version > ENVSPEC_VERSION,
             );
         }
@@ -953,7 +953,8 @@ mod tests {
         let major = LANG_SCHEMA_MAJOR;
         assert!(v(cur, &format!("{major}.0")).check_supported().is_ok());
         assert!(v(cur, &format!("{major}.99")).check_supported().is_ok());
-        let older = v(cur - 1, &format!("{major}.0")).check_supported().unwrap_err().to_string();
+        assert!(v(ENVSPEC_MIN_VERSION, &format!("{major}.0")).check_supported().is_ok());
+        let older = v(ENVSPEC_MIN_VERSION - 1, &format!("{major}.0")).check_supported().unwrap_err().to_string();
         assert!(older.contains("newer morloc release"), "{older}");
         let newer = v(cur + 1, &format!("{major}.0")).check_supported().unwrap_err().to_string();
         assert!(newer.contains("upgrade mim"), "{newer}");
@@ -996,7 +997,7 @@ mod tests {
         // A release whose envspec_version exceeds what this mim supports is refused
         // at manifest-parse (install) time with an actionable message.
         let j = r#"{"schema":1,"version":"9.9.9","rust_src":"x",
-          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":3,"lang_support_schema":"1.0"},
+          "versions":{"morloc_version":"9","abi_version":1,"envspec_version":4,"lang_support_schema":"1.0"},
           "triples":{},"sha256":{}}"#;
         assert!(ReleaseManifest::from_json(j).is_err());
         // A newer lang-support MAJOR is likewise refused.
