@@ -491,7 +491,10 @@ pub fn env_native_runtime_path(scope: Scope, name: &str) -> PathBuf {
 pub fn read_native_runtime(scope: Scope, name: &str) -> Result<NativeRuntime> {
     let p = env_native_runtime_path(scope, name);
     if p.is_file() {
-        read_config(&p)
+        let mut r: NativeRuntime = read_config(&p)?;
+        // RUN-6: a record written before toolchain paths were pinned at capture.
+        morloc_deps::pixi::pin_toolchain_paths(&mut r.activation_env);
+        Ok(r)
     } else {
         Err(ManagerError::ConfigNotFound(p.display().to_string()))
     }

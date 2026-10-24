@@ -1031,9 +1031,61 @@ pub fn capture_activation(
                 .to_string(),
         ));
     }
-    let delta = activation_delta(&parse_env0(base_text), activated);
+    let mut delta = activation_delta(&parse_env0(base_text), activated);
     require_compiler_vars(&delta, &String::from_utf8_lossy(&out.stderr))?;
+    pin_toolchain_paths(&mut delta);
     Ok(delta)
+}
+
+/// RUN-6: rewrite each toolchain variable whose value starts with a bare tool
+/// name (`CC=arm64-apple-darwin20.0.0-clang`) to that tool's absolute path in
+/// `$CONDA_PREFIX/bin`, keeping any arguments after it. conda names its tools
+/// bare and leaves the lookup to `PATH`, so anything that edits `PATH` after
+/// activation (a shell startup file, a wrapper) leaves `$CC` naming a tool
+/// that no longer resolves. A name with no file under the prefix, a value that
+/// is already a path, and the `CONDA_BACKUP_*` copies are left as they are.
+/// Idempotent, so a record captured before this rule can be pinned on read.
+pub fn pin_toolchain_paths(env: &mut [(String, String)]) {
+    let Some(bin) = env
+        .iter()
+        .find(|(k, _)| k == "CONDA_PREFIX")
+        .map(|(_, v)| v.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| Path::new(p).join("bin"))
+    else {
+        return;
+    };
+    for (key, value) in env.iter_mut() {
+        if !is_tool_var(key) {
+            continue;
+        }
+        let trimmed = value.trim_start();
+        let (name, rest) = trimmed.split_at(trimmed.find(char::is_whitespace).unwrap_or(trimmed.len()));
+        if name.is_empty() || name.contains('/') || name.starts_with('-') {
+            continue;
+        }
+        let tool = bin.join(name);
+        if tool.is_file() {
+            *value = format!("{}{rest}", tool.display());
+        }
+    }
+}
+
+/// Variables whose value is a program the build runs: the conda compiler and
+/// binutils activations (gcc on Linux, clang and cctools on macOS) and cargo's
+/// per-target linker.
+fn is_tool_var(key: &str) -> bool {
+    let base = key.strip_suffix("_FOR_BUILD").unwrap_or(key);
+    matches!(
+        base,
+        "CC" | "CXX" | "CPP" | "FC" | "F77" | "F90" | "GCC" | "GXX" | "CLANG" | "CLANGXX"
+            | "OBJC" | "OBJCXX" | "AR" | "AS" | "LD" | "LD_GOLD" | "NM" | "RANLIB" | "STRIP"
+            | "OBJCOPY" | "OBJDUMP" | "READELF" | "ADDR2LINE" | "SIZE" | "STRINGS"
+            | "CXXFILT" | "ELFEDIT" | "GPROF" | "GCC_AR" | "GCC_NM" | "GCC_RANLIB"
+            | "CHECKSYMS" | "INSTALL_NAME_TOOL" | "LIBTOOL" | "LIPO" | "NMEDIT" | "OTOOL"
+            | "PAGESTUFF" | "REDO_PREBINDING" | "SEG_ADDR_TABLE" | "SEG_HACK" | "SEGEDIT"
+            | "CODESIGN_ALLOCATE"
+    ) || (key.starts_with("CARGO_TARGET_") && key.ends_with("_LINKER"))
 }
 
 /// Fail the capture when the environment's conda toolchain activation exported
@@ -1788,6 +1840,87 @@ environments:
         let err = require_compiler_vars(&delta, "").unwrap_err().to_string();
         assert!(err.contains("$CC"), "{err}");
         assert!(!err.contains("$CXX"), "{err}");
+    }
+
+    fn fake_prefix(tools: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        for t in tools {
+            std::fs::write(dir.path().join("bin").join(t), "").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn toolchain_vars_are_pinned_to_the_prefix() {
+        let clang = "arm64-apple-darwin20.0.0-clang";
+        let prefix = fake_prefix(&[clang, "arm64-apple-darwin20.0.0-ar"]);
+        let p = prefix.path().display().to_string();
+        let mut env: Vec<(String, String)> = [
+            ("CONDA_PREFIX", p.as_str()),
+            ("CC", clang),
+            ("CC_FOR_BUILD", clang),
+            ("AR", "arm64-apple-darwin20.0.0-ar"),
+            ("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER", clang),
+            ("CXX", "arm64-apple-darwin20.0.0-clang++"),
+            ("OBJC", "arm64-apple-darwin20.0.0-clang -fobjc-arc"),
+            ("LD", "/usr/bin/ld"),
+            ("CONDA_BACKUP_CC", clang),
+            ("PIXI_PROJECT_NAME", clang),
+            ("CFLAGS", "-O2"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        pin_toolchain_paths(&mut env);
+        let once = env.clone();
+        pin_toolchain_paths(&mut env);
+        assert_eq!(env, once, "pinning is idempotent");
+        let get = |k: &str| env.iter().find(|(kk, _)| kk == k).unwrap().1.clone();
+        let abs = |t: &str| format!("{p}/bin/{t}");
+        assert_eq!(get("CC"), abs(clang));
+        assert_eq!(get("CC_FOR_BUILD"), abs(clang));
+        assert_eq!(get("AR"), abs("arm64-apple-darwin20.0.0-ar"));
+        assert_eq!(get("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER"), abs(clang));
+        assert_eq!(get("OBJC"), format!("{} -fobjc-arc", abs(clang)), "arguments kept");
+        // No such file under the prefix: the name is not ours to rewrite.
+        assert_eq!(get("CXX"), "arm64-apple-darwin20.0.0-clang++");
+        assert_eq!(get("LD"), "/usr/bin/ld");
+        assert_eq!(get("CONDA_BACKUP_CC"), clang);
+        assert_eq!(get("PIXI_PROJECT_NAME"), clang);
+        assert_eq!(get("CFLAGS"), "-O2");
+    }
+
+    #[test]
+    fn toolchain_vars_are_left_alone_without_a_prefix() {
+        let mut env = vec![("CC".to_string(), "clang".to_string())];
+        pin_toolchain_paths(&mut env);
+        assert_eq!(env, vec![("CC".to_string(), "clang".to_string())]);
+    }
+
+    /// The captured `$CC` must name the compiler without `PATH`: the user's
+    /// shell init may drop the prefix's `bin` after mim applies the record.
+    #[test]
+    fn captured_compiler_resolves_without_path() {
+        let prefix = fake_prefix(&["x-clang", "x-clang++"]);
+        let p = prefix.path().display().to_string();
+        let activate = prefix.path().join("etc/conda/activate.d");
+        std::fs::create_dir_all(&activate).unwrap();
+        std::fs::write(activate.join("clang.sh"), "export CC=x-clang\nexport CXX=x-clang++\n").unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let pixi = tools.path().join("pixi");
+        std::fs::write(
+            &pixi,
+            format!("#!/bin/sh\necho \"export CONDA_PREFIX='{p}'\"\necho \"export PATH='{p}/bin':\\$PATH\"\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pixi, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env_dir = tempfile::tempdir().unwrap();
+        let act = capture_activation(env_dir.path(), &pixi, None, None).expect("capture");
+        let get = |k: &str| act.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+        assert_eq!(get("CC"), Some(format!("{p}/bin/x-clang")));
+        assert_eq!(get("CXX"), Some(format!("{p}/bin/x-clang++")));
     }
 
     #[test]

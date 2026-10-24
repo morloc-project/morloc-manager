@@ -796,7 +796,9 @@ fn read_optional_spec(path: &Path) -> Result<Option<EnvSpec>> {
 /// error -- the cache is an optimization, not a source of truth.
 fn read_activation_cache(path: &Path) -> Option<Vec<(String, String)>> {
     let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<Vec<(String, String)>>(&text).ok()
+    let mut activation = serde_json::from_str::<Vec<(String, String)>>(&text).ok()?;
+    crate::pixi::pin_toolchain_paths(&mut activation);
+    Some(activation)
 }
 
 /// Persist the activation env-map beside the solved prefix. Best-effort: a write
@@ -1377,5 +1379,19 @@ mod tests {
         // corrupt content -> None (cache is an optimization, never an error)
         std::fs::write(&path, "not json").unwrap();
         assert!(read_activation_cache(&path).is_none());
+    }
+
+    #[test]
+    fn a_cached_bare_compiler_is_pinned_on_read() {
+        let prefix = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(prefix.path().join("bin")).unwrap();
+        std::fs::write(prefix.path().join("bin/x-cc"), "").unwrap();
+        let p = prefix.path().display().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("act.json");
+        let env = vec![("CONDA_PREFIX".to_string(), p.clone()), ("CC".to_string(), "x-cc".to_string())];
+        write_activation_cache(&path, &env);
+        let read = read_activation_cache(&path).unwrap();
+        assert!(read.contains(&("CC".to_string(), format!("{p}/bin/x-cc"))), "{read:?}");
     }
 }

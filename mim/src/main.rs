@@ -1428,9 +1428,10 @@ fn info_env_exports(
     engine: Option<ContainerEngine>,
 ) -> Vec<(String, String)> {
     match engine {
-        // Native: native_run_env exports MORLOC_HOME, the managed-env trio and
-        // (best-effort) MORLOC_PIXI. It does NOT export MORLOC_STATE (the nexus
-        // defaults that to MORLOC_HOME internally), so it is not listed here.
+        // Native: native_run_env exports MORLOC_HOME, the managed-env trio,
+        // MORLOC_STRICT_CONDA and (best-effort) MORLOC_PIXI. It does NOT export
+        // MORLOC_STATE (the nexus defaults that to MORLOC_HOME internally), so it
+        // is not listed here.
         None => {
             let mut v = vec![("MORLOC_HOME".to_string(), data_dir.display().to_string())];
             let morloc_bin = cfg::read_native_runtime(scope, name)
@@ -1441,6 +1442,7 @@ fn info_env_exports(
                 Ok(hook) => v.extend(managed_env_vars(name, &morloc_bin, &hook)),
                 Err(_) => v.push(("MORLOC_ENV".to_string(), name.to_string())),
             }
+            v.push((envagent::ENV_STRICT_CONDA.to_string(), "1".to_string()));
             if let Some(pixi) = locate_pixi(scope) {
                 v.push(("MORLOC_PIXI".to_string(), pixi.display().to_string()));
             }
@@ -4163,6 +4165,9 @@ pub(crate) fn native_run_env(
     for (k, v) in managed_env_vars(&env.name, &morloc_bin, &hook) {
         cmd.env(k, v);
     }
+    // RUN-6: a `morloc init` run inside the environment holds its tools to the
+    // environment's prefix, as the one mim runs at materialize does.
+    cmd.env(envagent::ENV_STRICT_CONDA, "1");
     // The pixi binary, so the in-env agent re-solves without rediscovering it.
     // Best-effort: pixi was already provisioned at materialize.
     if let Ok(pixi) = provision::provision_pixi(env.scope) {
@@ -8323,8 +8328,10 @@ fn shell_rcfile_body(env_name: &str) -> String {
     let template = r#"# mim: interactive shell for environment '__ENV__'.
 # Generated per launch -- NOT your ~/.bashrc. Sources the standard bash init so
 # your dotfiles apply, then installs a PROMPT_COMMAND hook that tags PS1.
+__MORLOC_CAPTURE__
 if [ -r /etc/bash.bashrc ]; then . /etc/bash.bashrc; fi
 if [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
+__MORLOC_CHECK__
 __morloc_prompt_tag() {
   case "$PS1" in
     *'(__ENV__)'*) ;;
@@ -8339,8 +8346,32 @@ else
 fi
 unset _morloc_pc
 "#;
-    template.replace("__ENV__", env_name)
+    template
+        .replace("__MORLOC_CAPTURE__", SHELL_PREFIX_CAPTURE)
+        .replace("__MORLOC_CHECK__", SHELL_PREFIX_CHECK)
+        .replace("__ENV__", env_name)
 }
+
+/// Startup-file lines that record the environment's conda prefix before the
+/// user's own init runs. Paired with `SHELL_PREFIX_CHECK`.
+const SHELL_PREFIX_CAPTURE: &str = "_morloc_prefix=\"${CONDA_PREFIX-}\"";
+
+/// RUN-6: after the user's init has run, warn (never repair) when it moved
+/// `CONDA_PREFIX` or dropped the prefix's `bin` from `PATH`; either leaves the
+/// shell running another environment's tools. Valid in bash and zsh; `__ENV__`
+/// is the environment's name.
+const SHELL_PREFIX_CHECK: &str = r#"if [ -n "$_morloc_prefix" ]; then
+  if [ "${CONDA_PREFIX-}" != "$_morloc_prefix" ]; then
+    printf '%s\n' "mim: warning: your shell startup files changed CONDA_PREFIX to '${CONDA_PREFIX-}'." \
+      "mim: environment '__ENV__' expects '$_morloc_prefix'; commands may use another environment's tools." >&2
+  fi
+  case ":$PATH:" in
+    *":$_morloc_prefix/bin:"*) ;;
+    *) printf '%s\n' "mim: warning: your shell startup files removed '$_morloc_prefix/bin' from PATH." \
+         "mim: tools of environment '__ENV__' may be shadowed; 'mim run' runs without your startup files." >&2 ;;
+  esac
+fi
+unset _morloc_prefix"#;
 
 /// Write the prompt-tagging rcfile into `dir`, returning its path. Best-effort:
 /// on failure the shell just launches without the env tag.
@@ -8366,12 +8397,15 @@ const ZDOTDIR_NAME: &str = ".morloc-zdotdir";
 fn write_zdotdir(dir: &std::path::Path, env_name: &str) -> Option<std::path::PathBuf> {
     let zdot = dir.join(ZDOTDIR_NAME);
     std::fs::create_dir_all(&zdot).ok()?;
-    let zshenv = "\
+    let zshenv = format!(
+        "\
 # mim: keep ZDOTDIR pointed here through .zshrc, but source the
 # user's real zshenv so their environment still applies.
-_morloc_real=\"${MORLOC_REAL_ZDOTDIR:-$HOME}\"
+{SHELL_PREFIX_CAPTURE}
+_morloc_real=\"${{MORLOC_REAL_ZDOTDIR:-$HOME}}\"
 [ -r \"$_morloc_real/.zshenv\" ] && source \"$_morloc_real/.zshenv\"
-";
+"
+    );
     // %F{208}/%f = orange foreground on/off; %B/%b = bold. zsh accounts for the
     // width of %-escapes itself, so no non-printing wrappers are needed.
     let zshrc = format!(
@@ -8380,6 +8414,7 @@ _morloc_real=\"${MORLOC_REAL_ZDOTDIR:-$HOME}\"
 # your ~/.zshrc. Sources your real zsh init, then installs a precmd prompt tag.
 _morloc_real=\"${{MORLOC_REAL_ZDOTDIR:-$HOME}}\"
 [ -r \"$_morloc_real/.zshrc\" ] && source \"$_morloc_real/.zshrc\"
+{check}
 _morloc_prompt_tag() {{
   case \"$PROMPT\" in
     *'({env_name})'*) ;;
@@ -8389,7 +8424,8 @@ _morloc_prompt_tag() {{
 precmd_functions+=(_morloc_prompt_tag)
 export ZDOTDIR=\"$_morloc_real\"
 unset MORLOC_REAL_ZDOTDIR _morloc_real
-"
+",
+        check = SHELL_PREFIX_CHECK.replace("__ENV__", env_name),
     );
     std::fs::write(zdot.join(".zshenv"), zshenv).ok()?;
     std::fs::write(zdot.join(".zshrc"), zshrc).ok()?;
@@ -13566,9 +13602,116 @@ run:
             .into_iter()
             .map(|(k, _)| k)
             .collect();
-        for k in ["MORLOC_HOME", "MORLOC_ENV", "MORLOC_BUILD_HOOK", "MORLOC_BIN"] {
+        for k in [
+            "MORLOC_HOME",
+            "MORLOC_ENV",
+            "MORLOC_BUILD_HOOK",
+            "MORLOC_BIN",
+            "MORLOC_STRICT_CONDA",
+        ] {
             assert!(keys.iter().any(|x| x == k), "{k} missing from {keys:?}");
         }
+    }
+
+    /// A record written before toolchain paths were pinned gets them on read,
+    /// so an existing environment is fixed without a re-solve.
+    #[test]
+    fn a_recorded_bare_compiler_is_pinned_on_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        cfg::test_roots::set(tmp.path());
+        let prefix = tmp.path().join("prefix");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::write(prefix.join("bin/arm64-apple-darwin20.0.0-clang"), "").unwrap();
+        let p = prefix.display().to_string();
+        let rt = NativeRuntime {
+            activation_env: vec![
+                ("CONDA_PREFIX".to_string(), p.clone()),
+                ("CC".to_string(), "arm64-apple-darwin20.0.0-clang".to_string()),
+            ],
+            manager_version: None,
+            morloc_bin: None,
+            fhs_wrapper: None,
+        };
+        cfg::write_native_runtime(Scope::Local, "n", &rt).unwrap();
+        let read = cfg::read_native_runtime(Scope::Local, "n").unwrap();
+        assert!(
+            read.activation_env
+                .contains(&("CC".to_string(), format!("{p}/bin/arm64-apple-darwin20.0.0-clang"))),
+            "{:?}",
+            read.activation_env
+        );
+    }
+
+    /// Run the generated bash rcfile as an interactive shell whose `~/.bashrc`
+    /// is `bashrc`, starting from a prefix whose `bin` leads `PATH`; returns
+    /// stderr.
+    fn bash_startup_stderr(bashrc: &str) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".bashrc"), bashrc).unwrap();
+        let rc = write_shell_rcfile(tmp.path(), "demo").unwrap();
+        let out = Command::new("bash")
+            .arg("--rcfile")
+            .arg(&rc)
+            .arg("-i")
+            .arg("-c")
+            .arg("true")
+            .env_clear()
+            .env("HOME", &home)
+            .env("CONDA_PREFIX", "/fake/prefix")
+            .env("PATH", "/fake/prefix/bin:/usr/bin:/bin")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    #[test]
+    fn shell_warns_when_startup_files_drop_the_prefix_from_path() {
+        let err = bash_startup_stderr("PATH=/usr/bin:/bin\n");
+        assert!(err.contains("removed '/fake/prefix/bin' from PATH"), "{err}");
+        assert!(err.contains("environment 'demo'"), "{err}");
+    }
+
+    #[test]
+    fn shell_warns_when_startup_files_switch_conda_prefix() {
+        let err = bash_startup_stderr("export CONDA_PREFIX=/other\n");
+        assert!(err.contains("changed CONDA_PREFIX to '/other'"), "{err}");
+    }
+
+    #[test]
+    fn shell_is_quiet_when_startup_files_keep_the_prefix() {
+        let err = bash_startup_stderr("PATH=/home/u/bin:$PATH\n");
+        assert!(!err.contains("mim: warning"), "{err}");
+    }
+
+    /// The zsh wrapper carries the same check; zsh may be absent off macOS.
+    #[test]
+    fn zsh_warns_when_startup_files_drop_the_prefix_from_path() {
+        if Command::new("zsh").arg("-fc").arg("true").output().is_err() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".zshrc"), "PATH=/usr/bin:/bin\n").unwrap();
+        let zdot = write_zdotdir(tmp.path(), "demo").unwrap();
+        let out = Command::new("zsh")
+            .arg("-i")
+            .arg("-c")
+            .arg("true")
+            .env_clear()
+            .env("HOME", &home)
+            .env("ZDOTDIR", &zdot)
+            .env("MORLOC_REAL_ZDOTDIR", &home)
+            .env("CONDA_PREFIX", "/fake/prefix")
+            .env("PATH", "/fake/prefix/bin:/usr/bin:/bin")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("removed '/fake/prefix/bin' from PATH"), "{err}");
     }
 
     /// `mim eval` refuses up front when the env's server has eval off.

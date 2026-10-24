@@ -127,7 +127,25 @@ command line, which another env's nexus also matches.
 `find_free_host_port` binds and releases; another process can take the port
 before the server binds.
 
+### F66 The native record is not refreshed by an in-env re-solve
+RUN-1, RUN-6. The record `run`/`shell`/`doctor` replay is written only at
+materialize (`materialize_native_env`). The in-env agent re-solves the
+same prefix and re-captures into
+`.morloc-activation.json` (`envstore::solve_world`), which the record never
+reads, so a package that adds an activation (a new compiler, a rust
+activation) reaches `morloc make` builds but not a later `shell`. Read, not
+reproduced.
+
 ## Compiler and nexus (belong in the compiler's issue list)
+
+- F67 The strict conda check passes a tool that does not resolve:
+  `checkCondaCoherence` skips absent tools (SystemConfig.hs `locateTool`),
+  so a `$CC` naming nothing passes, and a host `cargo` is flagged only when
+  the prefix also has one. It runs only in `morloc init`, never in
+  `morloc make`, so a build in a managed env whose `cargo`/`rustc` resolve
+  outside the prefix (rustup ahead on `PATH`) is not caught. Reported on
+  macOS as cc-rs "failed to find tool arm64-apple-darwin20.0.0-clang" in a
+  pool build; mim's side is RUN-6.
 
 - F38 IPv6 loopback can never bind: `format!("{}:{}", host, port)` gives
   `::1:9000` (nexus/mcp.rs).
