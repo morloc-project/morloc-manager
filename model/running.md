@@ -46,11 +46,12 @@ flag file, by phase and engine, then the command line.
 ### RUN-6 The environment's toolchain does not depend on the caller's shell
 Intent: ruled 2026-10-25
 Code: conforms 2026-10-25
-Tests: toolchain_vars_are_pinned_to_the_prefix, captured_compiler_resolves_without_path, capture_activates_once_and_records_no_conda_bookkeeping, capture_fails_when_the_compiler_is_not_installed, recorded_activation_drops_conda_bookkeeping, a_recorded_host_compiler_is_reported, only_override_forms_are_scrubbed_at_run_time, cc_rs_target_forms_are_tool_vars, a_recorded_bare_compiler_is_pinned_on_read, a_cached_bare_compiler_is_pinned_on_read, shell_warns_when_startup_files_drop_the_prefix_from_path, shell_warns_when_startup_files_switch_conda_prefix, shell_is_quiet_when_startup_files_keep_the_prefix
+Tests: toolchain_vars_are_pinned_to_the_prefix, captured_compiler_resolves_without_path, capture_activates_once_and_records_no_conda_bookkeeping, capture_fails_when_the_compiler_is_not_installed, a_doubled_activation_fails_the_capture, recorded_activation_drops_conda_bookkeeping, a_recorded_host_compiler_is_reported, only_override_forms_are_scrubbed_at_run_time, cc_rs_target_forms_are_tool_vars, a_recorded_bare_compiler_is_pinned_on_read, a_cached_bare_compiler_is_pinned_on_read, shell_warns_when_startup_files_drop_the_prefix_from_path, shell_warns_when_startup_files_switch_conda_prefix, shell_is_quiet_when_startup_files_keep_the_prefix
 
 mim captures an activation once, from a shell holding none of the caller's
-compiler or build-flag variables (the SDK selection stays the caller's),
-and fails when `$CC` or `$CXX` names no executable. Every program variable
+compiler, build-flag or package-search variables (the SDK selection stays
+the caller's), and fails when the activation scripts ran twice or when
+`$CC` or `$CXX` is not a program in the prefix. Every program variable
 it records (compilers, binutils, cargo's target linker, the per-target
 forms cc-rs reads first) names its tool by absolute path in the
 environment's prefix, and a native command sees none of the caller's
@@ -62,4 +63,5 @@ the environment, ahead of it on `PATH`, rather than deactivating it. Native
 holds its tools to the prefix. `shell` never undoes the user's startup
 files; it warns when they moved `CONDA_PREFIX` or dropped the prefix's
 `bin` from `PATH`, and when the record names a compiler that is not a
-program in the prefix.
+program in the prefix or came from a capture that ran the scripts twice;
+`update` then captures again even when the requirements are unchanged.

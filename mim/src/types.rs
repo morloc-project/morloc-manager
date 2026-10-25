@@ -841,6 +841,10 @@ pub struct NativeRuntime {
     /// `None` on glibc-FHS Linux and macOS, where behavior is unchanged.
     #[serde(default)]
     pub fhs_wrapper: Option<String>,
+    /// Set on read when the record came from a capture that activated twice;
+    /// see `morloc_deps::pixi::activated_twice`.
+    #[serde(skip)]
+    pub stale_capture: bool,
 }
 
 /// Persisted requirement inputs for an environment (native or container), kept

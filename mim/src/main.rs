@@ -4109,23 +4109,23 @@ pub(crate) fn native_run_env(
         ))
     })?;
 
-    let outside = if req.shell || io::stderr().is_terminal() {
-        morloc_deps::pixi::compilers_outside_prefix(&runtime.activation_env)
-    } else {
-        Vec::new()
-    };
-    if !outside.is_empty() {
-        let fix = format!("mim update --env {} --reinit", env.name);
-        let fix = match env.scope {
-            Scope::System => format!("ask your administrator to run 'sudo {fix}'"),
-            Scope::Local => format!("rebuild its toolchain with '{fix}'"),
+    if req.shell || io::stderr().is_terminal() {
+        let outside = morloc_deps::pixi::compilers_outside_prefix(&runtime.activation_env);
+        let problem = if !outside.is_empty() {
+            Some(format!("records {}, which is not a program in its conda prefix", outside.join(" and ")))
+        } else if runtime.stale_capture {
+            Some("was captured with its activation scripts run twice".to_string())
+        } else {
+            None
         };
-        eprintln!(
-            "mim: warning: environment '{}' records {}, which is not a program in its \
-             conda prefix; {fix}.",
-            env.name,
-            outside.join(" and "),
-        );
+        if let Some(problem) = problem {
+            let fix = format!("mim update --env {}", env.name);
+            let fix = match env.scope {
+                Scope::System => format!("ask your administrator to run 'sudo {fix}'"),
+                Scope::Local => format!("capture its toolchain again with '{fix}'"),
+            };
+            eprintln!("mim: warning: environment '{}' {problem}; {fix}.", env.name);
+        }
     }
 
     let data_dir = cfg::env_data_dir(env.scope, &env.name);
@@ -4791,7 +4791,10 @@ fn materialize_native_env(
     let unchanged = std::fs::read_to_string(&marker)
         .map(|prev| prev == key)
         .unwrap_or(false);
-    if unchanged && cfg::read_native_runtime(scope, name).is_ok() {
+    let reusable = cfg::read_native_runtime(scope, name).is_ok_and(|r| {
+        !r.stale_capture && morloc_deps::pixi::compilers_outside_prefix(&r.activation_env).is_empty()
+    });
+    if unchanged && reusable {
         eprintln!("Native toolchain is up to date (requirements unchanged).");
         return Ok(req.version);
     }
@@ -4878,6 +4881,7 @@ fn materialize_native_env(
             manager_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             morloc_bin: Some(req.morloc_bin.clone()),
             fhs_wrapper: fhs_wrapper.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            stale_capture: false,
         },
     )?;
     // Record the cache key (manifest + compiler identity) as successfully
@@ -8058,7 +8062,7 @@ fn materialize_container_env(
     if build_runtime {
         script.push_str(&serve::conda_activate_lines().join("\n"));
         script.push_str(
-            "\n[ -n \"${CC:-}\" ] || { echo \"the conda toolchain activation exported no \\$CC\" >&2; exit 1; }",
+            "\nfor t in \"${CC:-}\" \"${CXX:-}\"; do case \"$(command -v \"${t%% *}\")\" in \"$CONDA_PREFIX\"/bin/*) ;; *) echo \"the conda toolchain activation names no compiler program in $CONDA_PREFIX/bin ('$t')\" >&2; exit 1 ;; esac; done",
         );
         // Strict conda: build shims against ONLY the activated conda prefix's tools
         // (never a stray host python/R) so they are ABI-coherent with the env's
@@ -13658,6 +13662,7 @@ run:
             manager_version: None,
             morloc_bin: None,
             fhs_wrapper: None,
+            stale_capture: false,
         };
         cfg::write_native_runtime(Scope::Local, "n", &rt).unwrap();
         let read = cfg::read_native_runtime(Scope::Local, "n").unwrap();
@@ -13667,6 +13672,7 @@ run:
             "{:?}",
             read.activation_env
         );
+        assert!(read.stale_capture, "a backup equal to its variable's value marks a double activation");
         assert!(
             !read.activation_env.iter().any(|(k, _)| k == "CONDA_SHLVL" || k.starts_with("CONDA_BACKUP_")),
             "{:?}",

@@ -1740,6 +1740,7 @@ mod native_health_tests {
             manager_version: None,
             morloc_bin: None,
             fhs_wrapper: None,
+            stale_capture: false,
         }
     }
 

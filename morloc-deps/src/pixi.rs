@@ -1047,9 +1047,27 @@ pub fn capture_activation(
     let diagnostics = String::from_utf8_lossy(&out.stderr);
     let mut delta = activation_delta(&parse_env0(base_text), activated);
     require_compiler_vars(&delta, &diagnostics)?;
+    require_single_activation(&delta)?;
     normalize_activation(&mut delta);
     require_resolvable_compilers(&delta, &diagnostics)?;
     Ok(delta)
+}
+
+/// RUN-6: fail the capture when the activation scripts ran twice. conda's
+/// scripts back up a variable before setting it, and the caller's compiler and
+/// flag variables were scrubbed, so a backup equal to the variable's own value
+/// is what a second pass over the same scripts leaves.
+fn require_single_activation(delta: &[(String, String)]) -> Result<()> {
+    let doubled = doubled_vars(delta);
+    if doubled.is_empty() {
+        return Ok(());
+    }
+    Err(DepsError::Env(format!(
+        "the environment's activation scripts ran twice during capture (conda backed up \
+         ${} as its own value), so the recorded toolchain would be wrong. This is a \
+         mismatch between mim and the pixi it runs; report it with `pixi --version`.",
+        doubled.join(", $"),
+    )))
 }
 
 /// RUN-6: bring a recorded activation to the form mim replays: toolchain
@@ -1064,14 +1082,31 @@ pub fn normalize_activation(env: &mut Vec<(String, String)>) {
     pin_toolchain_paths(env);
 }
 
+/// The variables whose `CONDA_BACKUP_*` copy equals their own value: what a
+/// second pass over the same activation scripts leaves.
+fn doubled_vars(env: &[(String, String)]) -> Vec<&str> {
+    env.iter()
+        .filter_map(|(k, v)| {
+            let var = k.strip_prefix("CONDA_BACKUP_")?;
+            env.iter().any(|(kk, vv)| kk == var && vv == v).then_some(var)
+        })
+        .collect()
+}
+
+/// Whether an activation, before normalization, came from a capture that ran
+/// the activation scripts twice. Its other effects (flags appended twice)
+/// cannot be undone from the record, so it must be captured again.
+pub fn activated_twice(env: &[(String, String)]) -> bool {
+    !doubled_vars(env).is_empty()
+}
+
 /// RUN-6: rewrite each toolchain variable whose value starts with a bare tool
 /// name (`CC=arm64-apple-darwin20.0.0-clang`) to that tool's absolute path in
 /// `$CONDA_PREFIX/bin`, keeping any arguments after it. conda names its tools
 /// bare and leaves the lookup to `PATH`, so anything that edits `PATH` after
 /// activation (a shell startup file, a wrapper) leaves `$CC` naming a tool
-/// that no longer resolves. A name with no file under the prefix, a value that
-/// is already a path, and the `CONDA_BACKUP_*` copies are left as they are.
-/// Idempotent, so a record captured before this rule can be pinned on read.
+/// that no longer resolves. A name with no file under the prefix and a value
+/// that is already a path are left as they are. Idempotent.
 pub fn pin_toolchain_paths(env: &mut [(String, String)]) {
     let Some(bin) = prefix_bin(env) else {
         return;
@@ -1129,10 +1164,14 @@ fn override_base(key: &str) -> Option<&str> {
     (base != key).then_some(base)
 }
 
-/// A target triple as cc-rs spells it in a variable name: lowercase, with `-`
-/// or `_` separators, where variable names are uppercase.
+/// A target triple as cc-rs spells it in a variable name: lowercase, either
+/// joined by `-` (`aarch64-apple-darwin`, `wasm32-wasip1`) or with `-` turned
+/// into `_` (`x86_64_unknown_linux_gnu`, at least three parts), where variable
+/// names are uppercase.
 fn is_triple(s: &str) -> bool {
-    s.bytes().any(|b| b.is_ascii_lowercase()) && !s.bytes().any(|b| b.is_ascii_uppercase())
+    s.bytes().any(|b| b.is_ascii_lowercase())
+        && !s.bytes().any(|b| b.is_ascii_uppercase())
+        && (s.contains('-') || s.split('_').filter(|p| !p.is_empty()).count() >= 3)
 }
 
 fn is_tool_name(base: &str) -> bool {
@@ -1183,16 +1222,11 @@ fn require_resolvable_compilers(delta: &[(String, String)], diagnostics: &str) -
     if missing.is_empty() {
         return Ok(());
     }
-    let diagnostics = diagnostics.trim();
-    let detail = if diagnostics.is_empty() {
-        String::new()
-    } else {
-        format!("\nOutput from the environment's activation scripts:\n{diagnostics}")
-    };
+    let detail = activation_output(diagnostics);
     Err(DepsError::Env(format!(
         "the environment's conda toolchain activation set {}, which is not a program \
          in {}. The solved package that provides the compiler is missing or broken, so \
-         nothing can be built in this environment.{detail}",
+         nothing can be built in this environment.\n{detail}",
         missing.join(" and "),
         bin.display(),
     )))
@@ -1243,18 +1277,23 @@ fn require_compiler_vars(delta: &[(String, String)], diagnostics: &str) -> Resul
     if missing.is_empty() {
         return Ok(());
     }
-    let diagnostics = diagnostics.trim();
-    let detail = if diagnostics.is_empty() {
-        "The activation scripts produced no output.".to_string()
-    } else {
-        format!("Output from the environment's activation scripts:\n{diagnostics}")
-    };
+    let detail = activation_output(diagnostics);
     Err(DepsError::Env(format!(
         "the environment's conda toolchain activation exported no {}. morloc builds \
          its runtime and every pool with the compiler the environment names there, so \
          the environment is not usable without it.\n{detail}",
         missing.join(" or "),
     )))
+}
+
+/// What the activation scripts wrote to stderr, as the closing part of an error.
+fn activation_output(diagnostics: &str) -> String {
+    let diagnostics = diagnostics.trim();
+    if diagnostics.is_empty() {
+        "The activation scripts produced no output.".to_string()
+    } else {
+        format!("Output from the environment's activation scripts:\n{diagnostics}")
+    }
 }
 
 /// The activation delta: entries the activated environment ADDED or CHANGED
@@ -2091,6 +2130,21 @@ environments:
     }
 
     #[test]
+    fn a_doubled_activation_fails_the_capture() {
+        let delta = vec![
+            ("CC".to_string(), "/env/bin/x-clang".to_string()),
+            ("CONDA_BACKUP_CC".to_string(), "/env/bin/x-clang".to_string()),
+        ];
+        let err = require_single_activation(&delta).unwrap_err().to_string();
+        assert!(err.contains("$CC"), "{err}");
+        let single = vec![
+            ("JAVA_HOME".to_string(), "/env/lib/jvm".to_string()),
+            ("CONDA_BACKUP_JAVA_HOME".to_string(), "/usr/lib/jvm".to_string()),
+        ];
+        assert!(require_single_activation(&single).is_ok());
+    }
+
+    #[test]
     fn capture_fails_when_the_compiler_is_not_installed() {
         let (prefix, pixi) = fake_activation(&["x-clang++"], false);
         let env_dir = tempfile::tempdir().unwrap();
@@ -2168,11 +2222,12 @@ environments:
             "CFLAGS_aarch64_apple_darwin",
             "CXXFLAGS_x86_64-unknown-linux-gnu",
             "DEBUG_CFLAGS_aarch64-apple-darwin",
+            "CC_wasm32-wasip1",
             "GCC_AR_x86_64-unknown-linux-gnu",
         ] {
             assert!(is_override_var(k), "{k}");
         }
-        for k in ["CFLAGS", "LDFLAGS", "CFLAGS_EXTRA"] {
+        for k in ["CFLAGS", "LDFLAGS", "CFLAGS_EXTRA", "CC_wrapper", "AR_opts"] {
             assert!(!is_override_var(k), "{k}");
         }
     }
@@ -2229,8 +2284,11 @@ environments:
         // exports $AR, which the capture must preserve.
         write_manifest(
             dir.path(),
-            "[workspace]\nname = \"morloc-live-test\"\nchannels = [\"conda-forge\"]\n\
-             platforms = [\"linux-64\"]\n\n[dependencies]\n\"cxx-compiler\" = \"*\"\n",
+            &format!(
+                "[workspace]\nname = \"morloc-live-test\"\nchannels = [\"conda-forge\"]\n\
+                 platforms = [\"{}\"]\n\n[dependencies]\n\"cxx-compiler\" = \"<2\"\n",
+                crate::platform::conda_platform()
+            ),
         )
         .unwrap();
         solve(dir.path(), &pixi, None, None).expect("pixi solve");

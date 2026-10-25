@@ -492,7 +492,8 @@ pub fn read_native_runtime(scope: Scope, name: &str) -> Result<NativeRuntime> {
     let p = env_native_runtime_path(scope, name);
     if p.is_file() {
         let mut r: NativeRuntime = read_config(&p)?;
-        // RUN-6: a record written before the activation was normalized at capture.
+        // RUN-6: records are normalized on every read.
+        r.stale_capture = morloc_deps::pixi::activated_twice(&r.activation_env);
         morloc_deps::pixi::normalize_activation(&mut r.activation_env);
         Ok(r)
     } else {

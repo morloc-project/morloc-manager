@@ -74,6 +74,7 @@ fn is_toolchain_var(key: &str) -> bool {
             | "CONDA_TOOLCHAIN_BUILD" | "CONDA_TOOLCHAIN_HOST" | "HOST" | "BUILD"
             | "PYTHONHOME" | "R_HOME" | "_PYTHON_SYSCONFIGDATA_NAME"
     ) || is_build_flag_var(key)
+        || crate::pixi::is_tool_var(key)
 }
 
 /// Bookkeeping a conda/mamba/pixi activation writes to describe ITSELF. Left
@@ -202,9 +203,28 @@ pub fn scrub(cmd: &mut Command) {
     for key in &plan.remove {
         cmd.env_remove(key);
     }
+    let prefixes = ambient_prefixes(&env);
     for (key, value) in &plan.set {
-        cmd.env(key, value);
+        match std::env::var_os(key) {
+            Some(raw) if raw.to_str().is_none() => cmd.env(key, filter_path_list(&raw, &prefixes)),
+            _ => cmd.env(key, value),
+        };
     }
+}
+
+/// `list` without its entries inside `prefixes`, byte for byte: a list read
+/// lossily and rejoined would rewrite its entries that are not UTF-8.
+fn filter_path_list(list: &std::ffi::OsStr, prefixes: &[String]) -> std::ffi::OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let kept: Vec<&[u8]> = list
+        .as_bytes()
+        .split(|b| *b == b':')
+        .filter(|e| !e.is_empty() && !under_any(prefixes, &String::from_utf8_lossy(e)))
+        .collect();
+    if kept.is_empty() && list.as_bytes().split(|b| *b == b':').any(|e| !e.is_empty()) {
+        return std::ffi::OsString::from(FALLBACK_PATH);
+    }
+    std::ffi::OsString::from_vec(kept.join(&b':'))
 }
 
 /// This process's environment with UTF-8 names (`std::env::vars` panics on any

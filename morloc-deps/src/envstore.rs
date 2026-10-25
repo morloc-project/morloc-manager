@@ -797,6 +797,9 @@ fn read_optional_spec(path: &Path) -> Result<Option<EnvSpec>> {
 fn read_activation_cache(path: &Path) -> Option<Vec<(String, String)>> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut activation = serde_json::from_str::<Vec<(String, String)>>(&text).ok()?;
+    if crate::pixi::activated_twice(&activation) {
+        return None;
+    }
     crate::pixi::normalize_activation(&mut activation);
     Some(activation)
 }
