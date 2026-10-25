@@ -138,15 +138,6 @@ reproduced.
 
 ## Compiler and nexus (belong in the compiler's issue list)
 
-- F67 The strict conda check passes a tool that does not resolve:
-  `checkCondaCoherence` skips absent tools (SystemConfig.hs `locateTool`),
-  so a `$CC` naming nothing passes, and a host `cargo` is flagged only when
-  the prefix also has one. It runs only in `morloc init`, never in
-  `morloc make`, so a build in a managed env whose `cargo`/`rustc` resolve
-  outside the prefix (rustup ahead on `PATH`) is not caught. Reported on
-  macOS as cc-rs "failed to find tool arm64-apple-darwin20.0.0-clang" in a
-  pool build; mim's side is RUN-6.
-
 - F38 IPv6 loopback can never bind: `format!("{}:{}", host, port)` gives
   `::1:9000` (nexus/mcp.rs).
 - F39 `MORLOC_EVAL_ALLOW_NO_AUTH=0` waives the eval lock: any non-empty
