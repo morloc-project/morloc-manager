@@ -43,15 +43,23 @@ A container sees the host's environment variables only as named with
 `--env-var` or `--env-file`. Extra engine flags come from the environment's
 flag file, by phase and engine, then the command line.
 
-### RUN-6 The environment's toolchain does not depend on the caller's PATH
-Intent: proposed
-Code: conforms 2026-10-24
-Tests: toolchain_vars_are_pinned_to_the_prefix, captured_compiler_resolves_without_path, a_recorded_bare_compiler_is_pinned_on_read, a_cached_bare_compiler_is_pinned_on_read, shell_warns_when_startup_files_drop_the_prefix_from_path, shell_warns_when_startup_files_switch_conda_prefix, shell_is_quiet_when_startup_files_keep_the_prefix
+### RUN-6 The environment's toolchain does not depend on the caller's shell
+Intent: ruled 2026-10-25
+Code: conforms 2026-10-25
+Tests: toolchain_vars_are_pinned_to_the_prefix, captured_compiler_resolves_without_path, capture_activates_once_and_records_no_conda_bookkeeping, capture_fails_when_the_compiler_is_not_installed, recorded_activation_drops_conda_bookkeeping, a_recorded_host_compiler_is_reported, only_override_forms_are_scrubbed_at_run_time, cc_rs_target_forms_are_tool_vars, a_recorded_bare_compiler_is_pinned_on_read, a_cached_bare_compiler_is_pinned_on_read, shell_warns_when_startup_files_drop_the_prefix_from_path, shell_warns_when_startup_files_switch_conda_prefix, shell_is_quiet_when_startup_files_keep_the_prefix
 
-Every toolchain variable mim records from an activation (compilers,
-binutils, cargo's target linker) names its tool by absolute path in the
-environment's prefix, so a later change to `PATH` cannot make it name
-nothing or another environment's tool. Native `run` and `shell` export
-`MORLOC_STRICT_CONDA`, so a `morloc init` there holds its tools to the
-prefix. `shell` never undoes the user's startup files; it warns when they
-moved `CONDA_PREFIX` or dropped the prefix's `bin` from `PATH`.
+mim captures an activation once, from a shell holding none of the caller's
+compiler or build-flag variables (the SDK selection stays the caller's),
+and fails when `$CC` or `$CXX` names no executable. Every program variable
+it records (compilers, binutils, cargo's target linker, the per-target
+forms cc-rs reads first) names its tool by absolute path in the
+environment's prefix, and a native command sees none of the caller's
+per-target program or flag overrides (`TARGET_CC`, `CC_<target>`,
+`CFLAGS_<target>`, cargo's target linker) that the record does not set. The record carries no `CONDA_SHLVL`
+and no `CONDA_BACKUP_*`, so a conda in the user's shell activates on top of
+the environment, ahead of it on `PATH`, rather than deactivating it. Native
+`run` and `shell` export `MORLOC_STRICT_CONDA`, so a `morloc init` there
+holds its tools to the prefix. `shell` never undoes the user's startup
+files; it warns when they moved `CONDA_PREFIX` or dropped the prefix's
+`bin` from `PATH`, and when the record names a compiler that is not a
+program in the prefix.

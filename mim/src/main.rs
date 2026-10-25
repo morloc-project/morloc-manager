@@ -4028,12 +4028,15 @@ fn find_running_serve_container() -> Result<(String, ContainerEngine)> {
 // Container run
 // ======================================================================
 
-/// Apply a captured activation env-map to a `Command` (the inherited environ
-/// stays in place; callers add their own overrides afterwards). Callers pair
+/// Apply a captured activation env-map to a `Command`, over the inherited
+/// environ less its per-target tool and flag overrides that the map does not
+/// set (callers add their own overrides afterwards). Callers pair
 /// this with `morloc_deps::ambient::scrub` -- via `native_command`, or directly
 /// -- so the map is applied over an environment with no other conda activation
 /// in it, matching the clean-shell case the map was captured for.
 pub(crate) fn apply_activation(cmd: &mut Command, env: &[(String, String)]) {
+    // RUN-6: the caller's per-target overrides would replace the map's tools.
+    morloc_deps::ambient::scrub_unrecorded_tools(cmd, env);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -4105,6 +4108,25 @@ pub(crate) fn native_run_env(
             env.name, env.name
         ))
     })?;
+
+    let outside = if req.shell || io::stderr().is_terminal() {
+        morloc_deps::pixi::compilers_outside_prefix(&runtime.activation_env)
+    } else {
+        Vec::new()
+    };
+    if !outside.is_empty() {
+        let fix = format!("mim update --env {} --reinit", env.name);
+        let fix = match env.scope {
+            Scope::System => format!("ask your administrator to run 'sudo {fix}'"),
+            Scope::Local => format!("rebuild its toolchain with '{fix}'"),
+        };
+        eprintln!(
+            "mim: warning: environment '{}' records {}, which is not a program in its \
+             conda prefix; {fix}.",
+            env.name,
+            outside.join(" and "),
+        );
+    }
 
     let data_dir = cfg::env_data_dir(env.scope, &env.name);
     let mh = data_dir.to_string_lossy().to_string();
@@ -8035,6 +8057,9 @@ fn materialize_container_env(
     script.push_str(&prefix_postinstall_script());
     if build_runtime {
         script.push_str(&serve::conda_activate_lines().join("\n"));
+        script.push_str(
+            "\n[ -n \"${CC:-}\" ] || { echo \"the conda toolchain activation exported no \\$CC\" >&2; exit 1; }",
+        );
         // Strict conda: build shims against ONLY the activated conda prefix's tools
         // (never a stray host python/R) so they are ABI-coherent with the env's
         // interpreter and a build failure aborts loudly.
@@ -13627,6 +13652,8 @@ run:
             activation_env: vec![
                 ("CONDA_PREFIX".to_string(), p.clone()),
                 ("CC".to_string(), "arm64-apple-darwin20.0.0-clang".to_string()),
+                ("CONDA_SHLVL".to_string(), "1".to_string()),
+                ("CONDA_BACKUP_CC".to_string(), "arm64-apple-darwin20.0.0-clang".to_string()),
             ],
             manager_version: None,
             morloc_bin: None,
@@ -13637,6 +13664,11 @@ run:
         assert!(
             read.activation_env
                 .contains(&("CC".to_string(), format!("{p}/bin/arm64-apple-darwin20.0.0-clang"))),
+            "{:?}",
+            read.activation_env
+        );
+        assert!(
+            !read.activation_env.iter().any(|(k, _)| k == "CONDA_SHLVL" || k.starts_with("CONDA_BACKUP_")),
             "{:?}",
             read.activation_env
         );

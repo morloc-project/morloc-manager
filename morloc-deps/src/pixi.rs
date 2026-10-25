@@ -941,6 +941,10 @@ pub fn runtime_languages(locked: &[LockedPackage]) -> Vec<(&'static str, String)
         .collect()
 }
 
+/// The activation-script directory under a conda prefix, as pixi's shell-hook
+/// names it in the lines that source its scripts.
+pub const ACTIVATE_D: &str = "etc/conda/activate.d/";
+
 /// Capture the toolchain activation env-map from a solved pixi env. The map is
 /// what the native Runner injects before spawning a command, and it must carry
 /// EVERY variable the conda activation exports -- PATH + CONDA_PREFIX, and
@@ -950,14 +954,15 @@ pub fn runtime_languages(locked: &[LockedPackage]) -> Vec<(&'static str, String)
 /// `ar`/`gcc` on PATH, so those `$AR`/`$CC` entries are what let cargo/cc-rs find
 /// the archiver; dropping them breaks C-dependency builds.
 ///
-/// `pixi shell-hook` alone does NOT set those compiler vars -- they are exported
-/// by the `$CONDA_PREFIX/etc/conda/activate.d/*.sh` scripts, which the hook does
-/// not inline. So the capture activates exactly as the container's
-/// `morloc-activate` does (shell-hook THEN source activate.d) and diffs the
-/// resulting environment against the base, keeping only what activation added or
-/// changed. Statically parsing the hook text would silently drop `$AR` and leave
-/// native Rust builds failing with `cc-rs: failed to find tool "ar"` on any host
-/// without a bare `ar` on PATH.
+/// Those compiler vars are exported by the `$CONDA_PREFIX/etc/conda/activate.d`
+/// scripts. pixi's `shell-hook` sources them itself; the capture sources them
+/// only when the hook text does not, because a second pass records each
+/// variable's first value as its `CONDA_BACKUP_*`, which a later deactivation
+/// restores, and appends to the flag variables again. The capture
+/// evaluates the hook in a real shell and diffs the resulting environment
+/// against the base, keeping only what activation added or changed. Statically
+/// parsing the hook text would drop `$AR` and leave native Rust builds failing
+/// with `cc-rs: failed to find tool "ar"`.
 pub fn capture_activation(
     env_dir: &Path,
     pixi_bin: &Path,
@@ -975,17 +980,22 @@ pub fn capture_activation(
     // path must not break the script or inject commands. shell-hook's stdout is
     // captured into `hook` (not eval'd inline) so it cannot pollute the env dump;
     // its failure aborts with the real error surfaced (no `2>/dev/null`/`|| true`),
-    // and CONDA_PREFIX is asserted in-shell rather than assumed. Sourced activate.d
-    // stdout is sent to stderr so a chatty script cannot corrupt the dump.
+    // and CONDA_PREFIX is asserted in-shell rather than assumed. The hook and any
+    // activate.d script it or the capture sources write to stderr, so a chatty
+    // script cannot corrupt the dump.
     let script = format!(
         "{dump}\n\
          printf '%s\\0' {split}\n\
          hook=$({pixi} shell-hook --manifest-path {manifest} --shell bash) || exit 3\n\
-         eval \"$hook\"\n\
+         eval \"$hook\" >&2\n\
          [ -n \"$CONDA_PREFIX\" ] || exit 4\n\
-         for f in \"$CONDA_PREFIX/etc/conda/activate.d/\"*.sh; do [ -r \"$f\" ] && . \"$f\" >&2; done\n\
+         case \"$hook\" in\n\
+           *{activate_d}*) ;;\n\
+           *) for f in \"$CONDA_PREFIX/{activate_d}\"*.sh; do [ -r \"$f\" ] && . \"$f\" >&2; done ;;\n\
+         esac\n\
          {dump}",
         dump = ENV_DUMP,
+        activate_d = ACTIVATE_D,
         split = sh_quote(SPLIT),
         pixi = sh_quote(&pixi_bin.display().to_string()),
         manifest = sh_quote(&manifest.display().to_string()),
@@ -1008,6 +1018,9 @@ pub fn capture_activation(
     // of computing this platform's, which on macOS makes the clang activation
     // abort before it exports $CC.
     crate::ambient::scrub(&mut cmd);
+    // RUN-6: conda's activations keep a compiler the caller already exported
+    // (`CC,${CC:-...}`), so the caller's own $CC would become the environment's.
+    crate::ambient::scrub_toolchain(&mut cmd);
     apply_cert_env(&mut cmd, ssl_cert_file);
     let out = cmd
         .output()
@@ -1031,10 +1044,24 @@ pub fn capture_activation(
                 .to_string(),
         ));
     }
+    let diagnostics = String::from_utf8_lossy(&out.stderr);
     let mut delta = activation_delta(&parse_env0(base_text), activated);
-    require_compiler_vars(&delta, &String::from_utf8_lossy(&out.stderr))?;
-    pin_toolchain_paths(&mut delta);
+    require_compiler_vars(&delta, &diagnostics)?;
+    normalize_activation(&mut delta);
+    require_resolvable_compilers(&delta, &diagnostics)?;
     Ok(delta)
+}
+
+/// RUN-6: bring a recorded activation to the form mim replays: toolchain
+/// variables pinned to the prefix, and none of the bookkeeping that would let
+/// a conda in the user's shell treat the environment as one of its own
+/// activations. `CONDA_SHLVL` makes conda's next `activate` deactivate the
+/// environment (dropping its bin from PATH), and the `CONDA_BACKUP_*` copies
+/// are what that deactivation restores. mim never deactivates an environment,
+/// so neither has a use. Idempotent; also applied to records read from disk.
+pub fn normalize_activation(env: &mut Vec<(String, String)>) {
+    env.retain(|(k, _)| k != "CONDA_SHLVL" && !k.starts_with("CONDA_BACKUP_"));
+    pin_toolchain_paths(env);
 }
 
 /// RUN-6: rewrite each toolchain variable whose value starts with a bare tool
@@ -1046,13 +1073,7 @@ pub fn capture_activation(
 /// is already a path, and the `CONDA_BACKUP_*` copies are left as they are.
 /// Idempotent, so a record captured before this rule can be pinned on read.
 pub fn pin_toolchain_paths(env: &mut [(String, String)]) {
-    let Some(bin) = env
-        .iter()
-        .find(|(k, _)| k == "CONDA_PREFIX")
-        .map(|(_, v)| v.trim())
-        .filter(|p| !p.is_empty())
-        .map(|p| Path::new(p).join("bin"))
-    else {
+    let Some(bin) = prefix_bin(env) else {
         return;
     };
     for (key, value) in env.iter_mut() {
@@ -1072,10 +1093,49 @@ pub fn pin_toolchain_paths(env: &mut [(String, String)]) {
 }
 
 /// Variables whose value is a program the build runs: the conda compiler and
-/// binutils activations (gcc on Linux, clang and cctools on macOS) and cargo's
-/// per-target linker.
-fn is_tool_var(key: &str) -> bool {
-    let base = key.strip_suffix("_FOR_BUILD").unwrap_or(key);
+/// binutils activations (gcc on Linux, clang and cctools on macOS), cargo's
+/// per-target linker, and the forms cc-rs reads before the plain name
+/// (`TARGET_CC`, `HOST_CC`, `CC_<target>`).
+pub(crate) fn is_tool_var(key: &str) -> bool {
+    is_tool_name(key) || is_tool_override_var(key)
+}
+
+/// A per-target or per-role override of a program or flag variable: cargo's
+/// target linker, and cc-rs's `TARGET_CC`, `HOST_CFLAGS`, `CC_<target>`,
+/// `CFLAGS_<target>` and `_FOR_BUILD` forms.
+pub(crate) fn is_override_var(key: &str) -> bool {
+    is_tool_override_var(key)
+        || override_base(key).is_some_and(crate::ambient::is_build_flag_var)
+}
+
+/// The per-target and per-role forms of a program variable.
+pub(crate) fn is_tool_override_var(key: &str) -> bool {
+    (key.starts_with("CARGO_TARGET_") && key.ends_with("_LINKER"))
+        || override_base(key).is_some_and(is_tool_name)
+}
+
+/// The variable a per-target or per-role form overrides (`CC` for
+/// `TARGET_CC`, `CC_aarch64-apple-darwin` and `CC_FOR_BUILD`), or `None` for a
+/// name that is not such a form.
+fn override_base(key: &str) -> Option<&str> {
+    let role = key.strip_prefix("TARGET_").or_else(|| key.strip_prefix("HOST_"));
+    let k = role.unwrap_or(key);
+    let k = k.strip_suffix("_FOR_BUILD").unwrap_or(k);
+    let base = k
+        .match_indices('_')
+        .map(|(i, _)| (&k[..i], &k[i + 1..]))
+        .find(|(_, target)| is_triple(target))
+        .map_or(k, |(base, _)| base);
+    (base != key).then_some(base)
+}
+
+/// A target triple as cc-rs spells it in a variable name: lowercase, with `-`
+/// or `_` separators, where variable names are uppercase.
+fn is_triple(s: &str) -> bool {
+    s.bytes().any(|b| b.is_ascii_lowercase()) && !s.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+fn is_tool_name(base: &str) -> bool {
     matches!(
         base,
         "CC" | "CXX" | "CPP" | "FC" | "F77" | "F90" | "GCC" | "GXX" | "CLANG" | "CLANGXX"
@@ -1085,7 +1145,78 @@ fn is_tool_var(key: &str) -> bool {
             | "CHECKSYMS" | "INSTALL_NAME_TOOL" | "LIBTOOL" | "LIPO" | "NMEDIT" | "OTOOL"
             | "PAGESTUFF" | "REDO_PREBINDING" | "SEG_ADDR_TABLE" | "SEG_HACK" | "SEGEDIT"
             | "CODESIGN_ALLOCATE"
-    ) || (key.starts_with("CARGO_TARGET_") && key.ends_with("_LINKER"))
+    )
+}
+
+/// `$CONDA_PREFIX/bin` of an activation env-map.
+fn prefix_bin(env: &[(String, String)]) -> Option<std::path::PathBuf> {
+    env.iter()
+        .find(|(k, _)| k == "CONDA_PREFIX")
+        .map(|(_, v)| v.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| Path::new(p).join("bin"))
+}
+
+/// RUN-6: the `$CC`/`$CXX` entries of an activation env-map whose program is not
+/// an executable in the environment's prefix.
+pub fn compilers_outside_prefix(env: &[(String, String)]) -> Vec<String> {
+    let bin = prefix_bin(env);
+    env.iter()
+        .filter(|(k, _)| k == "CC" || k == "CXX")
+        .filter(|(_, v)| {
+            !program_candidates(v).any(|tool| {
+                let tool = Path::new(tool);
+                bin.as_deref().is_some_and(|b| tool.starts_with(b) && is_executable(tool))
+            })
+        })
+        .map(|(k, v)| format!("${k}={v}"))
+        .collect()
+}
+
+/// RUN-6: fail the capture when `$CC` or `$CXX` is not a program in the
+/// environment's prefix. conda's activation sets them without checking that the
+/// package carrying the program was installed, and the gap otherwise surfaces
+/// as a cc-rs "failed to find tool" in the first build, far from its cause.
+fn require_resolvable_compilers(delta: &[(String, String)], diagnostics: &str) -> Result<()> {
+    let bin = prefix_bin(delta).unwrap_or_default();
+    let missing = compilers_outside_prefix(delta);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let diagnostics = diagnostics.trim();
+    let detail = if diagnostics.is_empty() {
+        String::new()
+    } else {
+        format!("\nOutput from the environment's activation scripts:\n{diagnostics}")
+    };
+    Err(DepsError::Env(format!(
+        "the environment's conda toolchain activation set {}, which is not a program \
+         in {}. The solved package that provides the compiler is missing or broken, so \
+         nothing can be built in this environment.{detail}",
+        missing.join(" and "),
+        bin.display(),
+    )))
+}
+
+/// The ways to read a program out of a command-variable value, longest first:
+/// the whole value, then each prefix that ends before a space. A pinned path
+/// may itself contain spaces, and arguments may follow it.
+fn program_candidates(value: &str) -> impl Iterator<Item = &str> {
+    let value = value.trim();
+    std::iter::once(value).chain(
+        value
+            .char_indices()
+            .rev()
+            .filter(|(_, c)| c.is_whitespace())
+            .map(move |(i, _)| value[..i].trim_end()),
+    )
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// Fail the capture when the environment's conda toolchain activation exported
@@ -1846,9 +1977,15 @@ environments:
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("bin")).unwrap();
         for t in tools {
-            std::fs::write(dir.path().join("bin").join(t), "").unwrap();
+            write_executable(&dir.path().join("bin").join(t), "");
         }
         dir
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
@@ -1898,29 +2035,189 @@ environments:
         assert_eq!(env, vec![("CC".to_string(), "clang".to_string())]);
     }
 
+    /// A prefix with an activation script that counts its own runs and backs up
+    /// `$CC` the way conda's do, and a fake pixi whose hook activates the prefix
+    /// and, when `hook_sources` is set, sources activate.d itself as pixi does.
+    fn fake_activation(tools: &[&str], hook_sources: bool) -> (tempfile::TempDir, tempfile::TempDir) {
+        let prefix = fake_prefix(tools);
+        let p = prefix.path().display().to_string();
+        let activate = prefix.path().join("etc/conda/activate.d");
+        std::fs::create_dir_all(&activate).unwrap();
+        std::fs::write(
+            activate.join("clang.sh"),
+            "export RUNS=\"${RUNS:-}x\"\n\
+             [ -n \"${CC:-}\" ] && export CONDA_BACKUP_CC=\"$CC\"\n\
+             export CC=x-clang\nexport CXX=x-clang++\nexport CONDA_SHLVL=1\n",
+        )
+        .unwrap();
+        let mut hook = format!(
+            "#!/bin/sh\necho \"export CONDA_PREFIX='{p}'\"\necho \"export PATH='{p}/bin':\\$PATH\"\n"
+        );
+        if hook_sources {
+            hook.push_str(&format!("echo \". '{p}/etc/conda/activate.d/clang.sh'\"\n"));
+        }
+        let pixi_dir = tempfile::tempdir().unwrap();
+        write_executable(&pixi_dir.path().join("pixi"), &hook);
+        (prefix, pixi_dir)
+    }
+
     /// The captured `$CC` must name the compiler without `PATH`: the user's
     /// shell init may drop the prefix's `bin` after mim applies the record.
     #[test]
     fn captured_compiler_resolves_without_path() {
-        let prefix = fake_prefix(&["x-clang", "x-clang++"]);
+        let (prefix, pixi) = fake_activation(&["x-clang", "x-clang++"], false);
         let p = prefix.path().display().to_string();
-        let activate = prefix.path().join("etc/conda/activate.d");
-        std::fs::create_dir_all(&activate).unwrap();
-        std::fs::write(activate.join("clang.sh"), "export CC=x-clang\nexport CXX=x-clang++\n").unwrap();
-        let tools = tempfile::tempdir().unwrap();
-        let pixi = tools.path().join("pixi");
-        std::fs::write(
-            &pixi,
-            format!("#!/bin/sh\necho \"export CONDA_PREFIX='{p}'\"\necho \"export PATH='{p}/bin':\\$PATH\"\n"),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&pixi, std::fs::Permissions::from_mode(0o755)).unwrap();
         let env_dir = tempfile::tempdir().unwrap();
-        let act = capture_activation(env_dir.path(), &pixi, None, None).expect("capture");
+        let act = capture_activation(env_dir.path(), &pixi.path().join("pixi"), None, None)
+            .expect("capture");
         let get = |k: &str| act.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
         assert_eq!(get("CC"), Some(format!("{p}/bin/x-clang")));
         assert_eq!(get("CXX"), Some(format!("{p}/bin/x-clang++")));
+        assert_eq!(get("RUNS"), Some("x".to_string()), "activate.d sourced once");
+    }
+
+    /// When the hook sources activate.d, the capture must not source it again,
+    /// and the record must carry no conda bookkeeping for a later deactivation
+    /// to act on.
+    #[test]
+    fn capture_activates_once_and_records_no_conda_bookkeeping() {
+        let (_prefix, pixi) = fake_activation(&["x-clang", "x-clang++"], true);
+        let env_dir = tempfile::tempdir().unwrap();
+        let act = capture_activation(env_dir.path(), &pixi.path().join("pixi"), None, None)
+            .expect("capture");
+        let get = |k: &str| act.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+        assert_eq!(get("RUNS"), Some("x".to_string()), "activate.d sourced once");
+        assert_eq!(get("CONDA_SHLVL"), None);
+    }
+
+    #[test]
+    fn capture_fails_when_the_compiler_is_not_installed() {
+        let (prefix, pixi) = fake_activation(&["x-clang++"], false);
+        let env_dir = tempfile::tempdir().unwrap();
+        let err = capture_activation(env_dir.path(), &pixi.path().join("pixi"), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("$CC=x-clang"), "{err}");
+        assert!(err.contains(&format!("{}/bin", prefix.path().display())), "{err}");
+        assert!(!err.contains("$CXX"), "{err}");
+    }
+
+    #[test]
+    fn recorded_activation_drops_conda_bookkeeping() {
+        let mut env = vec![
+            ("CONDA_SHLVL".to_string(), "1".to_string()),
+            ("CONDA_BACKUP_CC".to_string(), "x-clang".to_string()),
+            ("CONDA_BACKUP_CFLAGS".to_string(), "-O2".to_string()),
+            ("CONDA_PREFIX".to_string(), "/nowhere".to_string()),
+        ];
+        normalize_activation(&mut env);
+        assert_eq!(env, vec![("CONDA_PREFIX".to_string(), "/nowhere".to_string())]);
+    }
+
+    #[test]
+    fn a_recorded_host_compiler_is_reported() {
+        let prefix = fake_prefix(&["x-clang", "x-clang++"]);
+        let p = prefix.path().display().to_string();
+        let env = |cc: &str| {
+            vec![
+                ("CONDA_PREFIX".to_string(), p.clone()),
+                ("CC".to_string(), cc.to_string()),
+                ("CXX".to_string(), format!("{p}/bin/x-clang++")),
+            ]
+        };
+        assert_eq!(compilers_outside_prefix(&env("gcc")), vec!["$CC=gcc".to_string()]);
+        assert_eq!(compilers_outside_prefix(&env("/usr/bin/cc")), vec!["$CC=/usr/bin/cc".to_string()]);
+        assert_eq!(
+            compilers_outside_prefix(&env(&format!("{p}/bin/missing"))),
+            vec![format!("$CC={p}/bin/missing")]
+        );
+        assert!(compilers_outside_prefix(&env(&format!("{p}/bin/x-clang -m64"))).is_empty());
+    }
+
+    #[test]
+    fn a_pinned_compiler_under_a_spaced_prefix_is_in_the_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("a b");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        write_executable(&prefix.join("bin/x-clang"), "");
+        let p = prefix.display().to_string();
+        for cc in [format!("{p}/bin/x-clang"), format!("{p}/bin/x-clang -m64")] {
+            let env = vec![("CONDA_PREFIX".to_string(), p.clone()), ("CC".to_string(), cc.clone())];
+            assert!(compilers_outside_prefix(&env).is_empty(), "{cc}");
+        }
+    }
+
+    #[test]
+    fn only_override_forms_are_scrubbed_at_run_time() {
+        for k in [
+            "TARGET_CC",
+            "HOST_CXX",
+            "CC_aarch64-apple-darwin",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+            "CC_FOR_BUILD",
+        ] {
+            assert!(is_tool_override_var(k), "{k}");
+        }
+        for k in ["CC", "SIZE", "STRINGS", "LD", "AS", "LIBTOOL"] {
+            assert!(!is_tool_override_var(k), "{k}");
+            assert!(!is_override_var(k), "{k}");
+        }
+        for k in [
+            "TARGET_CFLAGS",
+            "HOST_CXXFLAGS",
+            "CFLAGS_aarch64_apple_darwin",
+            "CXXFLAGS_x86_64-unknown-linux-gnu",
+            "DEBUG_CFLAGS_aarch64-apple-darwin",
+            "GCC_AR_x86_64-unknown-linux-gnu",
+        ] {
+            assert!(is_override_var(k), "{k}");
+        }
+        for k in ["CFLAGS", "LDFLAGS", "CFLAGS_EXTRA"] {
+            assert!(!is_override_var(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn cc_rs_target_forms_are_tool_vars() {
+        for k in [
+            "CC", "TARGET_CC", "HOST_CXX", "CC_aarch64-apple-darwin", "CC_aarch64_apple_darwin",
+            "AR_x86_64_unknown_linux_gnu", "TARGET_AR", "CC_FOR_BUILD",
+            "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER",
+        ] {
+            assert!(is_tool_var(k), "{k}");
+        }
+        for k in [
+            "CFLAGS", "LD_LIBRARY_PATH", "CC_ENABLE_DEBUG_OUTPUT", "CFLAGS_aarch64_apple_darwin",
+            "CONDA_BACKUP_CC", "PIXI_PROJECT_NAME",
+        ] {
+            assert!(!is_tool_var(k), "{k}");
+        }
+    }
+
+    /// The pixi mim provisions sources activate.d from its shell-hook, which the
+    /// capture and the container activation rely on to activate only once.
+    #[test]
+    #[ignore = "requires pixi + network; run with `cargo test -- --ignored`"]
+    fn live_shell_hook_sources_activate_d() {
+        let pixi = find_pixi();
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            &format!(
+                "[workspace]\nname = \"morloc-live-test\"\nchannels = [\"conda-forge\"]\n\
+                 platforms = [\"{}\"]\n\n[dependencies]\n\"c-compiler\" = \"<2\"\n",
+                crate::platform::conda_platform()
+            ),
+        )
+        .unwrap();
+        solve(dir.path(), &pixi, None, None).expect("pixi solve");
+        let out = Command::new(&pixi)
+            .args(["shell-hook", "--shell", "bash", "--manifest-path"])
+            .arg(dir.path().join("pixi.toml"))
+            .output()
+            .unwrap();
+        let hook = String::from_utf8_lossy(&out.stdout);
+        assert!(hook.contains("/etc/conda/activate.d/"), "{hook}");
     }
 
     #[test]

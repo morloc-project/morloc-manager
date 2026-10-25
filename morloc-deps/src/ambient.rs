@@ -69,13 +69,11 @@ fn is_toolchain_var(key: &str) -> bool {
             | "AR" | "AS" | "LD" | "NM" | "RANLIB" | "STRIP"
             | "OBJCOPY" | "OBJDUMP" | "READELF" | "ADDR2LINE" | "SIZE" | "STRINGS"
             | "GCC" | "GXX" | "GCC_AR" | "GCC_NM" | "GCC_RANLIB"
-            | "CFLAGS" | "CXXFLAGS" | "CPPFLAGS" | "LDFLAGS" | "FFLAGS" | "FORTRANFLAGS"
-            | "DEBUG_CFLAGS" | "DEBUG_CXXFLAGS" | "DEBUG_CPPFLAGS" | "DEBUG_FFLAGS"
-            | "CMAKE_ARGS" | "MESON_ARGS" | "CONDA_BUILD_SYSROOT" | "SDKROOT"
+            | "CONDA_BUILD_SYSROOT" | "SDKROOT"
             | "MACOSX_DEPLOYMENT_TARGET" | "OSX_DEPLOYMENT_TARGET"
             | "CONDA_TOOLCHAIN_BUILD" | "CONDA_TOOLCHAIN_HOST" | "HOST" | "BUILD"
             | "PYTHONHOME" | "R_HOME" | "_PYTHON_SYSCONFIGDATA_NAME"
-    )
+    ) || is_build_flag_var(key)
 }
 
 /// Bookkeeping a conda/mamba/pixi activation writes to describe ITSELF. Left
@@ -199,7 +197,7 @@ pub fn scrub_plan(env: &[(String, String)]) -> ScrubPlan {
 /// the only conda world the child sees. A no-op when no such environment is
 /// active in this process.
 pub fn scrub(cmd: &mut Command) {
-    let env: Vec<(String, String)> = std::env::vars().collect();
+    let env = utf8_vars();
     let plan = scrub_plan(&env);
     for key in &plan.remove {
         cmd.env_remove(key);
@@ -207,6 +205,66 @@ pub fn scrub(cmd: &mut Command) {
     for (key, value) in &plan.set {
         cmd.env(key, value);
     }
+}
+
+/// This process's environment with UTF-8 names (`std::env::vars` panics on any
+/// other), values read lossily, so a non-UTF-8 prefix is still recognized.
+fn utf8_vars() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.to_string_lossy().into_owned())))
+        .collect()
+}
+
+/// The names of this process's environment variables that are UTF-8, whatever
+/// their values.
+fn utf8_keys() -> Vec<String> {
+    std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect()
+}
+
+/// Remove the caller's own compiler and build-flag variables from `cmd`, active
+/// conda or not. For the activation capture: conda's activation scripts keep a
+/// `$CC`/`$CFLAGS` they find already set, so the caller's would be recorded as
+/// the environment's. The SDK selection (`SDKROOT`, the deployment target) is
+/// the caller's to make and stays.
+pub fn scrub_toolchain(cmd: &mut Command) {
+    for key in utf8_keys() {
+        if crate::pixi::is_tool_var(&key) || is_build_flag_var(&key) || is_build_search_var(&key) {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
+/// Remove from `cmd` each of this process's per-target program and flag
+/// overrides (`$TARGET_CC`, `$CC_<target>`, `$CFLAGS_<target>`, cargo's target
+/// linker, ...) that `recorded` does not set. cc-rs and cargo read these before
+/// the plain names the record sets, so a caller's own would replace the
+/// environment's tools and flags.
+pub fn scrub_unrecorded_tools(cmd: &mut Command, recorded: &[(String, String)]) {
+    for key in utf8_keys() {
+        if crate::pixi::is_override_var(&key) && !recorded.iter().any(|(k, _)| *k == key) {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
+/// Where a build looks for packages and its target, which conda's activation
+/// reads when already set.
+fn is_build_search_var(key: &str) -> bool {
+    matches!(
+        key,
+        "PKG_CONFIG_PATH" | "PKG_CONFIG_LIBDIR" | "CMAKE_PREFIX_PATH" | "CONDA_BUILD_SYSROOT"
+            | "HOST" | "BUILD"
+    )
+}
+
+/// Compiler and build-tool flag variables.
+pub(crate) fn is_build_flag_var(key: &str) -> bool {
+    matches!(
+        key,
+        "CFLAGS" | "CXXFLAGS" | "CPPFLAGS" | "LDFLAGS" | "ARFLAGS" | "FFLAGS" | "FORTRANFLAGS"
+            | "DEBUG_CFLAGS" | "DEBUG_CXXFLAGS" | "DEBUG_CPPFLAGS" | "DEBUG_FFLAGS"
+            | "CMAKE_ARGS" | "MESON_ARGS"
+    )
 }
 
 #[cfg(test)]

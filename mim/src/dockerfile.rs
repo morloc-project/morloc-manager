@@ -48,9 +48,10 @@ pub struct DockerfileInput<'a> {
 }
 
 /// In-image path of the activation wrapper this generator writes. Every
-/// container process goes through it: it exports CONDA_PREFIX, runs pixi's
-/// shell-hook for PATH, and sources the conda `activate.d` scripts that supply
-/// $CC/$AR and each language's runtime environment.
+/// container process goes through it: it exports CONDA_PREFIX and runs pixi's
+/// shell-hook, which sets PATH and sources the conda `activate.d` scripts that
+/// supply $CC/$AR and each language's runtime environment (an image without pixi
+/// sources them directly).
 pub const ACTIVATE_WRAPPER: &str = "/usr/local/bin/morloc-activate";
 
 /// Inputs to the deployment-image generator. See [`generate_deploy_dockerfile`].
@@ -713,8 +714,8 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
 
     // Establish container identity for the host UID, then self-activate the conda
     // toolchain -- for EVERY container process (the interactive shell, `morloc
-    // make`, and the cargo/cc-rs it spawns; see serve::conda_activate_lines for why
-    // activate.d must be sourced). The pixi path is absolute because the run-time
+    // make`, and the cargo/cc-rs it spawns; see serve::conda_activate_lines for how
+    // activate.d is sourced). The pixi path is absolute because the run-time
     // PATH does not include /opt/pixi/bin. Both identity paths deliberately do NOT
     // set HOME -- HOME is supplied by the container run env (serve::oci_base_env) so
     // the interactive and served paths agree. Lines avoid single quotes so the
@@ -790,7 +791,7 @@ ENV MORLOC_HOME=/opt/morloc
 WORKDIR /work
 
 # Env identity + conda activation for every container process
-RUN printf '%s\\n' '#!/bin/bash' 'if [ -f /usr/local/lib/morloc-nss-wrapper.so ] && ! getent passwd \"$(id -u)\" >/dev/null 2>&1; then' '  _p=\"$(mktemp)\"; _g=\"$(mktemp)\"' '  if [ -n \"$_p\" ] && [ -n \"$_g\" ]; then' '    printf \"morloc:x:%s:%s:morloc:/home/morloc:/bin/bash\\n\" \"$(id -u)\" \"$(id -g)\" > \"$_p\"' '    printf \"morloc:x:%s:\\n\" \"$(id -g)\" > \"$_g\"' '    export LD_PRELOAD=/usr/local/lib/morloc-nss-wrapper.so NSS_WRAPPER_PASSWD=\"$_p\" NSS_WRAPPER_GROUP=\"$_g\" USER=morloc LOGNAME=morloc' '  fi' 'fi' 'export CONDA_PREFIX=/env/.pixi/envs/default' 'eval \"$(/opt/pixi/bin/pixi shell-hook --manifest-path /env/pixi.toml --shell bash 2>/dev/null)\" || true' 'for f in \"$CONDA_PREFIX/etc/conda/activate.d/\"*.sh; do [ -r \"$f\" ] && . \"$f\"; done' 'exec \"$@\"' > /usr/local/bin/morloc-activate && chmod +x /usr/local/bin/morloc-activate
+RUN printf '%s\\n' '#!/bin/bash' 'if [ -f /usr/local/lib/morloc-nss-wrapper.so ] && ! getent passwd \"$(id -u)\" >/dev/null 2>&1; then' '  _p=\"$(mktemp)\"; _g=\"$(mktemp)\"' '  if [ -n \"$_p\" ] && [ -n \"$_g\" ]; then' '    printf \"morloc:x:%s:%s:morloc:/home/morloc:/bin/bash\\n\" \"$(id -u)\" \"$(id -g)\" > \"$_p\"' '    printf \"morloc:x:%s:\\n\" \"$(id -g)\" > \"$_g\"' '    export LD_PRELOAD=/usr/local/lib/morloc-nss-wrapper.so NSS_WRAPPER_PASSWD=\"$_p\" NSS_WRAPPER_GROUP=\"$_g\" USER=morloc LOGNAME=morloc' '  fi' 'fi' 'export CONDA_PREFIX=/env/.pixi/envs/default' '_morloc_hook=\"$(/opt/pixi/bin/pixi shell-hook --manifest-path /env/pixi.toml --shell bash 2>/dev/null)\" || _morloc_hook=; eval \"$_morloc_hook\" || true; case \"$_morloc_hook\" in *etc/conda/activate.d/*) ;; *) for f in \"$CONDA_PREFIX/etc/conda/activate.d/\"*.sh; do [ -r \"$f\" ] && . \"$f\"; done ;; esac; unset _morloc_hook' 'exec \"$@\"' > /usr/local/bin/morloc-activate && chmod +x /usr/local/bin/morloc-activate
 ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
 ";
         assert_eq!(got, expected);

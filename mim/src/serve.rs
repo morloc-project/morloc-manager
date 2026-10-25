@@ -656,26 +656,38 @@ pub fn prefix_volume(env_dir: &Path) -> String {
 pub const CONTAINER_GHCUP_BIN: &str = "/opt/.ghcup/bin";
 
 /// The shell lines that activate the mounted conda toolchain for a container
-/// process: set CONDA_PREFIX, run pixi's shell-hook (for PATH), then source the
-/// conda activate.d scripts. shell-hook alone does NOT export $CC/$AR, which the
-/// pool builds require, so the activate.d sourcing is mandatory. Shared by the
-/// image ENTRYPOINT and the env-materialize step so the two cannot drift.
-pub fn conda_activate_lines() -> [String; 3] {
-    let prefix = format!("{CONTAINER_PIXI_DIR}/.pixi/envs/default");
+/// process: set CONDA_PREFIX and run pixi's shell-hook, which also sources the
+/// conda activate.d scripts that export the $CC/$AR the pool builds require.
+/// When the hook fails or does not source them, the scripts are sourced
+/// directly, never both: a second pass would make each variable's backup its
+/// first value. Shared by the image
+/// ENTRYPOINT and the env-materialize step so the two cannot drift.
+pub fn conda_activate_lines() -> [String; 2] {
     [
-        format!("export CONDA_PREFIX={prefix}"),
+        container_prefix_export(),
         format!(
-            "eval \"$({CONTAINER_PIXI_BIN} shell-hook --manifest-path {CONTAINER_PIXI_DIR}/pixi.toml --shell bash 2>/dev/null)\" || true"
+            "_morloc_hook=\"$({CONTAINER_PIXI_BIN} shell-hook --manifest-path {CONTAINER_PIXI_DIR}/pixi.toml --shell bash 2>/dev/null)\" || _morloc_hook=; eval \"$_morloc_hook\" || true; case \"$_morloc_hook\" in *{activate_d}*) ;; *) {loop} ;; esac; unset _morloc_hook",
+            activate_d = morloc_deps::pixi::ACTIVATE_D,
+            loop = activate_d_loop(),
         ),
-        "for f in \"$CONDA_PREFIX/etc/conda/activate.d/\"*.sh; do [ -r \"$f\" ] && . \"$f\"; done".to_string(),
     ]
+}
+
+fn container_prefix_export() -> String {
+    format!("export CONDA_PREFIX={CONTAINER_PIXI_DIR}/.pixi/envs/default")
+}
+
+fn activate_d_loop() -> String {
+    format!(
+        "for f in \"$CONDA_PREFIX/{}\"*.sh; do [ -r \"$f\" ] && . \"$f\"; done",
+        morloc_deps::pixi::ACTIVATE_D
+    )
 }
 
 /// Activation for an image with no pixi: the prefix, and whatever
 /// `activate.d` scripts survived the cut. PATH is baked by the image.
 pub fn slim_activate_lines() -> [String; 2] {
-    let [prefix, _, activate_d] = conda_activate_lines();
-    [prefix, activate_d]
+    [container_prefix_export(), activate_d_loop()]
 }
 
 /// The in-container PATH for a requirement-derived image: installed program
