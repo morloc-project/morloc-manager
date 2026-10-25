@@ -1,0 +1,72 @@
+# End-to-end test of the native backend (`mim new --engine none`) on a clean
+# runner: this commit's mim builds a fresh environment from the latest morloc
+# release and live conda-forge, then builds the pacman demo, whose Rust pools
+# compile C through cc-rs, under `mim run` and under `mim shell` with hostile
+# startup files (a conda base auto-activated by `conda init`, and a PATH
+# reset). See ci/native-e2e.sh.
+#
+# The nightly run catches upstream drift (conda-forge compilers, pixi, the
+# morloc release) with no change on our side.
+
+name: Native end-to-end
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * *'
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            shell: /bin/zsh
+          - os: ubuntu-24.04
+            shell: /bin/bash
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Unit tests
+        run: cargo test --workspace
+
+      - name: Live activation capture with the pinned pixi
+        run: |
+          curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION="v$(sed -n 's/^pub const PIXI_VERSION: &str = "\(.*\)";/\1/p' mim/src/provision.rs)" bash
+          PATH="$HOME/.pixi/bin:$PATH" cargo test -p morloc-deps live_ -- --ignored
+
+      - name: Build and install mim
+        run: |
+          cargo build --release -p mim
+          mkdir -p "$HOME/.local/bin"
+          cp target/release/mim "$HOME/.local/bin/mim"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # The runner's own Rust toolchain must not stand in for the environment's:
+      # the user this mimics has none. GITHUB_PATH entries are prepended to every
+      # step's PATH, so the clean PATH is set inside this step.
+      - name: Native build of the demos
+        env:
+          SHELL: ${{ matrix.shell }}
+        run: |
+          PATH=$(printf %s "$PATH" | tr ':' '\n' | grep -v '/\.cargo/bin' | paste -sd: -)
+          export PATH
+          if command -v cargo; then echo "a host cargo is still on PATH" >&2; exit 1; fi
+          bash ci/native-e2e.sh "$RUNNER_TEMP/e2e"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-e2e-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/e2e/**/*.log
+            ${{ runner.temp }}/e2e/**/build.err
+          if-no-files-found: ignore
