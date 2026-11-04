@@ -36,3 +36,9 @@ the compiler writes and mim reads, so compatibility is mim's job.
   the user's. Do not create, update or remove environments without being
   asked.
 - Run `cargo build`/`cargo test` under `/work/scripts/memguard`.
+- Never build or install a release `mim`. The dev container runs inside an
+  environment that the host's `mim` launched, and it has no container engine,
+  rustup or musl toolchain. The user builds on the host with
+  `./scripts/build-static-container.sh` (docker or podman; output in
+  `out/mim`), installs it, and restages and relaunches the environment.
+  Changes reach this container only after that. Say what the user must run.
