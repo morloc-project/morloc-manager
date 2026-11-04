@@ -51,23 +51,40 @@ pub fn sync(
     installed: bool,
 ) -> Result<(), DepsError> {
     let hook = hook_context(|k| std::env::var(k).ok())?;
-    let ctx = hook.ctx;
-    let (key, provenance) = record_slot(name, installed, hook.foreign_state.as_deref());
-    let inputs = solve_inputs()?;
+    let owned = solve_inputs()?;
     let support = load_lang_support()?;
-    let inputs = inputs.bind(&support);
-
     let json = std::fs::read_to_string(spec)
         .map_err(|e| DepsError::Env(format!("cannot read {}: {e}", spec.display())))?;
+    sync_in(hook, &owned.bind(&support), name, &json, root, installed)
+}
+
+fn sync_in(
+    hook: HookContext,
+    inputs: &SolveInputs,
+    name: &str,
+    json: &str,
+    root: Option<&Path>,
+    installed: bool,
+) -> Result<(), DepsError> {
+    let ctx = hook.ctx;
+    let (key, provenance) = record_slot(name, installed, hook.foreign_state.as_deref());
+    let installs = provenance == Provenance::Installed;
+    let mut es = EnvSpec::from_json(json)?;
+    // DEP-4, DEP-12
+    let lock = ctx.lock_env()?;
+    ctx.check_env_ids()?;
+
     // Local (filesystem-path) deps never reach the store module-relative. An
     // installed program's Python locals are snapshotted into the pixi project
     // dir; every other local resolves to its live path (canonical real path
     // under the project root), keeping it editable. A spec with no local deps
-    // is passed through unchanged.
-    let mut es = EnvSpec::from_json(&json)?;
+    // is passed through unchanged. An install with a snapshot supersedes the
+    // program's scratch builds: their live paths must not meet the snapshot in
+    // one solve.
+    let supersede = installs && es.has_py_locals();
     let resolved = if es.has_local_deps() {
         let root = root.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        if installed && es.has_py_locals() {
+        if supersede {
             if env_is_immutable() {
                 return Err(DepsError::Env(format!(
                     "installing '{name}' needs a snapshot of its local python dependencies \
@@ -77,14 +94,11 @@ pub fn sync(
             }
             crate::localdeps::vendor_py_locals(&mut es, &root, &ctx.pixi_dir())
                 .map_err(|e| DepsError::Env(e.to_string()))?;
-            // An install supersedes any scratch build of the same program: its
-            // live path must not meet the snapshot in one solve.
-            ctx.remove_named(&key, Provenance::Scratch)?;
         }
         es.resolve_local_deps(&root)?;
         es.to_json()?
     } else {
-        json
+        json.to_string()
     };
 
     // Which languages this program's pools USE that have no morloc binding built
@@ -107,7 +121,7 @@ pub fn sync(
         )));
     }
 
-    let activation = match ctx.sync(&key, provenance, &resolved, &inputs) {
+    let activation = match ctx.sync(&lock, &key, provenance, &resolved, supersede, inputs) {
         Ok(a) => a,
         // A solve failure in an env that pins an interpreter minor (to protect an
         // already-built shim's ABI) is often that pin conflicting with a
@@ -159,18 +173,13 @@ pub fn sync(
             "Provisioning morloc bindings for language(s): {}...",
             missing.join(", ")
         );
-        // Serialize the shim build against concurrent makes on this env (a
-        // separate lock acquisition from `ctx.sync`, which released its lock on
-        // return) so two `morloc init`s cannot write the same shim artifacts at
-        // once. `morloc init` is idempotent, so a second waiter is a no-op.
-        let _build_lock = ctx.lock_env()?;
         build_new_language_shims(&activation, &home)?;
     }
 
     // Snapshots no stored spec references any more (a re-install with changed
     // source, an uninstalled program) are dropped; a failure here leaves only
     // stale copies behind, so it is a warning.
-    if installed {
+    if installs {
         match ctx
             .gather()
             .map_err(|e| e.to_string())
@@ -182,6 +191,7 @@ pub fn sync(
             Err(e) => eprintln!("Warning: could not sweep unreferenced local-dep snapshots: {e}"),
         }
     }
+    drop(lock);
     eprintln!("Environment dependencies synced for '{name}'.");
     Ok(())
 }
@@ -260,6 +270,8 @@ fn build_new_language_shims(activation: &[(String, String)], home: &Path) -> Res
         cmd.env("MORLOC_BIN_LINK_DIR", "");
     }
     cmd.env(ENV_INIT_INCREMENTAL, "1");
+    // DEP-4
+    cmd.env_remove("MORLOC_BUILD_HOOK");
     cmd.env(ENV_STRICT_CONDA, "1");
     let status = cmd
         .status()
@@ -283,11 +295,13 @@ pub fn clean() -> Result<(), DepsError> {
     let support = load_lang_support()?;
     let owned = solve_inputs()?;
     let inputs = owned.bind(&support);
-    let dropped = ctx.clean(&inputs)?;
+    let lock = ctx.lock_env()?;
+    let dropped = ctx.clean(&lock, &inputs)?;
     if !dropped.is_empty() {
         invalidate_shim_markers(&dropped);
         eprintln!("Dropped unused language runtime(s): {}.", dropped.join(", "));
     }
+    drop(lock);
     eprintln!("Environment reset to its installed baseline.");
     Ok(())
 }
@@ -313,6 +327,7 @@ pub fn spec() -> Result<(), DepsError> {
     let support = load_lang_support()?;
     let owned = solve_inputs()?;
     let inputs = owned.bind(&support);
+    let _lock = ctx.lock_env()?;
     let specs = ctx.sync_world()?;
     print!("{}", ctx.rendered_manifest(&specs, &inputs)?);
     Ok(())
@@ -353,10 +368,11 @@ struct HookContext {
     foreign_state: Option<PathBuf>,
 }
 
-/// DEP-11: the store is `MORLOC_ENV_STORE`, never the build's state. The pixi
-/// project defaults to `<store>/pixi`; a container passes `MORLOC_PIXI_DIR`. The
-/// build's state is the compiler's: `MORLOC_STATE`, else `MORLOC_HOME`, an
-/// empty value counting as unset.
+/// DEP-11: the store is `MORLOC_ENV_STORE`, never the build's state, and it
+/// must exist. The pixi project defaults to `<store>/pixi`; a container passes
+/// `MORLOC_PIXI_DIR`. The build's state is the compiler's: `MORLOC_STATE`, else
+/// `MORLOC_HOME`, else `$HOME/.local/share/morloc`, an empty value counting as
+/// unset. States are compared and keyed by their canonical path.
 fn hook_context(var: impl Fn(&str) -> Option<String>) -> Result<HookContext, DepsError> {
     let set = |k: &str| var(k).filter(|v| !v.is_empty());
     let store = set("MORLOC_ENV_STORE").map(PathBuf::from).ok_or_else(|| {
@@ -366,15 +382,22 @@ fn hook_context(var: impl Fn(&str) -> Option<String>) -> Result<HookContext, Dep
                 .to_string(),
         )
     })?;
-    let state = set("MORLOC_STATE").or_else(|| set("MORLOC_HOME")).map(PathBuf::from);
-    let same = |a: &Path, b: &Path| {
-        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        canon(a) == canon(b)
-    };
-    let foreign_state = match state {
-        Some(s) if same(&s, &store) => None,
+    let canon_store = std::fs::canonicalize(&store).map_err(|e| {
+        DepsError::Env(format!(
+            "the environment store {} named by MORLOC_ENV_STORE cannot be used ({e}); \
+             nothing was changed. If the environment was renamed or removed, start it \
+             again with `mim run` or `mim shell`.",
+            store.display()
+        ))
+    })?;
+    let state = set("MORLOC_STATE")
+        .or_else(|| set("MORLOC_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| set("HOME").map(|h| Path::new(&h).join(".local/share/morloc")));
+    let foreign_state = match state.map(|s| std::fs::canonicalize(&s).unwrap_or(s)) {
+        Some(s) if s == canon_store => None,
         Some(s) => Some(s),
-        None => Some(PathBuf::from("~")),
+        None => Some(PathBuf::new()),
     };
     let mut ctx = EnvContext::new(&store);
     if let Some(pixi_dir) = set("MORLOC_PIXI_DIR") {
@@ -396,7 +419,7 @@ fn record_slot(name: &str, installed: bool, foreign_state: Option<&Path>) -> (St
         None => (name.to_string(), Provenance::Scratch),
         Some(state) => {
             let digest = Sha256::digest(state.as_os_str().as_encoded_bytes());
-            let tag: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+            let tag = crate::provision::hex_lower(&digest[..6]);
             (format!("{name}@{tag}"), Provenance::Scratch)
         }
     }
@@ -532,6 +555,89 @@ mod tests {
             .err()
             .expect("a hook without MORLOC_ENV_STORE must refuse");
         assert!(err.to_string().contains("MORLOC_ENV_STORE"), "{err}");
+    }
+
+    #[test]
+    fn a_hook_whose_store_is_gone_refuses_and_creates_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let gone = d.path().join("renamed-away");
+        let err = hook_context(vars(&[("MORLOC_ENV_STORE", &gone), ("MORLOC_STATE", &gone)]))
+            .err()
+            .expect("a hook whose store does not exist must refuse");
+        assert!(err.to_string().contains(&gone.display().to_string()), "{err}");
+        assert!(!gone.exists());
+    }
+
+    #[test]
+    fn one_state_has_one_scratch_key_however_it_is_spelled() {
+        let d = tempfile::tempdir().unwrap();
+        let store = d.path().join("env");
+        let private = d.path().join("private");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&private).unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        let slash = PathBuf::from(format!("{}/", private.display()));
+
+        let key = |state: &Path| {
+            let hook = hook_context(vars(&[("MORLOC_ENV_STORE", &store), ("MORLOC_STATE", state)])).unwrap();
+            record_slot("prog", true, hook.foreign_state.as_deref()).0
+        };
+        assert_eq!(key(&private), key(&slash));
+        assert_eq!(key(&private), key(&link));
+    }
+
+    #[test]
+    fn a_build_with_no_state_set_uses_the_compilers_default_state() {
+        let d = tempfile::tempdir().unwrap();
+        let store = d.path().join("env");
+        std::fs::create_dir_all(&store).unwrap();
+        let home = d.path().join("home");
+        let default_state = home.join(".local/share/morloc");
+        std::fs::create_dir_all(&default_state).unwrap();
+
+        let hook = hook_context(vars(&[("MORLOC_ENV_STORE", &store), ("HOME", &home)])).unwrap();
+        assert_eq!(hook.foreign_state, Some(default_state.canonicalize().unwrap()));
+
+        // When that default is the store, the build is the environment's own.
+        let own = hook_context(vars(&[("MORLOC_ENV_STORE", &default_state), ("HOME", &home)])).unwrap();
+        assert_eq!(own.foreign_state, None);
+    }
+
+    /// DEP-12: the id check comes before any write, the vendored snapshot of
+    /// a program's Python locals included.
+    #[test]
+    fn a_refused_install_writes_nothing_into_the_project() {
+        let d = tempfile::tempdir().unwrap();
+        let store = d.path().join("env");
+        let shared = d.path().join("shared");
+        let owner = EnvContext::new(d.path().join("owner")).with_pixi_dir(&shared);
+        owner.adopt_env_ids(&owner.lock_env_creating().unwrap()).unwrap();
+        let mine = EnvContext::new(&store);
+        mine.adopt_env_ids(&mine.lock_env_creating().unwrap()).unwrap();
+        let listing = || {
+            let mut v: Vec<_> = std::fs::read_dir(&shared).unwrap().map(|e| e.unwrap().file_name()).collect();
+            v.sort();
+            v
+        };
+        let before = listing();
+
+        let root = d.path().join("prog");
+        std::fs::create_dir_all(root.join("src/mylib")).unwrap();
+        std::fs::write(root.join("src/mylib/__init__.py"), "V=1\n").unwrap();
+        let json = r#"{"envspec_version":2,"morloc_version":"0","packages":{"py":[{"name":"mylib","source":"local","path":"./src/mylib","editable":true}]}}"#;
+        let support = LangSupport::from_json(
+            r#"{"schema_version":"1.0","morloc_version":"0.99.0","languages":{"py":{"runtime":{"package":"python","version":">=3.10,<3.14","default":"3.12"}}}}"#,
+        )
+        .unwrap();
+        let channels = morloc_deps::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: Path::new("/nonexistent/pixi"), platform: "linux-64", channels: &channels };
+        let hook = HookContext { ctx: EnvContext::new(&store).with_pixi_dir(&shared), foreign_state: None };
+
+        let err = sync_in(hook, &inputs, "prog", json, Some(&root), true).unwrap_err();
+        assert!(err.to_string().contains("different environments"), "{err}");
+        assert_eq!(listing(), before);
+        assert!(EnvContext::new(&store).gather().unwrap().is_empty());
     }
 
     #[test]

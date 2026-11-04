@@ -126,12 +126,21 @@ pub fn image_repo_component(name: &str) -> String {
     }
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(name.as_bytes());
-    let hash: String = digest.iter().take(3).map(|b| format!("{b:02x}")).collect();
+    let hash = crate::provision::hex_lower(&digest[..3]);
     if out.is_empty() { hash } else { format!("{out}-{hash}") }
 }
 
 
 
+
+/// The lock of an environment whose store exists; one with none has no build
+/// to wait for.
+fn lock_if_present(data_dir: &std::path::Path) -> Result<Option<morloc_deps::envstore::EnvLock>> {
+    if !data_dir.is_dir() {
+        return Ok(None);
+    }
+    Ok(Some(morloc_deps::envstore::EnvContext::new(data_dir).lock_env_as_is()?))
+}
 
 /// Remove an environment and all its data (ENV-7). `engine` is the container
 /// engine for container-backed environments, or `None` for native ones. The
@@ -142,8 +151,8 @@ pub fn image_repo_component(name: &str) -> String {
 pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &str) -> Result<()> {
     let ec = config::read_env_config(scope, name)
         .map_err(|_| ManagerError::EnvironmentNotFound(name.to_string()))?;
-    // DEP-4: a build's solve in this environment finishes before its files go.
-    let _lock = morloc_deps::envstore::EnvContext::new(config::env_data_dir(scope, name)).lock_env()?;
+    // DEP-4
+    let _lock = lock_if_present(&config::env_data_dir(scope, name))?;
 
     match config::read_serve_runtime(scope, name).and_then(|rt| rt.handle) {
         Some(ServeHandle::Native { pid, pgid, start }) => crate::stop_native_serve(pid, pgid, start)?,
@@ -329,9 +338,8 @@ pub fn rename_environment(
 ) -> Result<EnvironmentConfig> {
     validate_rename(scope, old, new, ec)?;
     let old_data = config::env_data_dir(scope, old);
-    // DEP-4: the lock file moves with the data dir, so holding it across the
-    // rename keeps a build's solve from running against a moving store.
-    let _lock = morloc_deps::envstore::EnvContext::new(&old_data).lock_env()?;
+    // DEP-4
+    let _lock = lock_if_present(&old_data)?;
     let new_data = config::env_data_dir(scope, new);
     let old_cfg = config::env_config_dir(scope, old);
     let new_cfg = config::env_config_dir(scope, new);

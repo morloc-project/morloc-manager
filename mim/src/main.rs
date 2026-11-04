@@ -2763,13 +2763,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // inputs goes, so materialization solves and builds it all again. A
             // one-shot build flag is a request for a build, not for whatever the
             // marker says about the last one.
+            // DEP-4
+            let lock = adopted_env_lock(&cfg::env_data_dir(env_scope, &env_name))?;
             if reinit {
-                reset_for_reinit(env_scope, &env_name, &ec)?;
+                reset_for_reinit(&lock, env_scope, &env_name, &ec)?;
             } else if !engine_arg.is_empty() {
                 clear_materialized_marker(env_scope, &env_name, &ec);
             }
 
-            rematerialize_env(env_scope, &env_name, &[], requested, &engine_arg, verbose)?;
+            rematerialize_env(&lock, env_scope, &env_name, &[], requested, &engine_arg, verbose)?;
+            drop(lock);
             report_rematerialized(ec.backend.is_native(), &env_name);
             // Surface a broken conda extra (unresolved shared libs) LOUDLY now,
             // rather than leaving it to be discovered by running the tool.
@@ -3229,20 +3232,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    every later operation. (`new` needs no rollback: it persists only
             //    after a successful build.)
             if let Some(keep) = rebuild_version {
+                // DEP-4, ENV-8
+                let data_dir = cfg::env_data_dir(env_scope, &env_name);
+                let lock = adopted_env_lock(&data_dir)?;
                 let prev_ec = ec.clone();
                 let prev_inputs = cfg::read_env_inputs(env_scope, &env_name)?;
                 // Snapshot the requirements-store artifacts the rebuild's prime step
                 // overwrites (toolchain pins + conda extras) BEFORE it runs, so a
                 // failed rebuild restores them exactly -- like the cert snapshot.
-                let req_snapshot = envstore::EnvContext::new(&cfg::env_data_dir(env_scope, &env_name))
-                    .snapshot_requirements();
+                let req_snapshot = envstore::EnvContext::new(&data_dir).snapshot_requirements();
                 // The manifest and lock too: a failed rebuild has already re-solved
                 // them for the new config, and the make-time agent solves whatever
                 // lock it finds against the rolled-back store. Restoring the pair
                 // makes the next `pixi install --locked` return the prefix to the
                 // world the store describes.
-                let pixi_snapshot =
-                    snapshot_pixi_files(&cfg::env_data_dir(env_scope, &env_name).join("pixi"));
+                let pixi_snapshot = snapshot_pixi_files(&data_dir.join("pixi"));
 
                 // Each file is the env's whole list for its source; edit and
                 // re-apply to change it.
@@ -3288,8 +3292,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 }
 
                 // Rebuild at the CURRENT morloc version; `modify` never moves it.
-                match rematerialize_env(env_scope, &env_name, &[], Some(keep), &[], verbose) {
+                match rematerialize_env(&lock, env_scope, &env_name, &[], Some(keep), &[], verbose) {
                     Ok(()) => {
+                        drop(lock);
                         report_rematerialized(ec.backend.is_native(), &env_name);
                         // `modify --conda-packages` is the usual way a broken extra
                         // enters an env; warn LOUDLY now if one doesn't load.
@@ -3304,15 +3309,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         // toolchain.json/extras.json.
                         let _ = cfg::write_env_config(env_scope, &env_name, &prev_ec);
                         let _ = cfg::write_env_inputs(env_scope, &env_name, &prev_inputs);
-                        // DEP-4: the restore writes the store and the manifest.
-                        let data_dir = cfg::env_data_dir(env_scope, &env_name);
-                        let _lock = env_lock(&data_dir);
-                        restore_pixi_files(&pixi_snapshot);
-                        let _ = envstore::EnvContext::new(&data_dir).restore_requirements(&req_snapshot);
-                        forget_agent_solve(env_scope, &env_name);
                         if let Some(snap) = &cert_snapshot {
                             let _ = cert::restore_certs(env_scope, &env_name, snap);
                         }
+                        restore_pixi_files(&pixi_snapshot);
+                        let _ = envstore::EnvContext::new(&data_dir).restore_requirements(&req_snapshot);
+                        forget_agent_solve(env_scope, &env_name);
+                        drop(lock);
                         return Err(e);
                     }
                 }
@@ -3727,7 +3730,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    envspec.json, which gather_env_specs picks up from then on.
             //    Keep the env's current morloc version -- installing a module must
             //    never bump the toolchain out from under it.
-            rematerialize_env(scope, &env_name, &[dry], keep_version.clone(), &[], verbose)?;
+            // DEP-4
+            rematerialize_env(
+                &adopted_env_lock(&cfg::env_data_dir(scope, &env_name))?,
+                scope, &env_name, &[dry], keep_version.clone(), &[], verbose,
+            )?;
 
             // 3. Build + install into the now-complete environment. Step 2 may
             //    have rebuilt the image, so re-read the config.
@@ -3771,7 +3778,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    Re-solve so the manager's world (lock, image, cache marker) carries
             //    them too; the pre-build solve above held them back.
             if has_py_locals {
-                rematerialize_env(scope, &env_name, &[], keep_version, &[], verbose)?;
+                rematerialize_env(
+                    &adopted_env_lock(&cfg::env_data_dir(scope, &env_name))?,
+                    scope, &env_name, &[], keep_version, &[], verbose,
+                )?;
             }
             Ok(())
         }
@@ -4135,7 +4145,7 @@ pub(crate) fn native_run_env(
     }
 
     let data_dir = cfg::env_data_dir(env.scope, &env.name);
-    ensure_env_ids(&data_dir);
+    ensure_env_ids(env.scope, &env.name, &data_dir);
     let mh = data_dir.to_string_lossy().to_string();
 
     // On NixOS every conda/glibc binary runs inside the env's FHS sandbox; the
@@ -4750,7 +4760,7 @@ fn build_env_requirements(
 /// `--lang` pins. Re-solving is skipped when the rendered manifest is unchanged
 /// from a prior materialization (avoids a redundant solve on every `update`).
 fn materialize_native_env(
-    _lock: &envstore::EnvLock,
+    lock: &envstore::EnvLock,
     scope: Scope,
     name: &str,
     program_specs: &[envspec::EnvSpec],
@@ -4781,7 +4791,7 @@ fn materialize_native_env(
     // The conda prefix lives under this root and its activation feeds
     // CFLAGS/CXXFLAGS, which every C build tool word-splits.
     cfg::reject_whitespace_root(&env_dir)?;
-    prime_requirements_store(&env_dir, req.lang_spec.as_ref(), conda_packages)?;
+    prime_requirements_store(lock, &env_dir, req.lang_spec.as_ref(), conda_packages)?;
     let pixi_dir = env_dir.join("pixi");
     let manifest = pixi::render_manifest(&req.requirements);
 
@@ -4965,7 +4975,7 @@ fn installed_spec(
 /// uninstall them. A program whose local source the environment no longer
 /// holds is an error naming it: a raw module-relative path must never reach a
 /// solve.
-fn seed_installed_store(env_dir: &std::path::Path) -> Result<()> {
+fn seed_installed_store(lock: &envstore::EnvLock, env_dir: &std::path::Path) -> Result<()> {
     let ctx = envstore::EnvContext::new(env_dir);
     let stored: std::collections::HashSet<String> =
         ctx.installed_program_names().unwrap_or_default().into_iter().collect();
@@ -4976,9 +4986,9 @@ fn seed_installed_store(env_dir: &std::path::Path) -> Result<()> {
         let json = std::fs::read_to_string(&path)
             .map_err(|e| ManagerError::EnvError(format!("cannot read {}: {e}", path.display())))?;
         let (spec, _) = installed_spec(env_dir, &key, &json)?;
-        ctx.write_spec(&key, envstore::Provenance::Installed, &spec.to_json()?)?;
+        ctx.write_spec(lock, &key, envstore::Provenance::Installed, &spec.to_json()?)?;
         // The install supersedes any scratch build of the same program.
-        ctx.remove_named(&key, envstore::Provenance::Scratch)?;
+        ctx.remove_named(lock, &key, envstore::Provenance::Scratch)?;
     }
     for key in stored {
         // An entry for a program the environment does not hold (its build
@@ -4989,13 +4999,13 @@ fn seed_installed_store(env_dir: &std::path::Path) -> Result<()> {
                 "Dropping the stored requirements of '{key}': it is not installed in this \
                  environment."
             );
-            ctx.remove_named(&key, envstore::Provenance::Installed)?;
+            ctx.remove_named(lock, &key, envstore::Provenance::Installed)?;
             continue;
         }
         let json = ctx.read_installed(&key)?;
         let (spec, repaired) = installed_spec(env_dir, &key, &json)?;
         if repaired {
-            ctx.write_spec(&key, envstore::Provenance::Installed, &spec.to_json()?)?;
+            ctx.write_spec(lock, &key, envstore::Provenance::Installed, &spec.to_json()?)?;
         }
     }
     Ok(())
@@ -5006,11 +5016,12 @@ fn seed_installed_store(env_dir: &std::path::Path) -> Result<()> {
 /// the env's --lang pins as its toolchain spec. Without this the in-env agent
 /// re-solves a world missing the installed programs' deps or the interpreter pins.
 fn prime_requirements_store(
+    lock: &envstore::EnvLock,
     env_dir: &std::path::Path,
     lang_spec: Option<&envspec::EnvSpec>,
     conda_extras: &[String],
 ) -> Result<()> {
-    seed_installed_store(env_dir)?;
+    seed_installed_store(lock, env_dir)?;
     let ctx = envstore::EnvContext::new(env_dir);
     if let Some(json) = lang_spec.and_then(|ls| serde_json::to_string(ls).ok()) {
         let _ = ctx.write_toolchain(&json);
@@ -5042,9 +5053,9 @@ fn record_abi_lock_or_warn(
 /// their live path is valid only where the build ran (a container's `/work`
 /// mount is not a host path), and the in-env agent re-adds them on the next
 /// `morloc make`.
-fn gather_env_specs(scope: Scope, name: &str) -> Result<Vec<envspec::EnvSpec>> {
+fn gather_env_specs(lock: &envstore::EnvLock, scope: Scope, name: &str) -> Result<Vec<envspec::EnvSpec>> {
     let env_dir = cfg::env_data_dir(scope, name);
-    seed_installed_store(&env_dir)?;
+    seed_installed_store(lock, &env_dir)?;
     let ctx = envstore::EnvContext::new(&env_dir);
     let mut specs = ctx.gather_installed()?;
     let mut scratch = ctx.gather_scratch()?;
@@ -6885,8 +6896,7 @@ fn native_new(
         None
     } else {
         let data_dir = cfg::env_data_dir(scope, &env_name);
-        let lock = env_lock(&data_dir)?;
-        envstore::EnvContext::new(&data_dir).adopt_env_ids(&lock)?;
+        let lock = adopted_env_lock(&data_dir)?;
         materialize_native_env(&lock, scope, &env_name, &[], &lang_pins, &conda_packages, requested_version.as_deref(), local_runtime.as_deref(), verbose)?
             .parse::<Version>()
             .ok()
@@ -7347,15 +7357,13 @@ fn clear_materialized_marker(scope: Scope, name: &str, ec: &EnvironmentConfig) {
 /// Installed programs keep their launchers and manifests, which is what makes
 /// them persistent; a compiled pool built against the previous runtime is
 /// rebuilt by the next `morloc make`, as after any update.
-fn reset_for_reinit(scope: Scope, name: &str, ec: &EnvironmentConfig) -> Result<()> {
+fn reset_for_reinit(lock: &envstore::EnvLock, scope: Scope, name: &str, ec: &EnvironmentConfig) -> Result<()> {
     require_not_serving(scope, name, ec, format!(
         "environment '{name}' is being served; stop it first with \
          'mim stop --env {name}', then rebuild it."
     ))?;
     let data_dir = cfg::env_data_dir(scope, name);
-    let lock = env_lock(&data_dir)?;
-    discard_derived_state(&lock, &data_dir, ec.backend.container_engine())?;
-    drop(lock);
+    discard_derived_state(lock, &data_dir, ec.backend.container_engine())?;
     clear_materialized_marker(scope, name, ec);
     eprintln!(
         "Discarded the solved toolchain, scratch builds and language bindings of \
@@ -7369,12 +7377,12 @@ fn reset_for_reinit(scope: Scope, name: &str, ec: &EnvironmentConfig) -> Result<
 /// solved prefix (the engine volume when `engine` manages one, and any prefix
 /// tree or record mirror under the pixi project).
 fn discard_derived_state(
-    _lock: &envstore::EnvLock,
+    lock: &envstore::EnvLock,
     data_dir: &std::path::Path,
     engine: Option<ContainerEngine>,
 ) -> Result<()> {
     let ctx = envstore::EnvContext::new(data_dir);
-    ctx.clear_scratch()?;
+    ctx.clear_scratch(lock)?;
     ctx.clear_abi_lock()?;
     ctx.clear_solve_cache()?;
     let pixi_dir = ctx.pixi_dir();
@@ -7430,8 +7438,9 @@ fn discard_derived_state(
 /// they are never persisted; once the program builds, `morloc make --install`
 /// writes its real `envspec.json`, which `gather_env_specs` then picks up. The
 /// container/native solve caches make this a no-op when requirements are
-/// unchanged.
+/// unchanged. `lock` comes from `adopted_env_lock`.
 fn rematerialize_env(
+    lock: &envstore::EnvLock,
     scope: Scope,
     name: &str,
     extra_specs: &[envspec::EnvSpec],
@@ -7441,11 +7450,7 @@ fn rematerialize_env(
 ) -> Result<()> {
     let ec = cfg::read_env_config(scope, name)?;
     let lang_pins = cfg::read_env_inputs(scope, name)?.lang_pins;
-    // DEP-4: held from the gather to the forget, released before any build.
-    let data_dir = cfg::env_data_dir(scope, name);
-    let lock = env_lock(&data_dir)?;
-    envstore::EnvContext::new(&data_dir).adopt_env_ids(&lock)?;
-    let mut specs = gather_env_specs(scope, name)?;
+    let mut specs = gather_env_specs(lock, scope, name)?;
     specs.extend_from_slice(extra_specs);
 
     // The caller decides the version policy and passes the concrete tag to
@@ -7463,7 +7468,7 @@ fn rematerialize_env(
         let stdlib = resolve_stdlib_version(effective_version)?;
         let source = std::path::PathBuf::from(&dev.source);
         let image_tag = build_dev_container_image(
-            &lock, scope, name, target, &specs, &source, &lang_pins, &ec.system_packages,
+            lock, scope, name, target, &specs, &source, &lang_pins, &ec.system_packages,
             &ec.conda_packages, &stdlib, &ec.base_image, build_flags,
         )?;
         // Re-stage the dependency agent so a newer platform-matched mim (or the
@@ -7500,7 +7505,7 @@ fn rematerialize_env(
         // actually installed (symmetric with the container path below); without
         // this a native `update` leaves a stale version that misleads `doctor`
         // and the manifest-version check.
-        let mver = materialize_native_env(&lock, scope, name, &specs, &lang_pins, &ec.conda_packages, effective_version, local_runtime.as_deref(), verbose)?;
+        let mver = materialize_native_env(lock, scope, name, &specs, &lang_pins, &ec.conda_packages, effective_version, local_runtime.as_deref(), verbose)?;
         let mut ec = ec;
         ec.morloc_version = mver.parse::<Version>().ok();
         cfg::write_env_config(scope, name, &ec)?;
@@ -7509,7 +7514,7 @@ fn rematerialize_env(
     }
 
     let (image_tag, mver) = build_requirement_derived_image(
-        &lock, scope, name, ec.container_target()?, &specs, &lang_pins, &ec.system_packages,
+        lock, scope, name, ec.container_target()?, &specs, &lang_pins, &ec.system_packages,
         &ec.conda_packages, effective_version, local_runtime.as_deref(), &ec.base_image,
         build_flags,
     )?;
@@ -7523,22 +7528,40 @@ fn rematerialize_env(
 
 /// DEP-4: the environment's lock, held by the manager around its own solves.
 fn env_lock(data_dir: &std::path::Path) -> Result<envstore::EnvLock> {
-    Ok(envstore::EnvContext::new(data_dir).lock_env()?)
+    Ok(envstore::EnvContext::new(data_dir).lock_env_creating()?)
+}
+
+/// DEP-4 and DEP-12: the environment's lock, with the store and the pixi
+/// project given the environment's id under it.
+fn adopted_env_lock(data_dir: &std::path::Path) -> Result<envstore::EnvLock> {
+    let lock = env_lock(data_dir)?;
+    envstore::EnvContext::new(data_dir).adopt_env_ids(&lock)?;
+    Ok(lock)
 }
 
 /// DEP-12: give the store and the pixi project the environment's id before a
-/// build in it syncs. A failure leaves the hook refusing, with its reason.
-fn ensure_env_ids(data_dir: &std::path::Path) {
-    let ctx = envstore::EnvContext::new(data_dir);
-    if ctx.check_env_ids().is_ok() {
+/// build in it syncs. A failure leaves the hook refusing, so it is reported
+/// with the command that records the id.
+fn ensure_env_ids(scope: Scope, name: &str, data_dir: &std::path::Path) {
+    if envstore::EnvContext::new(data_dir).check_env_ids().is_ok() {
         return;
     }
-    if let Err(e) = ctx.lock_env().and_then(|lock| ctx.adopt_env_ids(&lock)) {
-        eprintln!(
-            "mim: warning: could not record the environment id under {}: {e}",
-            data_dir.display()
-        );
+    if let Err(e) = adopted_env_lock(data_dir) {
+        eprintln!("{}", env_id_warning(scope, name, data_dir, &e));
     }
+}
+
+fn env_id_warning(scope: Scope, name: &str, data_dir: &std::path::Path, e: &ManagerError) -> String {
+    let fix = format!("mim update --env {name}");
+    let fix = match scope {
+        Scope::System => format!("ask your administrator to run 'sudo {fix}'"),
+        Scope::Local => format!("run '{fix}'"),
+    };
+    format!(
+        "mim: warning: could not record the environment id under {} ({e}); builds in \
+         '{name}' refuse until it is recorded. To record it, {fix}.",
+        data_dir.display()
+    )
 }
 
 /// Drop the in-env agent's record of its last solve after the manager has
@@ -7557,7 +7580,7 @@ fn forget_agent_solve(scope: Scope, name: &str) {
 /// generated Dockerfile into a build context, and build the image. Returns the
 /// built image tag + the provisioned morloc version.
 fn build_requirement_derived_image(
-    _lock: &envstore::EnvLock,
+    lock: &envstore::EnvLock,
     scope: Scope,
     name: &str,
     target: arch::ContainerTarget,
@@ -7591,7 +7614,7 @@ fn build_requirement_derived_image(
     // the cache-hit early return: the store reflects the env's config/inputs, so a
     // re-run with an unchanged manifest still refreshes it. Idempotent writes; the
     // single writer for both the toolchain pins and the conda extras.
-    prime_requirements_store(&env_dir, req.lang_spec.as_ref(), conda_packages)?;
+    prime_requirements_store(lock, &env_dir, req.lang_spec.as_ref(), conda_packages)?;
 
     // Solve cache (mirrors the native path): skip the multi-minute solve + image
     // rebuild when the requirements AND the compiler are unchanged and the image
@@ -8183,7 +8206,7 @@ fn dev_image_key(world_digest: &str, dockerfile: &str) -> String {
 /// Sibling of `build_requirement_derived_image`; diverges because there is no
 /// prebuilt compiler to download/stage and the image bakes nothing from the source.
 fn build_dev_container_image(
-    _lock: &envstore::EnvLock,
+    lock: &envstore::EnvLock,
     scope: Scope,
     name: &str,
     target: arch::ContainerTarget,
@@ -8277,7 +8300,7 @@ fn build_dev_container_image(
     // so a re-run with an unchanged manifest (e.g. re-adding a conda extra that was
     // already pinned) still refreshes it. Idempotent writes; the single writer for
     // both the toolchain pins and the conda extras.
-    prime_requirements_store(&env_dir, lang_spec.as_ref(), conda_packages)?;
+    prime_requirements_store(lock, &env_dir, lang_spec.as_ref(), conda_packages)?;
 
     if !(up_to_date && container::image_exists_locally(engine, &image_tag)) {
         pixi::write_manifest(&pixi_host, &manifest)?;
@@ -8610,8 +8633,7 @@ fn container_new_derived(
         (None, None)
     } else {
         let data_dir = cfg::env_data_dir(scope, &env_name);
-        let lock = env_lock(&data_dir)?;
-        envstore::EnvContext::new(&data_dir).adopt_env_ids(&lock)?;
+        let lock = adopted_env_lock(&data_dir)?;
         let (image, version) = build_requirement_derived_image(
             &lock, scope, &env_name, target, &[], &lang_pins, &system_packages, &conda_packages,
             requested_version.as_deref(), local_runtime.as_deref(), &base_image, build_flags,
@@ -8727,8 +8749,7 @@ fn container_new_dev(
         let stdlib = resolve_stdlib_version(requested_version.as_deref())?;
         // A brand-new env has no installed programs yet, so no program specs.
         let data_dir = cfg::env_data_dir(scope, &env_name);
-        let lock = env_lock(&data_dir)?;
-        envstore::EnvContext::new(&data_dir).adopt_env_ids(&lock)?;
+        let lock = adopted_env_lock(&data_dir)?;
         let image_tag = build_dev_container_image(
             &lock, scope, &env_name, target, &[], &source_path, &lang_pins, &system_packages,
             &conda_packages, &stdlib, &base_image, build_flags,
@@ -9386,7 +9407,7 @@ pub(crate) fn container_run_env(
     let engine = ec.engine()?;
     let image = ec.active_image().to_string();
     let data_dir = cfg::env_data_dir(env_scope, &env_name);
-    ensure_env_ids(&data_dir);
+    ensure_env_ids(env_scope, &env_name, &data_dir);
     let v_data_dir = data_dir.to_string_lossy().to_string();
 
     // Optional SLURM submission bridge. The handle's drop tears the
@@ -10543,8 +10564,8 @@ mod tests {
         write_py_pkg(&env.path().join("exe/prog/src/mylib"), "V=1\n");
         write_program(env.path(), "plain", NO_LOCAL);
         let ctx = envstore::EnvContext::new(env.path());
-        ctx.write_spec("prog", envstore::Provenance::Scratch, NO_LOCAL).unwrap();
-        seed_installed_store(env.path()).unwrap();
+        ctx.write_spec(&env_lock(ctx.env_home()).unwrap(), "prog", envstore::Provenance::Scratch, NO_LOCAL).unwrap();
+        seed_installed_store(&env_lock(env.path()).unwrap(), env.path()).unwrap();
 
         let ctx = envstore::EnvContext::new(env.path());
         assert_eq!(ctx.installed_program_names().unwrap(), vec!["plain", "prog"]);
@@ -10556,7 +10577,7 @@ mod tests {
         assert!(env.path().join("pixi").join(&rel).join("v.py").exists());
         assert!(!localdeps::has_py_locals(&stored));
         // Idempotent: a second pass rewrites nothing.
-        seed_installed_store(env.path()).unwrap();
+        seed_installed_store(&env_lock(env.path()).unwrap(), env.path()).unwrap();
         assert_eq!(ctx.read_installed("prog").unwrap(), stored.to_json().unwrap());
     }
 
@@ -10571,8 +10592,8 @@ mod tests {
         write_py_pkg(&env.path().join("local/prog/mylib"), "LEGACY\n");
         let ctx = envstore::EnvContext::new(env.path());
         let legacy = r#"{"envspec_version":2,"morloc_version":"0","packages":{"py":[{"name":"mylib","source":"local","path":"/opt/morloc-state/local/prog/mylib","editable":false}]}}"#;
-        ctx.write_spec("prog", envstore::Provenance::Installed, legacy).unwrap();
-        seed_installed_store(env.path()).unwrap();
+        ctx.write_spec(&env_lock(ctx.env_home()).unwrap(), "prog", envstore::Provenance::Installed, legacy).unwrap();
+        seed_installed_store(&env_lock(env.path()).unwrap(), env.path()).unwrap();
         let stored = envspec::EnvSpec::from_json(&ctx.read_installed("prog").unwrap()).unwrap();
         let rel = vendored_path(&stored);
         assert_eq!(
@@ -10589,8 +10610,8 @@ mod tests {
         let env = tempfile::tempdir().unwrap();
         write_program(env.path(), "prog", NO_LOCAL);
         let ctx = envstore::EnvContext::new(env.path());
-        ctx.write_spec("stray", envstore::Provenance::Installed, RAW_LOCAL).unwrap();
-        seed_installed_store(env.path()).unwrap();
+        ctx.write_spec(&env_lock(ctx.env_home()).unwrap(), "stray", envstore::Provenance::Installed, RAW_LOCAL).unwrap();
+        seed_installed_store(&env_lock(env.path()).unwrap(), env.path()).unwrap();
         assert_eq!(ctx.installed_program_names().unwrap(), vec!["prog"]);
     }
 
@@ -10600,7 +10621,7 @@ mod tests {
         // must not be stored, and the error names the program.
         let env = tempfile::tempdir().unwrap();
         write_program(env.path(), "prog", RAW_LOCAL);
-        let err = seed_installed_store(env.path()).unwrap_err().to_string();
+        let err = seed_installed_store(&env_lock(env.path()).unwrap(), env.path()).unwrap_err().to_string();
         assert!(err.contains("'prog'") && err.contains("mylib"), "{err}");
         let ctx = envstore::EnvContext::new(env.path());
         assert!(ctx.installed_program_names().unwrap().is_empty());
@@ -10712,8 +10733,8 @@ mod tests {
         let data_dir = tmp.path();
         let ctx = envstore::EnvContext::new(data_dir);
         let spec = r#"{"envspec_version":2,"morloc_version":"0.99.0","languages":[{"lang":"py"}]}"#;
-        ctx.write_spec("keeper", envstore::Provenance::Installed, spec).unwrap();
-        ctx.write_spec("scratchy", envstore::Provenance::Scratch, spec).unwrap();
+        ctx.write_spec(&env_lock(ctx.env_home()).unwrap(), "keeper", envstore::Provenance::Installed, spec).unwrap();
+        ctx.write_spec(&env_lock(ctx.env_home()).unwrap(), "scratchy", envstore::Provenance::Scratch, spec).unwrap();
         ctx.write_conda_extras(&["bat".to_string()]).unwrap();
         let pixi = ctx.pixi_dir();
         std::fs::create_dir_all(morloc_deps::abi::conda_prefix(&pixi).join("conda-meta")).unwrap();
@@ -13670,6 +13691,16 @@ run:
         assert_eq!(environment::effective_default(), Some(("sys".to_string(), Scope::System)));
         let local = cfg::read_config::<Config>(&cfg::config_path(Scope::Local)).unwrap();
         assert_eq!(local.default_env.as_deref(), Some("sys"));
+    }
+
+    #[test]
+    fn a_missing_environment_id_names_the_command_that_records_it() {
+        let dir = std::path::Path::new("/data/e");
+        let e = ManagerError::EnvError("denied".to_string());
+        let system = env_id_warning(Scope::System, "sys", dir, &e);
+        assert!(system.contains("'sudo mim update --env sys'"), "{system}");
+        let local = env_id_warning(Scope::Local, "loc", dir, &e);
+        assert!(local.contains("'mim update --env loc'") && !local.contains("sudo"), "{local}");
     }
 
     /// DEP-11: every managed launch names the environment's store as the

@@ -65,20 +65,13 @@ by the manager. What does each provider mean in a container?
 
 ## Needs design (model first)
 
-### F2 Spec removals happen outside the solve lock
-DEP-4, DEP-5. `mim sync --installed` with Python locals vendors snapshots
-and removes scratch specs (`envagent.rs` `vendor_py_locals`,
-`remove_named`) before `EnvContext::sync` takes `.solve.lock`, and
-restores nothing on failure. `clean` clears `scratch/` under the lock but
-before its solve, and does not restore it.
-
 ### F3 Configuration-only changes are not serialized
 ENV-8. The manager takes the environment lock (DEP-4) around its solves,
-`rm` and rename only. The rest of `new`/`update`/`modify` (config record,
-default, dotfiles, home, shm, flag file, certificates) runs unlocked, so two
-such commands on one environment interleave. ENV-8: one lock for the whole
-command (it must then be released around a build, which takes it through
-the hook), or only for solves?
+`rm`, rename, and `modify`'s rebuild from its snapshot through its
+rollback. The rest of `new`/`update`/`modify` (config record, default,
+dotfiles, home, shm, flag file, certificates) runs unlocked, so two such
+commands on one environment interleave. Ruled 2026-11-04 for `modify`'s
+rebuild; the configuration steps remain.
 
 ### F5 `new`, `update` and `modify` are not atomic
 ENV-2, ENV-6. `new` writes everything before `env.yaml`, so a failure leaves
@@ -131,6 +124,37 @@ command line, which another env's nexus also matches.
 ### F63 `start` picks a free port, then binds it later
 `find_free_host_port` binds and releases; another process can take the port
 before the server binds.
+
+### F68 A concurrent rebuild can drop a first install's spec
+DEP-3. `seed_installed_store` (main.rs) drops an installed spec whose
+`exe/<name>` is absent. The hook records `installed/<name>` before the
+compiler creates `exe/<name>` (after the pools compile), so a `mim update`
+in that window drops the spec and solves its packages out of the prefix.
+Read, not reproduced.
+
+### F69 A build under another state is not superseded by an install
+DEP-13. An install with Python locals supersedes scratch specs named exactly
+`<name>`; a scratch build `<name>@<state>` from another state keeps its live
+path, which meets the install's snapshot of the same package in one solve.
+Read; how the renderer resolves two sources for one package is unchecked.
+
+### F70 The hook can misjudge the build's state
+DEP-13. The hook derives the compiler's state (`MORLOC_STATE`, else
+`MORLOC_HOME`, else `$HOME/.local/share/morloc`) but not a `home:` from the
+compiler's config file or `--config`, and resolves a relative
+`MORLOC_STATE` against its own cwd (the staging build dir). Each error
+records an own-state build as scratch. Fix: the compiler passes its resolved
+state to the hook (an `interface.md` change).
+
+### F71 flock across a VM bind mount is assumed
+DEP-4. On macOS Docker Desktop and podman machine the store reaches the
+container through a VM file share; whether flock there excludes the host's
+lock is unverified.
+
+### F72 A failed install leaves its Python snapshot behind
+DEP-4. `vendor_py_locals` copies an install's Python locals into the pixi
+project before the solve; a solve that fails leaves the copy, and only the
+next successful install sweeps it. Disk only: nothing references it.
 
 ### F66 The native record is not refreshed by an in-env re-solve
 RUN-1, RUN-6. The record `run`/`shell`/`doctor` replay is written only at

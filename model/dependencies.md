@@ -31,24 +31,34 @@ One package has one version. Unsatisfiable requirements fail the command.
 ### DEP-4 Solves of one environment are serialized
 Intent: ruled 2026-11-04
 Code: conforms 2026-11-04
-Tests: the_environment_lock_is_the_one_the_hook_takes
+Tests: the_environment_lock_is_the_one_the_hook_takes, a_waiter_locks_the_stores_current_lock_file, a_lock_for_another_environment_is_refused, only_the_managers_lock_creates_the_store
 
-Recording a spec, gathering the world, solving it, recording the result
-and building a language binding happen under one exclusive lock per
-environment, a file in its store, shared by the manager, the build hook and
-the container. Every path that writes the store, the solver's manifest or
-lock, or the solved prefix takes it. The manager holds it around its own
-solves only, never across a build, which takes it through the hook. Model:
-tla/EnvWorld.tla (no_manager_lock).
+One exclusive lock per environment, a file in its store, is shared by the
+manager, the build hook and the container. Every path that writes the
+store, the solver's manifest or lock, or the solved prefix takes it. A
+hook holds it once, from the id check (DEP-12) through any snapshot of a
+program's local packages, the solve, the binding build and the snapshot
+sweep. The manager holds it around its own solves only, never across a
+build, which takes it through the hook. A lock is taken on the file the
+store holds when it is granted: a waiter whose file was replaced (the
+environment removed or renamed, and another made in its place) locks the
+current one. Only the manager creates a store. Model: tla/EnvWorld.tla
+(no_manager_lock, write_before_check).
 
 ### DEP-5 A failed solve leaves the recorded requirements as they were
-Intent: proposed
-Code: deviates F2
-Tests: sync_rollback_restores_the_spec_it_replaced
+Intent: ruled 2026-11-04
+Code: conforms 2026-11-04
+Tests: a_failed_solve_leaves_the_store_as_it_was, an_install_supersedes_the_programs_scratch_builds_once_it_solves, a_later_scratch_build_of_an_installed_program_is_in_the_world, an_interrupted_commit_is_finished_by_the_next_lock, a_repeated_sync_takes_the_fast_path, a_fast_path_records_a_missing_interpreter_pin
 
-If a sync or clean fails, every spec it added, replaced or removed is
-restored. The solver's own files may be left changed; the next successful
-solve reconciles them.
+A sync or clean solves the world it would leave, then writes the specs it
+adds, replaces or removes, so a solve that fails, or a process that dies
+before it records, leaves the store as it was. A commit that writes one
+spec and removes others is one step: a crash part-way through it is
+finished, or undone if its spec was never written, by the next taker of
+the lock. The interpreter pin follows the prefix and is recorded by every
+sync that succeeds. The solver's own files may
+be left changed; the next successful solve reconciles them. Model:
+tla/EnvWorld.tla (commit_first).
 
 ### DEP-6 A solve with unchanged requirements does nothing
 Intent: ruled 2026-11-04
@@ -100,13 +110,15 @@ anything.
 ### DEP-11 The build hook works on its environment's store, whatever the state
 Intent: ruled 2026-11-04
 Code: conforms 2026-11-04
-Tests: the_hook_store_is_the_environments_not_the_states, a_hook_without_the_store_marker_refuses, managed_launches_name_the_environments_store
+Tests: the_hook_store_is_the_environments_not_the_states, a_hook_without_the_store_marker_refuses, a_hook_whose_store_is_gone_refuses_and_creates_nothing, managed_launches_name_the_environments_store
 
 Every managed process carries `MORLOC_ENV_STORE`, the environment's store
 as that process sees it. The build hook reads its specs, pins and lock from
 it, never from `MORLOC_STATE`, so a build under another state changes the
-environment's world and no other. A hook started without it refuses before
-writing anything. Model: tla/EnvWorld.tla (state_store).
+environment's world and no other. A hook started without it, or whose
+store does not exist (the environment was renamed or removed since the
+process started), refuses before writing anything. Model: tla/EnvWorld.tla
+(state_store).
 
 ### DEP-12 A store is never solved into another environment's project
 Intent: ruled 2026-11-04
@@ -120,12 +132,13 @@ clean whose two ids differ, or where either is absent, refuses before
 writing. Model: tla/EnvWorld.tla (no_id_check, wrong_marker).
 
 ### DEP-13 A build under another state is a scratch build
-Intent: proposed
+Intent: ruled 2026-11-04
 Code: conforms 2026-11-04
-Tests: a_build_under_another_state_is_recorded_as_scratch
+Tests: a_build_under_another_state_is_recorded_as_scratch, one_state_has_one_scratch_key_however_it_is_spelled, a_build_with_no_state_set_uses_the_compilers_default_state
 
-A sync whose `MORLOC_STATE` is not the environment's store records its spec
-as a scratch build under its program name qualified by a digest of that
-state, even with `--installed`. It never replaces a program installed in
+A sync whose state is not the environment's store records its spec as a
+scratch build under its program name qualified by a digest of that state's
+canonical path, even with `--installed`. The state is the compiler's:
+`MORLOC_STATE`, else `MORLOC_HOME`, else `$HOME/.local/share/morloc`. It never replaces a program installed in
 the environment, it does not replace that program's scratch builds, and
 `clean` drops it.
