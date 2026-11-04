@@ -25,7 +25,7 @@ here.
 
 ## Contracts with the compiler
 
-The four compiler <-> mim contracts are described in `README.md`. In each,
+The compiler <-> mim contracts are specified in `model/interface.md`. In each,
 the compiler writes and mim reads, so compatibility is mim's job.
 
 ## Safety

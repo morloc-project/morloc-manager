@@ -7,7 +7,7 @@ them, serves their programs, and freezes them into images.
 
 mim and the compiler are coupled only across process boundaries. In every
 contract the compiler (or its release) writes and mim reads, so mim carries
-the compatibility burden:
+the compatibility burden. `interface.md` fixes the shape of each:
 
 | Contract | Writer | When mim reads it |
 |---|---|---|
