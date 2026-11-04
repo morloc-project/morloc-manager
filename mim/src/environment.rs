@@ -142,6 +142,8 @@ pub fn image_repo_component(name: &str) -> String {
 pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &str) -> Result<()> {
     let ec = config::read_env_config(scope, name)
         .map_err(|_| ManagerError::EnvironmentNotFound(name.to_string()))?;
+    // DEP-4: a build's solve in this environment finishes before its files go.
+    let _lock = morloc_deps::envstore::EnvContext::new(config::env_data_dir(scope, name)).lock_env()?;
 
     match config::read_serve_runtime(scope, name).and_then(|rt| rt.handle) {
         Some(ServeHandle::Native { pid, pgid, start }) => crate::stop_native_serve(pid, pgid, start)?,
@@ -327,6 +329,9 @@ pub fn rename_environment(
 ) -> Result<EnvironmentConfig> {
     validate_rename(scope, old, new, ec)?;
     let old_data = config::env_data_dir(scope, old);
+    // DEP-4: the lock file moves with the data dir, so holding it across the
+    // rename keeps a build's solve from running against a moving store.
+    let _lock = morloc_deps::envstore::EnvContext::new(&old_data).lock_env()?;
     let new_data = config::env_data_dir(scope, new);
     let old_cfg = config::env_config_dir(scope, old);
     let new_cfg = config::env_config_dir(scope, new);

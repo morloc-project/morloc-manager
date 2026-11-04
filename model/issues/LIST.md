@@ -32,7 +32,7 @@ pin in `deps/abi.rs`.
 
 ### F14 `MORLOC_ENV` is the env name natively but `"container"` in OCI
 RUN-2. Is it the environment's name or only a flag? The compiler tests only
-non-emptiness. README.md and the manual's variable list should then say
+non-emptiness. IFC-7 and the manual's variable list should then say
 which (`serve::oci_managed_markers`).
 
 ### F16 A system default can resolve to a local environment
@@ -66,16 +66,19 @@ by the manager. What does each provider mean in a container?
 ## Needs design (model first)
 
 ### F2 Spec removals happen outside the solve lock
-DEP-4, DEP-5. `mim sync --installed` with Python locals removes scratch
-specs and vendors snapshots before taking `.solve.lock` and restores
-nothing on failure (`envagent::sync`); `clean` deletes `scratch/` before
-its solve and does not restore it.
+DEP-4, DEP-5. `mim sync --installed` with Python locals vendors snapshots
+and removes scratch specs (`envagent.rs` `vendor_py_locals`,
+`remove_named`) before `EnvContext::sync` takes `.solve.lock`, and
+restores nothing on failure. `clean` clears `scratch/` under the lock but
+before its solve, and does not restore it.
 
-### F3 The manager takes no lock
-ENV-8, DEP-4. Only the in-env agent takes `.solve.lock`. The manager's
-solves and `new`/`update`/`modify`/`rm`/`nuke`/rename race each other and
-`mim run -- morloc make`. ENV-8: one lock for every manager mutation, or
-only for solves?
+### F3 Configuration-only changes are not serialized
+ENV-8. The manager takes the environment lock (DEP-4) around its solves,
+`rm` and rename only. The rest of `new`/`update`/`modify` (config record,
+default, dotfiles, home, shm, flag file, certificates) runs unlocked, so two
+such commands on one environment interleave. ENV-8: one lock for the whole
+command (it must then be released around a build, which takes it through
+the hook), or only for solves?
 
 ### F5 `new`, `update` and `modify` are not atomic
 ENV-2, ENV-6. `new` writes everything before `env.yaml`, so a failure leaves
@@ -99,8 +102,10 @@ compiler model/runtime/issues/build-and-text.md.
 ## Other
 
 ### F10 Unverified downloads
-PROV-2. Only the compiler and rust source are checksummed. Not verified: the
-host pixi (`provision_pixi`), pixi in images (`curl pixi.sh/install.sh`),
+PROV-2. Checksummed: the compiler, the mim agent and the rust source. The
+lang-support asset is checked only when the manifest has its digest, and a
+mismatch is ignored (`provision.rs` `let _ =`). Not verified: the host pixi
+(`provision_pixi`), pixi in images (`curl pixi.sh/install.sh`),
 `stdlib-snapshot.txt`, the demos tarball and manifest, ghcup in dev images.
 
 ### F15 A command's own exit 125 reads as an engine error
@@ -135,42 +140,3 @@ same prefix and re-captures into
 reads, so a package that adds an activation (a new compiler, a rust
 activation) reaches `morloc make` builds but not a later `shell`. Read, not
 reproduced.
-
-## Compiler and nexus (belong in the compiler's issue list)
-
-- F38 IPv6 loopback can never bind: `format!("{}:{}", host, port)` gives
-  `::1:9000` (nexus/mcp.rs).
-- F39 `MORLOC_EVAL_ALLOW_NO_AUTH=0` waives the eval lock: any non-empty
-  value counts (nexus/cli.rs).
-- F40 The daemon's own HTTP `/eval`, `/typecheck`, `/bind` serve without a
-  token under `--allow-no-auth` (daemon_ffi.rs).
-- F41 `morloc install owner/name` may parse as core module `owner`
-  (Module.hs `moduleInstallParser` has no `eof`); unverified.
-- F42 The default config file is never read without `--config`
-  (Subcommands.hs), so `registry`, `lang_overrides`, `plane` are
-  unreachable; the manual's "Installing modules" says otherwise (F59).
-- F43 `installed_hash` records the requested pin, null when unpinned.
-- F44 Registry installs use `plane/<owner>/<name>`, `install --build` looks
-  in `plane/<name>`.
-- F45 envspec `modules` is first-wins, the resolver closer-wins.
-- F46 A program with only system deps gets a warning, not an error, without
-  a hook (`packageHasDeps`).
-- F47 `morloc init` rebuilds the runtime unless incremental, whatever `-f`
-  says; two SystemConfig.hs comments are wrong.
-- F48 Empty `MORLOC_HOME`/`MORLOC_STATE` is unset to Haskell, set to the
-  nexus.
-- F49 `install` writes wrappers and completions under `$MORLOC_HOME`.
-- F50 Dead `STATE/src/<base>/...` C++ search paths (Cpp.hs).
-- F51 `findBareModuleMaybe` skips the ambiguity check.
-- F52 The front end maps every `/call` failure to 500.
-- F53 `/call` reaches commands MCP excludes (stream args, `@stdin`).
-- F54 Daemon and front end differ on `/health` auth and 401 bodies;
-  single-program `mcp --http-port` has no `/health` or OPTIONS.
-- F55 MCP `notifications/cancelled` is ignored; a crashed child daemon
-  stays down until the next request.
-- F56 Stale comments: router scan path and transports (nexus/cli.rs,
-  main.rs), expose targets (State.hs, SystemConfig.hs), build hook named
-  `mim-env` (Build.hs).
-- F57 `GET /eval` with eval off is 405, not 404.
-- F58 A `__` collision in module/command names aborts the front end.
-- F59 Manual says `registry` is read from `~/.morloc/config.yaml` (F42).

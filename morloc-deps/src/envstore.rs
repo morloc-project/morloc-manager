@@ -66,6 +66,11 @@ pub struct EnvContext {
     pixi_dir: Option<PathBuf>,
 }
 
+/// The environment's exclusive lock (DEP-4), held until dropped. Functions that
+/// mutate an environment from the manager take one, so a caller cannot reach
+/// them without it.
+pub struct EnvLock(#[allow(dead_code)] Flock<File>);
+
 /// Whether a program's spec belongs to the canonical installed baseline or a
 /// transient scratch build. `clean` keeps only `Installed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,8 +457,59 @@ impl EnvContext {
     /// processes that mutate this env share its home -- in a container the agent's
     /// `env_home` is the host env dir via bind mount, so the same inode (hence the
     /// same `flock`) is seen across the host/container boundary.
-    fn solve_lock_path(&self) -> PathBuf {
+    pub fn solve_lock_path(&self) -> PathBuf {
         self.env_home.join(".solve.lock")
+    }
+
+    /// The environment id recorded in the store (DEP-12).
+    pub fn store_id_path(&self) -> PathBuf {
+        self.requirements_dir().join("env-id")
+    }
+
+    /// The environment id recorded in the pixi project (DEP-12).
+    pub fn pixi_id_path(&self) -> PathBuf {
+        self.pixi_dir().join(".morloc-env-id")
+    }
+
+    /// DEP-12: give the store an id if it has none and copy it into the pixi
+    /// project. Only the manager calls this: it alone holds the data dir that
+    /// contains both, so it alone knows they belong together.
+    pub fn adopt_env_ids(&self, _lock: &EnvLock) -> Result<()> {
+        let id = match read_trimmed(&self.store_id_path())? {
+            Some(id) => id,
+            None => {
+                let id = fresh_env_id(&self.env_home);
+                write_replacing(&self.store_id_path(), &format!("{id}\n"))?;
+                id
+            }
+        };
+        if read_trimmed(&self.pixi_id_path())?.as_deref() != Some(id.as_str()) {
+            write_replacing(&self.pixi_id_path(), &format!("{id}\n"))?;
+        }
+        Ok(())
+    }
+
+    /// DEP-12: refuse unless the store and the pixi project hold one id.
+    pub fn check_env_ids(&self) -> Result<()> {
+        let store = read_trimmed(&self.store_id_path())?;
+        let pixi = read_trimmed(&self.pixi_id_path())?;
+        match (store, pixi) {
+            (Some(a), Some(b)) if a == b => Ok(()),
+            (Some(_), Some(_)) => Err(DepsError::Env(format!(
+                "the requirements store {} and the pixi project {} belong to different \
+                 environments; nothing was changed. A build sees its environment's store \
+                 through MORLOC_ENV_STORE, which `mim run` and `mim shell` set.",
+                self.requirements_dir().display(),
+                self.pixi_dir().display()
+            ))),
+            _ => Err(DepsError::Env(format!(
+                "the requirements store {} or the pixi project {} has no environment id; \
+                 nothing was changed. Starting the environment again with `mim run` or \
+                 `mim shell` records it.",
+                self.requirements_dir().display(),
+                self.pixi_dir().display()
+            ))),
+        }
     }
 
     /// Take the env's exclusive solve lock, blocking until it is free. `sync` and
@@ -528,12 +584,10 @@ impl EnvContext {
     ///
     /// Materialize the declared world into this env's pixi prefix.
     ///
-    /// Invalidation is keyed on a DIGEST of the structured declared world
-    /// (`requirement_digest`), not the rendered `pixi.toml` TEXT: the workspace name,
-    /// whitespace, and constraint atom order are irrelevant, so the manager and agent
-    /// (which derive the env name differently) can no longer force a spurious
-    /// re-solve. A managed `morloc make` syncs on nearly every build, so the common
-    /// "nothing changed" case (digest unchanged + prefix + cached activation) is free.
+    /// DEP-6: the solve is skipped when the declared world's digest
+    /// (`requirement_digest`) and the `pixi.toml` on disk both match the last
+    /// successful solve here, the prefix exists and the activation is cached. A
+    /// manifest some other writer put there since is solved again.
     ///
     /// When the world DID change, `try_locked` picks the strategy:
     /// - `true` (sync): try `pixi install --locked` FIRST -- if the existing lock still
@@ -558,9 +612,13 @@ impl EnvContext {
         let cache_path = self.activation_cache_path();
         let digest_path = self.solved_digest_path();
         let prefix = crate::abi::conda_prefix(&pixi_dir);
-        let unchanged = std::fs::read_to_string(&digest_path)
-            .map(|prev| prev == digest)
-            .unwrap_or(false);
+        // DEP-6: the recorded digest names the world and the manifest that solve
+        // wrote; a manifest another writer replaced since is solved again.
+        let on_disk = std::fs::read_to_string(pixi_dir.join("pixi.toml")).ok();
+        let unchanged = match (std::fs::read_to_string(&digest_path), on_disk) {
+            (Ok(prev), Some(manifest)) => prev == solved_digest(&digest, &manifest),
+            _ => false,
+        };
         if unchanged && prefix.is_dir() {
             if let Some(activation) = read_activation_cache(&cache_path) {
                 return Ok(SolveOutcome { activation, solved: false });
@@ -574,7 +632,8 @@ impl EnvContext {
         // whole, forcing a corrective re-materialize.
         let _ = std::fs::remove_file(&cache_path);
         let _ = std::fs::remove_file(&digest_path);
-        crate::pixi::write_manifest(&pixi_dir, &crate::pixi::render_manifest(&reqs))?;
+        let mut written = crate::pixi::render_manifest(&reqs);
+        crate::pixi::write_manifest(&pixi_dir, &written)?;
         // In-env agent path (`mim sync`): the built image already sets the CA env vars,
         // which the pixi subprocess inherits, so no override is needed. No FHS
         // wrapping: the in-env agent already runs inside its execution environment.
@@ -600,7 +659,8 @@ impl EnvContext {
             let mut adopted = specs.to_vec();
             adopted.push(adopted_language_spec(&pulled, &inputs.lang_support.morloc_version));
             let reqs = self.requirement_set(&adopted, inputs)?;
-            crate::pixi::write_manifest(&pixi_dir, &crate::pixi::render_manifest(&reqs))?;
+            written = crate::pixi::render_manifest(&reqs);
+            crate::pixi::write_manifest(&pixi_dir, &written)?;
             crate::pixi::solve(&pixi_dir, inputs.pixi_bin, None, None)?;
             solved = true;
         }
@@ -626,7 +686,7 @@ impl EnvContext {
         write_activation_cache(&cache_path, &activation);
         // Record the digest of the world we just materialized so the next make can
         // fast-path. Written only after success, so a failed build is retried.
-        let _ = std::fs::write(&digest_path, &digest);
+        let _ = std::fs::write(&digest_path, solved_digest(&digest, &written));
         Ok(SolveOutcome { activation, solved })
     }
 
@@ -674,6 +734,7 @@ impl EnvContext {
         // Serialize concurrent solves against this env's shared prefix; held
         // through the write/gather/solve/record, released when `_lock` drops.
         let _lock = self.lock_solve()?;
+        self.check_env_ids()?;
         let slot = self.write_spec(program, provenance, spec_json)?;
         let specs = self.sync_world()?;
         // Prefer the manager's tested lock (`--locked`); re-solve only if it cannot
@@ -737,6 +798,7 @@ impl EnvContext {
     /// stale shim markers.
     pub fn clean(&self, inputs: &SolveInputs) -> Result<Vec<String>> {
         let _lock = self.lock_solve()?;
+        self.check_env_ids()?;
         self.clear_scratch()?;
         let mut specs = self.gather_installed()?;
         let before = self.runtime_language_set(inputs.platform)?;
@@ -776,8 +838,8 @@ impl EnvContext {
     /// SEPARATE acquisition from `sync`'s internal lock (which is released before
     /// the agent builds), so callers must not hold it across a `sync`/`clean`
     /// call -- that would deadlock on the same advisory lock.
-    pub fn lock_env(&self) -> Result<Flock<File>> {
-        self.lock_solve()
+    pub fn lock_env(&self) -> Result<EnvLock> {
+        self.lock_solve().map(EnvLock)
     }
 }
 
@@ -829,6 +891,50 @@ fn restore_or_remove(path: &Path, content: Option<&str>) -> Result<()> {
         }
         None => remove_if_present(path),
     }
+}
+
+/// Write `text` to `path` through a sibling temporary file and a rename, so a
+/// reader sees the old content or the new, never part of it.
+fn write_replacing(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| DepsError::Env(format!("cannot create {}: {e}", parent.display())))?;
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            DepsError::Env(format!("cannot write {}: {e}", path.display()))
+        })
+}
+
+/// The solve record: the declared world's digest and a digest of the manifest
+/// text that solve wrote.
+fn solved_digest(world: &str, manifest: &str) -> String {
+    let m: String = Sha256::digest(manifest.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    format!("{world}\nmanifest {m}\n")
+}
+
+/// A file's trimmed content; `None` when it is absent or empty.
+fn read_trimmed(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(t) if t.trim().is_empty() => Ok(None),
+        Ok(t) => Ok(Some(t.trim().to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(DepsError::Env(format!("cannot read {}: {e}", path.display()))),
+    }
+}
+
+/// A new environment id: a digest of this process, the store path and the
+/// clock, which no other environment's id repeats.
+fn fresh_env_id(env_home: &Path) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seed = format!("{}\0{}\0{nanos}", std::process::id(), env_home.display());
+    Sha256::digest(seed.as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Remove a file, tolerating its absence (an uninstall, or clearing a stale lock).
@@ -1396,5 +1502,125 @@ mod tests {
         write_activation_cache(&path, &env);
         let read = read_activation_cache(&path).unwrap();
         assert!(read.contains(&("CC".to_string(), format!("{p}/bin/x-cc"))), "{read:?}");
+    }
+
+    /// A pixi stand-in: any install copies the manifest into the prefix as
+    /// `solved.toml`, so a test can see which manifest the prefix was solved
+    /// from; shell-hook activates that prefix.
+    fn fake_pixi(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("bin/pixi");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n\
+             for a in \"$@\"; do case \"$prev\" in --manifest-path) m=\"$a\";; esac; prev=\"$a\"; done\n\
+             d=$(dirname \"$m\"); p=\"$d/.pixi/envs/default\"\n\
+             case \"$1\" in\n\
+             install) mkdir -p \"$p/conda-meta\" \"$p/bin\" && touch \"$p/bin/cc\" \"$p/bin/c++\" && chmod +x \"$p/bin/cc\" \"$p/bin/c++\" && cp \"$m\" \"$p/solved.toml\" && printf 'environments: {}\\n' > \"$d/pixi.lock\";;\n\
+             shell-hook) echo \"export CONDA_PREFIX='$p' CC='$p/bin/cc' CXX='$p/bin/c++'\";;\n\
+             *) exit 9;;\n\
+             esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn solved_manifest(ctx: &EnvContext) -> String {
+        std::fs::read_to_string(crate::abi::conda_prefix(&ctx.pixi_dir()).join("solved.toml")).unwrap()
+    }
+
+    fn adopted(ctx: &EnvContext) {
+        let lock = ctx.lock_env().unwrap();
+        ctx.adopt_env_ids(&lock).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_changed_after_the_digest_is_solved_again() {
+        let (d, ctx) = ctx();
+        adopted(&ctx);
+        let pixi = fake_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        ctx.sync("prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), &inputs).unwrap();
+        let rendered = std::fs::read_to_string(ctx.pixi_dir().join("pixi.toml")).unwrap();
+        assert_eq!(solved_manifest(&ctx), rendered);
+
+        // Another writer replaces the manifest and solves it; the recorded
+        // digest still names this world.
+        let other = "[workspace]\nname = \"other\"\n";
+        std::fs::write(ctx.pixi_dir().join("pixi.toml"), other).unwrap();
+        std::fs::write(crate::abi::conda_prefix(&ctx.pixi_dir()).join("solved.toml"), other).unwrap();
+
+        ctx.sync("prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), &inputs).unwrap();
+        assert_eq!(solved_manifest(&ctx), rendered, "the unchanged world must not fast-path onto another manifest");
+    }
+
+    #[test]
+    fn a_sync_refuses_a_project_with_another_id() {
+        let d = tempfile::tempdir().unwrap();
+        let shared = d.path().join("env/pixi");
+        let env = EnvContext::new(d.path().join("env"));
+        adopted(&env);
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("pixi.toml"), "keep\n").unwrap();
+
+        // A store adopted for its own project, then pointed at the shared one.
+        let other = EnvContext::new(d.path().join("other"));
+        adopted(&other);
+        let other = EnvContext::new(d.path().join("other")).with_pixi_dir(&shared);
+
+        let pixi = fake_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        let err = other.sync("prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), &inputs).unwrap_err();
+        assert!(err.to_string().contains("belong to different environments"), "{err}");
+        assert!(other.gather().unwrap().is_empty(), "a refused sync records no spec");
+        assert_eq!(std::fs::read_to_string(shared.join("pixi.toml")).unwrap(), "keep\n");
+        assert!(other.clean(&inputs).is_err());
+        assert_eq!(std::fs::read_to_string(shared.join("pixi.toml")).unwrap(), "keep\n");
+    }
+
+    #[test]
+    fn a_sync_refuses_a_missing_id() {
+        let (d, ctx) = ctx();
+        let pixi = fake_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        let err = ctx.sync("prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), &inputs).unwrap_err();
+        assert!(err.to_string().contains("no environment id"), "{err}");
+        assert!(ctx.gather().unwrap().is_empty());
+        assert!(!ctx.pixi_dir().join("pixi.toml").exists());
+
+        // Only the project's id: a store that was never this project's.
+        adopted(&ctx);
+        std::fs::remove_file(ctx.store_id_path()).unwrap();
+        assert!(ctx.sync("prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), &inputs).is_err());
+        assert!(ctx.clean(&inputs).is_err());
+        assert!(ctx.gather().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_manager_gives_store_and_project_one_id() {
+        let (_d, ctx) = ctx();
+        adopted(&ctx);
+        let id = std::fs::read_to_string(ctx.store_id_path()).unwrap();
+        assert!(!id.trim().is_empty());
+        assert_eq!(std::fs::read_to_string(ctx.pixi_id_path()).unwrap(), id);
+
+        // Adopting again keeps the id, and repairs a project holding another.
+        std::fs::write(ctx.pixi_id_path(), "stranger\n").unwrap();
+        adopted(&ctx);
+        assert_eq!(std::fs::read_to_string(ctx.store_id_path()).unwrap(), id);
+        assert_eq!(std::fs::read_to_string(ctx.pixi_id_path()).unwrap(), id);
+
+        // Two environments never share an id.
+        let (_e, other) = self::ctx();
+        adopted(&other);
+        assert_ne!(std::fs::read_to_string(other.store_id_path()).unwrap(), id);
     }
 }

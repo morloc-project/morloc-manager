@@ -734,6 +734,8 @@ pub fn oci_base_env(mh: &str) -> Vec<(String, String)> {
 pub fn oci_managed_markers() -> Vec<(String, String)> {
     vec![
         ("MORLOC_ENV".to_string(), "container".to_string()),
+        // DEP-11: the environment's store, mounted from its data dir.
+        ("MORLOC_ENV_STORE".to_string(), CONTAINER_MORLOC_STATE.to_string()),
         ("MORLOC_BUILD_HOOK".to_string(), format!("{CONTAINER_RUNTIME_BIN}/mim")),
         ("MORLOC_BIN".to_string(), format!("{CONTAINER_RUNTIME_BIN}/morloc")),
         ("MORLOC_PIXI".to_string(), CONTAINER_PIXI_BIN.to_string()),

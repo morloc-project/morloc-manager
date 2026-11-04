@@ -1407,11 +1407,14 @@ pub(crate) fn locate_pixi(scope: Scope) -> Option<std::path::PathBuf> {
 /// construction rather than by remembering three vars at each call site.
 fn managed_env_vars(
     env_name: &str,
+    store: &std::path::Path,
     morloc_bin: &std::path::Path,
     build_hook: &std::path::Path,
 ) -> Vec<(String, String)> {
     vec![
         ("MORLOC_ENV".to_string(), env_name.to_string()),
+        // DEP-11: the store the build hook syncs into, whatever MORLOC_STATE is.
+        ("MORLOC_ENV_STORE".to_string(), store.display().to_string()),
         ("MORLOC_BUILD_HOOK".to_string(), build_hook.display().to_string()),
         ("MORLOC_BIN".to_string(), morloc_bin.display().to_string()),
     ]
@@ -1439,7 +1442,7 @@ fn info_env_exports(
                 .and_then(|rt| rt.morloc_bin)
                 .unwrap_or_else(|| std::path::PathBuf::from("morloc"));
             match provision::mim_agent_for_host(scope) {
-                Ok(hook) => v.extend(managed_env_vars(name, &morloc_bin, &hook)),
+                Ok(hook) => v.extend(managed_env_vars(name, data_dir, &morloc_bin, &hook)),
                 Err(_) => v.push(("MORLOC_ENV".to_string(), name.to_string())),
             }
             v.push((envagent::ENV_STRICT_CONDA.to_string(), "1".to_string()));
@@ -3301,9 +3304,12 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         // toolchain.json/extras.json.
                         let _ = cfg::write_env_config(env_scope, &env_name, &prev_ec);
                         let _ = cfg::write_env_inputs(env_scope, &env_name, &prev_inputs);
+                        // DEP-4: the restore writes the store and the manifest.
+                        let data_dir = cfg::env_data_dir(env_scope, &env_name);
+                        let _lock = env_lock(&data_dir);
                         restore_pixi_files(&pixi_snapshot);
-                        let _ = envstore::EnvContext::new(&cfg::env_data_dir(env_scope, &env_name))
-                            .restore_requirements(&req_snapshot);
+                        let _ = envstore::EnvContext::new(&data_dir).restore_requirements(&req_snapshot);
+                        forget_agent_solve(env_scope, &env_name);
                         if let Some(snap) = &cert_snapshot {
                             let _ = cert::restore_certs(env_scope, &env_name, snap);
                         }
@@ -4129,6 +4135,7 @@ pub(crate) fn native_run_env(
     }
 
     let data_dir = cfg::env_data_dir(env.scope, &env.name);
+    ensure_env_ids(&data_dir);
     let mh = data_dir.to_string_lossy().to_string();
 
     // On NixOS every conda/glibc binary runs inside the env's FHS sandbox; the
@@ -4184,7 +4191,7 @@ pub(crate) fn native_run_env(
         .morloc_bin
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("morloc"));
-    for (k, v) in managed_env_vars(&env.name, &morloc_bin, &hook) {
+    for (k, v) in managed_env_vars(&env.name, &data_dir, &morloc_bin, &hook) {
         cmd.env(k, v);
     }
     // RUN-6: a `morloc init` run inside the environment holds its tools to the
@@ -4743,6 +4750,7 @@ fn build_env_requirements(
 /// `--lang` pins. Re-solving is skipped when the rendered manifest is unchanged
 /// from a prior materialization (avoids a redundant solve on every `update`).
 fn materialize_native_env(
+    _lock: &envstore::EnvLock,
     scope: Scope,
     name: &str,
     program_specs: &[envspec::EnvSpec],
@@ -6876,7 +6884,10 @@ fn native_new(
     let morloc_version = if no_init {
         None
     } else {
-        materialize_native_env(scope, &env_name, &[], &lang_pins, &conda_packages, requested_version.as_deref(), local_runtime.as_deref(), verbose)?
+        let data_dir = cfg::env_data_dir(scope, &env_name);
+        let lock = env_lock(&data_dir)?;
+        envstore::EnvContext::new(&data_dir).adopt_env_ids(&lock)?;
+        materialize_native_env(&lock, scope, &env_name, &[], &lang_pins, &conda_packages, requested_version.as_deref(), local_runtime.as_deref(), verbose)?
             .parse::<Version>()
             .ok()
     };
@@ -7342,7 +7353,9 @@ fn reset_for_reinit(scope: Scope, name: &str, ec: &EnvironmentConfig) -> Result<
          'mim stop --env {name}', then rebuild it."
     ))?;
     let data_dir = cfg::env_data_dir(scope, name);
-    discard_derived_state(&data_dir, ec.backend.container_engine())?;
+    let lock = env_lock(&data_dir)?;
+    discard_derived_state(&lock, &data_dir, ec.backend.container_engine())?;
+    drop(lock);
     clear_materialized_marker(scope, name, ec);
     eprintln!(
         "Discarded the solved toolchain, scratch builds and language bindings of \
@@ -7355,7 +7368,11 @@ fn reset_for_reinit(scope: Scope, name: &str, ec: &EnvironmentConfig) -> Result<
 /// the scratch specs, the interpreter pins, the solve cache, the lock, and the
 /// solved prefix (the engine volume when `engine` manages one, and any prefix
 /// tree or record mirror under the pixi project).
-fn discard_derived_state(data_dir: &std::path::Path, engine: Option<ContainerEngine>) -> Result<()> {
+fn discard_derived_state(
+    _lock: &envstore::EnvLock,
+    data_dir: &std::path::Path,
+    engine: Option<ContainerEngine>,
+) -> Result<()> {
     let ctx = envstore::EnvContext::new(data_dir);
     ctx.clear_scratch()?;
     ctx.clear_abi_lock()?;
@@ -7424,6 +7441,10 @@ fn rematerialize_env(
 ) -> Result<()> {
     let ec = cfg::read_env_config(scope, name)?;
     let lang_pins = cfg::read_env_inputs(scope, name)?.lang_pins;
+    // DEP-4: held from the gather to the forget, released before any build.
+    let data_dir = cfg::env_data_dir(scope, name);
+    let lock = env_lock(&data_dir)?;
+    envstore::EnvContext::new(&data_dir).adopt_env_ids(&lock)?;
     let mut specs = gather_env_specs(scope, name)?;
     specs.extend_from_slice(extra_specs);
 
@@ -7442,7 +7463,7 @@ fn rematerialize_env(
         let stdlib = resolve_stdlib_version(effective_version)?;
         let source = std::path::PathBuf::from(&dev.source);
         let image_tag = build_dev_container_image(
-            scope, name, target, &specs, &source, &lang_pins, &ec.system_packages,
+            &lock, scope, name, target, &specs, &source, &lang_pins, &ec.system_packages,
             &ec.conda_packages, &stdlib, &ec.base_image, build_flags,
         )?;
         // Re-stage the dependency agent so a newer platform-matched mim (or the
@@ -7479,7 +7500,7 @@ fn rematerialize_env(
         // actually installed (symmetric with the container path below); without
         // this a native `update` leaves a stale version that misleads `doctor`
         // and the manifest-version check.
-        let mver = materialize_native_env(scope, name, &specs, &lang_pins, &ec.conda_packages, effective_version, local_runtime.as_deref(), verbose)?;
+        let mver = materialize_native_env(&lock, scope, name, &specs, &lang_pins, &ec.conda_packages, effective_version, local_runtime.as_deref(), verbose)?;
         let mut ec = ec;
         ec.morloc_version = mver.parse::<Version>().ok();
         cfg::write_env_config(scope, name, &ec)?;
@@ -7488,7 +7509,7 @@ fn rematerialize_env(
     }
 
     let (image_tag, mver) = build_requirement_derived_image(
-        scope, name, ec.container_target()?, &specs, &lang_pins, &ec.system_packages,
+        &lock, scope, name, ec.container_target()?, &specs, &lang_pins, &ec.system_packages,
         &ec.conda_packages, effective_version, local_runtime.as_deref(), &ec.base_image,
         build_flags,
     )?;
@@ -7498,6 +7519,26 @@ fn rematerialize_env(
     cfg::write_env_config(scope, name, &ec)?;
     forget_agent_solve(scope, name);
     Ok(())
+}
+
+/// DEP-4: the environment's lock, held by the manager around its own solves.
+fn env_lock(data_dir: &std::path::Path) -> Result<envstore::EnvLock> {
+    Ok(envstore::EnvContext::new(data_dir).lock_env()?)
+}
+
+/// DEP-12: give the store and the pixi project the environment's id before a
+/// build in it syncs. A failure leaves the hook refusing, with its reason.
+fn ensure_env_ids(data_dir: &std::path::Path) {
+    let ctx = envstore::EnvContext::new(data_dir);
+    if ctx.check_env_ids().is_ok() {
+        return;
+    }
+    if let Err(e) = ctx.lock_env().and_then(|lock| ctx.adopt_env_ids(&lock)) {
+        eprintln!(
+            "mim: warning: could not record the environment id under {}: {e}",
+            data_dir.display()
+        );
+    }
 }
 
 /// Drop the in-env agent's record of its last solve after the manager has
@@ -7516,6 +7557,7 @@ fn forget_agent_solve(scope: Scope, name: &str) {
 /// generated Dockerfile into a build context, and build the image. Returns the
 /// built image tag + the provisioned morloc version.
 fn build_requirement_derived_image(
+    _lock: &envstore::EnvLock,
     scope: Scope,
     name: &str,
     target: arch::ContainerTarget,
@@ -8141,6 +8183,7 @@ fn dev_image_key(world_digest: &str, dockerfile: &str) -> String {
 /// Sibling of `build_requirement_derived_image`; diverges because there is no
 /// prebuilt compiler to download/stage and the image bakes nothing from the source.
 fn build_dev_container_image(
+    _lock: &envstore::EnvLock,
     scope: Scope,
     name: &str,
     target: arch::ContainerTarget,
@@ -8566,8 +8609,11 @@ fn container_new_derived(
     let (built_image, morloc_version) = if no_init {
         (None, None)
     } else {
+        let data_dir = cfg::env_data_dir(scope, &env_name);
+        let lock = env_lock(&data_dir)?;
+        envstore::EnvContext::new(&data_dir).adopt_env_ids(&lock)?;
         let (image, version) = build_requirement_derived_image(
-            scope, &env_name, target, &[], &lang_pins, &system_packages, &conda_packages,
+            &lock, scope, &env_name, target, &[], &lang_pins, &system_packages, &conda_packages,
             requested_version.as_deref(), local_runtime.as_deref(), &base_image, build_flags,
         )?;
         (Some(image), version.parse::<Version>().ok())
@@ -8680,8 +8726,11 @@ fn container_new_dev(
     } else {
         let stdlib = resolve_stdlib_version(requested_version.as_deref())?;
         // A brand-new env has no installed programs yet, so no program specs.
+        let data_dir = cfg::env_data_dir(scope, &env_name);
+        let lock = env_lock(&data_dir)?;
+        envstore::EnvContext::new(&data_dir).adopt_env_ids(&lock)?;
         let image_tag = build_dev_container_image(
-            scope, &env_name, target, &[], &source_path, &lang_pins, &system_packages,
+            &lock, scope, &env_name, target, &[], &source_path, &lang_pins, &system_packages,
             &conda_packages, &stdlib, &base_image, build_flags,
         )?;
         (Some(image_tag), stdlib.parse::<Version>().ok())
@@ -9337,6 +9386,7 @@ pub(crate) fn container_run_env(
     let engine = ec.engine()?;
     let image = ec.active_image().to_string();
     let data_dir = cfg::env_data_dir(env_scope, &env_name);
+    ensure_env_ids(&data_dir);
     let v_data_dir = data_dir.to_string_lossy().to_string();
 
     // Optional SLURM submission bridge. The handle's drop tears the
@@ -10676,7 +10726,7 @@ mod tests {
         // The runtime and installed launchers are not this step's to touch.
         std::fs::create_dir_all(data_dir.join("exe/keeper")).unwrap();
 
-        discard_derived_state(data_dir, None).unwrap();
+        discard_derived_state(&env_lock(data_dir).unwrap(), data_dir, None).unwrap();
 
         assert_eq!(ctx.installed_program_names().unwrap(), vec!["keeper".to_string()]);
         assert_eq!(ctx.program_names().unwrap(), vec!["keeper".to_string()]);
@@ -10690,7 +10740,7 @@ mod tests {
         // The manifest is re-rendered by the rebuild; leaving it is harmless.
         assert!(data_dir.join("exe/keeper").is_dir());
         // Idempotent: a second discard on the emptied env is not an error.
-        discard_derived_state(data_dir, None).unwrap();
+        discard_derived_state(&env_lock(data_dir).unwrap(), data_dir, None).unwrap();
     }
 
     #[test]
@@ -13620,6 +13670,24 @@ run:
         assert_eq!(environment::effective_default(), Some(("sys".to_string(), Scope::System)));
         let local = cfg::read_config::<Config>(&cfg::config_path(Scope::Local)).unwrap();
         assert_eq!(local.default_env.as_deref(), Some("sys"));
+    }
+
+    /// DEP-11: every managed launch names the environment's store as the
+    /// launched process sees it.
+    #[test]
+    fn managed_launches_name_the_environments_store() {
+        let data_dir = std::path::Path::new("/data/environments/e");
+        let native = managed_env_vars("e", data_dir, std::path::Path::new("morloc"), std::path::Path::new("mim"));
+        assert!(native.contains(&("MORLOC_ENV_STORE".to_string(), data_dir.display().to_string())), "{native:?}");
+
+        let oci = serve::oci_managed_markers();
+        assert!(
+            oci.contains(&("MORLOC_ENV_STORE".to_string(), serve::CONTAINER_MORLOC_STATE.to_string())),
+            "{oci:?}"
+        );
+        // The container's store is the data dir mounted there.
+        let (binds, _) = base_mounts(&data_dir.display().to_string());
+        assert!(binds.contains(&(data_dir.display().to_string(), serve::CONTAINER_MORLOC_STATE.to_string())));
     }
 
     /// `info` lists every managed-env variable a native run exports.

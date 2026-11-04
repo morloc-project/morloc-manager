@@ -29,12 +29,17 @@ requirements, the user's extra packages and the interpreter pins (DEP-7).
 One package has one version. Unsatisfiable requirements fail the command.
 
 ### DEP-4 Solves of one environment are serialized
-Intent: proposed
-Code: deviates F3
+Intent: ruled 2026-11-04
+Code: conforms 2026-11-04
+Tests: the_environment_lock_is_the_one_the_hook_takes
 
-Recording a spec, gathering the world, solving it and recording the result
-happen under one exclusive lock per environment, shared by the host and the
-container. Every path that writes the solver's manifest or lock takes it.
+Recording a spec, gathering the world, solving it, recording the result
+and building a language binding happen under one exclusive lock per
+environment, a file in its store, shared by the manager, the build hook and
+the container. Every path that writes the store, the solver's manifest or
+lock, or the solved prefix takes it. The manager holds it around its own
+solves only, never across a build, which takes it through the hook. Model:
+tla/EnvWorld.tla (no_manager_lock).
 
 ### DEP-5 A failed solve leaves the recorded requirements as they were
 Intent: proposed
@@ -46,12 +51,15 @@ restored. The solver's own files may be left changed; the next successful
 solve reconciles them.
 
 ### DEP-6 A solve with unchanged requirements does nothing
-Intent: proposed
-Code: unaudited
+Intent: ruled 2026-11-04
+Code: conforms 2026-11-04
+Tests: a_manifest_changed_after_the_digest_is_solved_again
 
 The world's requirements reduce to a canonical digest. When it equals the
-digest of the last successful solve and the solved prefix exists, the solve
-is skipped. The digest is written last, so an interrupted solve is redone.
+digest of the last successful solve, the solver's manifest on disk is the
+one that solve wrote, and the solved prefix exists, the solve is skipped.
+The digest is written last, so an interrupted solve is redone. Model:
+tla/EnvWorld.tla (digest_only).
 
 ### DEP-7 Versions move only when the requirements force them
 Intent: proposed
@@ -88,3 +96,36 @@ Code: unaudited
 In an environment marked immutable (a running server, a frozen image), a
 sync that would change the world or rebuild a binding fails before writing
 anything.
+
+### DEP-11 The build hook works on its environment's store, whatever the state
+Intent: ruled 2026-11-04
+Code: conforms 2026-11-04
+Tests: the_hook_store_is_the_environments_not_the_states, a_hook_without_the_store_marker_refuses, managed_launches_name_the_environments_store
+
+Every managed process carries `MORLOC_ENV_STORE`, the environment's store
+as that process sees it. The build hook reads its specs, pins and lock from
+it, never from `MORLOC_STATE`, so a build under another state changes the
+environment's world and no other. A hook started without it refuses before
+writing anything. Model: tla/EnvWorld.tla (state_store).
+
+### DEP-12 A store is never solved into another environment's project
+Intent: ruled 2026-11-04
+Code: conforms 2026-11-04
+Tests: a_sync_refuses_a_project_with_another_id, a_sync_refuses_a_missing_id, the_manager_gives_store_and_project_one_id
+
+An environment's store and its pixi project each hold the environment's
+id. Only the manager writes them, from the one data dir that holds both:
+it creates the store's id if absent and copies it to the project. A sync or
+clean whose two ids differ, or where either is absent, refuses before
+writing. Model: tla/EnvWorld.tla (no_id_check, wrong_marker).
+
+### DEP-13 A build under another state is a scratch build
+Intent: proposed
+Code: conforms 2026-11-04
+Tests: a_build_under_another_state_is_recorded_as_scratch
+
+A sync whose `MORLOC_STATE` is not the environment's store records its spec
+as a scratch build under its program name qualified by a digest of that
+state, even with `--installed`. It never replaces a program installed in
+the environment, it does not replace that program's scratch builds, and
+`clean` drops it.
