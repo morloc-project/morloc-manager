@@ -50,7 +50,7 @@ Intent: ruled 2026-11-04
 Code: conforms 2026-11-04
 Tests: a_failed_solve_leaves_the_store_as_it_was, an_install_supersedes_the_programs_scratch_builds_once_it_solves, a_later_scratch_build_of_an_installed_program_is_in_the_world, an_interrupted_commit_is_finished_by_the_next_lock, a_repeated_sync_takes_the_fast_path, a_fast_path_records_a_missing_interpreter_pin
 
-A sync or clean solves the world it would leave, then writes the specs it
+A sync or `clean --uninstalled` solves the world it would leave, then writes the specs it
 adds, replaces or removes, so a solve that fails, or a process that dies
 before it records, leaves the store as it was. A commit that writes one
 spec and removes others is one step: a crash part-way through it is
@@ -128,7 +128,7 @@ Tests: a_sync_refuses_a_project_with_another_id, a_sync_refuses_a_missing_id, th
 An environment's store and its pixi project each hold the environment's
 id. Only the manager writes them, from the one data dir that holds both:
 it creates the store's id if absent and copies it to the project. A sync or
-clean whose two ids differ, or where either is absent, refuses before
+`clean --uninstalled` whose two ids differ, or where either is absent, refuses before
 writing. Model: tla/EnvWorld.tla (no_id_check, wrong_marker).
 
 ### DEP-13 A build under another state is a scratch build
@@ -141,4 +141,4 @@ scratch build under its program name qualified by a digest of that state's
 canonical path, even with `--installed`. The state is the compiler's:
 `MORLOC_STATE`, else `MORLOC_HOME`, else `$HOME/.local/share/morloc`. It never replaces a program installed in
 the environment, it does not replace that program's scratch builds, and
-`clean` drops it.
+`clean --uninstalled` drops it.

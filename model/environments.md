@@ -99,3 +99,20 @@ Tests: container_data_dirs_are_checked_under_the_runtime_prefix
 `doctor` checks the invariants of this spec that it can observe and exits
 non-zero on any failure (or any warning with `--strict`). A freshly created
 environment of every backend passes.
+
+### ENV-12 clean removes only what the environment regenerates
+Intent: ruled 2026-11-15
+Code: conforms 2026-11-15
+Tests: clean_removes_old_pool_outputs_and_keeps_the_crate_cache, clean_keeps_a_pool_built_in_the_last_hour, clean_crates_removes_the_crate_cache_but_not_locks_or_pins, clean_dry_run_removes_nothing, clean_waits_while_cargo_holds_a_lock, clean_removes_only_old_empty_eval_dirs_and_killed_lock_merges
+
+`mim clean` removes the Rust pool build outputs from the shared cargo
+target dir and stale temporary files: empty `morloc eval` work dirs and the
+staging files of a killed lock merge. `-c`/`--crates` also removes the
+compiled crate cache. `-u`/`--uninstalled` also drops the requirements of
+programs built but never installed and re-solves the environment to its
+installed programs (DEP-5). `--dry-run` reports what would go. It never
+removes an installed program, a module, the runtime, the requirement
+store's installed specs, the environment cargo lock or cargo's lock files.
+It holds every cargo lock of the target dir while it works, and leaves any
+pool build or temporary file changed in the last hour, so a build in
+flight is not broken. On the host it runs inside the environment.

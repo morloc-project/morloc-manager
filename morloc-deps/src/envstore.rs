@@ -901,7 +901,7 @@ impl EnvContext {
             self.finish_commit().map_err(|e| {
                 DepsError::Env(format!(
                     "{e}; an interrupted change to the requirements store could not be \
-                     finished. Removing {} and running `mim clean` resets the store.",
+                     finished. Removing {} and running `mim clean --uninstalled` resets the store.",
                     self.pending_commit_path().display()
                 ))
             })?;

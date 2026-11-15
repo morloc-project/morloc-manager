@@ -1,6 +1,7 @@
 mod arch;
 mod bridge;
 mod cert;
+mod clean;
 mod config;
 mod container;
 mod demos;
@@ -859,6 +860,33 @@ Examples:
         #[command(subcommand)]
         action: EnvAction,
     },
+    /// Remove build caches and temporary files from an environment
+    #[command(display_order = 9)]
+    #[command(after_help = "\
+Examples:
+  mim clean                  # pool build outputs and stale temporary files
+  mim clean myenv --crates   # also the compiled crate cache
+  mim clean --uninstalled    # also forget programs built but never installed
+  mim clean --dry-run
+
+Inside an environment, cleans that environment.")]
+    Clean {
+        /// Environment name (default: the default environment)
+        name: Option<String>,
+        /// Look up the system-scope environment (when name is shadowed locally)
+        #[arg(long)]
+        system: bool,
+        /// Also remove the compiled crate cache; the next Rust build recompiles it
+        #[arg(short = 'c', long)]
+        crates: bool,
+        /// Also drop the requirements of programs built but never installed,
+        /// and re-solve the environment to its installed programs
+        #[arg(short = 'u', long)]
+        uninstalled: bool,
+        /// Print what would be removed, and remove nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List running servers
     #[command(display_order = 27)]
     #[command(after_help = "\
@@ -870,7 +898,7 @@ Examples:
     //
     // These run INSIDE a managed environment, not on the host. The morloc
     // compiler invokes `mim sync ...` as its build hook (MORLOC_BUILD_HOOK points
-    // at this binary); `clean`/`spec` are for a user in an entered shell. Hidden
+    // at this binary); `spec` is for a user in an entered shell. Hidden
     // because they are an internal contract with the compiler, not part of the
     // manager's user-facing surface. See `envagent`.
     #[command(hide = true)]
@@ -889,9 +917,6 @@ Examples:
         #[arg(long)]
         installed: bool,
     },
-    /// Resolve with only installed modules (reset the world to its baseline)
-    #[command(hide = true)]
-    Clean,
     /// Print the merged pixi manifest for the current declared world
     #[command(hide = true)]
     Spec,
@@ -1160,7 +1185,7 @@ fn emits_json(cmd: &Cmd) -> bool {
         | Cmd::Demos { .. }
         | Cmd::Env { .. }
         | Cmd::Sync { .. }
-        | Cmd::Clean
+        | Cmd::Clean { .. }
         | Cmd::Spec => false,
     }
 }
@@ -1189,7 +1214,7 @@ fn subcommand_name(cmd: &Cmd) -> &'static str {
         Cmd::Env { .. } => "env",
         Cmd::Status => "status",
         Cmd::Sync { .. } => "sync",
-        Cmd::Clean => "clean",
+        Cmd::Clean { .. } => "clean",
         Cmd::Spec => "spec",
     }
 }
@@ -1239,6 +1264,76 @@ fn resolve_env_or_default(name: Option<String>) -> Result<(String, Scope, Enviro
         }
         None => environment::resolve_default_environment(),
     }
+}
+
+/// ENV-12: `mim clean`. Inside an environment it cleans that environment;
+/// on the host it runs itself inside the named one, through the environment's
+/// own agent, so both backends and every mount layout share one code path.
+fn clean_env(
+    verbose: bool,
+    name: Option<String>,
+    system: bool,
+    crates: bool,
+    uninstalled: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if std::env::var_os("MORLOC_ENV").is_some() {
+        if name.is_some() || system {
+            return Err(ManagerError::EnvError(
+                "inside an environment, `mim clean` cleans this one; drop the name".to_string(),
+            ));
+        }
+        let var = |k: &str| {
+            std::env::var_os(k).map(std::path::PathBuf::from).ok_or_else(|| {
+                ManagerError::EnvError(format!("{k} is not set; is this a morloc environment?"))
+            })
+        };
+        let roots = clean::Roots { state: var("MORLOC_STATE")?, home: var("MORLOC_HOME")? };
+        clean::clean_files(&roots, crates, dry_run)?;
+        if uninstalled {
+            if dry_run {
+                eprintln!("Would reset the requirements to the installed programs and re-solve.");
+            } else {
+                envagent::clean()?;
+            }
+        }
+        return Ok(());
+    }
+
+    let (env_name, scope, ec) = if system {
+        let n = name.ok_or_else(|| {
+            ManagerError::EnvError("--system needs an environment name".to_string())
+        })?;
+        let ec = cfg::read_env_config(Scope::System, &n)?;
+        (n, Scope::System, ec)
+    } else {
+        resolve_env_or_default(name)?
+    };
+    if !dry_run {
+        require_env_writable(scope, &env_name, "`mim clean`")?;
+    }
+    let mut args: Vec<String> = ["sh", "-c", "exec \"$MORLOC_BUILD_HOOK\" clean \"$@\"", "mim-clean"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for (on, flag) in [(crates, "--crates"), (uninstalled, "--uninstalled"), (dry_run, "--dry-run")] {
+        if on {
+            args.push(flag.to_string());
+        }
+    }
+    runner::run_in_env(
+        Some((env_name, scope, ec)),
+        runner::RunRequest {
+            verbose,
+            shell: false,
+            args,
+            user_env: Vec::new(),
+            engine_args: Vec::new(),
+            flagfile: None,
+            phase: Phase::Run,
+            slurm_bridge: false,
+        },
+    )
 }
 
 /// Shared body of the `run` and `shell` subcommands: resolve the target
@@ -3976,13 +4071,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             demos::run(list, tag, morloc_version, force)
         }
 
+        // ---- clean (ENV-12) ----
+        Cmd::Clean { name, system, crates, uninstalled, dry_run } => {
+            clean_env(verbose, name, system, crates, uninstalled, dry_run)
+        }
+
         // ---- in-environment dependency agent (hidden; run inside an env) ----
         Cmd::Sync { name, spec, root, installed } => {
             envagent::sync(&name, &spec, root.as_deref(), installed)?;
-            Ok(())
-        }
-        Cmd::Clean => {
-            envagent::clean()?;
             Ok(())
         }
         Cmd::Spec => {
