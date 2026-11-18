@@ -1033,6 +1033,10 @@ pub(crate) fn scan_modules(fdb_dir: &str) -> Result<Vec<ModuleEntry>> {
     #[derive(serde::Deserialize)]
     struct ModuleStub {
         name: String,
+        /// `name` for a stdlib module, `library/name` otherwise (compiler
+        /// PKG-3); records written before libraries carry only the name.
+        #[serde(default)]
+        key: Option<String>,
         #[serde(default)]
         version: Option<String>,
         #[serde(default)]
@@ -1052,7 +1056,7 @@ pub(crate) fn scan_modules(fdb_dir: &str) -> Result<Vec<ModuleEntry>> {
         let stub: ModuleStub = serde_json::from_slice(&bytes).map_err(|e| fail(&path, &e))?;
         let sha256: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         modules.push(ModuleEntry {
-            name: stub.name,
+            name: stub.key.unwrap_or(stub.name),
             version: stub.version,
             sha256,
             morloc_version: stub.morloc_version,
@@ -1336,6 +1340,19 @@ mod tests {
         fs::remove_dir_all(&fdb).unwrap();
         fs::write(&fdb, "").unwrap();
         assert!(scan_modules(&fdb.to_string_lossy()).is_err());
+    }
+
+    /// Two libraries' modules of one name are told apart by their key.
+    #[test]
+    fn a_module_record_is_named_by_its_key() {
+        let d = tempfile::tempdir().unwrap();
+        let fdb = d.path().join("fdb");
+        fs::create_dir_all(&fdb).unwrap();
+        fs::write(fdb.join("std.convert.module"), r#"{"name":"convert","library":"std","key":"convert"}"#).unwrap();
+        fs::write(fdb.join("bio.convert.module"), r#"{"name":"convert","library":"bio","key":"bio/convert"}"#).unwrap();
+        let mut names: Vec<String> = scan_modules(&fdb.to_string_lossy()).unwrap().into_iter().map(|m| m.name).collect();
+        names.sort();
+        assert_eq!(names, vec!["bio/convert".to_string(), "convert".to_string()]);
     }
 
     /// FRZ-5: the audit sees what staging copies: a link by its target, and
