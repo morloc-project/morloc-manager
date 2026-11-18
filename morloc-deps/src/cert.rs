@@ -276,8 +276,8 @@ fn validate_cert(der: &[u8]) -> Result<ValidatedCert, String> {
 fn parse_raw_der(bytes: &[u8]) -> Result<CertReport, CertError> {
     // Raw DER (no PEM armor): decode as many concatenated certificates as parse,
     // so a multi-certificate DER bundle is not silently reduced to its first
-    // entry. Trailing non-certificate bytes (e.g. a newline) end the loop and are
-    // ignored, mirroring the leniency of the PEM path.
+    // entry. Trailing whitespace is ignored; a trailing DER object is not a
+    // certificate (a key appended to the bundle) and is refused like a PEM key.
     let mut certs = Vec::new();
     let mut rest = bytes;
     while let Ok((tail, cert)) = X509Certificate::from_der(rest) {
@@ -289,6 +289,9 @@ fn parse_raw_der(bytes: &[u8]) -> Result<CertReport, CertError> {
         rest = tail;
     }
     if !certs.is_empty() {
+        if rest.iter().find(|b| !b.is_ascii_whitespace()) == Some(&0x30) {
+            return Err(CertError::KeyMaterial { label: "DER object after the certificates".to_string() });
+        }
         return Ok(CertReport { certs, excluded: Vec::new() });
     }
     // Not a certificate. Distinguish "binary DER that isn't a cert" (a key or
@@ -436,6 +439,19 @@ mod tests {
         der.extend_from_slice(pems[1].contents());
         let report = parse_bundle(&der).unwrap();
         assert_eq!(report.certs.len(), 2, "both concatenated DER certs kept");
+    }
+
+    /// PROV-9: a DER object after the certificates (a key appended to the
+    /// bundle) is refused, as a key in a PEM bundle is; whitespace is not.
+    #[test]
+    fn raw_der_with_a_trailing_key_is_refused() {
+        let pems = pem::parse_many(public_roots_pem()).unwrap();
+        let mut der = pems[0].contents().to_vec();
+        der.extend_from_slice(&[0x30u8, 0x03, 0x02, 0x01, 0x00]);
+        assert!(matches!(parse_bundle(&der), Err(CertError::KeyMaterial { .. })));
+        let mut ok = pems[0].contents().to_vec();
+        ok.extend_from_slice(b"\n");
+        assert_eq!(parse_bundle(&ok).unwrap().certs.len(), 1);
     }
 
     #[test]

@@ -7,7 +7,7 @@ shape.
 
 ### IFC-1 The compiler writes and mim reads
 Intent: proposed
-Code: unaudited
+Code: conforms 2026-11-15
 
 In every contract the compiler or its release CI is the writer and mim the
 reader, so compatibility is mim's job. Each document carries a version. The
@@ -16,11 +16,11 @@ compiler holds the matching values in `Morloc.Version`.
 
 ### IFC-2 envspec.json states one program's requirements
 Intent: proposed
-Code: unaudited
+Code: deviates F76
 
-`morloc make` and `morloc envspec` write it into the program's build
-directory; mim also writes one for the languages pinned with `--lang`. Its
-fields:
+`morloc make` writes it into the program's build directory and `morloc
+envspec` prints it; mim also writes one for the languages pinned with
+`--lang`. Its fields:
 
 - `envspec_version`, an integer (DEP-2 gives the versions mim reads);
 - `morloc_version`, the writing compiler's version;
@@ -37,7 +37,7 @@ fields:
 
 ### IFC-3 A package requirement is tagged by its source
 Intent: proposed
-Code: unaudited
+Code: deviates F82, F86
 
 Each requirement has a `name` and a `source`, which fixes its other fields:
 
@@ -54,7 +54,7 @@ and `bioconductor` are not provisioned.
 
 ### IFC-4 morloc lang-support states the compiler's own requirements
 Intent: proposed
-Code: unaudited
+Code: conforms 2026-11-15
 
 `morloc lang-support` prints a document with a `schema_version`
 (`MAJOR.MINOR`; a new language or field is a minor bump), the compiler's
@@ -67,8 +67,9 @@ package, its allowed version range and a default; null for C++), a
 requirements that are not optional, and ignores `phase`.
 
 ### IFC-5 A development environment derives lang-support from source
-Intent: proposed
-Code: unaudited
+Intent: ruled 2026-11-15
+Code: conforms 2026-11-15
+Tests: a_dev_environment_stores_its_dev_conda_packages
 
 For an environment built from a compiler source tree, mim builds the same
 document from the tree's language files instead of calling the compiler.
@@ -77,19 +78,20 @@ the compiler itself; a released compiler never emits them.
 
 ### IFC-6 The release manifest describes one compiler release
 Intent: proposed
-Code: unaudited
+Code: conforms 2026-11-15
 
 `morloc-release-manifest.json`, published with each release, holds a
 `schema` integer, the release `version`, the name of the runtime source
 archive (`rust_src`), the compiler's contract `versions` (as printed by
 `morloc versions`: `morloc_version`, `abi_version`, `envspec_version`,
-`lang_support_schema`), a map from platform (`linux-x86_64`, ...) to the
-compiler asset name, and the `sha256` of every asset. PROV-1 to PROV-3 and
+`lang_support_schema`), a `triples` map from platform (`linux-x86_64`,
+...) to that platform's assets (the compiler under `morloc`), and the
+`sha256` of every asset. PROV-1 to PROV-3 and
 PROV-6 say how mim uses it.
 
 ### IFC-7 A managed process tells the compiler which hook to call
 Intent: proposed
-Code: unaudited
+Code: deviates F78
 
 mim exports `MORLOC_ENV`, `MORLOC_BUILD_HOOK` and `MORLOC_BIN` together
 (RUN-2). The compiler calls the hook only when `MORLOC_ENV` is set, and
@@ -100,7 +102,7 @@ development (PROV-8).
 
 ### IFC-8 The hook call
 Intent: proposed
-Code: unaudited
+Code: deviates F79
 
 The command line is DEP-1's. `--name` is the program's key in the store;
 `--spec` is the program's envspec (IFC-2); `--root` is the entry module's
@@ -111,7 +113,8 @@ the environment's own state).
 
 ### IFC-9 The hook reads its environment from the launcher
 Intent: proposed
-Code: unaudited
+Code: conforms 2026-11-15
+Tests: an_empty_pixi_variable_means_pixi_on_path
 
 Besides IFC-7's variables, the hook reads `MORLOC_HOME` (the runtime,
 required), `MORLOC_ENV_STORE` (the environment's store, required; DEP-11),

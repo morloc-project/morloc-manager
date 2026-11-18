@@ -70,4 +70,6 @@ GitHub issue. When a problem is fixed, trim its text.
 `model/check.sh` fails when an ID is defined twice, a prefix is used in two
 files, an `Intent` or `Code` field is missing or malformed, a `ruled` item
 cites no test, an `open` or `retired` item cites one, a cited test does not
-exist, or a spec file contains a non-ASCII character.
+exist, a spec file contains a non-ASCII character, an issue whose first line
+cites an item (`DEP-3, DEP-7.`) is not named in that item's `Code` (open
+items excepted), or a `Code` names an issue that does not exist.

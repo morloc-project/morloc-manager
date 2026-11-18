@@ -2,7 +2,7 @@
 
 ### DEP-1 The build hook is mim's only entry point during a build
 Intent: proposed
-Code: unaudited
+Code: conforms 2026-11-15
 
 Inside an environment, `morloc make` runs
 `$MORLOC_BUILD_HOOK sync --name <key> --spec envspec.json --root <dir>
@@ -12,7 +12,8 @@ to standard error.
 
 ### DEP-2 A spec of another version is refused with the direction of the fix
 Intent: proposed
-Code: unaudited
+Code: deviates F80
+Tests: a_refused_schema_names_the_direction_of_the_fix
 
 The envspec and lang-support documents carry versions. mim accepts the
 envspec versions it reads (2, and 3, which adds tools; a version 2 spec
@@ -21,7 +22,7 @@ version, and refuses others with "rebuild the program" or "upgrade mim".
 
 ### DEP-3 One solved world per environment
 Intent: proposed
-Code: unaudited
+Code: deviates F65, F68, F79, F81
 
 An environment has one set of packages: the solve of the union of every
 installed program's spec, every scratch build's spec, the compiler's own
@@ -30,7 +31,7 @@ One package has one version. Unsatisfiable requirements fail the command.
 
 ### DEP-4 Solves of one environment are serialized
 Intent: ruled 2026-11-04
-Code: conforms 2026-11-04
+Code: deviates F71, F72
 Tests: the_environment_lock_is_the_one_the_hook_takes, a_waiter_locks_the_stores_current_lock_file, a_lock_for_another_environment_is_refused, only_the_managers_lock_creates_the_store
 
 One exclusive lock per environment, a file in its store, is shared by the
@@ -73,7 +74,7 @@ tla/EnvWorld.tla (digest_only).
 
 ### DEP-7 Versions move only when the requirements force them
 Intent: proposed
-Code: deviates F18
+Code: deviates F18, F65
 
 A solve first tries the existing lock unchanged and re-solves only if the
 lock cannot satisfy the new requirements. Once an interpreter is
@@ -83,7 +84,7 @@ rebuilt, or refused in an immutable environment.
 
 ### DEP-8 Every declared dependency is provided, delegated, or refused
 Intent: proposed
-Code: unaudited
+Code: deviates F65, F82, F83
 
 conda and PyPI packages are solved into the world, and so are tools, the
 conda packages whose executables a program runs. Crates are left to
@@ -92,16 +93,18 @@ support are refused, never dropped. Two conflicting declarations of one
 package (two channels, two local paths, a path and a version) are refused.
 
 ### DEP-9 An installed program does not depend on its project directory
-Intent: proposed
-Code: unaudited
+Intent: ruled 2026-11-15
+Code: conforms 2026-11-15
+Tests: a_snapshot_keeps_subpackages_named_like_build_output, a_store_sweep_keeps_what_the_store_references
 
 A local Python package of an installed program is copied into the
 environment under the hash of its contents and the requirement points at
 the copy. Snapshots no installed program references are reclaimed.
 
 ### DEP-10 An immutable environment refuses any change to its world
-Intent: proposed
-Code: unaudited
+Intent: ruled 2026-11-15
+Code: deviates F86
+Tests: a_sync_says_whether_it_would_change_the_world
 
 In an environment marked immutable (a running server, a frozen image), a
 sync that would change the world or rebuild a binding fails before writing
@@ -133,7 +136,7 @@ writing. Model: tla/EnvWorld.tla (no_id_check, wrong_marker).
 
 ### DEP-13 A build under another state is a scratch build
 Intent: ruled 2026-11-04
-Code: conforms 2026-11-04
+Code: deviates F69, F70
 Tests: a_build_under_another_state_is_recorded_as_scratch, one_state_has_one_scratch_key_however_it_is_spelled, a_build_with_no_state_set_uses_the_compilers_default_state
 
 A sync whose state is not the environment's store records its spec as a

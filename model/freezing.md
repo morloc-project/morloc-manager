@@ -1,8 +1,9 @@
 # Freezing (FRZ)
 
 ### FRZ-1 A frozen image is the environment with nothing mounted
-Intent: proposed
-Code: unaudited
+Intent: ruled 2026-11-15
+Code: conforms 2026-11-15
+Tests: staging_copies_links_inside_the_environment_and_refuses_others
 
 `freeze` builds an image holding the environment's image, its toolchain
 installed from its lock, its runtime, every installed program with its
@@ -11,27 +12,29 @@ the views without access to the host that built it.
 
 ### FRZ-2 Only a Docker or Podman release environment can be frozen
 Intent: proposed
-Code: unaudited
+Code: conforms 2026-11-15
 
 Native, Apptainer, development and local-runtime environments are refused.
 
 ### FRZ-3 The toolchain in the image is the locked one
 Intent: proposed
-Code: unaudited
+Code: conforms 2026-11-15
 
 Packages are installed from the environment's lock without re-solving; a
 lock that does not install fails the freeze.
 
 ### FRZ-4 Freezing does not change the environment
-Intent: proposed
-Code: unaudited
+Intent: ruled 2026-11-15
+Code: deviates F114
+Tests: a_staging_dir_is_per_run_and_removed
 
 `freeze` reads the environment and writes only the image (and an archive if
 asked).
 
 ### FRZ-5 Freezing refuses what should not ship
-Intent: proposed
-Code: unaudited
+Intent: ruled 2026-11-15
+Code: conforms 2026-11-15
+Tests: the_audit_follows_links_and_covers_every_staged_directory
 
 Tool state in a program directory (version control, caches, virtual
 environments, build output) is refused. Large programs, large files and an
@@ -39,8 +42,9 @@ environment with no programs are confirmed by the user; without a terminal,
 confirmation is refusal. A force flag answers all of them.
 
 ### FRZ-6 The image decides nothing about who can reach it
-Intent: proposed
-Code: unaudited
+Intent: ruled 2026-11-15
+Code: conforms 2026-11-15
+Tests: a_command_argument_stays_one_element, an_eval_allow_entry_is_one_module_name
 
 Inside the image the server listens on every interface on one fixed port;
 the publisher of the port decides reachability. A token, if set at run
@@ -49,14 +53,14 @@ waived at run time (SERVE-5).
 
 ### FRZ-7 The image describes itself
 Intent: proposed
-Code: unaudited
+Code: conforms 2026-11-15
 
 Labels on the image record the Morloc version, the source environment, the
 programs, each adapter's modules, and the suggested shared-memory size.
 
 ### FRZ-8 A slim image runs every program it ships
 Intent: proposed
-Code: unaudited
+Code: deviates F116
 
 A slim image drops compilers, the solver, the Morloc compiler and build-only
 packages, except a tool a program declares and everything that tool depends

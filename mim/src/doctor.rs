@@ -256,7 +256,8 @@ pub fn native_doctor(
     check_cert_bundle(&mut c, ec);
     check_native_runtime(&mut c, env_name, rt.as_ref());
     check_fhs_sandbox(&mut c, rt.as_ref());
-    check_state(&mut c, &data_dir);
+    let administers = scope == Scope::Local || cfg::dir_writable(&cfg::data_dir(Scope::System));
+    check_state(&mut c, &data_dir, administers);
     if let Some(ref rt) = rt {
         check_activation_toolchain(&mut c, rt);
     }
@@ -425,12 +426,13 @@ fn runtime_dir_from_activation(activation: &[(String, String)]) -> Option<PathBu
         .map(|p| p.to_path_buf())
 }
 
-/// The provisioned runtime version: the `.provisioned` stamp, else the version
-/// segment of the store path (`runtimes/<version>/<triple>/`).
+/// The provisioned runtime version: the first line of the `.provisioned`
+/// stamp, else the version segment of the store path
+/// (`runtimes/<version>/<triple>/`).
 fn runtime_store_version(runtime_dir: &Path) -> Option<String> {
     fs::read_to_string(runtime_dir.join(".provisioned"))
         .ok()
-        .map(|s| s.trim().to_string())
+        .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
         .filter(|s| !s.is_empty())
         .or_else(|| {
             runtime_dir
@@ -986,10 +988,12 @@ fn check_dep_world(c: &mut Counts, pixi_dir: &Path) {
 
 /// State hygiene: the data dir is writable (build/serve/freeze all write), and
 /// no shared-memory segments leaked from a prior crash.
-fn check_state(c: &mut Counts, data_dir: &Path) {
+/// `administers`: whether the caller may change the environment (ENV-10); a
+/// user of a system environment runs in it without writing its data dir.
+fn check_state(c: &mut Counts, data_dir: &Path, administers: bool) {
     // Only probe writability when the dir exists (its absence is reported by
     // check_data_dirs); otherwise the ENOENT would read as a permissions issue.
-    if data_dir.is_dir() {
+    if administers && data_dir.is_dir() {
         let probe = data_dir.join(".doctor-write-probe");
         match fs::write(&probe, b"") {
             Ok(_) => {
@@ -1680,6 +1684,33 @@ fn check_slurm_prereqs(c: &mut Counts, engine: ContainerEngine, ec: &Environment
 #[cfg(test)]
 mod mount_home_tests {
     use super::*;
+
+    /// ENV-10, ENV-11: a user of a system environment, who may not change it,
+    /// is not told its read-only data dir is a failure.
+    #[test]
+    fn a_read_only_data_dir_fails_only_whoever_administers_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        fs::set_permissions(d.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(d.path().join("probe"), b"").is_ok() {
+            return; // running as root: nothing is read-only
+        }
+        let mut user = Counts::new(true);
+        check_state(&mut user, d.path(), false);
+        assert_eq!(user.fail, 0);
+        let mut admin = Counts::new(true);
+        check_state(&mut admin, d.path(), true);
+        assert_eq!(admin.fail, 1);
+        fs::set_permissions(d.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A stamp carries its asset digests after the version line.
+    #[test]
+    fn the_runtime_version_is_the_stamps_first_line() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join(".provisioned"), "0.98.3\nmorloc-linux aa\nsrc.tar.gz cc\n").unwrap();
+        assert_eq!(runtime_store_version(d.path()).as_deref(), Some("0.98.3"));
+    }
 
     /// The way out of a vanished host home is `--no-mount-home`; every value
     /// given to `--mount-home` is a path, so advising a word would create and

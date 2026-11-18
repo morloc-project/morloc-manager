@@ -1,8 +1,9 @@
 # Environments (ENV)
 
 ### ENV-1 An environment is a name in a scope
-Intent: proposed
-Code: unaudited
+Intent: ruled 2026-11-15
+Code: conforms 2026-11-15
+Tests: a_lookup_refuses_a_name_that_leaves_the_tree, a_listed_legacy_environment_is_found
 
 The scope is *local* (one user) or *system* (every user on the machine).
 A name is 1-64 characters of ASCII letters, digits, `-`, `_` and `.`,
@@ -19,7 +20,7 @@ invisible, unremovable remnant.
 
 ### ENV-3 Each scope has a configuration root and a data root
 Intent: proposed
-Code: unaudited
+Code: deviates F93
 
 An environment's configuration (settings, views, the serve record) lives
 under the scope's configuration root and is never visible inside the
@@ -76,8 +77,8 @@ This includes a solve started by the build hook (DEP-4).
 
 ### ENV-9 The Morloc version moves only when asked
 Intent: proposed
-Code: conforms 2026-10-09
-Tests: install_into_a_version_less_environment_is_refused
+Code: conforms 2026-11-15
+Tests: install_into_a_version_less_environment_is_refused, an_unreadable_module_manifest_is_an_error
 
 An environment records the Morloc version it was provisioned with. Only
 `update --latest` and `update --morloc-version` change it; every other
@@ -86,15 +87,15 @@ declared Morloc range excludes the target, unless overridden.
 
 ### ENV-10 A system environment is changed only by root
 Intent: proposed
-Code: unaudited
+Code: conforms 2026-11-15
 
 Creating, changing, serving and removing a system environment require root.
 Running commands in it and making it a personal default do not.
 
 ### ENV-11 doctor passes on every healthy environment
 Intent: proposed
-Code: unaudited
-Tests: container_data_dirs_are_checked_under_the_runtime_prefix
+Code: deviates F94
+Tests: container_data_dirs_are_checked_under_the_runtime_prefix, a_read_only_data_dir_fails_only_whoever_administers_it
 
 `doctor` checks the invariants of this spec that it can observe and exits
 non-zero on any failure (or any warning with `--strict`). A freshly created
@@ -103,7 +104,7 @@ environment of every backend passes.
 ### ENV-12 clean removes only what the environment regenerates
 Intent: ruled 2026-11-15
 Code: conforms 2026-11-15
-Tests: clean_removes_old_pool_outputs_and_keeps_the_crate_cache, clean_keeps_a_pool_built_in_the_last_hour, clean_crates_removes_the_crate_cache_but_not_locks_or_pins, clean_dry_run_removes_nothing, clean_waits_while_cargo_holds_a_lock, clean_removes_only_old_empty_eval_dirs_and_killed_lock_merges
+Tests: clean_removes_old_pool_outputs_and_keeps_the_crate_cache, clean_keeps_a_pool_built_in_the_last_hour, clean_crates_removes_the_crate_cache_but_not_locks_or_pins, clean_dry_run_removes_nothing, clean_waits_while_cargo_holds_a_lock, clean_removes_only_old_empty_eval_dirs_and_killed_lock_merges, clean_inside_a_native_environment_uses_the_compilers_state
 
 `mim clean` removes the Rust pool build outputs from the shared cargo
 target dir and stale temporary files: empty `morloc eval` work dirs and the

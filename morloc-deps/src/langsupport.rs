@@ -121,14 +121,16 @@ impl LangSupport {
                     self.schema_version
                 ))
             })?;
-        if major != crate::version::LANG_SCHEMA_MAJOR {
-            return Err(DepsError::Env(format!(
-                "lang-support schema_version {} is incompatible with this mim \
-                 (supports {}.x); upgrade mim or morloc.",
-                self.schema_version, crate::version::LANG_SCHEMA_MAJOR
-            )));
-        }
-        Ok(())
+        let fix = match major.cmp(&crate::version::LANG_SCHEMA_MAJOR) {
+            std::cmp::Ordering::Equal => return Ok(()),
+            std::cmp::Ordering::Greater => "upgrade mim",
+            std::cmp::Ordering::Less => "use a newer morloc release",
+        };
+        Err(DepsError::Env(format!(
+            "lang-support schema_version {} is incompatible with this mim (supports {}.x); {fix}.",
+            self.schema_version,
+            crate::version::LANG_SCHEMA_MAJOR
+        )))
     }
 
     /// Build the table by parsing a morloc SOURCE tree's requirement YAMLs
@@ -250,6 +252,19 @@ mod tests {
         assert!(LangSupport::from_json(r#"{"schema_version":"1.7","morloc_version":"0"}"#).is_ok());
     }
 
+    /// DEP-2: a refusal names the side to move.
+    #[test]
+    fn a_refused_schema_names_the_direction_of_the_fix() {
+        let newer = LangSupport::from_json(r#"{"schema_version":"2.0","morloc_version":"0"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(newer.contains("upgrade mim") && !newer.contains("or morloc"), "{newer}");
+        let older = LangSupport::from_json(r#"{"schema_version":"0.9","morloc_version":"0"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(older.contains("newer morloc release") && !older.contains("upgrade mim"), "{older}");
+    }
+
     /// Parse the actual repo `data/lang/*.yaml` (three levels up from this crate).
     /// This is the conformance guard: the Rust `from_source_dir` must agree with
     /// the Haskell `renderLangSupport` on the same inputs -- so it asserts the
@@ -257,10 +272,18 @@ mod tests {
     /// against the real data. Skips gracefully if run outside the source tree.
     #[test]
     fn from_source_dir_parses_repo_yamls() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        if !root.join(crate::layout::CORE_REQUIREMENTS).is_file() {
-            return; // out-of-tree build; nothing to check
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../compiler/morloc");
+        if !root.is_dir() {
+            eprintln!("skipped: no compiler tree at {}", root.display());
+            return;
         }
+        assert!(
+            root.join(crate::layout::CORE_REQUIREMENTS).is_file(),
+            "{} has no {}",
+            root.display(),
+            crate::layout::CORE_REQUIREMENTS
+        );
         let ls = LangSupport::from_source_dir(&root, "0.98.1").unwrap();
         // The stdlib base is injected, not read from the source's own version.
         assert_eq!(ls.morloc_version, "0.98.1");

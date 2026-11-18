@@ -648,17 +648,8 @@ impl EnvContext {
         let cache_path = self.activation_cache_path();
         let digest_path = self.solved_digest_path();
         let prefix = crate::abi::conda_prefix(&pixi_dir);
-        // DEP-6: the recorded digest names the world and the manifest that solve
-        // wrote; a manifest another writer replaced since is solved again.
-        let on_disk = std::fs::read_to_string(pixi_dir.join("pixi.toml")).ok();
-        let unchanged = match (std::fs::read_to_string(&digest_path), on_disk) {
-            (Ok(prev), Some(manifest)) => prev == solved_digest(&digest, &manifest),
-            _ => false,
-        };
-        if unchanged && prefix.is_dir() {
-            if let Some(activation) = read_activation_cache(&cache_path) {
-                return Ok(SolveOutcome { activation, solved: false });
-            }
+        if let Some(activation) = self.solved_activation(&reqs) {
+            return Ok(SolveOutcome { activation, solved: false });
         }
         // Invalidate the cached activation BEFORE touching the prefix. Otherwise an
         // interrupted materialize (SIGKILL mid install) that has already written the
@@ -754,6 +745,51 @@ impl EnvContext {
     /// solve. The store changes only after the solve succeeds, so a failed or
     /// interrupted sync leaves it as it was. The world solved is the one the
     /// store then holds, in gather order.
+    /// DEP-6: the activation of the last successful solve here, when that solve
+    /// was of exactly `reqs`. The recorded digest names the world and the
+    /// manifest the solve wrote, so a manifest another writer replaced since,
+    /// a missing prefix or a missing activation all mean "not solved".
+    fn solved_activation(&self, reqs: &crate::pixi::RequirementSet) -> Option<Vec<(String, String)>> {
+        let pixi_dir = self.pixi_dir();
+        let manifest = std::fs::read_to_string(pixi_dir.join("pixi.toml")).ok()?;
+        let prev = std::fs::read_to_string(self.solved_digest_path()).ok()?;
+        let digest = crate::pixi::requirement_digest(reqs);
+        if prev != solved_digest(&digest, &manifest) || !crate::abi::conda_prefix(&pixi_dir).is_dir() {
+            return None;
+        }
+        read_activation_cache(&self.activation_cache_path())
+    }
+
+    /// DEP-10: whether `sync` of this spec would change the solved world. It
+    /// would not when the last solve here was of the same world, or, with that
+    /// record gone (`mim update` drops it, a frozen image never carries it),
+    /// when the manifest on disk is the one this world renders and the prefix
+    /// exists. Writes nothing.
+    pub fn sync_changes_world(
+        &self,
+        program: &str,
+        provenance: Provenance,
+        spec_json: &str,
+        supersede_scratch: bool,
+        inputs: &SolveInputs,
+    ) -> Result<bool> {
+        let spec = EnvSpec::from_json(spec_json)?;
+        let change = Change {
+            path: self.spec_path(program, provenance, &spec)?,
+            spec,
+            drop: if supersede_scratch { self.named_paths(program, Provenance::Scratch)? } else { Vec::new() },
+        };
+        let specs = self.sync_world_with(Some(&change))?;
+        let reqs = self.requirement_set(&specs, inputs)?;
+        if self.solved_activation(&reqs).is_some() {
+            return Ok(false);
+        }
+        let pixi_dir = self.pixi_dir();
+        let on_disk = std::fs::read_to_string(pixi_dir.join("pixi.toml")).ok();
+        let same = on_disk.as_deref() == Some(crate::pixi::render_manifest(&reqs).as_str());
+        Ok(!(same && crate::abi::conda_prefix(&pixi_dir).is_dir()))
+    }
+
     pub fn sync(
         &self,
         lock: &EnvLock,
@@ -1687,6 +1723,31 @@ mod tests {
             ctx.sync(&lock, name, prov, &spec(r#"{"lang":"py"}"#), false, &inputs).unwrap();
             assert_eq!(installs(&pixi), n, "{name} solved again");
         }
+    }
+
+    /// DEP-10: an immutable environment asks, writing nothing, whether a sync
+    /// would change its solved world.
+    #[test]
+    fn a_sync_says_whether_it_would_change_the_world() {
+        let (d, ctx) = ctx();
+        adopted(&ctx);
+        let pixi = fake_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        let lock = ctx.lock_env().unwrap();
+        let same = spec(r#"{"lang":"py"}"#);
+        assert!(ctx.sync_changes_world("p", Provenance::Scratch, &same, false, &inputs).unwrap());
+        ctx.sync(&lock, "p", Provenance::Scratch, &same, false, &inputs).unwrap();
+        assert!(!ctx.sync_changes_world("p", Provenance::Scratch, &same, false, &inputs).unwrap());
+        // `mim update` forgets the agent's solve record, and a frozen image does
+        // not carry it; the manifest on disk still names the solved world.
+        std::fs::remove_file(ctx.solved_digest_path()).unwrap();
+        assert!(!ctx.sync_changes_world("p", Provenance::Scratch, &same, false, &inputs).unwrap());
+        let before = texts(&ctx.gather().unwrap());
+        let moved = spec(r#"{"lang":"py","constraint":"3.11.*"}"#);
+        assert!(ctx.sync_changes_world("q", Provenance::Scratch, &moved, false, &inputs).unwrap());
+        assert_eq!(texts(&ctx.gather().unwrap()), before);
     }
 
     /// A scratch build made after an install of the same name is part of the

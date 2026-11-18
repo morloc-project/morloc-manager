@@ -313,6 +313,12 @@ pub fn read_active_config() -> Option<Config> {
 /// env.json for envs created before the YAML switch.
 pub fn read_env_config(scope: Scope, name: &str) -> Result<EnvironmentConfig> {
     let yaml_path = env_config_path(scope, name);
+    // ENV-1: only a listed name is read, so a name with `/` or `..` never
+    // leaves the tree, and an older environment whose name is invalid today
+    // stays readable by the name it is listed under.
+    if !env_listed(scope, name) {
+        return Err(ManagerError::ConfigNotFound(yaml_path.display().to_string()));
+    }
     let ec = if yaml_path.is_file() {
         read_yaml_config(&yaml_path)?
     } else {
@@ -555,15 +561,19 @@ pub fn write_views(scope: Scope, name: &str, views: &ViewSet) -> Result<()> {
 pub fn find_env_scope(name: &str) -> Result<Scope> {
     // The name becomes a path component; `..` or `/` would leave the tree.
     crate::environment::validate_env_name(name)?;
-    let local_path = env_config_path(Scope::Local, name);
-    if local_path.is_file() {
-        return Ok(Scope::Local);
-    }
-    let sys_path = env_config_path(Scope::System, name);
-    if sys_path.is_file() {
-        return Ok(Scope::System);
+    for scope in [Scope::Local, Scope::System] {
+        if env_listed(scope, name) {
+            return Ok(scope);
+        }
     }
     Err(ManagerError::EnvironmentNotFound(name.to_string()))
+}
+
+/// Whether `name` is an environment of `scope` under exactly that spelling. A
+/// path test alone would let `FOO` find `foo` on a case-folding filesystem,
+/// while every engine name derived from `FOO` names nothing.
+fn env_listed(scope: Scope, name: &str) -> bool {
+    list_env_names(scope).iter().any(|n| n == name)
 }
 
 /// List environment names in a given scope. Recognizes both env.yaml (new) and
@@ -1006,6 +1016,32 @@ mod tests {
             Some(crate::types::LocalRuntimeConfig { source: "/rt".to_string() });
         let err = migrate_env_config(ec).expect_err("dev + local_runtime must fail");
         assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    /// ENV-1: a lookup reads only a listed environment, so a `--system` lookup
+    /// of `../x` never reads a record outside the environments tree.
+    #[test]
+    fn a_lookup_refuses_a_name_that_leaves_the_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        test_roots::set(tmp.path());
+        let outside = config_dir(Scope::System).join("x");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("env.yaml"), V1_YAML).unwrap();
+        assert!(matches!(read_env_config(Scope::System, "../x"), Err(ManagerError::ConfigNotFound(_))));
+    }
+
+    /// ENV-1: a lookup finds the name exactly as listed, so a legacy
+    /// `env.json` environment is found as well as listed.
+    #[test]
+    fn a_listed_legacy_environment_is_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        test_roots::set(tmp.path());
+        let dir = env_config_dir(Scope::Local, "old");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("env.json"), "{}").unwrap();
+        assert_eq!(list_env_names(Scope::Local), vec!["old".to_string()]);
+        assert_eq!(find_env_scope("old").unwrap(), Scope::Local);
+        assert!(find_env_scope("OLD").is_err());
     }
 
     /// An unreadable `env-inputs.json` is an error, not "no pins": treating it

@@ -27,6 +27,7 @@ pub fn serve_environment(
     extra_flags: &[String],
     shm_size: &Option<String>,
     user_env: &[(String, String)],
+    secret_env: &[(String, String)],
     command: &[String],
     mount_home: Option<&str>,
     platform: Option<Arch>,
@@ -46,6 +47,7 @@ pub fn serve_environment(
             ports,
             extra_flags,
             user_env,
+            secret_env,
             command,
         );
     }
@@ -71,7 +73,7 @@ pub fn serve_environment(
     let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
     let cfg = serve_run_config(
         image, data_dir, container_name, ports, publish_host, network, extra_flags, shm_size,
-        user_env, command, mount_home, suffix, platform,
+        user_env, secret_env, command, mount_home, suffix, platform,
     )?;
 
     if verbose {
@@ -378,6 +380,7 @@ fn serve_run_config(
     extra_flags: &[String],
     shm_size: &Option<String>,
     user_env: &[(String, String)],
+    secret_env: &[(String, String)],
     command: &[String],
     mount_home: Option<&str>,
     selinux_suffix: &str,
@@ -416,6 +419,7 @@ fn serve_run_config(
     // persistent runtime mount) is NOT marked, so on-demand works there.
     cfg.env.push(("MORLOC_IMMUTABLE".to_string(), "1".to_string()));
     cfg.env.extend(user_env.iter().cloned());
+    cfg.secret_env = secret_env.to_vec();
     cfg.command = Some(command.to_vec());
     cfg.shm_size = shm_size.clone();
     cfg.extra_flags = vec!["-d".to_string()];
@@ -760,6 +764,7 @@ fn serve_apptainer_instance(
     ports: &[(u16, u16)],
     extra_flags: &[String],
     user_env: &[(String, String)],
+    secret_env: &[(String, String)],
     command: &[String],
 ) -> Result<()> {
     // Stop any leftover instance with this name from a previous run.
@@ -831,6 +836,7 @@ fn serve_apptainer_instance(
 
     let status = Command::new(exe)
         .args(&argv)
+        .envs(crate::container::apptainer_forwarded(secret_env))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1043,6 +1049,24 @@ mod tests {
     /// mounts, and on an SELinux host each is readable only once relabelled.
     /// The suffix the caller decides on must land on every bind mount and on
     /// no engine volume, which is engine storage and cannot be relabelled.
+    /// SERVE-4: the token of a served container is named on the engine's
+    /// command line and valued only in the engine process's environment.
+    #[test]
+    fn a_served_containers_token_is_off_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_string_lossy().to_string();
+        let secret = vec![("MORLOC_MCP_TOKEN".to_string(), "tok-123".to_string())];
+        let cmd = vec!["morloc-nexus".to_string()];
+        let cfg = serve_run_config(
+            "img", &data_dir, "n", &[(8080, 8080)], None, None, &[], &None, &[], &secret, &cmd,
+            None, "", None,
+        )
+        .unwrap();
+        let args = crate::container::build_run_args(ContainerEngine::Podman, &[], &cfg);
+        assert!(!args.iter().any(|a| a.contains("tok-123")), "{args:?}");
+        assert_eq!(crate::container::engine_process_env(ContainerEngine::Podman, &cfg), secret);
+    }
+
     #[test]
     fn a_served_container_relabels_every_bind_mount_and_no_volume() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1050,7 +1074,7 @@ mod tests {
         let cmd = vec!["morloc-nexus".to_string(), "router".to_string()];
         let cfg = serve_run_config(
             "img", &data_dir, "morloc-serve-dev", &[(8080, 8080)], None, None, &[], &None, &[],
-            &cmd, None, ":z", None,
+            &[], &cmd, None, ":z", None,
         )
         .unwrap();
         let args = crate::container::build_run_args(

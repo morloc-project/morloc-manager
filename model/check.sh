@@ -66,6 +66,35 @@ for item, d in items.items():
         if t not in tests:
             errors.append(f"{d['where']}: test {t} does not exist")
 
+issues = {}
+list_path = os.path.join(model, "issues", "LIST.md")
+lines = open(list_path, encoding="utf-8").read().split("\n")
+for n, line in enumerate(lines, 1):
+    m = re.match(r"### F(\d+) ", line)
+    if not m:
+        continue
+    first = next((l for l in lines[n:] if l.strip()), "")
+    cited = []
+    lead = re.match(r"((?:[A-Z]+-\d+(?:/\d+)*)(?:, [A-Z]+-\d+(?:/\d+)*)*)[ .]", first)
+    if lead:
+        for ref in lead[1].split(", "):
+            pre, nums = ref.split("-", 1)
+            cited += [f"{pre}-{k}" for k in nums.split("/")]
+    issues[f"F{m[1]}"] = (n, cited)
+
+for f, (n, cited) in issues.items():
+    for item in cited:
+        d = items.get(item)
+        if d is None:
+            errors.append(f"issues/LIST.md:{n}: {f} cites unknown item {item}")
+        elif d["intent"] != "open" and not re.search(rf"\b{f}\b", d["code"] or ""):
+            errors.append(f"{d['where']}: {item} is cited by {f} but its Code does not name it")
+for item, d in items.items():
+    if d["code"] and d["code"].startswith("Code: deviates"):
+        for f in re.findall(r"\bF\d+\b", d["code"]):
+            if f not in issues:
+                errors.append(f"{d['where']}: {item} names {f}, which is not in issues/LIST.md")
+
 for e in errors:
     print(e)
 counts = {k: sum(1 for d in items.values() if d["intent"] == k) for k in ("ruled", "proposed", "open", "retired")}

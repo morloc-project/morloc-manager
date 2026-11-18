@@ -125,9 +125,10 @@ pub fn freeze_environment(
             "Data directory does not exist: {v_data_dir}"
         )));
     }
-    let modules = scan_modules(&format!("{v_data_dir}/fdb"));
+    let modules = scan_modules(&format!("{v_data_dir}/fdb"))?;
     let programs = scan_programs(&format!("{v_data_dir}/exe"));
-    let exposure = config::read_views(scope, env_name).unwrap_or_default();
+    let exposure = config::read_views(scope, env_name)?;
+    crate::check_eval_allow(&exposure)?;
     if flavor == Flavor::Slim {
         if let Some(eval) = &exposure.eval {
             return Err(ManagerError::FreezeError(format!(
@@ -138,7 +139,7 @@ pub fn freeze_environment(
             )));
         }
     }
-    check_programs(v_data_dir, &programs, force)?;
+    check_programs(v_data_dir, force)?;
 
     // Validate the programs in the environment as it actually runs: the runtime
     // and the toolchain are mounts, not image layers, so a validation without
@@ -157,10 +158,8 @@ pub fn freeze_environment(
     // cannot be handed to the engine as-is: it also holds caches, logs, a build
     // context of its own and the environment's home, all of which would be sent
     // to the daemon and baked into a layer.
-    let context = context_dir(scope, env_name, Path::new(v_data_dir));
-    let _ = fs::remove_dir_all(&context);
-    fs::create_dir_all(&context)
-        .map_err(|e| ManagerError::FreezeError(format!("cannot create the build context: {e}")))?;
+    let staging = StagingDir::create(context_dir(scope, env_name, Path::new(v_data_dir)))?;
+    let context = staging.0.clone();
     eprintln!("Staging the environment into a build context...");
     for rel in &paths {
         if flavor == Flavor::Slim && rel == "runtime" {
@@ -235,10 +234,7 @@ pub fn freeze_environment(
         platform,
     };
     let status = crate::container::container_build_visible(engine, &cfg);
-    // The context is large (the runtime alone is around a hundred megabytes) and
-    // is worth nothing once the image exists, so it goes whether or not the
-    // build succeeded.
-    let _ = fs::remove_dir_all(&context);
+    drop(staging);
     if !status.success() {
         return Err(ManagerError::FreezeError(format!(
             "the deployment image build failed (see the output above). The environment \
@@ -247,13 +243,12 @@ pub fn freeze_environment(
     }
 
     eprintln!("Built {tag}");
+    // FRZ-1: the image stands alone, so it is checked with nothing mounted. A
+    // slim one must also resolve every library from what the cut left behind.
     if flavor == Flavor::Slim {
-        // The image stands alone, so it is checked with nothing mounted: the
-        // launchers must find the nexus, and the nexus and every pool binary
-        // must resolve their libraries from what the cut left behind.
         check_linkage(engine, tag, platform, verbose)?;
-        crate::serve::validate_programs(engine, tag, platform, &programs, Vec::new(), Vec::new(), verbose)?;
     }
+    crate::serve::validate_programs(engine, tag, platform, &programs, Vec::new(), Vec::new(), verbose)?;
     if let Some(path) = save_to {
         eprintln!("Saving {tag} to {path}...");
         crate::container::save_image(engine, tag, path)
@@ -312,22 +307,25 @@ struct ProgramAudit {
 
 /// Walk `exe/<name>/` for each program. A tool-state directory is recorded
 /// and not entered -- it may be a build tree of gigabytes, and the point of
-/// finding it is to stop quickly -- so a program's size excludes it. Symlinks
-/// are not followed: a link out of the tree is copied as a file by the
-/// staging step, so it is sized as one here.
+/// finding it is to stop quickly -- so a program's size excludes it. Links are
+/// followed, each target once, as the staging step copies them.
 fn audit_programs(exe_dir: &Path, names: &[String]) -> ProgramAudit {
     let mut audit = ProgramAudit::default();
     for name in names {
         let root = exe_dir.join(name);
         let mut total = 0u64;
+        let mut seen = std::collections::HashSet::new();
         let mut stack = vec![root.clone()];
         while let Some(dir) = stack.pop() {
+            if !fs::canonicalize(&dir).is_ok_and(|c| seen.insert(c)) {
+                continue;
+            }
             let Ok(entries) = fs::read_dir(&dir) else {
                 continue;
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                let Ok(meta) = entry.metadata() else {
+                let Ok(meta) = fs::metadata(&path) else {
                     continue;
                 };
                 let rel = path
@@ -453,10 +451,24 @@ fn audit_verdict(audit: &ProgramAudit, force: bool, interactive: bool) -> Verdic
 /// Refuse or ask before any container runs, so a project that needs its
 /// `.morlocignore` fixed learns that in a second rather than after validation
 /// and a staging copy.
-fn check_programs(v_data_dir: &str, programs: &[ProgramEntry], force: bool) -> Result<()> {
+/// Every directory under `exe/`, which is what staging copies: a built program
+/// or anything else left there.
+fn staged_program_dirs(exe_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(exe_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+fn check_programs(v_data_dir: &str, force: bool) -> Result<()> {
     use std::io::{self, IsTerminal, Write};
-    let names: Vec<String> = programs.iter().map(|p| p.name.clone()).collect();
-    let audit = audit_programs(&Path::new(v_data_dir).join("exe"), &names);
+    let exe = Path::new(v_data_dir).join("exe");
+    let audit = audit_programs(&exe, &staged_program_dirs(&exe));
     for line in audit_report(&audit) {
         eprintln!("{line}");
     }
@@ -680,6 +692,30 @@ fn context_dir(scope: Scope, env_name: &str, v_data_dir: &Path) -> PathBuf {
     }
 }
 
+/// FRZ-4: one freeze's build context, its own however many freezes of the
+/// environment run at once, and removed however the freeze ends: it is large
+/// (the runtime alone is around a hundred megabytes) and worth nothing after.
+struct StagingDir(PathBuf);
+
+impl StagingDir {
+    fn create(parent: PathBuf) -> Result<Self> {
+        let dir = parent.join(format!("run-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)
+            .map_err(|e| ManagerError::FreezeError(format!("cannot create the build context: {e}")))?;
+        Ok(StagingDir(dir))
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+        if let Some(parent) = self.0.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+}
+
 fn stage_into_context(root: &Path, context: &Path, rel: &str) -> Result<()> {
     let from = root.join(rel);
     let to = context.join(rel);
@@ -688,7 +724,16 @@ fn stage_into_context(root: &Path, context: &Path, rel: &str) -> Result<()> {
             .map_err(|e| ManagerError::FreezeError(format!("cannot stage {rel}: {e}")));
     }
     if from.is_dir() {
-        return crate::provision::copy_dir_excluding(&from, &to, &[], false)
+        let outside = links_leaving(&from, root)?;
+        if !outside.is_empty() {
+            return Err(ManagerError::FreezeError(format!(
+                "these links lead outside the parts of the environment a freeze \
+                 copies, or nowhere, so the image would not hold them; copy their \
+                 content in or remove the links:\n  {}",
+                outside.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n  ")
+            )));
+        }
+        return crate::provision::copy_dir_excluding(&from, &to, &[], true)
             .map_err(|e| ManagerError::FreezeError(format!("cannot stage {rel}: {e}")));
     }
     if let Some(parent) = to.parent() {
@@ -698,6 +743,41 @@ fn stage_into_context(root: &Path, context: &Path, rel: &str) -> Result<()> {
     fs::copy(&from, &to)
         .map_err(|e| ManagerError::FreezeError(format!("cannot stage {rel}: {e}")))?;
     Ok(())
+}
+
+/// The parts of an environment a freeze copies, by directory.
+const FROZEN_DIRS: [&str; 6] = ["runtime", PROGRAMS_PART, "fdb", "src", "modules", "pixi/local"];
+
+/// FRZ-1: the symlinks under `dir` that do not resolve, and those to a
+/// directory outside the frozen parts of the environment at `root`. Links are
+/// not followed while searching.
+fn links_leaving(dir: &Path, root: &Path) -> Result<Vec<PathBuf>> {
+    let root = fs::canonicalize(root)
+        .map_err(|e| ManagerError::FreezeError(format!("cannot resolve {}: {e}", root.display())))?;
+    let frozen: Vec<PathBuf> = FROZEN_DIRS.iter().map(|p| root.join(p)).collect();
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let entries = fs::read_dir(&d)
+            .map_err(|e| ManagerError::FreezeError(format!("cannot read {}: {e}", d.display())))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_symlink() {
+                let leaves = match fs::canonicalize(&path) {
+                    Err(_) => true,
+                    Ok(t) => t.is_dir() && !frozen.iter().any(|f| t.starts_with(f)),
+                };
+                if leaves {
+                    out.push(path);
+                }
+            } else if kind.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Top-level runtime directories that exist to build programs, not to run
@@ -711,7 +791,6 @@ const RUNTIME_BUILD_INPUTS: [&str; 2] = ["include", "rust"];
 /// own and travels.
 fn stage_runtime_without_build_inputs(root: &Path, context: &Path) -> Result<()> {
     let from = root.join("runtime");
-    let to = context.join("runtime");
     let entries = fs::read_dir(&from)
         .map_err(|e| ManagerError::FreezeError(format!("cannot read runtime: {e}")))?;
     for entry in entries.flatten() {
@@ -719,7 +798,7 @@ fn stage_runtime_without_build_inputs(root: &Path, context: &Path) -> Result<()>
         if RUNTIME_BUILD_INPUTS.contains(&name.as_str()) {
             continue;
         }
-        stage_into_context(&from, &to, &name)?;
+        stage_into_context(root, context, &format!("runtime/{name}"))?;
     }
     Ok(())
 }
@@ -937,14 +1016,19 @@ pub(crate) fn frozen_paths(v_data_dir: &Path) -> Result<Vec<String>> {
 // Internal: scanning installed state
 // ======================================================================
 
-pub(crate) fn scan_modules(fdb_dir: &str) -> Vec<ModuleEntry> {
+/// The installed modules recorded in `fdb_dir`. A missing directory holds
+/// none; one that cannot be read, or a manifest that cannot be read or
+/// parsed, is an error naming it, since a module-range gate or an image label
+/// built from a partial list would be wrong.
+pub(crate) fn scan_modules(fdb_dir: &str) -> Result<Vec<ModuleEntry>> {
     let fdb_path = Path::new(fdb_dir);
-    if !fdb_path.is_dir() {
-        return Vec::new();
+    if !fdb_path.exists() {
+        return Ok(Vec::new());
     }
-    let Ok(entries) = fs::read_dir(fdb_path) else {
-        return Vec::new();
+    let fail = |p: &Path, e: &dyn std::fmt::Display| {
+        ManagerError::EnvError(format!("cannot read the module record {}: {e}", p.display()))
     };
+    let entries = fs::read_dir(fdb_path).map_err(|e| fail(fdb_path, &e))?;
 
     #[derive(serde::Deserialize)]
     struct ModuleStub {
@@ -957,27 +1041,25 @@ pub(crate) fn scan_modules(fdb_dir: &str) -> Vec<ModuleEntry> {
         built_with_morloc: Option<String>,
     }
 
-    entries
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .ends_with(".module")
-        })
-        .filter_map(|e| {
-            let bytes = fs::read(e.path()).ok()?;
-            let stub: ModuleStub = serde_json::from_slice(&bytes).ok()?;
-            let digest = Sha256::digest(&bytes);
-            let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-            Some(ModuleEntry {
-                name: stub.name,
-                version: stub.version,
-                sha256,
-                morloc_version: stub.morloc_version,
-                built_with_morloc: stub.built_with_morloc,
-            })
-        })
-        .collect()
+    let mut modules = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| fail(fdb_path, &e))?;
+        let path = entry.path();
+        if !entry.file_name().to_string_lossy().ends_with(".module") {
+            continue;
+        }
+        let bytes = fs::read(&path).map_err(|e| fail(&path, &e))?;
+        let stub: ModuleStub = serde_json::from_slice(&bytes).map_err(|e| fail(&path, &e))?;
+        let sha256: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        modules.push(ModuleEntry {
+            name: stub.name,
+            version: stub.version,
+            sha256,
+            morloc_version: stub.morloc_version,
+            built_with_morloc: stub.built_with_morloc,
+        });
+    }
+    Ok(modules)
 }
 
 pub(crate) fn scan_programs(exe_dir: &str) -> Vec<ProgramEntry> {
@@ -1235,6 +1317,89 @@ mod tests {
         assert_eq!(sh_word("$HOME"), "'$HOME'");
         assert_eq!(sh_word("it's"), "'it'\\''s'");
         assert_eq!(sh_word(""), "''");
+    }
+
+    /// ENV-9, FRZ-7: a module manifest that cannot be read is an error, never
+    /// a module that is not there; a missing fdb holds no modules.
+    #[test]
+    fn an_unreadable_module_manifest_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let fdb = d.path().join("fdb");
+        assert!(scan_modules(&fdb.to_string_lossy()).unwrap().is_empty());
+        fs::create_dir_all(&fdb).unwrap();
+        fs::write(fdb.join("ok.module"), r#"{"name":"ok","morloc_version":">=0.1"}"#).unwrap();
+        assert_eq!(scan_modules(&fdb.to_string_lossy()).unwrap().len(), 1);
+        fs::write(fdb.join("bad.module"), "{ not json").unwrap();
+        let err = scan_modules(&fdb.to_string_lossy()).unwrap_err().to_string();
+        assert!(err.contains("bad.module"), "{err}");
+        fs::remove_file(fdb.join("bad.module")).unwrap();
+        fs::remove_dir_all(&fdb).unwrap();
+        fs::write(&fdb, "").unwrap();
+        assert!(scan_modules(&fdb.to_string_lossy()).is_err());
+    }
+
+    /// FRZ-5: the audit sees what staging copies: a link by its target, and
+    /// every directory under exe/, a built program or not.
+    #[test]
+    fn the_audit_follows_links_and_covers_every_staged_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("exe");
+        fs::create_dir_all(exe.join("p")).unwrap();
+        let big = root.path().join("big.bin");
+        fs::File::create(&big).unwrap().set_len(LARGE_FILE_BYTES + 1).unwrap();
+        std::os::unix::fs::symlink(&big, exe.join("p/data.bin")).unwrap();
+        fs::create_dir_all(exe.join("loose/.git")).unwrap();
+        let audit = audit_programs(&exe, &staged_program_dirs(&exe));
+        assert!(audit.large_files.iter().any(|(n, r, _)| n == "p" && r == "data.bin"), "{audit:?}");
+        assert!(audit.tool_state.iter().any(|(n, r)| n == "loose" && r == ".git"), "{audit:?}");
+    }
+
+    /// FRZ-4: a freeze's build context is its own and is gone however the
+    /// freeze ends, leaving no directory behind in the environment.
+    #[test]
+    fn a_staging_dir_is_per_run_and_removed() {
+        let env = tempfile::tempdir().unwrap();
+        let parent = env.path().join(FREEZE_CONTEXT_SUBDIR);
+        let other = parent.join("run-1");
+        let dir = {
+            let staging = StagingDir::create(parent.clone()).unwrap();
+            assert!(staging.0.is_dir() && staging.0 != other);
+            fs::create_dir_all(&other).unwrap();
+            staging.0.clone()
+        };
+        assert!(!dir.exists());
+        assert!(other.is_dir(), "another run's context was touched");
+        fs::remove_dir(&other).unwrap();
+        drop(StagingDir::create(parent.clone()).unwrap());
+        assert!(!parent.exists());
+    }
+
+    /// FRZ-1: a linked directory inside the environment travels as content; a
+    /// link out of it depends on the host and is refused by name.
+    #[test]
+    fn staging_copies_links_inside_the_environment_and_refuses_others() {
+        let env = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = env.path();
+        fs::create_dir_all(root.join("src/shared")).unwrap();
+        fs::write(root.join("src/shared/x.py"), "x").unwrap();
+        fs::create_dir_all(root.join("exe/p")).unwrap();
+        std::os::unix::fs::symlink(root.join("src/shared"), root.join("exe/p/data")).unwrap();
+        let ctx = tempfile::tempdir().unwrap();
+        stage_into_context(root, ctx.path(), "exe").unwrap();
+        assert!(ctx.path().join("exe/p/data/x.py").is_file());
+
+        fs::create_dir_all(root.join("logs")).unwrap();
+        std::os::unix::fs::symlink(root.join("logs"), root.join("exe/p/logs")).unwrap();
+        let ctx = tempfile::tempdir().unwrap();
+        let err = stage_into_context(root, ctx.path(), "exe").unwrap_err().to_string();
+        assert!(err.contains("exe/p/logs"), "{err}");
+        fs::remove_file(root.join("exe/p/logs")).unwrap();
+
+        std::os::unix::fs::symlink(outside.path(), root.join("exe/p/ext")).unwrap();
+        let ctx = tempfile::tempdir().unwrap();
+        let err = stage_into_context(root, ctx.path(), "exe").unwrap_err().to_string();
+        assert!(err.contains("exe/p/ext"), "{err}");
     }
 
     #[test]

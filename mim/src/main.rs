@@ -1266,6 +1266,16 @@ fn resolve_env_or_default(name: Option<String>) -> Result<(String, Scope, Enviro
     }
 }
 
+/// The runtime and the compiler's state of the environment this process runs
+/// in. A native launch sets only MORLOC_HOME, which is then also the state.
+fn clean_roots(var: impl Fn(&str) -> Option<String>) -> Result<clean::Roots> {
+    let home = var("MORLOC_HOME").filter(|v| !v.is_empty()).ok_or_else(|| {
+        ManagerError::EnvError("MORLOC_HOME is not set; is this a morloc environment?".to_string())
+    })?;
+    let state = envagent::compiler_state(&var).expect("MORLOC_HOME is set");
+    Ok(clean::Roots { state, home: home.into() })
+}
+
 /// ENV-12: `mim clean`. Inside an environment it cleans that environment;
 /// on the host it runs itself inside the named one, through the environment's
 /// own agent, so both backends and every mount layout share one code path.
@@ -1283,12 +1293,7 @@ fn clean_env(
                 "inside an environment, `mim clean` cleans this one; drop the name".to_string(),
             ));
         }
-        let var = |k: &str| {
-            std::env::var_os(k).map(std::path::PathBuf::from).ok_or_else(|| {
-                ManagerError::EnvError(format!("{k} is not set; is this a morloc environment?"))
-            })
-        };
-        let roots = clean::Roots { state: var("MORLOC_STATE")?, home: var("MORLOC_HOME")? };
+        let roots = clean_roots(|k| std::env::var(k).ok())?;
         clean::clean_files(&roots, crates, dry_run)?;
         if uninstalled {
             if dry_run {
@@ -1536,9 +1541,9 @@ fn info_env_exports(
                 .ok()
                 .and_then(|rt| rt.morloc_bin)
                 .unwrap_or_else(|| std::path::PathBuf::from("morloc"));
-            match provision::mim_agent_for_host(scope) {
-                Ok(hook) => v.extend(managed_env_vars(name, data_dir, &morloc_bin, &hook)),
-                Err(_) => v.push(("MORLOC_ENV".to_string(), name.to_string())),
+            // Without an agent `run` refuses to launch, so nothing is exported.
+            if let Ok(hook) = provision::mim_agent_for_host(scope) {
+                v.extend(managed_env_vars(name, data_dir, &morloc_bin, &hook));
             }
             v.push((envagent::ENV_STRICT_CONDA.to_string(), "1".to_string()));
             if let Some(pixi) = locate_pixi(scope) {
@@ -3568,6 +3573,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 }
             };
             let user_env = collect_env_vars(&env_vars, env_file.as_deref())?;
+            refuse_serve_auth_vars(&user_env)?;
             let token = resolve_mcp_token(auth_token);
 
             // Backend-dispatched launch (container image vs detached host nexus);
@@ -3949,6 +3955,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                          (eval can import nothing; add modules with --allow)."
                     );
                 } else {
+                    for m in &allow {
+                        validate_allow_module(m)?;
+                    }
                     views.eval = Some(EvalCapability { allow: allow.clone() });
                     eprintln!("Enabled eval in '{env_name}', allow-list: {}.", allow.join(", "));
                 }
@@ -4716,12 +4725,20 @@ fn resolve_env_requirements(
         }
         .ok_or_else(|| {
             ManagerError::BackendUnsupported(format!(
-                "no prebuilt morloc runtime is published for this platform ({}/{})",
+                "no prebuilt morloc runtime is published for this platform ({}/{}); \
+                 use a container backend (--engine docker or podman)",
                 std::env::consts::OS,
                 std::env::consts::ARCH
             ))
         })?;
-        let (runtime_dir, version) = provision::provision_runtime(scope, &tag, triple)?;
+        let (runtime_dir, version) = provision::provision_runtime(scope, &tag, triple).map_err(|e| {
+            match (e, container) {
+                (ManagerError::BackendUnsupported(m), None) => {
+                    ManagerError::BackendUnsupported(format!("{m}; use a container backend"))
+                }
+                (e, _) => e,
+            }
+        })?;
         let morloc_bin = provision::runtime_morloc_bin(&runtime_dir);
         // `container` lets the table be generated in a container when the host
         // cannot run the compiler (native passes None; it runs on the host by
@@ -5129,6 +5146,15 @@ fn prime_requirements_store(
     Ok(())
 }
 
+/// IFC-5: the conda extras a dev environment stores. The in-env agent reads
+/// the compiler's lang-support table, which never names the source tree's
+/// dev-conda packages, so they ride the stored extras into its solves.
+fn dev_store_extras(conda_packages: &[String], support: &langsupport::LangSupport) -> Vec<String> {
+    let mut extras = conda_packages.to_vec();
+    extras.extend(support.dev_conda.iter().filter(|p| !conda_packages.contains(p)).cloned());
+    extras
+}
+
 /// Record the shim-ABI pin AFTER the solve (see `envstore::record_abi_lock`),
 /// identically for both backends; a failure is a warning, not fatal. The env's
 /// pixi dir is the `EnvContext` default (`<env_dir>/pixi`) for both.
@@ -5202,7 +5228,9 @@ fn resolve_new_env_name(
         return Err(ManagerError::EnvError("Environment name cannot be empty".to_string()));
     }
     environment::validate_env_name(&env_name)?;
-    if cfg::env_config_path(scope, &env_name).is_file() {
+    if cfg::env_config_path(scope, &env_name).is_file()
+        || cfg::env_config_path_legacy_json(scope, &env_name).is_file()
+    {
         return Err(ManagerError::EnvError(format!(
             "Environment '{env_name}' already exists. Change it with \
              'mim modify --env {env_name} ...', or remove it first with \
@@ -7328,7 +7356,7 @@ fn gate_module_compat(
     ignore: bool,
 ) -> Result<Option<String>> {
     let fdb = cfg::env_data_dir(scope, name).join("fdb");
-    let constrained: Vec<(String, String)> = freeze::scan_modules(&fdb.to_string_lossy())
+    let constrained: Vec<(String, String)> = freeze::scan_modules(&fdb.to_string_lossy())?
         .into_iter()
         .filter_map(|m| m.morloc_version.map(|c| (m.name, c)))
         .collect();
@@ -7544,6 +7572,20 @@ fn rematerialize_env(
     build_flags: &[String],
     verbose: bool,
 ) -> Result<()> {
+    rematerialize_world(lock, scope, name, extra_specs, requested_version, build_flags, verbose)?;
+    localdeps::sweep_store_or_warn(&envstore::EnvContext::new(cfg::env_data_dir(scope, name)));
+    Ok(())
+}
+
+fn rematerialize_world(
+    lock: &envstore::EnvLock,
+    scope: Scope,
+    name: &str,
+    extra_specs: &[envspec::EnvSpec],
+    requested_version: Option<String>,
+    build_flags: &[String],
+    verbose: bool,
+) -> Result<()> {
     let ec = cfg::read_env_config(scope, name)?;
     let lang_pins = cfg::read_env_inputs(scope, name)?.lang_pins;
     let mut specs = gather_env_specs(lock, scope, name)?;
@@ -7724,11 +7766,12 @@ fn build_requirement_derived_image(
     let persisted_build_flags =
         cfg::read_flag_config(scope, name)?.materialize(Phase::Build, engine);
     let key = format!(
-        "{}{}{}{}base:{base_image}\narch:{arch}\n",
+        "{}{}{}{}base:{base_image}\narch:{arch}\nmim-agent: {}\n",
         cache_key(&pixi::requirement_digest(&req.requirements), &req.morloc_bin, system_packages),
         lang_installs_key_fragment(&req.lang_installs),
         cert::cache_fragment_for_env(scope, name),
         build_flags_key_fragment(&persisted_build_flags),
+        provision::agent_identity(arch.release_triple())?,
     );
     let marker = materialized_marker(scope, name, false);
     let unchanged = std::fs::read_to_string(&marker)
@@ -8242,6 +8285,7 @@ fn materialize_container_env(
         publish_host: None,
         network: None,
         env: serve::oci_base_env(serve::CONTAINER_MORLOC_HOME),
+        secret_env: Vec::new(),
         read_only: false,
         interactive: false,
         remove_after: true,
@@ -8396,7 +8440,7 @@ fn build_dev_container_image(
     // so a re-run with an unchanged manifest (e.g. re-adding a conda extra that was
     // already pinned) still refreshes it. Idempotent writes; the single writer for
     // both the toolchain pins and the conda extras.
-    prime_requirements_store(lock, &env_dir, lang_spec.as_ref(), conda_packages)?;
+    prime_requirements_store(lock, &env_dir, lang_spec.as_ref(), &dev_store_extras(conda_packages, &support))?;
 
     if !(up_to_date && container::image_exists_locally(engine, &image_tag)) {
         pixi::write_manifest(&pixi_host, &manifest)?;
@@ -9155,6 +9199,7 @@ fn resolve_serve_spec(
         for m in ex.viewed_modules() {
             ensure_program_installed(ec, scope, name, &m)?;
         }
+        check_eval_allow(&ex)?;
         let eval_allow = ex.eval.as_ref().map(|e| e.allow.join(","));
         Ok(ServeSpec { mcp: ex.mcp.clone(), api: ex.api.clone(), eval_allow })
     }
@@ -9229,11 +9274,12 @@ fn native_serve(
     );
     apply_activation(&mut cmd, &runtime.activation_env);
     cmd.env("MORLOC_HOME", &mh);
-    if let Some(t) = &token {
-        cmd.env("MORLOC_MCP_TOKEN", t);
-    }
     for (k, v) in user_env {
         cmd.env(k, v);
+    }
+    scrub_serve_auth(&mut cmd);
+    if let Some(t) = &token {
+        cmd.env("MORLOC_MCP_TOKEN", t);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -9346,11 +9392,12 @@ pub(crate) fn container_serve(
         req.expose, req.allow_plaintext, req.allow_no_auth, req.unsafe_serve,
         req.eval_allow_no_auth, cfg!(target_os = "linux"), req.token.clone(),
     )?;
-    let mut user_env = req.user_env.clone();
+    let user_env = req.user_env.clone();
     let mut mcp_token: Option<String> = None;
+    let mut secret_env = Vec::new();
     if let Some(t) = plan.token {
         mcp_token = Some(t.clone());
-        user_env.push(("MORLOC_MCP_TOKEN".to_string(), t));
+        secret_env.push(("MORLOC_MCP_TOKEN".to_string(), t));
     }
     let mut extra_flags = flag_source(env.scope, env_name, req.flagfile.as_deref())?
         .materialize(Phase::Start, engine);
@@ -9365,7 +9412,7 @@ pub(crate) fn container_serve(
     serve::serve_environment(
         engine, req.verbose, &image, &data_dir.to_string_lossy(), &container_name,
         &[(req.host_port, req.container_port)], plan.publish_host.as_deref(), plan.network.as_deref(),
-        &extra_flags, &Some(ec.shm_size.clone()), &user_env, &plan.command,
+        &extra_flags, &Some(ec.shm_size.clone()), &user_env, &secret_env, &plan.command,
         ec.mount_home.as_deref(), platform,
     )?;
 
@@ -9909,6 +9956,52 @@ fn ensure_program_installed(
         )));
     }
     Ok(())
+}
+
+/// A module name as the eval allow-list holds it: the list reaches the nexus
+/// comma-joined, and the Dockerfile command of a frozen image.
+fn validate_allow_module(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ManagerError::EnvError(format!(
+            "'{name}' is not a module name (letters, digits, '-', '_' and '.', \
+             starting with a letter or digit)"
+        )))
+    }
+}
+
+/// Refuse a stored allow-list entry that is not one module name, as a views
+/// file written by hand or by an older mim may hold.
+pub(crate) fn check_eval_allow(views: &ViewSet) -> Result<()> {
+    for m in views.eval.iter().flat_map(|e| &e.allow) {
+        validate_allow_module(m)?;
+    }
+    Ok(())
+}
+
+/// The variables the nexus reads its auth from. mim sets them from its own
+/// flags only (SERVE-4, SERVE-5).
+const SERVE_AUTH_VARS: [&str; 2] = ["MORLOC_MCP_TOKEN", "MORLOC_EVAL_ALLOW_NO_AUTH"];
+
+fn refuse_serve_auth_vars(user_env: &[(String, String)]) -> Result<()> {
+    match user_env.iter().find(|(k, _)| SERVE_AUTH_VARS.contains(&k.as_str())) {
+        Some((k, _)) => Err(ManagerError::EnvError(format!(
+            "{k} cannot be given with --env-var or --env-file; pass the token with \
+             --auth-token or MORLOC_MCP_TOKEN in mim's environment, and the eval \
+             waiver with --eval-allow-no-auth"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn scrub_serve_auth(cmd: &mut Command) {
+    for k in SERVE_AUTH_VARS {
+        cmd.env_remove(k);
+    }
 }
 
 /// Resolve the MCP bearer token: an explicit `--auth-token` wins, else the
@@ -13686,6 +13779,76 @@ run:
         let local = native_router_command("/s", 9000, &spec, false, false, false);
         assert!(local.contains(&"--eval-allow-no-auth".to_string()), "{local:?}");
         assert!(local.windows(2).any(|w| w == ["--http-host", "127.0.0.1"]), "{local:?}");
+    }
+
+    /// An eval allow-list entry is one module name: it can neither carry a
+    /// second name (the list reaches the nexus comma-joined) nor a flag.
+    #[test]
+    fn an_eval_allow_entry_is_one_module_name() {
+        for ok in ["bio", "bio-rust", "bio.seq", "root_py2"] {
+            assert!(validate_allow_module(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "a,b", "x\", \"--eval-allow-no-auth", "-x", "a b", "a\nb", "../x"] {
+            assert!(validate_allow_module(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// IFC-5: a dev environment's in-env solves, which read the compiler's
+    /// table, keep the dev-conda packages only the source tree names.
+    #[test]
+    fn a_dev_environment_stores_its_dev_conda_packages() {
+        let support = langsupport::LangSupport::from_json(
+            r#"{"schema_version":"1.0","morloc_version":"0","dev-conda":["gmp","zlib"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            dev_store_extras(&["jq".to_string()], &support),
+            vec!["jq".to_string(), "gmp".to_string(), "zlib".to_string()]
+        );
+    }
+
+    /// ENV-12: `mim clean` inside an environment cleans the compiler's state,
+    /// which a native launch leaves to MORLOC_HOME.
+    #[test]
+    fn clean_inside_a_native_environment_uses_the_compilers_state() {
+        let native = |k: &str| (k == "MORLOC_HOME").then(|| "/env/data".to_string());
+        let roots = clean_roots(native).unwrap();
+        assert_eq!(roots.state, std::path::PathBuf::from("/env/data"));
+        assert_eq!(roots.home, std::path::PathBuf::from("/env/data"));
+        let container = |k: &str| match k {
+            "MORLOC_HOME" => Some("/opt/morloc".to_string()),
+            "MORLOC_STATE" => Some("/opt/morloc-state".to_string()),
+            _ => None,
+        };
+        assert_eq!(clean_roots(container).unwrap().state, std::path::PathBuf::from("/opt/morloc-state"));
+        assert!(clean_roots(|_| None).is_err());
+    }
+
+    /// SERVE-5: a native nexus learns its auth only from mim's own flags; the
+    /// caller's shell values of the variables the nexus reads are removed.
+    #[test]
+    fn a_native_serve_drops_the_callers_auth_variables() {
+        let mut cmd = Command::new("true");
+        scrub_serve_auth(&mut cmd);
+        let removed: Vec<_> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().to_string())
+            .collect();
+        for k in SERVE_AUTH_VARS {
+            assert!(removed.iter().any(|r| r == k), "{k} not removed: {removed:?}");
+        }
+    }
+
+    /// The serve auth variables cannot be smuggled in with --env-var, where
+    /// the expose gate and the serve record would not see them.
+    #[test]
+    fn serve_auth_variables_are_refused_as_user_variables() {
+        for k in SERVE_AUTH_VARS {
+            let err = refuse_serve_auth_vars(&[(k.to_string(), "x".to_string())]).unwrap_err();
+            assert!(err.to_string().contains(k), "{err}");
+        }
+        assert!(refuse_serve_auth_vars(&[("FOO".to_string(), "x".to_string())]).is_ok());
     }
 
     /// Only a 2xx eval response is a result; a failed or refused evaluation

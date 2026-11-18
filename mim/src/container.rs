@@ -32,6 +32,10 @@ pub struct RunConfig {
     /// and suppressed. `None` uses the engine default (bridge).
     pub network: Option<String>,
     pub env: Vec<(String, String)>,
+    /// Variables whose values must not appear on the engine's command line
+    /// (SERVE-4): named in the argv, valued in the engine process's environment
+    /// (`engine_process_env`). Only for names the engine CLI itself ignores.
+    pub secret_env: Vec<(String, String)>,
     pub read_only: bool,
     pub interactive: bool,
     pub remove_after: bool,
@@ -58,6 +62,7 @@ impl RunConfig {
             publish_host: None,
             network: None,
             env: Vec::new(),
+            secret_env: Vec::new(),
             read_only: false,
             interactive: false,
             remove_after: true,
@@ -163,7 +168,28 @@ pub fn container_run(engine: ContainerEngine, cfg: &RunConfig) -> (ExitStatus, S
     let exe = engine_executable(engine);
     let extra = engine_specific_run_flags_io(engine);
     let args = build_run_args(engine, &extra, cfg);
-    run_process(exe, &args)
+    run_process_env(exe, &args, &engine_process_env(engine, cfg))
+}
+
+/// The variables the engine process itself must carry so the container sees
+/// `cfg.secret_env`: as named for docker/podman `-e NAME`, and for Apptainer
+/// under the prefixes it forwards without a flag.
+pub fn engine_process_env(engine: ContainerEngine, cfg: &RunConfig) -> Vec<(String, String)> {
+    match argstyle(engine) {
+        ArgStyle::Oci => cfg.secret_env.clone(),
+        ArgStyle::Apptainer => apptainer_forwarded(&cfg.secret_env),
+    }
+}
+
+/// `vars` as Apptainer forwards them into a container: `APPTAINERENV_`, or
+/// `SINGULARITYENV_` when the binary is SingularityCE (`apptainer_executable`).
+pub fn apptainer_forwarded(vars: &[(String, String)]) -> Vec<(String, String)> {
+    vars.iter()
+        .flat_map(|(k, v)| {
+            [("APPTAINERENV_", k, v), ("SINGULARITYENV_", k, v)]
+                .map(|(p, k, v)| (format!("{p}{k}"), v.clone()))
+        })
+        .collect()
 }
 
 /// Like `container_run` but captures both stdout and stderr (no streaming).
@@ -171,7 +197,7 @@ pub fn container_run_quiet(engine: ContainerEngine, cfg: &RunConfig) -> (ExitSta
     let exe = engine_executable(engine);
     let extra = engine_specific_run_flags_io(engine);
     let args = build_run_args(engine, &extra, cfg);
-    run_process_quiet(exe, &args)
+    run_process_quiet_env(exe, &args, &engine_process_env(engine, cfg))
 }
 
 pub fn container_run_passthrough(
@@ -200,6 +226,7 @@ pub fn container_run_passthrough(
 
     Command::new(exe)
         .args(&args)
+        .envs(engine_process_env(engine, cfg))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -577,6 +604,10 @@ fn build_oci_run_args(
         args.push("-e".to_string());
         args.push(format!("{key}={val}"));
     }
+    for (key, _) in &cfg.secret_env {
+        args.push("-e".to_string());
+        args.push(key.clone());
+    }
     args.extend(cfg.extra_flags.iter().cloned());
     push_platform(&mut args, cfg.platform);
     args.push(cfg.image.clone());
@@ -795,8 +826,13 @@ fn report_spawn_failure(exe: &str, e: io::Error) -> ExitStatus {
 /// Run a process with stderr streamed live to the terminal.
 /// Returns (exit_status, captured_stdout, "").
 fn run_process(exe: &str, args: &[String]) -> (ExitStatus, String, String) {
+    run_process_env(exe, args, &[])
+}
+
+fn run_process_env(exe: &str, args: &[String], env: &[(String, String)]) -> (ExitStatus, String, String) {
     let output = Command::new(exe)
         .args(args)
+        .envs(env.iter().cloned())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -822,7 +858,11 @@ fn spawn_failure(exe: &str, e: io::Error) -> (ExitStatus, String, String) {
 /// Run a process with all output captured (no streaming).
 /// Used when stderr must be parsed (e.g., for error classification).
 fn run_process_quiet(exe: &str, args: &[String]) -> (ExitStatus, String, String) {
-    let output = Command::new(exe).args(args).stdin(Stdio::null()).output();
+    run_process_quiet_env(exe, args, &[])
+}
+
+fn run_process_quiet_env(exe: &str, args: &[String], env: &[(String, String)]) -> (ExitStatus, String, String) {
+    let output = Command::new(exe).args(args).envs(env.iter().cloned()).stdin(Stdio::null()).output();
     match output {
         Ok(output) => (
             output.status,
@@ -863,6 +903,30 @@ mod tests {
         assert!(err.contains("/nonexistent/podman"), "{err}");
         let (status, _, _) = run_process("/nonexistent/podman", &["ps".to_string()]);
         assert!(!status.success());
+    }
+
+    /// SERVE-4: a secret reaches the container by name; its value is in no
+    /// engine argument, only in the environment of the engine process.
+    #[test]
+    fn a_secret_variable_never_appears_on_the_engine_command_line() {
+        let mut cfg = RunConfig::new("img");
+        cfg.env = vec![("MORLOC_HOME".to_string(), "/opt/morloc".to_string())];
+        cfg.secret_env = vec![("MORLOC_MCP_TOKEN".to_string(), "s3cret-value".to_string())];
+        for engine in [ContainerEngine::Docker, ContainerEngine::Podman, ContainerEngine::Apptainer] {
+            let args = build_run_args(engine, &engine_specific_run_flags(engine), &cfg);
+            assert!(!args.iter().any(|a| a.contains("s3cret-value")), "{engine:?}: {args:?}");
+            let env = engine_process_env(engine, &cfg);
+            assert!(env.iter().any(|(_, v)| v == "s3cret-value"), "{engine:?}: {env:?}");
+        }
+        let docker = build_run_args(ContainerEngine::Docker, &[], &cfg);
+        assert!(docker.windows(2).any(|w| w[0] == "-e" && w[1] == "MORLOC_MCP_TOKEN"), "{docker:?}");
+        assert_eq!(
+            engine_process_env(ContainerEngine::Apptainer, &cfg),
+            vec![
+                ("APPTAINERENV_MORLOC_MCP_TOKEN".to_string(), "s3cret-value".to_string()),
+                ("SINGULARITYENV_MORLOC_MCP_TOKEN".to_string(), "s3cret-value".to_string()),
+            ]
+        );
     }
 
     /// Only an engine's own "no such object" answer means absent; an engine

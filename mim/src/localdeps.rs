@@ -20,10 +20,14 @@ use morloc_deps::envspec::{local_source, EnvSpec, PackageReq, VENDOR_DIR};
 use sha2::{Digest, Sha256};
 
 use crate::error::{ManagerError, Result};
-use crate::provision::copy_dir_excluding;
+use crate::provision::copy_dir_excluding_at_root;
 
-/// Directory names not worth copying into a snapshot.
-const SKIP_DIRS: &[&str] = &["target", ".git", "__pycache__", ".venv", "node_modules", "build"];
+/// Directory names not worth copying into a snapshot, at any depth.
+const SKIP_DIRS: &[&str] = &[".git", "__pycache__", ".venv", "node_modules"];
+
+/// Build output, skipped only at the package root: deeper down a directory of
+/// that name can be a subpackage.
+const SKIP_ROOT_DIRS: &[&str] = &["target", "build"];
 
 /// Hex digits of the content hash that name a snapshot directory.
 const HASH_LEN: usize = 12;
@@ -88,7 +92,7 @@ pub fn vendor_snapshot(src: &Path, name: &str, pixi_dir: &Path) -> Result<String
     if tmp.exists() {
         let _ = std::fs::remove_dir_all(&tmp);
     }
-    copy_dir_excluding(src, &tmp, SKIP_DIRS, true)?;
+    copy_dir_excluding_at_root(src, &tmp, SKIP_ROOT_DIRS, SKIP_DIRS, true)?;
     let hash = tree_hash(&tmp)?;
     let dest = parent.join(&hash);
     if dest.is_dir() {
@@ -141,13 +145,27 @@ fn hash_dir(root: &Path, dir: &Path, hasher: &mut Sha256) -> Result<()> {
 /// store.
 const SWEEP_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// Remove every snapshot under `<pixi_dir>/local` older than [`SWEEP_GRACE`]
-/// that no spec in `specs` references, returning the manifest-relative paths
-/// removed. Temp dirs of an in-flight copy are left alone.
-pub fn sweep_unreferenced_snapshots(pixi_dir: &Path, specs: &[EnvSpec]) -> Result<Vec<String>> {
-    sweep_snapshots(pixi_dir, specs, SWEEP_GRACE)
+
+/// DEP-9: sweep the snapshots no spec in the environment's store references,
+/// after a solve that succeeded under the environment lock. A failure leaves
+/// only stale copies, so it is a warning.
+pub fn sweep_store_or_warn(ctx: &morloc_deps::envstore::EnvContext) {
+    if let Err(e) = sweep_store_with(ctx, SWEEP_GRACE) {
+        eprintln!("Warning: could not sweep unreferenced local-dep snapshots: {e}");
+    }
 }
 
+fn sweep_store_with(
+    ctx: &morloc_deps::envstore::EnvContext,
+    grace: std::time::Duration,
+) -> std::result::Result<Vec<String>, String> {
+    let specs = ctx.gather().map_err(|e| e.to_string())?;
+    sweep_snapshots(&ctx.pixi_dir(), &specs, grace).map_err(|e| e.to_string())
+}
+
+/// Remove every snapshot under `<pixi_dir>/local` older than `grace` that no
+/// spec in `specs` references, returning the manifest-relative paths removed.
+/// Temp dirs of an in-flight copy are left alone.
 fn sweep_snapshots(
     pixi_dir: &Path,
     specs: &[EnvSpec],
@@ -290,6 +308,27 @@ mod tests {
         assert!(vendor_snapshot(&pkg, "My_lib.2-x", &pixi.path().join("pixi")).is_ok());
     }
 
+    /// DEP-9: build output is skipped at the package root only; a subpackage
+    /// that happens to be named `build` or `target` is part of the package.
+    #[test]
+    fn a_snapshot_keeps_subpackages_named_like_build_output() {
+        let root = tempfile::tempdir().unwrap();
+        let pixi = tempfile::tempdir().unwrap();
+        let pkg = root.path().join("mylib");
+        write_pkg(&pkg, "x = 1\n");
+        for d in ["build", "target", "mylib/build", "mylib/target", "mylib/__pycache__"] {
+            std::fs::create_dir_all(pkg.join(d)).unwrap();
+            std::fs::write(pkg.join(d).join("__init__.py"), "").unwrap();
+        }
+        let rel = vendor_snapshot(&pkg, "mylib", &pixi.path().join("pixi")).unwrap();
+        let snap = pixi.path().join("pixi").join(rel);
+        assert!(snap.join("mylib/build/__init__.py").is_file());
+        assert!(snap.join("mylib/target/__init__.py").is_file());
+        assert!(!snap.join("build").exists());
+        assert!(!snap.join("target").exists());
+        assert!(!snap.join("mylib/__pycache__").exists());
+    }
+
     #[test]
     fn strip_removes_py_locals_only() {
         let j = r#"{"envspec_version":2,"morloc_version":"0","packages":{"py":[{"name":"mylib","source":"local","path":"vendor/mylib","editable":true}],"rust":[{"name":"mycrate","source":"local","path":"vendor/mycrate","editable":false}]}}"#;
@@ -369,6 +408,29 @@ mod tests {
         assert!(!pixi.path().join(vendored_path(&e)).join("__pycache__").exists());
     }
 
+    /// DEP-9: the sweep after any successful solve reads the store, so a
+    /// snapshot only a dropped program referenced goes and a recorded one stays.
+    #[test]
+    fn a_store_sweep_keeps_what_the_store_references() {
+        use morloc_deps::envstore::{EnvContext, Provenance};
+        let root = tempfile::tempdir().unwrap();
+        let env = tempfile::tempdir().unwrap();
+        let ctx = EnvContext::new(env.path());
+        let lock = ctx.lock_env_creating().unwrap();
+        let pkg = root.path().join("vendor/mylib");
+        write_pkg(&pkg, "V=1\n");
+        let mut dropped = spec_with_py_local("vendor/mylib");
+        vendor_py_locals(&mut dropped, root.path(), &ctx.pixi_dir()).unwrap();
+        std::fs::write(pkg.join("v.py"), "V=2\n").unwrap();
+        let mut kept = spec_with_py_local("vendor/mylib");
+        vendor_py_locals(&mut kept, root.path(), &ctx.pixi_dir()).unwrap();
+        ctx.write_spec(&lock, "p", Provenance::Installed, &serde_json::to_string(&kept).unwrap())
+            .unwrap();
+        let removed = sweep_store_with(&ctx, std::time::Duration::ZERO).unwrap();
+        assert_eq!(removed, vec![vendored_path(&dropped)]);
+        assert!(ctx.pixi_dir().join(vendored_path(&kept)).exists());
+    }
+
     #[test]
     fn sweep_removes_only_unreferenced_snapshots() {
         let root = tempfile::tempdir().unwrap();
@@ -385,7 +447,7 @@ mod tests {
 
         // A snapshot within the grace period is not the sweep's to remove
         // either: it may belong to an install still writing its store entry.
-        assert!(sweep_unreferenced_snapshots(pixi.path(), &[]).unwrap().is_empty());
+        assert!(sweep_snapshots(pixi.path(), &[], SWEEP_GRACE).unwrap().is_empty());
         assert!(pixi.path().join(vendored_path(&a)).exists());
 
         let zero = std::time::Duration::ZERO;

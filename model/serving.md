@@ -2,7 +2,7 @@
 
 ### SERVE-1 Only what a view names is served
 Intent: proposed
-Code: unaudited
+Code: deviates F105
 
 An environment has a view per adapter (MCP, the JSON API) listing installed
 modules, and an optional eval allow-list. Installing a module never serves
@@ -29,8 +29,9 @@ it still names the process or container mim started. `stop` ends it and
 removes the record, and a record whose server is gone is removed too.
 
 ### SERVE-4 A server reachable from other machines requires a credential
-Intent: proposed
-Code: unaudited
+Intent: ruled 2026-11-15
+Code: deviates F106
+Tests: a_secret_variable_never_appears_on_the_engine_command_line, a_served_containers_token_is_off_the_command_line, serve_auth_variables_are_refused_as_user_variables
 
 A server binds loopback unless exposed. An exposed server requires an
 acknowledgement that it speaks plaintext, and a token unless the operator
@@ -39,8 +40,9 @@ generates it, writes it to disk, or puts it on a command line. NET-1 in the
 compiler spec governs the server's side.
 
 ### SERVE-5 Eval on an exposed server requires the token
-Intent: proposed
-Code: unaudited
+Intent: ruled 2026-11-15
+Code: conforms 2026-11-15
+Tests: a_native_serve_drops_the_callers_auth_variables
 
 On a loopback server eval needs no token. On an exposed one it runs only for
 callers presenting the token, unless the operator waives that separately

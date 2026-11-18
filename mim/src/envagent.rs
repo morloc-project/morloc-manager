@@ -73,6 +73,7 @@ fn sync_in(
     // DEP-4, DEP-12
     let lock = ctx.lock_env()?;
     ctx.check_env_ids()?;
+    let home = morloc_home()?;
 
     // Local (filesystem-path) deps never reach the store module-relative. An
     // installed program's Python locals are snapshotted into the pixi project
@@ -107,7 +108,6 @@ fn sync_in(
     // markers. Checked BEFORE `ctx.sync` so an immutable env can refuse without
     // committing anything (a committed scratch spec would otherwise re-trigger the
     // refusal on every LATER build in the env, including unrelated ones).
-    let home = morloc_home()?;
     let missing = declared_langs_missing_shims(&es, &home);
     if !missing.is_empty() && env_is_immutable() {
         return Err(DepsError::Env(format!(
@@ -121,6 +121,21 @@ fn sync_in(
         )));
     }
 
+    // DEP-10: an immutable environment refuses before writing anything a sync
+    // that would solve, or that needs a binding rebuilt for the current prefix.
+    if env_is_immutable() {
+        if ctx.sync_changes_world(&key, provenance, &resolved, supersede, inputs)? {
+            return Err(DepsError::Env(format!(
+                "building '{name}' needs packages this environment does not hold, and a \
+                 served or frozen image cannot change its toolchain. Install the program \
+                 into the environment before serving or freezing it."
+            )));
+        }
+        let stale = stale_declared_shims(&es, &home, &abi::meta_dir(&ctx.pixi_dir()));
+        if !stale.is_empty() {
+            return Err(stale_binding_refusal(name, &stale));
+        }
+    }
     let activation = match ctx.sync(&lock, &key, provenance, &resolved, supersede, inputs) {
         Ok(a) => a,
         // A solve failure in an env that pins an interpreter minor (to protect an
@@ -146,12 +161,7 @@ fn sync_in(
     // an incremental `morloc init` keys the rebuild on.
     let stale = stale_declared_shims(&es, &home, &abi::meta_dir(&ctx.pixi_dir()));
     if !stale.is_empty() && env_is_immutable() {
-        return Err(DepsError::Env(format!(
-            "building '{name}' needs morloc bindings this environment holds for another \
-             interpreter version:\n  {}\nA served or frozen image cannot rebuild them. \
-             Rebuild the environment: `mim update --reinit`.",
-            stale.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("\n  ")
-        )));
+        return Err(stale_binding_refusal(name, &stale));
     }
     let mut missing = missing;
     for defect in &stale {
@@ -176,24 +186,19 @@ fn sync_in(
         build_new_language_shims(&activation, &home)?;
     }
 
-    // Snapshots no stored spec references any more (a re-install with changed
-    // source, an uninstalled program) are dropped; a failure here leaves only
-    // stale copies behind, so it is a warning.
-    if installs {
-        match ctx
-            .gather()
-            .map_err(|e| e.to_string())
-            .and_then(|specs| {
-                crate::localdeps::sweep_unreferenced_snapshots(&ctx.pixi_dir(), &specs)
-                    .map_err(|e| e.to_string())
-            }) {
-            Ok(_) => {}
-            Err(e) => eprintln!("Warning: could not sweep unreferenced local-dep snapshots: {e}"),
-        }
-    }
+    crate::localdeps::sweep_store_or_warn(&ctx);
     drop(lock);
     eprintln!("Environment dependencies synced for '{name}'.");
     Ok(())
+}
+
+fn stale_binding_refusal(name: &str, stale: &[impl std::fmt::Display]) -> DepsError {
+    DepsError::Env(format!(
+        "building '{name}' needs morloc bindings this environment holds for another \
+         interpreter version:\n  {}\nA served or frozen image cannot rebuild them. \
+         Rebuild the environment: `mim update --reinit`.",
+        stale.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("\n  ")
+    ))
 }
 
 /// The languages a program's pools USE (from the compiler-emitted `es.languages`)
@@ -232,7 +237,7 @@ fn stale_declared_shims(es: &EnvSpec, home: &Path, meta_dir: &Path) -> Vec<abi::
 /// always exports it, and building/checking shims against the wrong home would
 /// loop forever.
 fn morloc_home() -> Result<PathBuf, DepsError> {
-    std::env::var("MORLOC_HOME").map(PathBuf::from).map_err(|_| {
+    std::env::var("MORLOC_HOME").ok().filter(|v| !v.is_empty()).map(PathBuf::from).ok_or_else(|| {
         DepsError::Env(
             "MORLOC_HOME is not set; on-demand language provisioning needs it to locate the \
              runtime where language bindings are built. Run inside a morloc environment."
@@ -368,6 +373,16 @@ struct HookContext {
     foreign_state: Option<PathBuf>,
 }
 
+/// DEP-13: the compiler's state: `MORLOC_STATE`, else `MORLOC_HOME`, else
+/// `$HOME/.local/share/morloc`, an empty value counting as unset.
+pub(crate) fn compiler_state(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let set = |k: &str| var(k).filter(|v| !v.is_empty());
+    set("MORLOC_STATE")
+        .or_else(|| set("MORLOC_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| set("HOME").map(|h| Path::new(&h).join(".local/share/morloc")))
+}
+
 /// DEP-11: the store is `MORLOC_ENV_STORE`, never the build's state, and it
 /// must exist. The pixi project defaults to `<store>/pixi`; a container passes
 /// `MORLOC_PIXI_DIR`. The build's state is the compiler's: `MORLOC_STATE`, else
@@ -390,10 +405,7 @@ fn hook_context(var: impl Fn(&str) -> Option<String>) -> Result<HookContext, Dep
             store.display()
         ))
     })?;
-    let state = set("MORLOC_STATE")
-        .or_else(|| set("MORLOC_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| set("HOME").map(|h| Path::new(&h).join(".local/share/morloc")));
+    let state = compiler_state(&var);
     let foreign_state = match state.map(|s| std::fs::canonicalize(&s).unwrap_or(s)) {
         Some(s) if s == canon_store => None,
         Some(s) => Some(s),
@@ -428,9 +440,12 @@ fn record_slot(name: &str, installed: bool, foreign_state: Option<&Path>) -> (St
 /// The pixi binary: `MORLOC_PIXI` if the environment names it, else `pixi` on PATH
 /// (resolved by the OS at spawn).
 fn pixi_bin() -> PathBuf {
-    std::env::var("MORLOC_PIXI")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("pixi"))
+    pixi_bin_from(|k| std::env::var(k).ok())
+}
+
+/// IFC-9: `MORLOC_PIXI`, an empty value counting as unset, else `pixi`.
+fn pixi_bin_from(var: impl Fn(&str) -> Option<String>) -> PathBuf {
+    var("MORLOC_PIXI").filter(|v| !v.is_empty()).map_or_else(|| PathBuf::from("pixi"), PathBuf::from)
 }
 
 /// The language-support table, obtained from the compiler. Prefer the exact
@@ -509,6 +524,14 @@ mod tests {
         // An unbuilt binding is the missing-marker path's business, not this one's.
         std::fs::remove_file(markers.join("python")).unwrap();
         assert!(stale_declared_shims(&py, &home, &meta).is_empty());
+    }
+
+    /// An empty MORLOC_PIXI is unset, like every variable the hook reads.
+    #[test]
+    fn an_empty_pixi_variable_means_pixi_on_path() {
+        assert_eq!(pixi_bin_from(|_| Some(String::new())), PathBuf::from("pixi"));
+        assert_eq!(pixi_bin_from(|_| None), PathBuf::from("pixi"));
+        assert_eq!(pixi_bin_from(|_| Some("/x/pixi".to_string())), PathBuf::from("/x/pixi"));
     }
 
     fn vars(pairs: &[(&str, &Path)]) -> impl Fn(&str) -> Option<String> {
