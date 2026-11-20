@@ -19,7 +19,7 @@ use std::process::Command;
 use crate::environment;
 use crate::error::{ManagerError, Result};
 use crate::provision::{
-    curl_capture, curl_capture_quiet, curl_download, curl_effective_url, parse_tag_from_release_url,
+    curl_capture, curl_capture_quiet, curl_download, curl_effective_url, parse_tag_from_release_url, Trust,
 };
 
 /// Release base for the dungeon. Override with `MORLOC_DEMOS_BASE` to test
@@ -79,7 +79,7 @@ fn bare_version(s: &str) -> String {
 /// Explicit (`--morloc-version`) is a contract: a missing release is a hard
 /// error. Otherwise (active env, or the latest release) a missing release falls
 /// back to the most recent published dungeon release.
-fn resolve_target(morloc_version: Option<&str>) -> Result<(String, bool)> {
+fn resolve_target(trust: &Trust, morloc_version: Option<&str>) -> Result<(String, bool)> {
     if let Some(v) = morloc_version {
         return Ok((bare_version(v), true));
     }
@@ -90,14 +90,14 @@ fn resolve_target(morloc_version: Option<&str>) -> Result<(String, bool)> {
         }
     }
     // Not in an environment: default to the latest morloc release.
-    let tag = crate::provision::fetch_latest_tag()?;
+    let tag = crate::provision::fetch_latest_tag(trust)?;
     Ok((bare_version(&tag), false))
 }
 
 /// The most recent published dungeon release version, via the `releases/latest`
 /// redirect (no REST API).
-fn latest_dungeon_version(base: &str) -> Result<String> {
-    let final_url = curl_effective_url(&format!("{base}/latest"))?;
+fn latest_dungeon_version(trust: &Trust, base: &str) -> Result<String> {
+    let final_url = curl_effective_url(trust, &format!("{base}/latest"))?;
     let tag = parse_tag_from_release_url(&final_url).ok_or_else(|| {
         ManagerError::EnvError(format!(
             "could not determine the latest dungeon release from {final_url}"
@@ -112,22 +112,22 @@ fn latest_dungeon_version(base: &str) -> Result<String> {
 /// Fetch the manifest for the target version, applying the explicit/fallback
 /// policy. Returns the resolved version (which may differ from the target on a
 /// fallback) and the manifest body.
-fn fetch_manifest(base: &str, target: &str, explicit: bool) -> Result<(String, String)> {
+fn fetch_manifest(trust: &Trust, base: &str, target: &str, explicit: bool) -> Result<(String, String)> {
     // A miss here is expected (fallback) or reported cleanly (explicit), so
     // probe quietly -- curl's own 404 line would otherwise precede our message.
-    match curl_capture_quiet(&asset_url(base, target, "manifest.tsv")) {
+    match curl_capture_quiet(trust, &asset_url(base, target, "manifest.tsv")) {
         Ok(body) => Ok((target.to_string(), body)),
         Err(_) if explicit => Err(ManagerError::EnvError(format!(
             "no demos published for morloc {target}"
         ))),
         Err(_) => {
             // Fall back to the most recent published dungeon release.
-            let latest = latest_dungeon_version(base).map_err(|_| {
+            let latest = latest_dungeon_version(trust, base).map_err(|_| {
                 ManagerError::EnvError(
                     "no demos are published yet".to_string(),
                 )
             })?;
-            let body = curl_capture(&asset_url(base, &latest, "manifest.tsv"))?;
+            let body = curl_capture(trust, &asset_url(base, &latest, "manifest.tsv"))?;
             eprintln!(
                 "warning: no demos published for morloc {target}; using the most recent ({latest})"
             );
@@ -181,6 +181,7 @@ fn print_list(version: &str, tag: Option<&str>, demos: &[&Demo]) {
 /// directory beside the destination and renamed into place, so a failed
 /// download or extraction leaves no destination behind.
 fn pull(
+    trust: &Trust,
     base: &str,
     version: &str,
     tag: Option<&str>,
@@ -200,7 +201,7 @@ fn pull(
     let stage = into.join(format!(".{dest_name}.partial-{}", std::process::id()));
     std::fs::create_dir(&stage)
         .map_err(|e| ManagerError::EnvError(format!("could not create {}: {e}", stage.display())))?;
-    let staged = stage_demos(base, version, demos, &stage);
+    let staged = stage_demos(trust, base, version, demos, &stage);
     let result = staged.and_then(|out| {
         if dest.exists() {
             std::fs::remove_dir_all(&dest).map_err(|e| {
@@ -220,13 +221,14 @@ fn pull(
 /// Download the bundle into `stage` and extract the selected demos to
 /// `<stage>/out`, which is returned.
 fn stage_demos(
+    trust: &Trust,
     base: &str,
     version: &str,
     demos: &[&Demo],
     stage: &std::path::Path,
 ) -> Result<std::path::PathBuf> {
     let tarball = stage.join("demos.tar.gz");
-    curl_download(&asset_url(base, version, "demos.tar.gz"), &tarball)?;
+    curl_download(trust, &asset_url(base, version, "demos.tar.gz"), &tarball)?;
     let out = stage.join("out");
     std::fs::create_dir(&out)
         .map_err(|e| ManagerError::EnvError(format!("could not create {}: {e}", out.display())))?;
@@ -257,9 +259,15 @@ fn stage_demos(
 pub fn run(list: bool, tag: Option<String>, morloc_version: Option<String>, force: bool) -> Result<()> {
     let base = demos_base();
     let tag = tag.as_deref();
+    // PROV-9: demos belong to no environment; they trust the default one's
+    // certificates, else the user's.
+    let trust = match environment::effective_default() {
+        Some((name, scope)) => Trust::for_env(scope, &name),
+        None => Trust::user(),
+    };
 
-    let (target, explicit) = resolve_target(morloc_version.as_deref())?;
-    let (version, manifest) = fetch_manifest(&base, &target, explicit)?;
+    let (target, explicit) = resolve_target(&trust, morloc_version.as_deref())?;
+    let (version, manifest) = fetch_manifest(&trust, &base, &target, explicit)?;
     let demos = parse_manifest(&manifest);
     let selected = select(&demos, tag, &version)?;
 
@@ -270,7 +278,7 @@ pub fn run(list: bool, tag: Option<String>, morloc_version: Option<String>, forc
     ensure_tar()?;
     let cwd = std::env::current_dir()
         .map_err(|e| ManagerError::EnvError(format!("cannot read the current directory: {e}")))?;
-    pull(&base, &version, tag, &selected, force, &cwd)
+    pull(&trust, &base, &version, tag, &selected, force, &cwd)
 }
 
 fn ensure_tar() -> Result<()> {
@@ -305,7 +313,7 @@ mod tests {
             tags: Vec::new(),
             synopsis: String::new(),
         };
-        let err = pull("file:///nonexistent", "0.0.0", None, &[&demo], false, into.path());
+        let err = pull(&Trust::System, "file:///nonexistent", "0.0.0", None, &[&demo], false, into.path());
         assert!(err.is_err());
         assert_eq!(std::fs::read_dir(into.path()).unwrap().count(), 0);
     }

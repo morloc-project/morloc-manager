@@ -78,11 +78,10 @@ dotfiles, home, shm, flag file, certificates) runs unlocked, so two such
 commands on one environment interleave. Ruled 2026-11-04 for `modify`'s
 rebuild; the configuration steps remain.
 
-### F5 `new`, `update` and `modify` are not atomic
-ENV-2, ENV-6. `new` writes everything before `env.yaml`, so a failure leaves
-an invisible, unremovable directory that the next `new` reuses. `update` has
-no rollback. `modify` rolls back only the rebuild; earlier changes (rename,
-default, dotfiles, home, shm, flag file, pins, certificates) stay.
+### F5 `update` and `modify` are not atomic
+ENV-6. `update` has no rollback. `modify` rolls back only the rebuild;
+earlier changes (rename, default, dotfiles, home, shm, flag file, pins,
+certificates) stay.
 
 ### F24 Configuration read-modify-write is unlocked
 ENV-8. Writes are locked and atomic, reads are not, so default, rename and
@@ -115,11 +114,6 @@ wrapper.
 DEP-7. `pixi::install_locked` treats every non-zero exit (a network error
 too) as a stale lock, and the fallback solve may move versions. Telling
 them apart needs pixi's exact stale-lock message.
-
-### F62 Off Linux a reused server pid is not detected
-SERVE-3. Identity is the leader's start time from `/proc`; on macOS a live
-pid is trusted (`serve_leader`), and pre-start-time records fall back to the
-command line, which another env's nexus also matches.
 
 ### F63 `start` picks a free port, then binds it later
 `find_free_host_port` binds and releases; another process can take the port
@@ -238,19 +232,12 @@ the agent's `morloc init` honors; neither apptainer nor native init sets
 CARGO_HOME, so cargo's registry may land in `~/.cargo` unless the rust
 activation sets it. Read, not reproduced.
 
-### F98 mim's own downloads ignore the environment's CA bundle
-PROV-9. `provision::curl_base` passes no `--cacert`, so releases, the rust
-source, pixi, foreign agents, the stdlib snapshot and demos use only the
-host store. Behind TLS inspection with a CA the host does not trust, `new
---cert-bundle` fails at the first download. Needs the environment's bundle
-threaded to every download. Read, not reproduced.
-
-### F99 run does not always use the user's directory or own its files
-RUN-1. Under SELinux from `$HOME`, `run` drops the `/work` mount and runs
-in `/opt/morloc`; rootless docker's `--user uid:gid` writes files as a
-subuid; apptainer puts a host-wide link dir ahead of the env's programs on
+### F99 run does not always use the user's directory
+RUN-1. Apptainer puts a host-wide link dir ahead of the env's programs on
 PATH; a native run with a deleted cwd runs in the env data dir. Read, not
-reproduced.
+reproduced. Files that a rootless docker run with `--user` (mim before
+RUN-1's ruling) wrote in the user's own directories stay subuid-owned; mim
+reclaims only the env's data dir.
 
 ### F100 Apptainer runs keep foreign activations
 RUN-4. Apptainer runs pass the host environment through (no `--cleanenv`),

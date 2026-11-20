@@ -76,11 +76,14 @@ manages it (or a verified release of the same version for another
 platform). An override exists for development.
 
 ### PROV-9 Extra certificate authorities reach every tool that downloads
-Intent: ruled 2026-11-15
-Code: deviates F98
-Tests: raw_der_with_a_trailing_key_is_refused
+Intent: ruled 2026-11-20
+Code: conforms 2026-11-20
+Tests: raw_der_with_a_trailing_key_is_refused, a_download_carries_the_bundle_it_trusts, a_download_for_no_environment_honours_the_users_bundle, a_download_for_an_environment_trusts_its_bundle, curl_is_built_only_by_curl_base, a_pending_trust_is_a_private_host_bundle_removed_on_drop
 
 A certificate bundle given to an environment is validated (certificates
 only, no keys), installed in its image, and exported to the solver, the
-package managers and the runtime. Its fingerprints are recorded so drift is
-reported.
+package managers, the runtime and mim's own downloads. Its fingerprints are
+recorded so drift is reported. A download that belongs to no environment
+honours the user's `CURL_CA_BUNDLE` or `SSL_CERT_FILE`; `demos` uses the
+default environment's bundle; an interactive `new` asks for the bundle
+before the version, whose check is a download.

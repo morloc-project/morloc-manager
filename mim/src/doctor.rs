@@ -759,7 +759,7 @@ pub(crate) fn probe_extras_container(
             platform,
             ..RunConfig::new(image)
         };
-        let (status, stdout, _) = container_run_quiet(engine, &cfg);
+        let (status, stdout, _) = container_run_quiet(engine, &cfg).ok()?;
         (status.success() || !stdout.is_empty()).then_some(stdout)
     })
 }
@@ -1494,10 +1494,9 @@ fn check_programs_deep(
         );
         cfg.platform = platform;
         if verbose {
-            let exe = engine_executable(engine);
-            let extra = crate::container::engine_specific_run_flags_io(engine);
-            let args = crate::container::build_run_args(engine, &extra, &cfg);
-            eprintln!("[mim] {exe} {}", args.join(" "));
+            if let Ok(args) = crate::container::run_argv(engine, &cfg) {
+                eprintln!("[mim] {} {}", engine_executable(engine), args.join(" "));
+            }
         }
         container_run_quiet(engine, &cfg)
     };
@@ -1506,7 +1505,13 @@ fn check_programs_deep(
     // cannot read it (an unlabelled directory on an SELinux host, say) fails
     // every smoke test with a message about the program rather than the mount.
     let exe_in_container = format!("{state}/exe");
-    let (status, _, stderr) = run(vec!["test".to_string(), "-r".to_string(), exe_in_container]);
+    let (status, _, stderr) = match run(vec!["test".to_string(), "-r".to_string(), exe_in_container]) {
+        Ok(out) => out,
+        Err(e) => {
+            c.fail(&e.to_string());
+            return;
+        }
+    };
     if !status.success() {
         let snippet: String = stderr.lines().take(3).collect::<Vec<_>>().join("\n       ");
         c.fail(&format!("Cannot read the state mount from the container: {snippet}"));
@@ -1538,7 +1543,13 @@ fn check_programs_deep(
     }
     for prog in &programs {
         let exe_path = format!("{}/bin/{}", crate::serve::CONTAINER_MORLOC_HOME, prog.name);
-        let (status, _, stderr) = run(vec![exe_path, "--help".to_string()]);
+        let (status, _, stderr) = match run(vec![exe_path, "--help".to_string()]) {
+            Ok(out) => out,
+            Err(e) => {
+                c.fail(&e.to_string());
+                return;
+            }
+        };
         if status.success() {
             c.pass(&format!("{} -- smoke test passed", prog.name));
         } else {

@@ -11,12 +11,14 @@ starting with a letter or digit, and is unique within its scope. A lookup
 by name tries local, then system.
 
 ### ENV-2 An environment exists exactly when its configuration record does
-Intent: proposed
-Code: deviates F5
+Intent: ruled 2026-11-20
+Code: conforms 2026-11-20
+Tests: a_failed_new_leaves_nothing_behind, a_committed_new_keeps_its_files_and_drops_its_marker, an_interrupted_new_is_removed_at_its_commit, a_marked_remnant_is_listed_removed_and_replaced, a_remnant_whose_lock_is_held_is_left_alone, an_unmarked_remnant_is_refused_by_new_and_removed_by_rm, a_container_remnant_names_its_image_and_volume, a_failed_native_new_leaves_no_remnant, a_recorded_environment_is_never_cleaned_as_a_remnant
 
-Anything mim leaves on disk for a name without a record is either removed
-before mim returns or reused by the next `new` of that name; it is never an
-invisible, unremovable remnant.
+An environment exists exactly when its configuration record does. A `new`
+that fails, or is interrupted, removes what it created before mim returns.
+After a killed `new`, `ls` lists the remnant as incomplete, and `rm` or the
+next `new` of that name removes it.
 
 ### ENV-3 Each scope has a configuration root and a data root
 Intent: proposed

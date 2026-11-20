@@ -54,6 +54,11 @@ pub fn serve_environment(
 
     // Clean up any existing dead container with this name (silently)
     let _ = crate::container::container_remove_quiet(engine, container_name);
+    // RUN-1: a server holds no capability, so files an earlier docker run
+    // wrote as another uid must be the caller's before it can write them.
+    if engine == ContainerEngine::Docker {
+        crate::container::reclaim_if_foreign(image, std::path::Path::new(data_dir))?;
+    }
 
     if network == Some("host") {
         eprintln!(
@@ -78,15 +83,14 @@ pub fn serve_environment(
 
     if verbose {
         let exe = engine_executable(engine);
-        let extra = crate::container::engine_specific_run_flags_io(engine);
-        let args = crate::container::build_run_args(engine, &extra, &cfg);
+        let args = crate::container::run_argv(engine, &cfg)?;
         let quoted: Vec<String> = args.iter().map(|a| {
             if a.contains(' ') { format!("'{a}'") } else { a.clone() }
         }).collect();
         eprintln!("[mim] {exe} {}", quoted.join(" "));
     }
 
-    let (status, _stdout, run_err) = container_run(engine, &cfg);
+    let (status, _stdout, run_err) = container_run(engine, &cfg)?;
     if !status.success() {
         // `container_run` may have left a partially-created container behind
         // (e.g., port conflict after container creation). Clean it up so the
@@ -396,6 +400,9 @@ fn serve_run_config(
     cfg.network = network.map(str::to_string);
     let mh = CONTAINER_MORLOC_HOME;
     let (binds, volumes) = crate::base_mounts(data_dir);
+    // RUN-1: a server runs as container root under rootless docker, so it
+    // holds no capability.
+    cfg.hardened = true;
     cfg.bind_mounts = binds;
     cfg.volumes = volumes;
     // A host-mounted home shadows the env-owned one for served daemons too, so a
@@ -454,11 +461,10 @@ pub fn validate_programs(
         cfg.platform = platform;
         if verbose {
             let exe = engine_executable(engine);
-            let extra = crate::container::engine_specific_run_flags_io(engine);
-            let args = crate::container::build_run_args(engine, &extra, &cfg);
+            let args = crate::container::run_argv(engine, &cfg)?;
             eprintln!("[mim] {exe} {}", args.join(" "));
         }
-        let (status, _stdout, stderr) = container_run_quiet(engine, &cfg);
+        let (status, _stdout, stderr) = container_run_quiet(engine, &cfg)?;
         if status.success() {
             let n = prog.commands.len();
             eprintln!("  [ok] {} ({} commands)", prog.name, n);
@@ -1089,13 +1095,20 @@ mod tests {
             .collect();
         assert_eq!(mounts.len(), cfg.bind_mounts.len() + cfg.volumes.len(), "{args:?}");
         for (host, container) in &cfg.bind_mounts {
-            let want = format!("{host}:{container}:z");
+            let want = match container.strip_suffix(":ro") {
+                Some(target) => format!("{host}:{target}:ro,z"),
+                None => format!("{host}:{container}:z"),
+            };
             assert!(mounts.contains(&&want), "{want} missing from {mounts:?}");
         }
         for (volume, container) in &cfg.volumes {
             let want = format!("{volume}:{container}");
             assert!(mounts.contains(&&want), "{want} missing from {mounts:?}");
         }
+        // RUN-1: the server holds no capability.
+        assert!(args.iter().any(|a| a == "--cap-drop=ALL"), "{args:?}");
+        assert!(args.windows(2).any(|w| w[0] == "--security-opt" && w[1] == "no-new-privileges"));
+
         // The same env every container process gets, plus the immutability mark.
         let path = cfg.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone()).unwrap();
         assert!(path.split(':').any(|d| d == format!("{CONTAINER_MORLOC_HOME}/bin")), "{path}");

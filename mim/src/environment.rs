@@ -1,11 +1,10 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use serde::Serialize;
 
 use crate::config;
-use crate::container::{self, engine_executable, image_exists_locally, Probe};
+use crate::container::{self, image_exists_locally, Probe};
 use crate::error::{ManagerError, Result};
 use crate::serve;
 use crate::types::*;
@@ -47,29 +46,19 @@ pub struct EnvInfo {
 /// For docker/podman this uses `<engine> run --rm <ref>`; for apptainer it
 /// uses `apptainer exec <sif-path>`.
 pub fn detect_morloc_version(engine: ContainerEngine, image: &str) -> Result<Version> {
-    let exe = engine_executable(engine);
-    let argv: Vec<&str> = match engine {
-        ContainerEngine::Docker | ContainerEngine::Podman => {
-            vec!["run", "--rm", image, "morloc", "--version"]
-        }
-        ContainerEngine::Apptainer => vec!["exec", image, "morloc", "--version"],
+    let cfg = container::RunConfig {
+        command: Some(vec!["morloc".to_string(), "--version".to_string()]),
+        ..container::RunConfig::new(image)
     };
-    let output = Command::new(exe)
-        .args(&argv)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| ManagerError::EnvError(format!("Failed to run container: {e}")))?;
-
-    if !output.status.success() {
+    let (status, stdout, stderr) = container::container_run_quiet(engine, &cfg)?;
+    if !status.success() {
         return Err(ManagerError::EnvError(format!(
             "Image '{image}' does not have a working morloc binary: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         )));
     }
 
-    let ver_out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let ver_out = stdout.trim().to_string();
     Version::from_command_output(&ver_out).ok_or_else(|| {
         ManagerError::EnvError(format!(
             "Could not parse morloc version from image '{image}' output: {ver_out}"
@@ -155,7 +144,11 @@ pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &
     let _lock = lock_if_present(&config::env_data_dir(scope, name))?;
 
     match config::read_serve_runtime(scope, name).and_then(|rt| rt.handle) {
-        Some(ServeHandle::Native { pid, pgid, start }) => crate::stop_native_serve(pid, pgid, start)?,
+        Some(ServeHandle::Native { pid, pgid, start, boot }) => {
+            if let crate::NativeStop::Stale(why) = crate::stop_native_serve(pid, pgid, start, boot.as_deref())? {
+                eprintln!("'{name}' was not serving: {why}.");
+            }
+        }
         Some(ServeHandle::Container { engine: e, name: recorded }) => {
             remove_engine_object(e, "container", &recorded, || {
                 let _ = container::container_stop(e, &recorded);
@@ -170,6 +163,14 @@ pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &
                     let _ = container::container_remove_quiet(engine, &cname);
                 })?;
             }
+        }
+    }
+
+    if let (Some(ContainerEngine::Docker), Some(img)) = (engine, ec.built_image.as_deref()) {
+        // Without the image there is nothing to reclaim with; any foreign file
+        // then makes `remove_tree` name the directory to clear by hand.
+        if container::image_exists_locally(ContainerEngine::Docker, img) {
+            container::reclaim_if_foreign(img, &config::env_data_dir(scope, name))?;
         }
     }
 
@@ -198,7 +199,7 @@ pub fn remove_environment(engine: Option<ContainerEngine>, scope: Scope, name: &
 /// Remove an engine object with `remove` if the engine reports it, and fail
 /// unless the engine then reports it absent. An engine that cannot answer is
 /// a failure, never taken for absence.
-fn remove_engine_object(
+pub(crate) fn remove_engine_object(
     engine: ContainerEngine,
     kind: &str,
     object: &str,
@@ -228,7 +229,7 @@ fn remove_engine_object(
 
 /// Delete a directory tree. A tree with read-only directories of the
 /// caller's own (a Go module cache, say) is made writable and retried.
-fn remove_tree(path: &Path, env: &str) -> Result<()> {
+pub(crate) fn remove_tree(path: &Path, env: &str) -> Result<()> {
     if fs::symlink_metadata(path).is_err() {
         return Ok(());
     }
@@ -816,11 +817,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 9000,
             token_required: false,
-            handle: Some(ServeHandle::Native {
-                pid,
-                pgid: pid,
-                start: crate::process_start_ticks(pid),
-            }),
+            handle: Some(crate::native_serve_handle(pid)),
         };
         config::write_serve_runtime(Scope::Local, "srv", &record).unwrap();
         remove_environment(None, Scope::Local, "srv").unwrap();

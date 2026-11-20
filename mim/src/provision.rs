@@ -183,9 +183,9 @@ pub fn asset_url(tag: &str, asset: &str) -> String {
 /// Best-effort: returns None on any failure (a release without the asset,
 /// offline, network error) so provisioning proceeds with no default snapshot
 /// rather than failing.
-pub fn fetch_stdlib_snapshot(version: &str) -> Option<String> {
+pub fn fetch_stdlib_snapshot(trust: &Trust, version: &str) -> Option<String> {
     let url = asset_url(&format!("v{version}"), "stdlib-snapshot.txt");
-    curl_capture_quiet(&url).ok()
+    curl_capture_quiet(trust, &url).ok()
 }
 
 /// The public release page for `tag` (HTTP 200 if the release exists, 404
@@ -198,13 +198,13 @@ pub fn release_page_url(tag: &str) -> String {
 /// resolved tag. Checks the release PAGE (which 404s for a nonexistent tag)
 /// rather than a specific asset, so it does not depend on which assets a given
 /// release publishes.
-pub fn verify_release(requested: &str) -> Result<String> {
-    let tag = resolve_tag(requested)?;
+pub fn verify_release(trust: &Trust, requested: &str) -> Result<String> {
+    let tag = resolve_tag(trust, requested)?;
     let url = release_page_url(&tag);
     // -I/-o /dev/null: a HEAD that discards the body; -f (from curl_base) makes a
     // 404 a non-success exit. Silence curl's own stderr so the caller controls
     // the message.
-    let ok = curl_base()
+    let ok = curl_base(trust)
         .args(["-I", "-o", "/dev/null"])
         .arg(&url)
         .stderr(Stdio::null())
@@ -218,13 +218,47 @@ pub fn verify_release(requested: &str) -> Result<String> {
     }
 }
 
+/// PROV-9: the certificates a download trusts. Every download names one, so
+/// none can fall back to the system store by omission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Trust {
+    /// curl's own store.
+    System,
+    /// Exactly this bundle (`--cacert` replaces the system store).
+    Bundle(PathBuf),
+}
+
+impl Trust {
+    /// A download belonging to no environment: the user's `CURL_CA_BUNDLE` or
+    /// `SSL_CERT_FILE`, else the system store.
+    pub fn user() -> Trust {
+        Self::from_vars(|k| std::env::var_os(k))
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Trust {
+        ["CURL_CA_BUNDLE", "SSL_CERT_FILE"]
+            .iter()
+            .find_map(|k| var(k).filter(|v| !v.is_empty()))
+            .map_or(Trust::System, |v| Trust::Bundle(PathBuf::from(v)))
+    }
+
+    /// A download for environment `name`: its materialized host bundle (its
+    /// corporate certificates plus the public roots), else the user's.
+    pub fn for_env(scope: Scope, name: &str) -> Trust {
+        crate::cert::host_bundle_if_present(scope, name).map_or_else(Trust::user, Trust::Bundle)
+    }
+}
+
 /// A curl command hardened with the same TLS/proto flags and stdio for every
 /// fetch. Callers add `-o <dest>` (download) or just the URL (capture).
-fn curl_base() -> Command {
+fn curl_base(trust: &Trust) -> Command {
     let mut c = Command::new("curl");
     c.args(["--proto", "=https", "--tlsv1.2", "-fsSL"])
         .stdin(Stdio::null())
         .stderr(Stdio::inherit());
+    if let Trust::Bundle(path) = trust {
+        c.arg("--cacert").arg(path);
+    }
     c
 }
 
@@ -234,8 +268,8 @@ fn curl_spawn_err(e: std::io::Error) -> ManagerError {
 
 /// Capture a URL's body to a string via curl (follows redirects; fails on HTTP
 /// error). Used to fetch the release manifest.
-pub(crate) fn curl_capture(url: &str) -> Result<String> {
-    let out = curl_base().arg(url).output().map_err(curl_spawn_err)?;
+pub(crate) fn curl_capture(trust: &Trust, url: &str) -> Result<String> {
+    let out = curl_base(trust).arg(url).output().map_err(curl_spawn_err)?;
     if !out.status.success() {
         return Err(ManagerError::EnvError(format!("download failed: {url}")));
     }
@@ -245,8 +279,8 @@ pub(crate) fn curl_capture(url: &str) -> Result<String> {
 /// Like `curl_capture` but silences curl's own stderr. For probes where a 404
 /// is an expected, handled outcome (the caller reports it), so curl's raw error
 /// line does not precede the caller's message.
-pub(crate) fn curl_capture_quiet(url: &str) -> Result<String> {
-    let out = curl_base()
+pub(crate) fn curl_capture_quiet(trust: &Trust, url: &str) -> Result<String> {
+    let out = curl_base(trust)
         .arg(url)
         .stderr(Stdio::null())
         .output()
@@ -259,8 +293,8 @@ pub(crate) fn curl_capture_quiet(url: &str) -> Result<String> {
 
 /// The final URL after following redirects for `url` (an HTTP HEAD; the body is
 /// discarded). Used to resolve the `releases/latest` redirect to its tag page.
-pub(crate) fn curl_effective_url(url: &str) -> Result<String> {
-    let out = curl_base()
+pub(crate) fn curl_effective_url(trust: &Trust, url: &str) -> Result<String> {
+    let out = curl_base(trust)
         .args(["-I", "-o", "/dev/null", "-w", "%{url_effective}"])
         .arg(url)
         .output()
@@ -289,9 +323,9 @@ pub(crate) fn parse_tag_from_release_url(url: &str) -> Option<String> {
 /// provisioning behind shared IPs / CI / NAT; the web redirect carries no such
 /// per-hour cap and needs no token. Set `MORLOC_RELEASE_TAG` to pin an explicit
 /// tag and skip this lookup entirely.
-pub fn fetch_latest_tag() -> Result<String> {
+pub fn fetch_latest_tag(trust: &Trust) -> Result<String> {
     let latest = "https://github.com/morloc-project/morloc/releases/latest";
-    let final_url = curl_effective_url(latest)?;
+    let final_url = curl_effective_url(trust, latest)?;
     parse_tag_from_release_url(&final_url).ok_or_else(|| {
         ManagerError::EnvError(format!(
             "could not determine the latest release tag from {final_url}"
@@ -302,10 +336,10 @@ pub fn fetch_latest_tag() -> Result<String> {
 /// Resolve a requested release specifier to a concrete GitHub tag. "latest"
 /// follows GitHub's releases/latest redirect; a bare version like "0.98.3" becomes "v0.98.3"; anything
 /// else (an explicit tag such as "dev" or "v0.98.3") is used verbatim.
-pub fn resolve_tag(requested: &str) -> Result<String> {
+pub fn resolve_tag(trust: &Trust, requested: &str) -> Result<String> {
     let requested = requested.trim();
     if requested.eq_ignore_ascii_case("latest") {
-        fetch_latest_tag()
+        fetch_latest_tag(trust)
     } else if requested.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         Ok(format!("v{requested}"))
     } else {
@@ -322,8 +356,8 @@ pub fn runtimes_dir(scope: Scope, version: &str, triple: &str) -> PathBuf {
 }
 
 /// Download a URL to a path via curl (follows redirects; fails on HTTP error).
-pub(crate) fn curl_download(url: &str, dest: &Path) -> Result<()> {
-    let status = curl_base()
+pub(crate) fn curl_download(trust: &Trust, url: &str, dest: &Path) -> Result<()> {
+    let status = curl_base(trust)
         .arg("-o")
         .arg(dest)
         .arg(url)
@@ -385,6 +419,7 @@ fn part_path(dest: &Path) -> PathBuf {
 /// download and verification succeed, so an interrupted, corrupt, or unverifiable
 /// fetch never leaves a file that a presence check would bless as valid.
 fn download_asset(
+    trust: &Trust,
     tag: &str,
     asset: &str,
     dest: &Path,
@@ -392,7 +427,7 @@ fn download_asset(
 ) -> Result<()> {
     let part = part_path(dest);
     let result = (|| {
-        curl_download(&asset_url(tag, asset), &part)?;
+        curl_download(trust, &asset_url(tag, asset), &part)?;
         let expected = digests.get(asset).ok_or_else(|| {
             ManagerError::EnvError(format!(
                 "no SHA-256 published for asset {asset}; refusing an unverified download"
@@ -533,7 +568,7 @@ pub fn mim_agent_for_host(_scope: Scope) -> Result<PathBuf> {
 ///      release, verify it, cache it, and return the cached path. Reached only
 ///      when building an image for a different platform than the host (e.g. a
 ///      macOS-arm64 host building a Linux image).
-pub fn mim_for_triple(scope: Scope, triple: &str) -> Result<PathBuf> {
+pub fn mim_for_triple(trust: &Trust, scope: Scope, triple: &str) -> Result<PathBuf> {
     let over = mim_env_override_for_staging()?;
     let running = running_mim()?;
     match agent_source(over.as_deref(), triple, host_release_triple(), &running) {
@@ -553,7 +588,7 @@ pub fn mim_for_triple(scope: Scope, triple: &str) -> Result<PathBuf> {
     if cached.is_file() {
         return Ok(cached);
     }
-    download_mim(triple, &cached)?;
+    download_mim(trust, triple, &cached)?;
     Ok(cached)
 }
 
@@ -635,7 +670,7 @@ fn elf_is_static(path: &Path) -> Option<bool> {
 /// An absent checksum file is a hard error -- an unverifiable binary is never
 /// installed. The body lands on a temporary `.part` path and is renamed into place
 /// only after the download and verification succeed.
-fn download_mim(triple: &str, dest: &Path) -> Result<()> {
+fn download_mim(trust: &Trust, triple: &str, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             ManagerError::EnvError(format!("cannot create {}: {e}", parent.display()))
@@ -648,12 +683,12 @@ fn download_mim(triple: &str, dest: &Path) -> Result<()> {
     eprintln!("Fetching the dependency agent ({asset}, {tag})...");
     let part = part_path(dest);
     let result = (|| {
-        curl_download(&url, &part)?;
+        curl_download(trust, &url, &part)?;
         // The checksum file is REQUIRED: never install an unverified binary. The
         // fetch can fail because the file is genuinely absent (a partial release)
         // OR for a transport reason (proxy/TLS/DNS); surface the underlying error
         // rather than asserting one cause.
-        let sha_body = curl_capture(&sha_url).map_err(|e| {
+        let sha_body = curl_capture(trust, &sha_url).map_err(|e| {
             ManagerError::EnvError(format!(
                 "could not fetch the checksum file {asset}.sha256 from {sha_url} ({e}); \
                  refusing to install an unverified {asset}"
@@ -753,8 +788,8 @@ fn check_stamp(found: &str, expected: &str, tag: &str, entry: &Path) -> Result<(
 
 /// Fetch and parse the release manifest attached to a GitHub `tag`. The
 /// manifest declares the concrete version and the per-triple asset names.
-pub fn fetch_manifest(tag: &str) -> Result<ReleaseManifest> {
-    let text = curl_capture(&asset_url(tag, MANIFEST_ASSET))?;
+pub fn fetch_manifest(trust: &Trust, tag: &str) -> Result<ReleaseManifest> {
+    let text = curl_capture(trust, &asset_url(tag, MANIFEST_ASSET))?;
     ReleaseManifest::from_json(&text)
 }
 
@@ -769,15 +804,16 @@ pub fn fetch_manifest(tag: &str) -> Result<ReleaseManifest> {
 /// (the compiler runs, and libmorloc is built, inside the image -- so on a macOS
 /// host a Linux/arm64 container needs the linux-arm64 runtime, not macos-arm64).
 pub fn provision_runtime(
+    trust: &Trust,
     scope: Scope,
     requested: &str,
     triple: &str,
 ) -> Result<(PathBuf, String)> {
     // Resolve "latest"/a bare version to a concrete download tag (asset URLs need
     // the real tag, not the "latest" alias).
-    let tag = resolve_tag(requested)?;
+    let tag = resolve_tag(trust, requested)?;
     eprintln!("Provisioning morloc runtime from release {tag}...");
-    let manifest = fetch_manifest(&tag)?;
+    let manifest = fetch_manifest(trust, &tag)?;
     let version = manifest.version.clone();
     let assets = manifest.assets_for(triple).ok_or_else(|| {
         ManagerError::BackendUnsupported(format!(
@@ -804,13 +840,13 @@ pub fn provision_runtime(
         // so the runtime that pools link/load is ABI-coherent with the toolchain
         // that compiles those pools.
         let morloc_dest = runtime_morloc_bin(&dir);
-        download_asset(&tag, &assets.morloc, &morloc_dest, &manifest.sha256)?;
+        download_asset(trust, &tag, &assets.morloc, &morloc_dest, &manifest.sha256)?;
         make_executable(&morloc_dest)?;
 
         // Wipe any stale rust/ from an interrupted prior extraction so a
         // re-provision never mixes old and new files.
         let src_tar = dir.join(&manifest.rust_src);
-        download_asset(&tag, &manifest.rust_src, &src_tar, &manifest.sha256)?;
+        download_asset(trust, &tag, &manifest.rust_src, &src_tar, &manifest.sha256)?;
         let _ = std::fs::remove_dir_all(runtime_rust_src(&dir));
         extract_tar_gz(&src_tar, &dir)?;
         let _ = std::fs::remove_file(&src_tar);
@@ -827,7 +863,7 @@ pub fn provision_runtime(
     // that publishes one must deliver it intact (PROV-2).
     let ls = dir.join(LANG_SUPPORT_FILE);
     if !ls.exists() && manifest.sha256.contains_key(LANG_SUPPORT_ASSET) {
-        download_asset(&tag, LANG_SUPPORT_ASSET, &ls, &manifest.sha256)?;
+        download_asset(trust, &tag, LANG_SUPPORT_ASSET, &ls, &manifest.sha256)?;
     }
 
     Ok((dir, version))
@@ -863,7 +899,7 @@ fn host_pixi_current(bin_dir: &Path) -> bool {
         && std::fs::read_to_string(bin_dir.join(PIXI_VERSION_STAMP)).is_ok_and(|v| v.trim() == PIXI_VERSION)
 }
 
-pub fn provision_pixi(scope: Scope) -> Result<PathBuf> {
+pub fn provision_pixi(trust: &Trust, scope: Scope) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("MORLOC_PIXI") {
         if !p.is_empty() {
             return Ok(PathBuf::from(p));
@@ -898,7 +934,7 @@ pub fn provision_pixi(scope: Scope) -> Result<PathBuf> {
             ManagerError::EnvError(format!("cannot create {}: {e}", stage.display()))
         })?;
         let tar = stage.join("pixi.tar.gz");
-        curl_download(&url, &tar)?;
+        curl_download(trust, &url, &tar)?;
         extract_tar_gz(&tar, &stage)?;
         let extracted = stage.join("pixi");
         if !extracted.is_file() {
@@ -1029,7 +1065,7 @@ fn copy_dir_inner(
 /// plus the Rust workspace source. libmorloc.so + morloc-nexus are built from
 /// that source in-image by `morloc init`, so they are not staged. Everything
 /// comes from the downloaded runtime -- no host morloc install is required.
-pub fn stage_runtime(scope: Scope, triple: &str, src: &Path, dest: &Path) -> Result<()> {
+pub fn stage_runtime(trust: &Trust, scope: Scope, triple: &str, src: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)
         .map_err(|e| ManagerError::EnvError(format!("cannot create {}: {e}", dest.display())))?;
     let from = runtime_morloc_bin(src);
@@ -1048,7 +1084,7 @@ pub fn stage_runtime(scope: Scope, triple: &str, src: &Path, dest: &Path) -> Res
     // CONTAINER's platform, not the host's, so a macOS host building a Linux image
     // stages the Linux mim -- `mim_for_triple` returns the running mim when the
     // triples match and downloads the matching release binary otherwise.
-    let agent = mim_for_triple(scope, triple)?;
+    let agent = mim_for_triple(trust, scope, triple)?;
     stage_mim_agent(&agent, dest)?;
     let rust = runtime_rust_src(src);
     if !rust.is_dir() {
@@ -1063,6 +1099,70 @@ pub fn stage_runtime(scope: Scope, triple: &str, src: &Path, dest: &Path) -> Res
 
 #[cfg(test)]
 mod tests {
+
+    /// PROV-9: a bundle replaces curl's store with exactly that file; the
+    /// system trust passes nothing.
+    #[test]
+    fn a_download_carries_the_bundle_it_trusts() {
+        let args = |t: &Trust| -> Vec<String> {
+            curl_base(t).get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+        };
+        let bundle = args(&Trust::Bundle(PathBuf::from("/c/host.pem")));
+        assert!(bundle.windows(2).any(|w| w[0] == "--cacert" && w[1] == "/c/host.pem"), "{bundle:?}");
+        assert!(!args(&Trust::System).iter().any(|a| a == "--cacert"));
+    }
+
+    /// PROV-9: a download for no environment honours the user's bundle
+    /// variables, `CURL_CA_BUNDLE` first.
+    #[test]
+    fn a_download_for_no_environment_honours_the_users_bundle() {
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| std::ffi::OsString::from(v))
+        };
+        assert_eq!(Trust::from_vars(vars(&[])), Trust::System);
+        assert_eq!(Trust::from_vars(vars(&[("CURL_CA_BUNDLE", "")])), Trust::System);
+        assert_eq!(Trust::from_vars(vars(&[("SSL_CERT_FILE", "/s")])), Trust::Bundle("/s".into()));
+        assert_eq!(
+            Trust::from_vars(vars(&[("SSL_CERT_FILE", "/s"), ("CURL_CA_BUNDLE", "/c")])),
+            Trust::Bundle("/c".into())
+        );
+    }
+
+    /// PROV-9: an environment's download trusts its materialized host bundle.
+    #[test]
+    fn a_download_for_an_environment_trusts_its_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::test_roots::set(tmp.path());
+        let host = crate::cert::host_bundle_path(Scope::Local, "e");
+        std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+        std::fs::write(&host, "x").unwrap();
+        assert_eq!(Trust::for_env(Scope::Local, "e"), Trust::Bundle(host));
+    }
+
+    /// PROV-9: mim runs curl in one place, so no download can skip its trust.
+    #[test]
+    fn curl_is_built_only_by_curl_base() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let mut offenders = Vec::new();
+        let mut dirs = vec![root.join("mim/src"), root.join("morloc-deps/src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let body = text.find("\nmod tests {").map_or(&text[..], |i| &text[..i]);
+                let n = body.matches(&format!("Command::new({:?})", "curl")).count();
+                let allowed = usize::from(path.ends_with("mim/src/provision.rs"));
+                if n != allowed {
+                    offenders.push(format!("{}: {n}", path.display()));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "{offenders:?}");
+    }
     use super::*;
 
     /// Two links to one directory each get its content; only a link back into
@@ -1274,9 +1374,9 @@ mod tests {
 
     #[test]
     fn resolve_tag_normalizes_versions_and_passes_channels() {
-        assert_eq!(resolve_tag("0.98.3").unwrap(), "v0.98.3");
-        assert_eq!(resolve_tag("v0.98.3").unwrap(), "v0.98.3");
-        assert_eq!(resolve_tag("dev").unwrap(), "dev");
+        assert_eq!(resolve_tag(&Trust::System, "0.98.3").unwrap(), "v0.98.3");
+        assert_eq!(resolve_tag(&Trust::System, "v0.98.3").unwrap(), "v0.98.3");
+        assert_eq!(resolve_tag(&Trust::System, "dev").unwrap(), "dev");
     }
 
     #[test]

@@ -1,13 +1,21 @@
 # Running (RUN)
 
 ### RUN-1 A command runs with the environment's installation and the user's directory
-Intent: proposed
+Intent: ruled 2026-11-20
 Code: deviates F66, F99
+Tests: the_container_user_is_the_caller_for_every_daemon_mapping, docker_security_options_tell_rootless_from_userns_remap, every_container_run_goes_through_run_argv, a_selinux_run_from_home_disables_labels, a_bind_joins_read_only_and_relabel_options, reclaiming_files_chowns_them_to_the_host_caller, a_served_container_relabels_every_bind_mount_and_no_volume
 
 `run` and `shell` execute with the environment's compiler, runtime,
 toolchain and installed programs first on `PATH`, `MORLOC_HOME` set to its
 runtime, and the user's current directory as the working directory (mounted
 at `/work` in a container). Files written there belong to the invoking user.
+Under rootless Docker the container runs as its root, which is the caller;
+under rootful Docker with userns-remap it runs in the host user namespace.
+A failed rootless probe is an error, never taken for rootful. Under
+SELinux, a directory unsafe to relabel (the home directory) is mounted with
+labelling disabled for that container. A server drops every capability and
+cannot gain privileges. `start` and `rm` hand back to the caller files an
+earlier docker run wrote as another uid.
 
 ### RUN-2 A managed command can build
 Intent: proposed

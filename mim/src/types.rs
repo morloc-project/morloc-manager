@@ -867,14 +867,16 @@ pub enum ServeHandle {
     /// A container/apptainer instance, torn down by engine + name.
     Container { engine: ContainerEngine, name: String },
     /// A detached host process group (native backend), torn down by killing
-    /// pgid. `start` is the leader's start time (clock ticks since boot, from
-    /// `/proc/<pid>/stat`), which tells our leader from a later process that
-    /// reused its pid; absent on records from older mims and off Linux.
+    /// pgid. `start` (the leader's start time as the kernel reports it) and
+    /// `boot` (the boot id) tell our leader from a later process that reused
+    /// its pid (SERVE-3); a record without them identifies nothing.
     Native {
         pid: u32,
         pgid: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boot: Option<String>,
     },
 }
 

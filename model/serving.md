@@ -19,14 +19,19 @@ installed, and removing a module from an environment's views removes it from
 the allow-list too.
 
 ### SERVE-3 One server per environment
-Intent: proposed
-Code: deviates F8, F62
-Tests: stop_clears_a_record_whose_container_is_gone, stop_never_signals_a_process_that_reused_the_server_pid, a_serve_leader_is_judged_by_its_start_time
+Intent: ruled 2026-11-20
+Code: deviates F8
+Tests: stop_clears_a_record_whose_container_is_gone, a_serve_leader_is_classified_by_start_time_and_boot, a_spawned_serve_leader_is_recognised_as_ours, stop_never_signals_the_group_of_a_gone_leader, stop_refuses_an_unverifiable_server_until_forgotten
 
 `start` launches one server and records its handle; it refuses while that
-server is alive unless told to replace it. A handle is judged alive only if
-it still names the process or container mim started. `stop` ends it and
-removes the record, and a record whose server is gone is removed too.
+server is alive unless told to replace it. A native handle holds the
+leader's pid, its start time and the boot id. A leader that is gone, or
+one recorded in another boot or now naming another process, is stale: its
+record is removed and nothing is signalled. A leader whose identity cannot
+be read is unknown: `stop` and `start` refuse and name the pid and group,
+and `stop --forget` removes the record. A process group is never signalled
+on its id alone. `stop` ends a live server and removes the record, and
+says which of the two happened.
 
 ### SERVE-4 A server reachable from other machines requires a credential
 Intent: ruled 2026-11-15

@@ -883,7 +883,7 @@ fn check_linkage(
         platform,
         ..crate::container::RunConfig::new(tag)
     };
-    let (status, stdout, stderr) = crate::container::container_run_quiet(engine, &cfg);
+    let (status, stdout, stderr) = crate::container::container_run_quiet(engine, &cfg)?;
     if verbose {
         eprintln!("{stdout}");
     }
