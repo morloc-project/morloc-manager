@@ -57,7 +57,10 @@ entries at all?
 ### F26 System-dependency providers are handled inconsistently
 `pixi.rs` makes every provider except exact `"host"` a conda dependency
 (including `vcpkg`); `EnvSpec::native_blockers` lowercases and is used only
-by the manager. What does each provider mean in a container?
+by the manager. What does each provider mean in a container? Since compiler
+PKG-12 (2026-11-19) the compiler emits no `system` entries (C++ link names
+were sent there and solved as conda packages), so only a hand-written
+envspec reaches this path.
 
 ### F27 Undecided small behaviors
 - Native `run` may download pixi (`provision_pixi`); may `run` use the
