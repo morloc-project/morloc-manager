@@ -4,6 +4,8 @@ use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 
+use crate::error::ManagerError;
+type MimResult<T> = crate::error::Result<T>;
 use crate::types::ContainerEngine;
 
 // ======================================================================
@@ -32,6 +34,10 @@ pub struct RunConfig {
     /// and suppressed. `None` uses the engine default (bridge).
     pub network: Option<String>,
     pub env: Vec<(String, String)>,
+    /// Variables whose values must not appear on the engine's command line
+    /// (SERVE-4): named in the argv, valued in the engine process's environment
+    /// (`engine_process_env`). Only for names the engine CLI itself ignores.
+    pub secret_env: Vec<(String, String)>,
     pub read_only: bool,
     pub interactive: bool,
     pub remove_after: bool,
@@ -40,6 +46,11 @@ pub struct RunConfig {
     pub command: Option<Vec<String>>,
     pub work_dir: Option<String>,
     pub selinux_suffix: String,
+    /// RUN-1: the container runs with SELinux labelling off, so a directory
+    /// unsafe to relabel (the user's home) is mounted unrelabelled.
+    pub label_disable: bool,
+    /// RUN-1: a server drops every capability and cannot gain privileges.
+    pub hardened: bool,
     pub extra_flags: Vec<String>,
     /// The architecture the image was built for, passed as `--platform` so the
     /// engine never guesses from the host or from `DOCKER_DEFAULT_PLATFORM`.
@@ -58,6 +69,7 @@ impl RunConfig {
             publish_host: None,
             network: None,
             env: Vec::new(),
+            secret_env: Vec::new(),
             read_only: false,
             interactive: false,
             remove_after: true,
@@ -66,6 +78,8 @@ impl RunConfig {
             command: None,
             work_dir: None,
             selinux_suffix: String::new(),
+            label_disable: false,
+            hardened: false,
             extra_flags: Vec::new(),
             platform: None,
         }
@@ -159,19 +173,36 @@ fn has_on_path(exe: &str) -> bool {
 // Operations
 // ======================================================================
 
-pub fn container_run(engine: ContainerEngine, cfg: &RunConfig) -> (ExitStatus, String, String) {
-    let exe = engine_executable(engine);
-    let extra = engine_specific_run_flags_io(engine);
-    let args = build_run_args(engine, &extra, cfg);
-    run_process(exe, &args)
+pub fn container_run(engine: ContainerEngine, cfg: &RunConfig) -> MimResult<(ExitStatus, String, String)> {
+    let args = run_argv(engine, cfg)?;
+    Ok(run_process_env(engine_executable(engine), &args, &engine_process_env(engine, cfg)))
+}
+
+/// The variables the engine process itself must carry so the container sees
+/// `cfg.secret_env`: as named for docker/podman `-e NAME`, and for Apptainer
+/// under the prefixes it forwards without a flag.
+pub fn engine_process_env(engine: ContainerEngine, cfg: &RunConfig) -> Vec<(String, String)> {
+    match argstyle(engine) {
+        ArgStyle::Oci => cfg.secret_env.clone(),
+        ArgStyle::Apptainer => apptainer_forwarded(&cfg.secret_env),
+    }
+}
+
+/// `vars` as Apptainer forwards them into a container: `APPTAINERENV_`, or
+/// `SINGULARITYENV_` when the binary is SingularityCE (`apptainer_executable`).
+pub fn apptainer_forwarded(vars: &[(String, String)]) -> Vec<(String, String)> {
+    vars.iter()
+        .flat_map(|(k, v)| {
+            [("APPTAINERENV_", k, v), ("SINGULARITYENV_", k, v)]
+                .map(|(p, k, v)| (format!("{p}{k}"), v.clone()))
+        })
+        .collect()
 }
 
 /// Like `container_run` but captures both stdout and stderr (no streaming).
-pub fn container_run_quiet(engine: ContainerEngine, cfg: &RunConfig) -> (ExitStatus, String, String) {
-    let exe = engine_executable(engine);
-    let extra = engine_specific_run_flags_io(engine);
-    let args = build_run_args(engine, &extra, cfg);
-    run_process_quiet(exe, &args)
+pub fn container_run_quiet(engine: ContainerEngine, cfg: &RunConfig) -> MimResult<(ExitStatus, String, String)> {
+    let args = run_argv(engine, cfg)?;
+    Ok(run_process_quiet_env(engine_executable(engine), &args, &engine_process_env(engine, cfg)))
 }
 
 pub fn container_run_passthrough(
@@ -179,10 +210,9 @@ pub fn container_run_passthrough(
     verbose: bool,
     shell: bool,
     cfg: &RunConfig,
-) -> ExitStatus {
+) -> MimResult<ExitStatus> {
     let exe = engine_executable(engine);
-    let extra = engine_specific_run_flags_io(engine);
-    let args = build_run_args(engine, &extra, cfg);
+    let args = run_argv(engine, cfg)?;
 
     if verbose || shell {
         let quoted: Vec<String> = args
@@ -200,11 +230,12 @@ pub fn container_run_passthrough(
 
     Command::new(exe)
         .args(&args)
+        .envs(engine_process_env(engine, cfg))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .unwrap_or_else(|e| report_spawn_failure(exe, e))
+        .map_or_else(|e| Ok(report_spawn_failure(exe, e)), Ok)
 }
 
 /// Build a container image with all output (stdout+stderr) redirected to stderr.
@@ -414,7 +445,7 @@ pub fn volume_copy(
         ]),
         ..RunConfig::new(image)
     };
-    let (status, _, stderr) = container_run_quiet(engine, &cfg);
+    let (status, _, stderr) = container_run_quiet(engine, &cfg).map_err(|e| e.to_string())?;
     if status.success() {
         Ok(())
     } else {
@@ -547,7 +578,7 @@ fn build_oci_run_args(
     }
     for (host, container) in &cfg.bind_mounts {
         args.push("-v".to_string());
-        args.push(format!("{host}:{container}{}", cfg.selinux_suffix));
+        args.push(bind_spec(host, container, &cfg.selinux_suffix, cfg.label_disable));
     }
     // After the bind mounts, so a volume whose target nests inside one is applied
     // over it. Both engines order mounts by destination depth regardless, but
@@ -577,6 +608,19 @@ fn build_oci_run_args(
         args.push("-e".to_string());
         args.push(format!("{key}={val}"));
     }
+    for (key, _) in &cfg.secret_env {
+        args.push("-e".to_string());
+        args.push(key.clone());
+    }
+    if cfg.label_disable {
+        args.push("--security-opt".to_string());
+        args.push("label=disable".to_string());
+    }
+    if cfg.hardened {
+        args.push("--cap-drop=ALL".to_string());
+        args.push("--security-opt".to_string());
+        args.push("no-new-privileges".to_string());
+    }
     args.extend(cfg.extra_flags.iter().cloned());
     push_platform(&mut args, cfg.platform);
     args.push(cfg.image.clone());
@@ -584,6 +628,29 @@ fn build_oci_run_args(
         args.extend(cmd.iter().cloned());
     }
     args
+}
+
+/// A `-v` bind: `host:target[:opts]`, where a target written `path:ro` and the
+/// SELinux relabel `:z` share one comma-separated option field. A container
+/// with labelling disabled relabels nothing.
+fn bind_spec(host: &str, container: &str, selinux_suffix: &str, label_disable: bool) -> String {
+    let (target, ro) = match container.strip_suffix(":ro") {
+        Some(t) => (t, true),
+        None => (container, false),
+    };
+    let relabel = selinux_suffix.trim_start_matches(':');
+    let mut opts: Vec<&str> = Vec::new();
+    if ro {
+        opts.push("ro");
+    }
+    if !relabel.is_empty() && !label_disable {
+        opts.push(relabel);
+    }
+    if opts.is_empty() {
+        format!("{host}:{target}")
+    } else {
+        format!("{host}:{target}:{}", opts.join(","))
+    }
 }
 
 /// `--platform` goes after the user's flags: the engine takes the last
@@ -697,27 +764,169 @@ fn warn_dropped(message: &str) {
     }
 }
 
-pub fn engine_specific_run_flags_io(engine: ContainerEngine) -> Vec<String> {
-    let uid = nix::unistd::getuid();
+/// How a docker daemon maps the container's users to the host's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerUsers {
+    /// Container uids are host uids.
+    Rootful,
+    /// The daemon runs as the caller: container root is the caller.
+    Rootless,
+    /// A rootful daemon with userns-remap: container uids are shifted.
+    UsernsRemap,
+}
+
+/// RUN-1: read `docker info --format '{{json .SecurityOptions}}'`, a JSON list
+/// of `name=<option>[,key=value...]` entries.
+pub fn parse_docker_security_options(json: &str) -> Result<DockerUsers, String> {
+    let opts: Vec<String> = serde_json::from_str(json.trim())
+        .map_err(|e| format!("unreadable security options {:?}: {e}", json.trim()))?;
+    let names: Vec<&str> =
+        opts.iter().filter_map(|o| o.split(',').next()?.strip_prefix("name=")).collect();
+    Ok(if names.contains(&"rootless") {
+        DockerUsers::Rootless
+    } else if names.contains(&"userns") {
+        DockerUsers::UsernsRemap
+    } else {
+        DockerUsers::Rootful
+    })
+}
+
+fn probe_docker_users() -> Result<DockerUsers, String> {
+    let out = Command::new(engine_executable(ContainerEngine::Docker))
+        .args(["info", "--format", "{{json .SecurityOptions}}"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    parse_docker_security_options(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn docker_users() -> MimResult<DockerUsers> {
+    static USERS: OnceLock<Result<DockerUsers, String>> = OnceLock::new();
+    USERS.get_or_init(probe_docker_users).clone().map_err(|why| {
+        ManagerError::EnvError(format!(
+            "cannot tell whether `docker` is rootless: `docker info` gave no security \
+             options ({why}). If `docker` is podman's compatibility command, use the \
+             podman engine instead."
+        ))
+    })
+}
+
+/// RUN-1: the flags that make the container's user the caller, so files it
+/// writes belong to them. `users` is the docker daemon's mapping.
+pub fn identity_flags(engine: ContainerEngine, users: DockerUsers, uid: u32, gid: u32) -> Vec<String> {
+    let as_caller = || vec!["--user".to_string(), format!("{uid}:{gid}")];
     match engine {
-        ContainerEngine::Podman => {
-            if uid.is_root() {
-                Vec::new()
-            } else {
-                vec!["--userns=keep-id".to_string()]
+        ContainerEngine::Podman if uid == 0 => Vec::new(),
+        ContainerEngine::Podman => vec!["--userns=keep-id".to_string()],
+        ContainerEngine::Docker => match users {
+            DockerUsers::Rootless => Vec::new(),
+            DockerUsers::Rootful if uid == 0 => Vec::new(),
+            DockerUsers::Rootful => as_caller(),
+            DockerUsers::UsernsRemap => {
+                let mut flags = vec!["--userns=host".to_string()];
+                if uid != 0 {
+                    flags.extend(as_caller());
+                }
+                flags
             }
-        }
-        ContainerEngine::Docker => {
-            if uid.is_root() {
-                Vec::new()
-            } else {
-                let gid = nix::unistd::getgid();
-                vec!["--user".to_string(), format!("{}:{}", uid, gid)]
-            }
-        }
+        },
         // Apptainer runs as the calling user and ignores --user/--userns.
         ContainerEngine::Apptainer => Vec::new(),
     }
+}
+
+fn engine_specific_run_flags_io(engine: ContainerEngine) -> MimResult<Vec<String>> {
+    let users = match engine {
+        ContainerEngine::Docker => docker_users()?,
+        _ => DockerUsers::Rootful,
+    };
+    Ok(identity_flags(engine, users, nix::unistd::getuid().as_raw(), nix::unistd::getgid().as_raw()))
+}
+
+/// The argv that runs `image` to hand every file under host directory `dir`
+/// back to the caller (uid `uid`, gid `gid`), for a daemon mapping `users`.
+pub fn reclaim_argv(users: DockerUsers, image: &str, dir: &str, selinux_suffix: &str, uid: u32, gid: u32) -> Vec<String> {
+    let (flags, owner) = match users {
+        DockerUsers::Rootless => (Vec::new(), "0:0".to_string()),
+        DockerUsers::Rootful => (vec!["--user".to_string(), "0:0".to_string()], format!("{uid}:{gid}")),
+        DockerUsers::UsernsRemap => (
+            vec!["--userns=host".to_string(), "--user".to_string(), "0:0".to_string()],
+            format!("{uid}:{gid}"),
+        ),
+    };
+    let cfg = RunConfig {
+        bind_mounts: vec![(dir.to_string(), "/reclaim".to_string())],
+        selinux_suffix: selinux_suffix.to_string(),
+        command: Some(vec!["chown".to_string(), "-R".to_string(), owner, "/reclaim".to_string()]),
+        ..RunConfig::new(image)
+    };
+    build_run_args(ContainerEngine::Docker, &flags, &cfg)
+}
+
+/// RUN-1: files an earlier docker run wrote as another host uid (a subuid,
+/// under rootless docker) are handed back to the caller, so they can be
+/// deleted.
+pub fn reclaim_ownership(image: &str, dir: &str, selinux_suffix: &str) -> MimResult<()> {
+    let users = docker_users()?;
+    let args = reclaim_argv(
+        users,
+        image,
+        dir,
+        selinux_suffix,
+        nix::unistd::getuid().as_raw(),
+        nix::unistd::getgid().as_raw(),
+    );
+    let (status, _, stderr) = run_process_quiet(engine_executable(ContainerEngine::Docker), &args);
+    if status.success() {
+        Ok(())
+    } else {
+        Err(ManagerError::EnvError(format!(
+            "could not hand the files under {dir} back to you: {}",
+            stderr.trim()
+        )))
+    }
+}
+
+/// Whether anything under `path` belongs to a uid other than the caller's.
+fn holds_foreign_files(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let me = nix::unistd::getuid();
+    if me.is_root() {
+        return false;
+    }
+    let me = me.as_raw();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+        if meta.uid() != me {
+            return true;
+        }
+        if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&p) {
+                stack.extend(entries.flatten().map(|e| e.path()));
+            }
+        }
+    }
+    false
+}
+
+/// RUN-1: hand `dir` back to the caller if an earlier docker run left files
+/// in it owned by another uid.
+pub fn reclaim_if_foreign(image: &str, dir: &Path) -> MimResult<()> {
+    if !holds_foreign_files(dir) {
+        return Ok(());
+    }
+    let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
+    reclaim_ownership(image, &dir.to_string_lossy(), suffix)
+}
+
+/// The engine argv that runs `cfg`, identity flags included. Every container
+/// mim runs goes through here.
+pub fn run_argv(engine: ContainerEngine, cfg: &RunConfig) -> MimResult<Vec<String>> {
+    Ok(build_run_args(engine, &engine_specific_run_flags_io(engine)?, cfg))
 }
 
 /// Pure version for testing.
@@ -795,8 +1004,13 @@ fn report_spawn_failure(exe: &str, e: io::Error) -> ExitStatus {
 /// Run a process with stderr streamed live to the terminal.
 /// Returns (exit_status, captured_stdout, "").
 fn run_process(exe: &str, args: &[String]) -> (ExitStatus, String, String) {
+    run_process_env(exe, args, &[])
+}
+
+fn run_process_env(exe: &str, args: &[String], env: &[(String, String)]) -> (ExitStatus, String, String) {
     let output = Command::new(exe)
         .args(args)
+        .envs(env.iter().cloned())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -822,7 +1036,11 @@ fn spawn_failure(exe: &str, e: io::Error) -> (ExitStatus, String, String) {
 /// Run a process with all output captured (no streaming).
 /// Used when stderr must be parsed (e.g., for error classification).
 fn run_process_quiet(exe: &str, args: &[String]) -> (ExitStatus, String, String) {
-    let output = Command::new(exe).args(args).stdin(Stdio::null()).output();
+    run_process_quiet_env(exe, args, &[])
+}
+
+fn run_process_quiet_env(exe: &str, args: &[String], env: &[(String, String)]) -> (ExitStatus, String, String) {
+    let output = Command::new(exe).args(args).envs(env.iter().cloned()).stdin(Stdio::null()).output();
     match output {
         Ok(output) => (
             output.status,
@@ -843,6 +1061,107 @@ pub fn exit_code_to_int(status: ExitStatus) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// RUN-1: the daemon's mapping, read from real `docker info` output.
+    #[test]
+    fn docker_security_options_tell_rootless_from_userns_remap() {
+        let rootless = r#"["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]"#;
+        let remap = r#"["name=apparmor","name=seccomp,profile=builtin","name=userns","name=cgroupns"]"#;
+        let rootful = "[\"name=apparmor\",\"name=seccomp,profile=builtin\",\"name=cgroupns\"]\n";
+        assert_eq!(parse_docker_security_options(rootless), Ok(DockerUsers::Rootless));
+        assert_eq!(parse_docker_security_options(remap), Ok(DockerUsers::UsernsRemap));
+        assert_eq!(parse_docker_security_options(rootful), Ok(DockerUsers::Rootful));
+        assert!(parse_docker_security_options("").is_err());
+        assert!(parse_docker_security_options("<no value>").is_err());
+    }
+
+    /// RUN-1: files a container writes belong to the caller. Rootless docker
+    /// already runs as the caller, userns-remap is lifted, and podman is
+    /// unchanged.
+    #[test]
+    fn the_container_user_is_the_caller_for_every_daemon_mapping() {
+        use DockerUsers::*;
+        let d = |users, uid| identity_flags(ContainerEngine::Docker, users, uid, 100);
+        assert_eq!(d(Rootless, 1000), Vec::<String>::new());
+        assert_eq!(d(Rootless, 0), Vec::<String>::new());
+        assert_eq!(d(Rootful, 1000), vec!["--user", "1000:100"]);
+        assert_eq!(d(Rootful, 0), Vec::<String>::new());
+        assert_eq!(d(UsernsRemap, 1000), vec!["--userns=host", "--user", "1000:100"]);
+        assert_eq!(d(UsernsRemap, 0), vec!["--userns=host"]);
+        for users in [Rootless, Rootful, UsernsRemap] {
+            assert_eq!(identity_flags(ContainerEngine::Podman, users, 1000, 100), vec!["--userns=keep-id"]);
+            assert!(identity_flags(ContainerEngine::Podman, users, 0, 0).is_empty());
+            assert!(identity_flags(ContainerEngine::Apptainer, users, 1000, 100).is_empty());
+        }
+    }
+
+    /// RUN-1: every container mim runs takes its identity flags from
+    /// `run_argv`; nothing builds a run argv around it.
+    #[test]
+    fn every_container_run_goes_through_run_argv() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut files = Vec::new();
+        let mut dirs = vec![src];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let body = match text.find("\nmod tests {") {
+                Some(i) => &text[..i],
+                None => &text[..],
+            };
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            for (n, line) in body.lines().enumerate() {
+                let builds = line.contains("engine_specific_run_flags_io(") || line.contains("build_run_args(");
+                if builds && name != "container.rs" {
+                    offenders.push(format!("{name}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "{offenders:#?}");
+    }
+
+    /// RUN-1: the repair runs as a user that can chown and hands the files to
+    /// whoever the caller is on the host.
+    #[test]
+    fn reclaiming_files_chowns_them_to_the_host_caller() {
+        let argv = |users| reclaim_argv(users, "img", "/d", "", 1000, 100);
+        let rootless = argv(DockerUsers::Rootless);
+        assert!(!rootless.iter().any(|a| a == "--user"), "{rootless:?}");
+        assert!(rootless.ends_with(&["img", "chown", "-R", "0:0", "/reclaim"].map(String::from)), "{rootless:?}");
+        let remap = argv(DockerUsers::UsernsRemap);
+        assert!(remap.iter().any(|a| a == "--userns=host"), "{remap:?}");
+        assert!(remap.windows(2).any(|w| w[0] == "--user" && w[1] == "0:0"), "{remap:?}");
+        assert!(remap.ends_with(&["chown", "-R", "1000:100", "/reclaim"].map(String::from)), "{remap:?}");
+        assert!(argv(DockerUsers::Rootful).windows(2).any(|w| w[0] == "-v" && w[1] == "/d:/reclaim"));
+    }
+
+    /// A read-only bind and the SELinux relabel share one option field, and
+    /// a container with labelling disabled relabels nothing.
+    #[test]
+    fn a_bind_joins_read_only_and_relabel_options() {
+        assert_eq!(bind_spec("/h", "/c", "", false), "/h:/c");
+        assert_eq!(bind_spec("/h", "/c", ":z", false), "/h:/c:z");
+        assert_eq!(bind_spec("/h", "/c:ro", "", false), "/h:/c:ro");
+        assert_eq!(bind_spec("/h", "/c:ro", ":z", false), "/h:/c:ro,z");
+        assert_eq!(bind_spec("/h", "/c", ":z", true), "/h:/c");
+        let mut cfg = RunConfig::new("img");
+        cfg.bind_mounts = vec![("/home/u".to_string(), "/work".to_string())];
+        cfg.selinux_suffix = ":z".to_string();
+        cfg.label_disable = true;
+        let args = build_run_args(ContainerEngine::Podman, &[], &cfg);
+        assert!(args.windows(2).any(|w| w[0] == "-v" && w[1] == "/home/u:/work"), "{args:?}");
+        assert!(args.windows(2).any(|w| w[0] == "--security-opt" && w[1] == "label=disable"), "{args:?}");
+    }
     use super::*;
     use std::os::unix::process::ExitStatusExt;
 
@@ -863,6 +1182,30 @@ mod tests {
         assert!(err.contains("/nonexistent/podman"), "{err}");
         let (status, _, _) = run_process("/nonexistent/podman", &["ps".to_string()]);
         assert!(!status.success());
+    }
+
+    /// SERVE-4: a secret reaches the container by name; its value is in no
+    /// engine argument, only in the environment of the engine process.
+    #[test]
+    fn a_secret_variable_never_appears_on_the_engine_command_line() {
+        let mut cfg = RunConfig::new("img");
+        cfg.env = vec![("MORLOC_HOME".to_string(), "/opt/morloc".to_string())];
+        cfg.secret_env = vec![("MORLOC_MCP_TOKEN".to_string(), "s3cret-value".to_string())];
+        for engine in [ContainerEngine::Docker, ContainerEngine::Podman, ContainerEngine::Apptainer] {
+            let args = build_run_args(engine, &engine_specific_run_flags(engine), &cfg);
+            assert!(!args.iter().any(|a| a.contains("s3cret-value")), "{engine:?}: {args:?}");
+            let env = engine_process_env(engine, &cfg);
+            assert!(env.iter().any(|(_, v)| v == "s3cret-value"), "{engine:?}: {env:?}");
+        }
+        let docker = build_run_args(ContainerEngine::Docker, &[], &cfg);
+        assert!(docker.windows(2).any(|w| w[0] == "-e" && w[1] == "MORLOC_MCP_TOKEN"), "{docker:?}");
+        assert_eq!(
+            engine_process_env(ContainerEngine::Apptainer, &cfg),
+            vec![
+                ("APPTAINERENV_MORLOC_MCP_TOKEN".to_string(), "s3cret-value".to_string()),
+                ("SINGULARITYENV_MORLOC_MCP_TOKEN".to_string(), "s3cret-value".to_string()),
+            ]
+        );
     }
 
     /// Only an engine's own "no such object" answer means absent; an engine

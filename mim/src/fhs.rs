@@ -155,7 +155,7 @@ fn nix_bin() -> PathBuf {
 /// rebuild instead of silently reusing a stale sandbox. The out-link under
 /// `<data_dir>/fhs/result` is an indirect nix GC root, so the sandbox survives
 /// `nix-collect-garbage`.
-pub fn ensure_fhs_wrapper(scope: Scope) -> Result<PathBuf> {
+pub fn ensure_fhs_wrapper(trust: &crate::provision::Trust, scope: Scope) -> Result<PathBuf> {
     let dir = fhs_dir(scope);
     let wrapper = wrapper_path(scope);
     let nix_file = dir.join("fhs.nix");
@@ -186,7 +186,12 @@ pub fn ensure_fhs_wrapper(scope: Scope) -> Result<PathBuf> {
 
     eprintln!("Building the FHS sandbox with nix (first time on this host; may take a while)...");
     let out_link = dir.join("result");
-    let status = Command::new(nix_bin())
+    let mut nix = Command::new(nix_bin());
+    // PROV-9: nix fetches nixpkgs; it trusts the environment's bundle.
+    if let crate::provision::Trust::Bundle(bundle) = trust {
+        nix.env("NIX_SSL_CERT_FILE", bundle);
+    }
+    let status = nix
         .arg(&nix_file)
         .arg("-o")
         .arg(&out_link)

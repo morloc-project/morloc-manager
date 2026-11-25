@@ -183,9 +183,9 @@ pub fn asset_url(tag: &str, asset: &str) -> String {
 /// Best-effort: returns None on any failure (a release without the asset,
 /// offline, network error) so provisioning proceeds with no default snapshot
 /// rather than failing.
-pub fn fetch_stdlib_snapshot(version: &str) -> Option<String> {
+pub fn fetch_stdlib_snapshot(trust: &Trust, version: &str) -> Option<String> {
     let url = asset_url(&format!("v{version}"), "stdlib-snapshot.txt");
-    curl_capture_quiet(&url).ok()
+    curl_capture_quiet(trust, &url).ok()
 }
 
 /// The public release page for `tag` (HTTP 200 if the release exists, 404
@@ -198,13 +198,13 @@ pub fn release_page_url(tag: &str) -> String {
 /// resolved tag. Checks the release PAGE (which 404s for a nonexistent tag)
 /// rather than a specific asset, so it does not depend on which assets a given
 /// release publishes.
-pub fn verify_release(requested: &str) -> Result<String> {
-    let tag = resolve_tag(requested)?;
+pub fn verify_release(trust: &Trust, requested: &str) -> Result<String> {
+    let tag = resolve_tag(trust, requested)?;
     let url = release_page_url(&tag);
     // -I/-o /dev/null: a HEAD that discards the body; -f (from curl_base) makes a
     // 404 a non-success exit. Silence curl's own stderr so the caller controls
     // the message.
-    let ok = curl_base()
+    let ok = curl_base(trust)
         .args(["-I", "-o", "/dev/null"])
         .arg(&url)
         .stderr(Stdio::null())
@@ -218,13 +218,47 @@ pub fn verify_release(requested: &str) -> Result<String> {
     }
 }
 
+/// PROV-9: the certificates a download trusts. Every download names one, so
+/// none can fall back to the system store by omission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Trust {
+    /// curl's own store.
+    System,
+    /// Exactly this bundle (`--cacert` replaces the system store).
+    Bundle(PathBuf),
+}
+
+impl Trust {
+    /// A download belonging to no environment: the user's `CURL_CA_BUNDLE` or
+    /// `SSL_CERT_FILE`, else the system store.
+    pub fn user() -> Trust {
+        Self::from_vars(|k| std::env::var_os(k))
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Trust {
+        ["CURL_CA_BUNDLE", "SSL_CERT_FILE"]
+            .iter()
+            .find_map(|k| var(k).filter(|v| !v.is_empty()))
+            .map_or(Trust::System, |v| Trust::Bundle(PathBuf::from(v)))
+    }
+
+    /// A download for environment `name`: its materialized host bundle (its
+    /// corporate certificates plus the public roots), else the user's.
+    pub fn for_env(scope: Scope, name: &str) -> Trust {
+        crate::cert::host_bundle_if_present(scope, name).map_or_else(Trust::user, Trust::Bundle)
+    }
+}
+
 /// A curl command hardened with the same TLS/proto flags and stdio for every
 /// fetch. Callers add `-o <dest>` (download) or just the URL (capture).
-fn curl_base() -> Command {
+fn curl_base(trust: &Trust) -> Command {
     let mut c = Command::new("curl");
     c.args(["--proto", "=https", "--tlsv1.2", "-fsSL"])
         .stdin(Stdio::null())
         .stderr(Stdio::inherit());
+    if let Trust::Bundle(path) = trust {
+        c.arg("--cacert").arg(path);
+    }
     c
 }
 
@@ -234,8 +268,8 @@ fn curl_spawn_err(e: std::io::Error) -> ManagerError {
 
 /// Capture a URL's body to a string via curl (follows redirects; fails on HTTP
 /// error). Used to fetch the release manifest.
-pub(crate) fn curl_capture(url: &str) -> Result<String> {
-    let out = curl_base().arg(url).output().map_err(curl_spawn_err)?;
+pub(crate) fn curl_capture(trust: &Trust, url: &str) -> Result<String> {
+    let out = curl_base(trust).arg(url).output().map_err(curl_spawn_err)?;
     if !out.status.success() {
         return Err(ManagerError::EnvError(format!("download failed: {url}")));
     }
@@ -245,8 +279,8 @@ pub(crate) fn curl_capture(url: &str) -> Result<String> {
 /// Like `curl_capture` but silences curl's own stderr. For probes where a 404
 /// is an expected, handled outcome (the caller reports it), so curl's raw error
 /// line does not precede the caller's message.
-pub(crate) fn curl_capture_quiet(url: &str) -> Result<String> {
-    let out = curl_base()
+pub(crate) fn curl_capture_quiet(trust: &Trust, url: &str) -> Result<String> {
+    let out = curl_base(trust)
         .arg(url)
         .stderr(Stdio::null())
         .output()
@@ -259,8 +293,8 @@ pub(crate) fn curl_capture_quiet(url: &str) -> Result<String> {
 
 /// The final URL after following redirects for `url` (an HTTP HEAD; the body is
 /// discarded). Used to resolve the `releases/latest` redirect to its tag page.
-pub(crate) fn curl_effective_url(url: &str) -> Result<String> {
-    let out = curl_base()
+pub(crate) fn curl_effective_url(trust: &Trust, url: &str) -> Result<String> {
+    let out = curl_base(trust)
         .args(["-I", "-o", "/dev/null", "-w", "%{url_effective}"])
         .arg(url)
         .output()
@@ -289,9 +323,9 @@ pub(crate) fn parse_tag_from_release_url(url: &str) -> Option<String> {
 /// provisioning behind shared IPs / CI / NAT; the web redirect carries no such
 /// per-hour cap and needs no token. Set `MORLOC_RELEASE_TAG` to pin an explicit
 /// tag and skip this lookup entirely.
-pub fn fetch_latest_tag() -> Result<String> {
+pub fn fetch_latest_tag(trust: &Trust) -> Result<String> {
     let latest = "https://github.com/morloc-project/morloc/releases/latest";
-    let final_url = curl_effective_url(latest)?;
+    let final_url = curl_effective_url(trust, latest)?;
     parse_tag_from_release_url(&final_url).ok_or_else(|| {
         ManagerError::EnvError(format!(
             "could not determine the latest release tag from {final_url}"
@@ -302,10 +336,10 @@ pub fn fetch_latest_tag() -> Result<String> {
 /// Resolve a requested release specifier to a concrete GitHub tag. "latest"
 /// follows GitHub's releases/latest redirect; a bare version like "0.98.3" becomes "v0.98.3"; anything
 /// else (an explicit tag such as "dev" or "v0.98.3") is used verbatim.
-pub fn resolve_tag(requested: &str) -> Result<String> {
+pub fn resolve_tag(trust: &Trust, requested: &str) -> Result<String> {
     let requested = requested.trim();
     if requested.eq_ignore_ascii_case("latest") {
-        fetch_latest_tag()
+        fetch_latest_tag(trust)
     } else if requested.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         Ok(format!("v{requested}"))
     } else {
@@ -322,8 +356,8 @@ pub fn runtimes_dir(scope: Scope, version: &str, triple: &str) -> PathBuf {
 }
 
 /// Download a URL to a path via curl (follows redirects; fails on HTTP error).
-pub(crate) fn curl_download(url: &str, dest: &Path) -> Result<()> {
-    let status = curl_base()
+pub(crate) fn curl_download(trust: &Trust, url: &str, dest: &Path) -> Result<()> {
+    let status = curl_base(trust)
         .arg("-o")
         .arg(dest)
         .arg(url)
@@ -385,6 +419,7 @@ fn part_path(dest: &Path) -> PathBuf {
 /// download and verification succeed, so an interrupted, corrupt, or unverifiable
 /// fetch never leaves a file that a presence check would bless as valid.
 fn download_asset(
+    trust: &Trust,
     tag: &str,
     asset: &str,
     dest: &Path,
@@ -392,7 +427,7 @@ fn download_asset(
 ) -> Result<()> {
     let part = part_path(dest);
     let result = (|| {
-        curl_download(&asset_url(tag, asset), &part)?;
+        curl_download(trust, &asset_url(tag, asset), &part)?;
         let expected = digests.get(asset).ok_or_else(|| {
             ManagerError::EnvError(format!(
                 "no SHA-256 published for asset {asset}; refusing an unverified download"
@@ -533,19 +568,101 @@ pub fn mim_agent_for_host(_scope: Scope) -> Result<PathBuf> {
 ///      release, verify it, cache it, and return the cached path. Reached only
 ///      when building an image for a different platform than the host (e.g. a
 ///      macOS-arm64 host building a Linux image).
-pub fn mim_for_triple(scope: Scope, triple: &str) -> Result<PathBuf> {
-    if let Some(p) = mim_env_override_for_staging()? {
-        return Ok(p);
-    }
-    if host_release_triple() == Some(triple) {
-        return running_mim();
+pub fn mim_for_triple(trust: &Trust, scope: Scope, triple: &str) -> Result<PathBuf> {
+    let over = mim_env_override_for_staging()?;
+    let running = running_mim()?;
+    match agent_source(over.as_deref(), triple, host_release_triple(), &running) {
+        AgentSource::Override(p) if elf_is_static(p) == Some(false) => {
+            return Err(ManagerError::EnvError(format!(
+                "MORLOC_MIM_ENV names {}, which is dynamically linked and cannot run in the \
+                 environment's container; point it at a static build \
+                 (./scripts/build-static-container.sh)",
+                p.display()
+            )));
+        }
+        AgentSource::Override(p) => return Ok(p.to_path_buf()),
+        AgentSource::Running => return Ok(running),
+        AgentSource::Release => {}
     }
     let cached = mim_cache_bin(scope, triple);
     if cached.is_file() {
         return Ok(cached);
     }
-    download_mim(triple, &cached)?;
+    download_mim(trust, triple, &cached)?;
     Ok(cached)
+}
+
+/// PROV-7: the identity of the agent `mim_for_triple` stages for `triple`, for
+/// the image cache key. A file is identified by size and mtime, as the compiler
+/// is; a release agent by its release and platform.
+pub fn agent_identity(triple: &str) -> Result<String> {
+    Ok(agent_identity_for(
+        mim_env_override_for_staging()?.as_deref(),
+        triple,
+        host_release_triple(),
+        &running_mim()?,
+    ))
+}
+
+fn agent_identity_for(over: Option<&Path>, triple: &str, host: Option<&str>, running: &Path) -> String {
+    let source = agent_source(over, triple, host, running);
+    let file = |p: &Path| {
+        let m = std::fs::metadata(p).ok();
+        let mtime = m
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        format!("{}:{}:{mtime}", p.display(), m.map_or(0, |m| m.len()))
+    };
+    match source {
+        AgentSource::Override(p) => format!("override {}", file(p)),
+        AgentSource::Running => format!("running {}", file(running)),
+        AgentSource::Release => format!("release {}/{triple}", mim_release_tag()),
+    }
+}
+
+/// Which mim a container of platform `triple` gets (PROV-8): the override,
+/// else the running mim when it is built for that platform and statically
+/// linked, else this version's release for `triple`.
+#[derive(Debug, PartialEq, Eq)]
+enum AgentSource<'a> {
+    Override(&'a Path),
+    Running,
+    Release,
+}
+
+fn agent_source<'a>(over: Option<&'a Path>, triple: &str, host: Option<&str>, running: &Path) -> AgentSource<'a> {
+    match over {
+        Some(p) => AgentSource::Override(p),
+        None if host == Some(triple) && elf_is_static(running) != Some(false) => AgentSource::Running,
+        None => AgentSource::Release,
+    }
+}
+
+/// Whether the 64-bit ELF at `path` is statically linked (has no `PT_INTERP`
+/// program header). `None` when it is not a 64-bit ELF or cannot be read.
+fn elf_is_static(path: &Path) -> Option<bool> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.get(..4)? != b"\x7fELF" || *bytes.get(4)? != 2 {
+        return None;
+    }
+    let little = *bytes.get(5)? == 1;
+    let num = |at: usize, n: usize| -> Option<u64> {
+        let b = bytes.get(at..at + n)?;
+        Some(b.iter().enumerate().fold(0u64, |acc, (i, &x)| {
+            let shift = if little { i } else { n - 1 - i } * 8;
+            acc | (u64::from(x) << shift)
+        }))
+    };
+    let (phoff, phentsize, phnum) = (num(0x20, 8)? as usize, num(0x36, 2)? as usize, num(0x38, 2)? as usize);
+    const PT_INTERP: u64 = 3;
+    for i in 0..phnum {
+        if num(phoff + i * phentsize, 4)? == PT_INTERP {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// Download `mim-<triple>` from this mim's release into `dest` atomically,
@@ -553,7 +670,7 @@ pub fn mim_for_triple(scope: Scope, triple: &str) -> Result<PathBuf> {
 /// An absent checksum file is a hard error -- an unverifiable binary is never
 /// installed. The body lands on a temporary `.part` path and is renamed into place
 /// only after the download and verification succeed.
-fn download_mim(triple: &str, dest: &Path) -> Result<()> {
+fn download_mim(trust: &Trust, triple: &str, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             ManagerError::EnvError(format!("cannot create {}: {e}", parent.display()))
@@ -566,12 +683,12 @@ fn download_mim(triple: &str, dest: &Path) -> Result<()> {
     eprintln!("Fetching the dependency agent ({asset}, {tag})...");
     let part = part_path(dest);
     let result = (|| {
-        curl_download(&url, &part)?;
+        curl_download(trust, &url, &part)?;
         // The checksum file is REQUIRED: never install an unverified binary. The
         // fetch can fail because the file is genuinely absent (a partial release)
         // OR for a transport reason (proxy/TLS/DNS); surface the underlying error
         // rather than asserting one cause.
-        let sha_body = curl_capture(&sha_url).map_err(|e| {
+        let sha_body = curl_capture(trust, &sha_url).map_err(|e| {
             ManagerError::EnvError(format!(
                 "could not fetch the checksum file {asset}.sha256 from {sha_url} ({e}); \
                  refusing to install an unverified {asset}"
@@ -641,10 +758,38 @@ fn extract_tar_gz(tar: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The completion stamp of a provisioned runtime: its version, then the digest
+/// of each asset it was made from.
+fn stamp_text(manifest: &ReleaseManifest, assets: &TripleAssets) -> String {
+    let digest = |a: &str| manifest.sha256.get(a).map_or("", String::as_str).to_ascii_lowercase();
+    format!(
+        "{}\n{} {}\n{} {}\n",
+        manifest.version,
+        assets.morloc,
+        digest(&assets.morloc),
+        manifest.rust_src,
+        digest(&manifest.rust_src)
+    )
+}
+
+/// PROV-4: a complete entry is used only for the release it was made from. A
+/// stamp holding only a version predates the digests and cannot be compared.
+fn check_stamp(found: &str, expected: &str, tag: &str, entry: &Path) -> Result<()> {
+    if found.trim().lines().count() <= 1 || found == expected {
+        return Ok(());
+    }
+    Err(ManagerError::EnvError(format!(
+        "release {tag} was re-published with different assets than the runtime \
+         provisioned from it in {}; a provisioned release is never modified. Use \
+         another release, or remove that entry if no environment uses it.",
+        entry.display()
+    )))
+}
+
 /// Fetch and parse the release manifest attached to a GitHub `tag`. The
 /// manifest declares the concrete version and the per-triple asset names.
-pub fn fetch_manifest(tag: &str) -> Result<ReleaseManifest> {
-    let text = curl_capture(&asset_url(tag, MANIFEST_ASSET))?;
+pub fn fetch_manifest(trust: &Trust, tag: &str) -> Result<ReleaseManifest> {
+    let text = curl_capture(trust, &asset_url(tag, MANIFEST_ASSET))?;
     ReleaseManifest::from_json(&text)
 }
 
@@ -659,19 +804,20 @@ pub fn fetch_manifest(tag: &str) -> Result<ReleaseManifest> {
 /// (the compiler runs, and libmorloc is built, inside the image -- so on a macOS
 /// host a Linux/arm64 container needs the linux-arm64 runtime, not macos-arm64).
 pub fn provision_runtime(
+    trust: &Trust,
     scope: Scope,
     requested: &str,
     triple: &str,
 ) -> Result<(PathBuf, String)> {
     // Resolve "latest"/a bare version to a concrete download tag (asset URLs need
     // the real tag, not the "latest" alias).
-    let tag = resolve_tag(requested)?;
+    let tag = resolve_tag(trust, requested)?;
     eprintln!("Provisioning morloc runtime from release {tag}...");
-    let manifest = fetch_manifest(&tag)?;
+    let manifest = fetch_manifest(trust, &tag)?;
     let version = manifest.version.clone();
     let assets = manifest.assets_for(triple).ok_or_else(|| {
         ManagerError::BackendUnsupported(format!(
-            "release {tag} publishes no runtime for {triple}; use a container backend"
+            "release {tag} publishes no runtime for {triple}"
         ))
     })?;
 
@@ -682,7 +828,10 @@ pub fn provision_runtime(
     // interrupted prior run; the stamp is absent until provisioning fully
     // succeeds, so a crash always re-provisions.
     let stamp = dir.join(".provisioned");
-    if !stamp.exists() {
+    let expected = stamp_text(&manifest, assets);
+    if let Ok(found) = std::fs::read_to_string(&stamp) {
+        check_stamp(&found, &expected, &tag, &dir)?;
+    } else {
         std::fs::create_dir_all(&dir)
             .map_err(|e| ManagerError::EnvError(format!("cannot create {}: {e}", dir.display())))?;
         // Ship only the prebuilt morloc COMPILER (it never links into a pool) and
@@ -691,18 +840,18 @@ pub fn provision_runtime(
         // so the runtime that pools link/load is ABI-coherent with the toolchain
         // that compiles those pools.
         let morloc_dest = runtime_morloc_bin(&dir);
-        download_asset(&tag, &assets.morloc, &morloc_dest, &manifest.sha256)?;
+        download_asset(trust, &tag, &assets.morloc, &morloc_dest, &manifest.sha256)?;
         make_executable(&morloc_dest)?;
 
         // Wipe any stale rust/ from an interrupted prior extraction so a
         // re-provision never mixes old and new files.
         let src_tar = dir.join(&manifest.rust_src);
-        download_asset(&tag, &manifest.rust_src, &src_tar, &manifest.sha256)?;
+        download_asset(trust, &tag, &manifest.rust_src, &src_tar, &manifest.sha256)?;
         let _ = std::fs::remove_dir_all(runtime_rust_src(&dir));
         extract_tar_gz(&src_tar, &dir)?;
         let _ = std::fs::remove_file(&src_tar);
 
-        std::fs::write(&stamp, &version).map_err(|e| {
+        std::fs::write(&stamp, &expected).map_err(|e| {
             ManagerError::EnvError(format!("cannot write {}: {e}", stamp.display()))
         })?;
     }
@@ -710,11 +859,11 @@ pub fn provision_runtime(
     // The lang-support table lets the manager render pixi manifests without
     // running the compiler on the host (essential where the glibc compiler can't
     // execute, e.g. NixOS/musl). Best-effort: older releases lack this asset.
+    // Older releases lack the asset and publish no digest for it; a release
+    // that publishes one must deliver it intact (PROV-2).
     let ls = dir.join(LANG_SUPPORT_FILE);
-    if !ls.exists() {
-        // Best-effort (older releases lack this asset), but still atomic +
-        // checksum-verified when the manifest publishes a digest for it.
-        let _ = download_asset(&tag, LANG_SUPPORT_ASSET, &ls, &manifest.sha256);
+    if !ls.exists() && manifest.sha256.contains_key(LANG_SUPPORT_ASSET) {
+        download_asset(trust, &tag, LANG_SUPPORT_ASSET, &ls, &manifest.sha256)?;
     }
 
     Ok((dir, version))
@@ -740,7 +889,17 @@ fn pixi_triple(os: &str, arch: &str) -> Option<&'static str> {
 /// overrides (dev/testing); otherwise a per-user copy is downloaded once into
 /// `<data_dir>/bin/pixi` and reused. This makes the conda solve self-contained --
 /// the host does not need pixi installed.
-pub fn provision_pixi(scope: Scope) -> Result<PathBuf> {
+/// The file beside the host pixi naming its version.
+const PIXI_VERSION_STAMP: &str = ".pixi-version";
+
+/// Whether `bin_dir` holds the pinned pixi: the host lock and an image's
+/// `pixi install --locked` must run one version.
+fn host_pixi_current(bin_dir: &Path) -> bool {
+    bin_dir.join("pixi").is_file()
+        && std::fs::read_to_string(bin_dir.join(PIXI_VERSION_STAMP)).is_ok_and(|v| v.trim() == PIXI_VERSION)
+}
+
+pub fn provision_pixi(trust: &Trust, scope: Scope) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("MORLOC_PIXI") {
         if !p.is_empty() {
             return Ok(PathBuf::from(p));
@@ -748,7 +907,7 @@ pub fn provision_pixi(scope: Scope) -> Result<PathBuf> {
     }
     let bin_dir = config::data_dir(scope).join("bin");
     let dest = bin_dir.join("pixi");
-    if dest.is_file() {
+    if host_pixi_current(&bin_dir) {
         return Ok(dest);
     }
     let triple = pixi_triple(std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
@@ -768,14 +927,14 @@ pub fn provision_pixi(scope: Scope) -> Result<PathBuf> {
     let url = format!(
         "https://github.com/prefix-dev/pixi/releases/download/v{PIXI_VERSION}/pixi-{triple}.tar.gz"
     );
-    let stage = bin_dir.join(".pixi-stage");
+    let stage = bin_dir.join(format!(".pixi-stage.{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     let result = (|| {
         std::fs::create_dir_all(&stage).map_err(|e| {
             ManagerError::EnvError(format!("cannot create {}: {e}", stage.display()))
         })?;
         let tar = stage.join("pixi.tar.gz");
-        curl_download(&url, &tar)?;
+        curl_download(trust, &url, &tar)?;
         extract_tar_gz(&tar, &stage)?;
         let extracted = stage.join("pixi");
         if !extracted.is_file() {
@@ -787,6 +946,9 @@ pub fn provision_pixi(scope: Scope) -> Result<PathBuf> {
         make_executable(&extracted)?;
         std::fs::rename(&extracted, &dest).map_err(|e| {
             ManagerError::EnvError(format!("cannot finalize {}: {e}", dest.display()))
+        })?;
+        std::fs::write(bin_dir.join(PIXI_VERSION_STAMP), PIXI_VERSION).map_err(|e| {
+            ManagerError::EnvError(format!("cannot record the pixi version in {}: {e}", bin_dir.display()))
         })
     })();
     // Drop the staging dir on every path (success or any early `?` failure).
@@ -823,13 +985,26 @@ pub fn copy_dir_excluding(
     skip: &[&str],
     follow_symlinked_dirs: bool,
 ) -> Result<()> {
+    copy_dir_excluding_at_root(src, dst, &[], skip, follow_symlinked_dirs)
+}
+
+/// `copy_dir_excluding`, also leaving out the directories named in
+/// `root_skip` directly under `src` (and only there).
+pub fn copy_dir_excluding_at_root(
+    src: &Path,
+    dst: &Path,
+    root_skip: &[&str],
+    skip: &[&str],
+    follow_symlinked_dirs: bool,
+) -> Result<()> {
     let mut visited = std::collections::HashSet::new();
-    copy_dir_inner(src, dst, skip, follow_symlinked_dirs, &mut visited)
+    copy_dir_inner(src, dst, root_skip, skip, follow_symlinked_dirs, &mut visited)
 }
 
 fn copy_dir_inner(
     src: &Path,
     dst: &Path,
+    root_skip: &[&str],
     skip: &[&str],
     follow_symlinked_dirs: bool,
     visited: &mut std::collections::HashSet<std::path::PathBuf>,
@@ -842,6 +1017,7 @@ fn copy_dir_inner(
         let from = entry.path();
         let name = entry.file_name();
         let to = dst.join(&name);
+        let skipped = |list: &[&str]| list.iter().any(|s| name.to_str() == Some(s));
         // file_type() does NOT follow the link, so we can tell a symlink apart
         // from a real directory before deciding whether to recurse.
         let is_symlink = entry
@@ -853,23 +1029,30 @@ fn copy_dir_inner(
                 if !follow_symlinked_dirs {
                     continue;
                 }
-                // Recurse into the canonical target, skipping a target already
-                // seen on this copy (breaks symlink cycles).
+                // Recurse into the canonical target unless it is a directory
+                // this copy is inside of (a cycle); `visited` holds the targets
+                // of the links on the current path only.
                 let canon = std::fs::canonicalize(&from).map_err(|e| {
                     ManagerError::EnvError(format!("cannot resolve symlink {}: {e}", from.display()))
                 })?;
-                if visited.insert(canon.clone()) {
-                    copy_dir_inner(&canon, &to, skip, follow_symlinked_dirs, visited)?;
+                if skipped(root_skip) {
+                    continue;
+                }
+                let src_canon = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+                if !src_canon.starts_with(&canon) && visited.insert(canon.clone()) {
+                    let copied = copy_dir_inner(&canon, &to, &[], skip, follow_symlinked_dirs, visited);
+                    visited.remove(&canon);
+                    copied?;
                 }
             } else {
                 // A symlink to a file: copy its target content (fs::copy follows).
                 copy_file(&from, &to)?;
             }
         } else if from.is_dir() {
-            if skip.iter().any(|s| name.to_str() == Some(s)) {
+            if skipped(skip) || skipped(root_skip) {
                 continue;
             }
-            copy_dir_inner(&from, &to, skip, follow_symlinked_dirs, visited)?;
+            copy_dir_inner(&from, &to, &[], skip, follow_symlinked_dirs, visited)?;
         } else {
             copy_file(&from, &to)?;
         }
@@ -882,7 +1065,7 @@ fn copy_dir_inner(
 /// plus the Rust workspace source. libmorloc.so + morloc-nexus are built from
 /// that source in-image by `morloc init`, so they are not staged. Everything
 /// comes from the downloaded runtime -- no host morloc install is required.
-pub fn stage_runtime(scope: Scope, triple: &str, src: &Path, dest: &Path) -> Result<()> {
+pub fn stage_runtime(trust: &Trust, scope: Scope, triple: &str, src: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)
         .map_err(|e| ManagerError::EnvError(format!("cannot create {}: {e}", dest.display())))?;
     let from = runtime_morloc_bin(src);
@@ -901,7 +1084,7 @@ pub fn stage_runtime(scope: Scope, triple: &str, src: &Path, dest: &Path) -> Res
     // CONTAINER's platform, not the host's, so a macOS host building a Linux image
     // stages the Linux mim -- `mim_for_triple` returns the running mim when the
     // triples match and downloads the matching release binary otherwise.
-    let agent = mim_for_triple(scope, triple)?;
+    let agent = mim_for_triple(trust, scope, triple)?;
     stage_mim_agent(&agent, dest)?;
     let rust = runtime_rust_src(src);
     if !rust.is_dir() {
@@ -916,7 +1099,166 @@ pub fn stage_runtime(scope: Scope, triple: &str, src: &Path, dest: &Path) -> Res
 
 #[cfg(test)]
 mod tests {
+
+    /// PROV-9: a bundle replaces curl's store with exactly that file; the
+    /// system trust passes nothing.
+    #[test]
+    fn a_download_carries_the_bundle_it_trusts() {
+        let args = |t: &Trust| -> Vec<String> {
+            curl_base(t).get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+        };
+        let bundle = args(&Trust::Bundle(PathBuf::from("/c/host.pem")));
+        assert!(bundle.windows(2).any(|w| w[0] == "--cacert" && w[1] == "/c/host.pem"), "{bundle:?}");
+        assert!(!args(&Trust::System).iter().any(|a| a == "--cacert"));
+    }
+
+    /// PROV-9: a download for no environment honours the user's bundle
+    /// variables, `CURL_CA_BUNDLE` first.
+    #[test]
+    fn a_download_for_no_environment_honours_the_users_bundle() {
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| std::ffi::OsString::from(v))
+        };
+        assert_eq!(Trust::from_vars(vars(&[])), Trust::System);
+        assert_eq!(Trust::from_vars(vars(&[("CURL_CA_BUNDLE", "")])), Trust::System);
+        assert_eq!(Trust::from_vars(vars(&[("SSL_CERT_FILE", "/s")])), Trust::Bundle("/s".into()));
+        assert_eq!(
+            Trust::from_vars(vars(&[("SSL_CERT_FILE", "/s"), ("CURL_CA_BUNDLE", "/c")])),
+            Trust::Bundle("/c".into())
+        );
+    }
+
+    /// PROV-9: an environment's download trusts its materialized host bundle.
+    #[test]
+    fn a_download_for_an_environment_trusts_its_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::test_roots::set(tmp.path());
+        let host = crate::cert::host_bundle_path(Scope::Local, "e");
+        std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+        std::fs::write(&host, "x").unwrap();
+        assert_eq!(Trust::for_env(Scope::Local, "e"), Trust::Bundle(host));
+    }
+
+    /// PROV-9: mim runs curl in one place, so no download can skip its trust.
+    #[test]
+    fn curl_is_built_only_by_curl_base() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let mut offenders = Vec::new();
+        let mut dirs = vec![root.join("mim/src"), root.join("morloc-deps/src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let body = text.find("\nmod tests {").map_or(&text[..], |i| &text[..i]);
+                let n = body.matches(&format!("Command::new({:?})", "curl")).count();
+                let allowed = usize::from(path.ends_with("mim/src/provision.rs"));
+                if n != allowed {
+                    offenders.push(format!("{}: {n}", path.display()));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "{offenders:?}");
+    }
     use super::*;
+
+    /// Two links to one directory each get its content; only a link back into
+    /// a directory being copied (a cycle) is skipped.
+    #[test]
+    fn every_link_to_a_shared_directory_is_copied() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        std::fs::create_dir_all(src.join("shared")).unwrap();
+        std::fs::write(src.join("shared/x"), "x").unwrap();
+        for l in ["a", "b"] {
+            std::os::unix::fs::symlink(src.join("shared"), src.join(l)).unwrap();
+        }
+        std::os::unix::fs::symlink(&src, src.join("shared/up")).unwrap();
+        let dst = d.path().join("dst");
+        copy_dir_excluding(&src, &dst, &[], true).unwrap();
+        for l in ["a/x", "b/x", "shared/x"] {
+            assert!(dst.join(l).is_file(), "{l} missing");
+        }
+        assert!(!dst.join("shared/up").exists());
+    }
+
+    /// The host pixi is the pinned version: one from an older mim, or with no
+    /// version recorded, is fetched again.
+    #[test]
+    fn a_host_pixi_of_another_version_is_not_reused() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(!host_pixi_current(d.path()));
+        std::fs::write(d.path().join("pixi"), "bin").unwrap();
+        assert!(!host_pixi_current(d.path()));
+        std::fs::write(d.path().join(PIXI_VERSION_STAMP), "0.0.1").unwrap();
+        assert!(!host_pixi_current(d.path()));
+        std::fs::write(d.path().join(PIXI_VERSION_STAMP), PIXI_VERSION).unwrap();
+        assert!(host_pixi_current(d.path()));
+    }
+
+    /// PROV-4: a provisioned entry records the digests it was made from, so a
+    /// release re-published under the same version is refused, not served
+    /// from the stale entry.
+    #[test]
+    fn a_republished_release_is_detected() {
+        let m = ReleaseManifest::from_json(SAMPLE).unwrap();
+        let assets = m.assets_for("linux-x86_64").unwrap();
+        let stamp = stamp_text(&m, assets);
+        assert!(check_stamp(&stamp, &stamp, "v0.98.3", Path::new("/r")).is_ok());
+        assert!(check_stamp("0.98.3", &stamp, "v0.98.3", Path::new("/r")).is_ok());
+        let mut moved = m.clone();
+        moved.sha256.insert(assets.morloc.clone(), "ff".to_string());
+        let err = check_stamp(&stamp, &stamp_text(&moved, assets), "v0.98.3", Path::new("/r")).unwrap_err();
+        assert!(err.to_string().contains("re-published"), "{err}");
+    }
+
+    /// PROV-8: a dynamically linked mim never reaches a container: the release
+    /// of this version stands in for the running one.
+    #[test]
+    fn a_dynamic_mim_is_not_staged_into_a_container() {
+        let elf = |interp: bool| {
+            let mut b = vec![0u8; 0x40 + 56];
+            b[..4].copy_from_slice(b"\x7fELF");
+            b[4] = 2;
+            b[5] = 1;
+            b[0x20] = 0x40;
+            b[0x36] = 56;
+            b[0x38] = 1;
+            b[0x40] = if interp { 3 } else { 1 };
+            b
+        };
+        let d = tempfile::tempdir().unwrap();
+        let (dynamic, fixed) = (d.path().join("dyn"), d.path().join("static"));
+        std::fs::write(&dynamic, elf(true)).unwrap();
+        std::fs::write(&fixed, elf(false)).unwrap();
+        assert_eq!(elf_is_static(&dynamic), Some(false));
+        assert_eq!(elf_is_static(&fixed), Some(true));
+        assert_eq!(elf_is_static(&d.path().join("missing")), None);
+        let t = "linux-x86_64";
+        assert_eq!(agent_source(None, t, Some(t), &dynamic), AgentSource::Release);
+        assert_eq!(agent_source(None, t, Some(t), &fixed), AgentSource::Running);
+        assert_eq!(agent_source(Some(&dynamic), t, Some(t), &fixed), AgentSource::Override(&dynamic));
+    }
+
+    /// PROV-7, PROV-8: the image key names the agent it bakes, so a new mim, a
+    /// rebuilt override or another release's agent rebuilds the image.
+    #[test]
+    fn the_agent_identity_follows_the_staged_binary() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = d.path().join("mim");
+        std::fs::write(&bin, "v1").unwrap();
+        let running = agent_identity_for(None, "linux-x86_64", Some("linux-x86_64"), &bin);
+        let over = agent_identity_for(Some(&bin), "linux-x86_64", Some("linux-x86_64"), &bin);
+        let foreign = agent_identity_for(None, "linux-aarch64", Some("linux-x86_64"), &bin);
+        assert_ne!(running, over);
+        assert!(foreign.contains(&mim_release_tag()) && foreign.contains("linux-aarch64"), "{foreign}");
+        std::fs::write(&bin, "v2, longer").unwrap();
+        assert_ne!(agent_identity_for(None, "linux-x86_64", Some("linux-x86_64"), &bin), running);
+        assert_ne!(agent_identity_for(Some(&bin), "linux-x86_64", None, &bin), over);
+    }
 
     const SAMPLE: &str = r#"{
       "schema": 1,
@@ -1032,9 +1374,9 @@ mod tests {
 
     #[test]
     fn resolve_tag_normalizes_versions_and_passes_channels() {
-        assert_eq!(resolve_tag("0.98.3").unwrap(), "v0.98.3");
-        assert_eq!(resolve_tag("v0.98.3").unwrap(), "v0.98.3");
-        assert_eq!(resolve_tag("dev").unwrap(), "dev");
+        assert_eq!(resolve_tag(&Trust::System, "0.98.3").unwrap(), "v0.98.3");
+        assert_eq!(resolve_tag(&Trust::System, "v0.98.3").unwrap(), "v0.98.3");
+        assert_eq!(resolve_tag(&Trust::System, "dev").unwrap(), "dev");
     }
 
     #[test]
@@ -1122,7 +1464,9 @@ mod tests {
         assert!(mim_env_override_for_staging().unwrap().is_none());
         assert_eq!(mim_agent_for_host(Scope::Local).unwrap(), running_mim().unwrap());
         if let Some(host) = host_release_triple() {
-            assert_eq!(mim_for_triple(Scope::Local, host).unwrap(), running_mim().unwrap());
+            let running = running_mim().unwrap();
+            let want = if elf_is_static(&running) == Some(false) { AgentSource::Release } else { AgentSource::Running };
+            assert_eq!(agent_source(None, host, Some(host), &running), want);
         }
 
         // Empty string is treated as unset.

@@ -66,6 +66,14 @@ pub struct EnvContext {
     pixi_dir: Option<PathBuf>,
 }
 
+/// The environment's exclusive lock (DEP-4), for the store it was taken on.
+/// Functions that mutate an environment take one, so a caller cannot reach
+/// them without it.
+pub struct EnvLock {
+    _flock: Flock<File>,
+    home: PathBuf,
+}
+
 /// Whether a program's spec belongs to the canonical installed baseline or a
 /// transient scratch build. `clean` keeps only `Installed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,18 +91,6 @@ impl Provenance {
     }
 }
 
-/// A spec's exact location in the store, returned by [`EnvContext::write_spec`] so
-/// the writer can undo precisely the write it made -- and nothing else. The `sync`
-/// rollback needs that precision: sweeping every slot sharing the program's name
-/// would discard a different, still-good declared world built earlier under the
-/// same name. It also carries what the slot held before, so a rollback puts
-/// back an earlier successful build's spec instead of deleting it.
-#[derive(Debug, Clone)]
-pub struct SpecSlot {
-    path: PathBuf,
-    previous: Option<Vec<u8>>,
-}
-
 /// The scratch sub-directory for a declared world: the first 16 hex digits of the
 /// SHA-256 of its canonical JSON. Truncated because it only has to separate the
 /// worlds present in one environment, and the full digest makes for an unreadable
@@ -109,7 +105,7 @@ pub struct SpecSlot {
 fn world_digest(spec: &EnvSpec) -> Result<String> {
     let canonical = spec.to_json()?;
     let digest = Sha256::digest(canonical.as_bytes());
-    Ok(digest.iter().take(8).map(|b| format!("{b:02x}")).collect())
+    Ok(crate::cert::hex_lower(&digest[..8]))
 }
 
 impl EnvContext {
@@ -137,8 +133,8 @@ impl EnvContext {
     }
 
     /// Persist a program's compiler-produced envspec JSON under the given
-    /// provenance, returning the slot it landed in. The spec is validated before it
-    /// is written so a malformed spec never enters the store.
+    /// provenance. The spec is validated before it is written so a malformed
+    /// spec never enters the store.
     ///
     /// An INSTALLED program occupies `installed/<program>.json`: the environment
     /// owns one `exe/<program>`, so its name is a unique slot.
@@ -159,59 +155,46 @@ impl EnvContext {
     /// tell "this program dropped a dependency" from "a different program built
     /// under the same name". Retaining the old world over-states the environment,
     /// which keeps a built program working; dropping it would break one.
-    pub fn write_spec(
-        &self,
-        program: &str,
-        provenance: Provenance,
-        json: &str,
-    ) -> Result<SpecSlot> {
-        validate_program_name(program)?;
+    pub fn write_spec(&self, lock: &EnvLock, program: &str, provenance: Provenance, json: &str) -> Result<()> {
+        self.owns(lock)?;
         let spec = EnvSpec::from_json(json)?;
-        let dir = match provenance {
-            Provenance::Installed => self.provenance_dir(provenance),
-            Provenance::Scratch => self.provenance_dir(provenance).join(world_digest(&spec)?),
-        };
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| DepsError::Env(format!("cannot create {}: {e}", dir.display())))?;
-        let path = dir.join(format!("{program}.json"));
-        let previous = match std::fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(DepsError::Env(format!("cannot read {}: {e}", path.display()))),
-        };
-        std::fs::write(&path, json)
-            .map_err(|e| DepsError::Env(format!("cannot write {}: {e}", path.display())))?;
-        Ok(SpecSlot { path, previous })
+        write_replacing(&self.spec_path(program, provenance, &spec)?, json)
     }
 
-    /// Undo exactly the write [`write_spec`](Self::write_spec) made, and nothing
-    /// else -- the rollback of a failed `sync` (DEP-5): the slot gets back what it
-    /// held before, or is removed if it held nothing.
-    pub fn rollback_spec(&self, slot: &SpecSlot) -> Result<()> {
-        match &slot.previous {
-            Some(bytes) => std::fs::write(&slot.path, bytes).map_err(|e| {
-                DepsError::Env(format!("cannot restore {}: {e}", slot.path.display()))
-            }),
-            None => remove_spec_file(&slot.path),
-        }
+    /// The slot a program's spec occupies under `provenance`.
+    fn spec_path(&self, program: &str, provenance: Provenance, spec: &EnvSpec) -> Result<PathBuf> {
+        validate_program_name(program)?;
+        let dir = match provenance {
+            Provenance::Installed => self.provenance_dir(provenance),
+            Provenance::Scratch => self.provenance_dir(provenance).join(world_digest(spec)?),
+        };
+        Ok(dir.join(format!("{program}.json")))
+    }
+
+    /// Every slot holding `program` under `provenance`.
+    fn named_paths(&self, program: &str, provenance: Provenance) -> Result<Vec<PathBuf>> {
+        validate_program_name(program)?;
+        Ok(json_paths(&self.provenance_dir(provenance))?
+            .into_iter()
+            .filter(|p| p.file_stem().and_then(|s| s.to_str()) == Some(program))
+            .collect())
     }
 
     /// Remove EVERY spec stored under `program` in a provenance tier, whichever
     /// declared world keyed it. Installing a program supersedes its scratch builds,
     /// which sit in per-world slots, so superseding must sweep them all rather than
     /// guess a world.
-    pub fn remove_named(&self, program: &str, provenance: Provenance) -> Result<()> {
-        validate_program_name(program)?;
-        for path in json_paths(&self.provenance_dir(provenance))? {
-            if path.file_stem().and_then(|s| s.to_str()) == Some(program) {
-                remove_spec_file(&path)?;
-            }
+    pub fn remove_named(&self, lock: &EnvLock, program: &str, provenance: Provenance) -> Result<()> {
+        self.owns(lock)?;
+        for path in self.named_paths(program, provenance)? {
+            remove_spec_file(&path)?;
         }
         Ok(())
     }
 
     /// Delete every scratch spec: the `clean` reset to the installed baseline.
-    pub fn clear_scratch(&self) -> Result<()> {
+    pub fn clear_scratch(&self, lock: &EnvLock) -> Result<()> {
+        self.owns(lock)?;
         let dir = self.provenance_dir(Provenance::Scratch);
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => Ok(()),
@@ -224,7 +207,11 @@ impl EnvContext {
     /// `installed/`, ordered by program name for deterministic downstream
     /// rendering. `clean` re-solves exactly this set, so the pins survive it.
     pub fn gather_installed(&self) -> Result<Vec<EnvSpec>> {
-        let mut specs = read_specs(&self.provenance_dir(Provenance::Installed))?;
+        self.gather_installed_with(None)
+    }
+
+    fn gather_installed_with(&self, change: Option<&Change>) -> Result<Vec<EnvSpec>> {
+        let mut specs = self.tier(Provenance::Installed, change)?;
         if let Some(toolchain) = self.read_toolchain()? {
             specs.push(toolchain);
         }
@@ -233,13 +220,38 @@ impl EnvContext {
 
     /// The scratch builds' specs, ordered by slot.
     pub fn gather_scratch(&self) -> Result<Vec<EnvSpec>> {
-        read_specs(&self.provenance_dir(Provenance::Scratch))
+        self.tier(Provenance::Scratch, None)
+    }
+
+    /// One provenance tier's specs in gather order, as they would be after
+    /// `change` were committed.
+    fn tier(&self, provenance: Provenance, change: Option<&Change>) -> Result<Vec<EnvSpec>> {
+        let dir = self.provenance_dir(provenance);
+        let mut paths = json_paths(&dir)?;
+        if let Some(c) = change {
+            paths.retain(|p| !c.drop.contains(p) && *p != c.path);
+            if c.path.starts_with(&dir) {
+                paths.push(c.path.clone());
+                paths.sort_by(spec_order);
+            }
+        }
+        paths
+            .iter()
+            .map(|path| match change {
+                Some(c) if *path == c.path => Ok(c.spec.clone()),
+                _ => read_spec(path),
+            })
+            .collect()
     }
 
     /// What `sync` solves: the declared world plus the shim-ABI pin. `mim spec`
     /// renders the same set, so it prints the manifest the next sync solves.
     pub fn sync_world(&self) -> Result<Vec<EnvSpec>> {
-        let mut specs = self.gather()?;
+        self.sync_world_with(None)
+    }
+
+    fn sync_world_with(&self, change: Option<&Change>) -> Result<Vec<EnvSpec>> {
+        let mut specs = self.gather_with(change)?;
         self.append_abi_lock(&mut specs)?;
         Ok(specs)
     }
@@ -248,8 +260,12 @@ impl EnvContext {
     /// ordered by program name. The total order matters: the union feeds a
     /// solve-cache marker compared as text, so a non-deterministic order churns.
     pub fn gather(&self) -> Result<Vec<EnvSpec>> {
-        let mut specs = self.gather_installed()?;
-        specs.extend(self.gather_scratch()?);
+        self.gather_with(None)
+    }
+
+    fn gather_with(&self, change: Option<&Change>) -> Result<Vec<EnvSpec>> {
+        let mut specs = self.gather_installed_with(change)?;
+        specs.extend(self.tier(Provenance::Scratch, change)?);
         Ok(specs)
     }
 
@@ -414,8 +430,8 @@ impl EnvContext {
     /// `append_abi_lock`), so a dependency that would bump an interpreter minor
     /// fails the solve legibly rather than silently breaking the shim ABI.
     ///
-    /// Called after any solve that (re)built the shims: the manager's provision and
-    /// the in-env agent's make-time `sync`/`clean`. A re-provision is free to move
+    /// Called by the manager's provision after its solve, by `clean` after a
+    /// re-solve, and by every successful `sync` (DEP-5). A re-provision is free to move
     /// the interpreter; the recorded pin gates the agent's later make-time solves
     /// (see `append_abi_lock`). If the env has no ABI-relevant interpreter, any
     /// stale lock is removed.
@@ -433,6 +449,9 @@ impl EnvContext {
             Some(spec) => {
                 let json = serde_json::to_string(&spec)
                     .map_err(|e| DepsError::Env(format!("cannot serialize abi lock: {e}")))?;
+                if std::fs::read_to_string(self.abi_lock_path()).ok().as_deref() == Some(json.as_str()) {
+                    return Ok(());
+                }
                 self.write_requirements_file(&self.abi_lock_path(), &json)
             }
             None => remove_if_present(&self.abi_lock_path()),
@@ -452,46 +471,119 @@ impl EnvContext {
     /// processes that mutate this env share its home -- in a container the agent's
     /// `env_home` is the host env dir via bind mount, so the same inode (hence the
     /// same `flock`) is seen across the host/container boundary.
-    fn solve_lock_path(&self) -> PathBuf {
+    pub fn solve_lock_path(&self) -> PathBuf {
         self.env_home.join(".solve.lock")
     }
 
-    /// Take the env's exclusive solve lock, blocking until it is free. `sync` and
-    /// `clean` both render `pixi.toml` and solve into the one shared prefix, so
-    /// concurrent `morloc make`s against a single env must serialize -- otherwise
-    /// one overwrites the manifest the other is mid-solve on. The returned
-    /// [`Flock`] releases on drop (end of the caller's scope), including on the
-    /// error/rollback path. A first non-blocking attempt lets us tell the user we
-    /// are waiting rather than pausing silently.
-    ///
-    /// It serializes solves against each other, NOT against programs RUNNING out of
-    /// the prefix -- those neither take nor could hold this lock for their lifetime
-    /// (a served daemon would block every later build forever). A solve that changes
-    /// the world can therefore still relink or move a package under a running
-    /// program's pools; the store's per-world scratch slots keep the declared world
-    /// from SHRINKING under one, which is the reachable half of that hazard.
-    fn lock_solve(&self) -> Result<Flock<File>> {
-        let path = self.solve_lock_path();
-        // env_home normally exists (it is the state root), but be defensive.
-        std::fs::create_dir_all(&self.env_home)
-            .map_err(|e| DepsError::Env(format!("cannot create {}: {e}", self.env_home.display())))?;
-        let open = || {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)
-                .map_err(|e| DepsError::Env(format!("cannot open solve lock {}: {e}", path.display())))
-        };
-        let lock_err = |e: Errno| DepsError::Env(format!("cannot lock {}: {e}", path.display()));
-        match Flock::lock(open()?, FlockArg::LockExclusiveNonblock) {
-            Ok(guard) => Ok(guard),
-            Err((file, Errno::EAGAIN)) => {
-                eprintln!("Waiting for another dependency sync on this environment to finish...");
-                Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, e)| lock_err(e))
+    /// The environment id recorded in the store (DEP-12).
+    pub fn store_id_path(&self) -> PathBuf {
+        self.requirements_dir().join("env-id")
+    }
+
+    /// The environment id recorded in the pixi project (DEP-12).
+    pub fn pixi_id_path(&self) -> PathBuf {
+        self.pixi_dir().join(".morloc-env-id")
+    }
+
+    /// DEP-12: give the store an id if it has none and copy it into the pixi
+    /// project. Only the manager calls this: it alone holds the data dir that
+    /// contains both, so it alone knows they belong together.
+    pub fn adopt_env_ids(&self, lock: &EnvLock) -> Result<()> {
+        self.owns(lock)?;
+        let id = match read_trimmed(&self.store_id_path())? {
+            Some(id) => id,
+            None => {
+                let id = fresh_env_id(&self.env_home);
+                write_replacing(&self.store_id_path(), &format!("{id}\n"))?;
+                id
             }
-            Err((_, e)) => Err(lock_err(e)),
+        };
+        if read_trimmed(&self.pixi_id_path())?.as_deref() != Some(id.as_str()) {
+            write_replacing(&self.pixi_id_path(), &format!("{id}\n"))?;
         }
+        Ok(())
+    }
+
+    /// DEP-12: refuse unless the store and the pixi project hold one id.
+    pub fn check_env_ids(&self) -> Result<()> {
+        let store = read_trimmed(&self.store_id_path())?;
+        let pixi = read_trimmed(&self.pixi_id_path())?;
+        match (store, pixi) {
+            (Some(a), Some(b)) if a == b => Ok(()),
+            (Some(_), Some(_)) => Err(DepsError::Env(format!(
+                "the requirements store {} and the pixi project {} belong to different \
+                 environments; nothing was changed. A build sees its environment's store \
+                 through MORLOC_ENV_STORE, which `mim run` and `mim shell` set.",
+                self.requirements_dir().display(),
+                self.pixi_dir().display()
+            ))),
+            _ => Err(DepsError::Env(format!(
+                "the requirements store {} or the pixi project {} has no environment id; \
+                 nothing was changed. `mim update` records it, as does starting the \
+                 environment with `mim run` or `mim shell` as a user who can write it.",
+                self.requirements_dir().display(),
+                self.pixi_dir().display()
+            ))),
+        }
+    }
+
+    /// The lock must be this store's.
+    fn owns(&self, lock: &EnvLock) -> Result<()> {
+        if lock.home == self.env_home {
+            Ok(())
+        } else {
+            Err(DepsError::Env(format!(
+                "the lock on {} does not cover {}; nothing was changed",
+                lock.home.display(),
+                self.env_home.display()
+            )))
+        }
+    }
+
+    /// DEP-4: take the environment's lock on the file its store holds now,
+    /// blocking until it is free. A first non-blocking attempt lets us tell the
+    /// user we are waiting rather than pausing silently.
+    fn lock_solve(&self) -> Result<Flock<File>> {
+        self.lock_from(self.open_lock_file()?)
+    }
+
+    /// Lock `file`, and the store's lock file again whenever the one locked is
+    /// no longer the one at its path.
+    fn lock_from(&self, mut file: File) -> Result<Flock<File>> {
+        let path = self.solve_lock_path();
+        loop {
+            let lock_err = |e: Errno| DepsError::Env(format!("cannot lock {}: {e}", path.display()));
+            let guard = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(guard) => guard,
+                Err((file, Errno::EAGAIN)) => {
+                    eprintln!("Waiting for another dependency sync on this environment to finish...");
+                    Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, e)| lock_err(e))?
+                }
+                Err((_, e)) => return Err(lock_err(e)),
+            };
+            if is_current(&guard, &path) {
+                return Ok(guard);
+            }
+            file = self.open_lock_file()?;
+        }
+    }
+
+    fn open_lock_file(&self) -> Result<File> {
+        let path = self.solve_lock_path();
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => DepsError::Env(format!(
+                    "the environment store {} does not exist; nothing was changed. If the \
+                     environment was renamed or removed, start it again with `mim run` or \
+                     `mim shell`.",
+                    self.env_home.display()
+                )),
+                _ => DepsError::Env(format!("cannot open solve lock {}: {e}", path.display())),
+            })
     }
 
     /// Render the given specs to a pixi manifest (the merged, backend-neutral
@@ -528,12 +620,10 @@ impl EnvContext {
     ///
     /// Materialize the declared world into this env's pixi prefix.
     ///
-    /// Invalidation is keyed on a DIGEST of the structured declared world
-    /// (`requirement_digest`), not the rendered `pixi.toml` TEXT: the workspace name,
-    /// whitespace, and constraint atom order are irrelevant, so the manager and agent
-    /// (which derive the env name differently) can no longer force a spurious
-    /// re-solve. A managed `morloc make` syncs on nearly every build, so the common
-    /// "nothing changed" case (digest unchanged + prefix + cached activation) is free.
+    /// DEP-6: the solve is skipped when the declared world's digest
+    /// (`requirement_digest`) and the `pixi.toml` on disk both match the last
+    /// successful solve here, the prefix exists and the activation is cached. A
+    /// manifest some other writer put there since is solved again.
     ///
     /// When the world DID change, `try_locked` picks the strategy:
     /// - `true` (sync): try `pixi install --locked` FIRST -- if the existing lock still
@@ -544,8 +634,8 @@ impl EnvContext {
     ///   language; installing the old lock would keep it, so the lock must be rebuilt.
     ///
     /// `solved` is `true` only when a real re-solve ran (a `--locked` install reuses
-    /// the lock, so the world is unchanged -> `false`), which is exactly the signal
-    /// `sync`/`clean` use to decide whether to re-record the abi-lock.
+    /// the lock, so the world is unchanged -> `false`); `clean` re-records the
+    /// abi-lock only then.
     pub fn solve_world(
         &self,
         specs: &[EnvSpec],
@@ -558,13 +648,8 @@ impl EnvContext {
         let cache_path = self.activation_cache_path();
         let digest_path = self.solved_digest_path();
         let prefix = crate::abi::conda_prefix(&pixi_dir);
-        let unchanged = std::fs::read_to_string(&digest_path)
-            .map(|prev| prev == digest)
-            .unwrap_or(false);
-        if unchanged && prefix.is_dir() {
-            if let Some(activation) = read_activation_cache(&cache_path) {
-                return Ok(SolveOutcome { activation, solved: false });
-            }
+        if let Some(activation) = self.solved_activation(&reqs) {
+            return Ok(SolveOutcome { activation, solved: false });
         }
         // Invalidate the cached activation BEFORE touching the prefix. Otherwise an
         // interrupted materialize (SIGKILL mid install) that has already written the
@@ -574,7 +659,8 @@ impl EnvContext {
         // whole, forcing a corrective re-materialize.
         let _ = std::fs::remove_file(&cache_path);
         let _ = std::fs::remove_file(&digest_path);
-        crate::pixi::write_manifest(&pixi_dir, &crate::pixi::render_manifest(&reqs))?;
+        let mut written = crate::pixi::render_manifest(&reqs);
+        crate::pixi::write_manifest(&pixi_dir, &written)?;
         // In-env agent path (`mim sync`): the built image already sets the CA env vars,
         // which the pixi subprocess inherits, so no override is needed. No FHS
         // wrapping: the in-env agent already runs inside its execution environment.
@@ -600,7 +686,8 @@ impl EnvContext {
             let mut adopted = specs.to_vec();
             adopted.push(adopted_language_spec(&pulled, &inputs.lang_support.morloc_version));
             let reqs = self.requirement_set(&adopted, inputs)?;
-            crate::pixi::write_manifest(&pixi_dir, &crate::pixi::render_manifest(&reqs))?;
+            written = crate::pixi::render_manifest(&reqs);
+            crate::pixi::write_manifest(&pixi_dir, &written)?;
             crate::pixi::solve(&pixi_dir, inputs.pixi_bin, None, None)?;
             solved = true;
         }
@@ -626,12 +713,12 @@ impl EnvContext {
         write_activation_cache(&cache_path, &activation);
         // Record the digest of the world we just materialized so the next make can
         // fast-path. Written only after success, so a failed build is retried.
-        let _ = std::fs::write(&digest_path, &digest);
+        let _ = std::fs::write(&digest_path, solved_digest(&digest, &written));
         Ok(SolveOutcome { activation, solved })
     }
 
-    /// The digest of the declared world last successfully materialized into the pixi
-    /// prefix (the structured `requirement_digest`, not the `pixi.toml` text).
+    /// The record of the last successful solve: the declared world's digest and
+    /// the digest of the manifest it wrote (DEP-6).
     fn solved_digest_path(&self) -> PathBuf {
         self.pixi_dir().join(".morloc-solved-digest")
     }
@@ -653,57 +740,127 @@ impl EnvContext {
             .collect())
     }
 
-    /// Merge a program's spec into the declared world under `provenance`,
-    /// re-solve, and install. On failure the tentative spec is rolled back so the
-    /// STORE is never left half-applied (the no-mutation rule), and the error is
-    /// returned as-is -- `solve_world` failures include setup errors (an
-    /// unwritable prefix, a missing pixi, etc.), not only unsatisfiability, so
-    /// they must NOT be blanket-relabeled as a dependency conflict.
-    ///
-    /// The store rollback does NOT undo a partial pixi prefix install (pixi links
-    /// into the shared prefix as it solves). A stale `pixi.toml`/`pixi.lock` or a
-    /// partially-linked prefix is reconciled on the next successful re-solve
-    /// (`sync` or `clean`), which re-renders from the rolled-back store.
-    pub fn sync(
+    /// DEP-5: merge a program's spec into the declared world under
+    /// `provenance`, replacing its scratch builds when `supersede_scratch`, and
+    /// solve. The store changes only after the solve succeeds, so a failed or
+    /// interrupted sync leaves it as it was. The world solved is the one the
+    /// store then holds, in gather order.
+    /// DEP-6: the activation of the last successful solve here, when that solve
+    /// was of exactly `reqs`. The recorded digest names the world and the
+    /// manifest the solve wrote, so a manifest another writer replaced since,
+    /// a missing prefix or a missing activation all mean "not solved".
+    fn solved_activation(&self, reqs: &crate::pixi::RequirementSet) -> Option<Vec<(String, String)>> {
+        let pixi_dir = self.pixi_dir();
+        let manifest = std::fs::read_to_string(pixi_dir.join("pixi.toml")).ok()?;
+        let prev = std::fs::read_to_string(self.solved_digest_path()).ok()?;
+        let digest = crate::pixi::requirement_digest(reqs);
+        if prev != solved_digest(&digest, &manifest) || !crate::abi::conda_prefix(&pixi_dir).is_dir() {
+            return None;
+        }
+        read_activation_cache(&self.activation_cache_path())
+    }
+
+    /// DEP-10: whether `sync` of this spec would change the solved world. It
+    /// would not when the last solve here was of the same world, or, with that
+    /// record gone (`mim update` drops it, a frozen image never carries it),
+    /// when the manifest on disk is the one this world renders and the prefix
+    /// exists. Writes nothing.
+    pub fn sync_changes_world(
         &self,
         program: &str,
         provenance: Provenance,
         spec_json: &str,
+        supersede_scratch: bool,
+        inputs: &SolveInputs,
+    ) -> Result<bool> {
+        let spec = EnvSpec::from_json(spec_json)?;
+        let change = Change {
+            path: self.spec_path(program, provenance, &spec)?,
+            spec,
+            drop: if supersede_scratch { self.named_paths(program, Provenance::Scratch)? } else { Vec::new() },
+        };
+        let specs = self.sync_world_with(Some(&change))?;
+        let reqs = self.requirement_set(&specs, inputs)?;
+        if self.solved_activation(&reqs).is_some() {
+            return Ok(false);
+        }
+        let pixi_dir = self.pixi_dir();
+        let on_disk = std::fs::read_to_string(pixi_dir.join("pixi.toml")).ok();
+        let same = on_disk.as_deref() == Some(crate::pixi::render_manifest(&reqs).as_str());
+        Ok(!(same && crate::abi::conda_prefix(&pixi_dir).is_dir()))
+    }
+
+    pub fn sync(
+        &self,
+        lock: &EnvLock,
+        program: &str,
+        provenance: Provenance,
+        spec_json: &str,
+        supersede_scratch: bool,
         inputs: &SolveInputs,
     ) -> Result<Vec<(String, String)>> {
-        // Serialize concurrent solves against this env's shared prefix; held
-        // through the write/gather/solve/record, released when `_lock` drops.
-        let _lock = self.lock_solve()?;
-        let slot = self.write_spec(program, provenance, spec_json)?;
-        let specs = self.sync_world()?;
+        self.owns(lock)?;
+        self.check_env_ids()?;
+        let spec = EnvSpec::from_json(spec_json)?;
+        let change = Change {
+            path: self.spec_path(program, provenance, &spec)?,
+            spec,
+            drop: if supersede_scratch { self.named_paths(program, Provenance::Scratch)? } else { Vec::new() },
+        };
+        let specs = self.sync_world_with(Some(&change))?;
         // Prefer the manager's tested lock (`--locked`); re-solve only if it cannot
         // satisfy this program's world.
-        match self.solve_world(&specs, inputs, true) {
-            Ok(outcome) => {
-                if outcome.solved {
-                    // Pin the interpreter minor the (about-to-be-built) shims
-                    // will link against, so a later solve cannot silently move it
-                    // and break the ABI. Recorded here, under the solve lock, as
-                    // part of the same sync: whichever caller adds a language on
-                    // demand -- the in-env agent or the manager's provision --
-                    // pins the interpreter the moment it is provisioned.
-                    self.record_abi_lock(inputs.lang_support.morloc_version.as_str(), inputs.lang_support)?;
-                }
-                // The agent decides whether to build shims from actual SHIM state
-                // (a per-language `morloc init` marker), NOT from a before/after
-                // lock diff: the lock reflects PROVISIONING, so a language present
-                // in the lock whose shim failed to build (or an immutable env that
-                // never built it) must stay flagged on every retry, which a lock
-                // diff -- empty once the language is in the lock -- cannot do.
-                Ok(outcome.activation)
-            }
-            Err(e) => {
-                if let Err(undo) = self.rollback_spec(&slot) {
-                    return Err(DepsError::Env(format!("{e}; also, {undo}")));
-                }
-                Err(e)
+        let outcome = self.solve_world(&specs, inputs, true)?;
+        self.commit(&change, spec_json)?;
+        // DEP-5: the pin follows the prefix; one this sync cannot record, the
+        // next records.
+        if let Err(e) = self.record_abi_lock(inputs.lang_support.morloc_version.as_str(), inputs.lang_support) {
+            eprintln!("Warning: could not record the interpreter version pin: {e}");
+        }
+        Ok(outcome.activation)
+    }
+
+    /// Write a sync's spec and remove the specs it supersedes. With removals,
+    /// a note naming them and the spec's digest is written first, so a commit
+    /// a crash interrupts is finished by the next lock (DEP-5).
+    fn commit(&self, change: &Change, spec_json: &str) -> Result<()> {
+        if change.drop.is_empty() {
+            return write_replacing(&change.path, spec_json);
+        }
+        let rel = |p: &Path| p.strip_prefix(self.requirements_dir()).unwrap_or(p).display().to_string();
+        let mut note = format!("{}\n{}\n", rel(&change.path), crate::cert::hex_lower(&Sha256::digest(spec_json)));
+        for path in &change.drop {
+            note.push_str(&format!("{}\n", rel(path)));
+        }
+        write_replacing(&self.pending_commit_path(), &note)?;
+        write_replacing(&change.path, spec_json)?;
+        self.finish_commit()
+    }
+
+    fn pending_commit_path(&self) -> PathBuf {
+        self.requirements_dir().join("pending-commit")
+    }
+
+    /// Finish a commit whose spec was written: remove the specs it supersedes.
+    /// A note whose spec was never written is dropped with nothing removed.
+    fn finish_commit(&self) -> Result<()> {
+        let Some(note) = read_trimmed(&self.pending_commit_path())? else {
+            return Ok(());
+        };
+        let mut lines = note.lines();
+        let (Some(spec), Some(digest)) = (lines.next(), lines.next()) else {
+            return remove_if_present(&self.pending_commit_path());
+        };
+        let dir = self.requirements_dir();
+        let written = std::fs::read(dir.join(spec))
+            .map(|bytes| crate::cert::hex_lower(&Sha256::digest(bytes)) == digest)
+            .unwrap_or(false);
+        if written {
+            for path in lines {
+                remove_spec_file(&dir.join(path))?;
             }
         }
+        remove_if_present(&self.pending_commit_path())
     }
 
     /// The names (file stems) of the installed programs only (the canonical
@@ -725,19 +882,19 @@ impl EnvContext {
         Ok(names)
     }
 
-    /// Reset the declared world to the installed baseline: drop all scratch
-    /// specs, then re-solve so the prefix reflects only installed programs (plus
-    /// the pinned toolchain). Unlike `sync`, this does NOT append the abi-lock:
-    /// clean is the one path allowed to DROP an unreferenced on-demand language,
+    /// Reset the declared world to the installed baseline: solve the installed
+    /// programs (plus the pinned toolchain), then drop every scratch spec.
+    /// Unlike `sync`, this does NOT append the abi-lock: clean is the one path
+    /// allowed to DROP an unreferenced on-demand language,
     /// so it re-solves free of the old interpreter pins, then re-records the pin
     /// for whatever interpreters survive (pruning pins for dropped ones).
     /// Pinned (`--lang`) languages live in the toolchain spec and so survive;
     /// on-demand languages no program references are dropped. Returns the
     /// languages whose runtime was dropped, so the agent can invalidate their
     /// stale shim markers.
-    pub fn clean(&self, inputs: &SolveInputs) -> Result<Vec<String>> {
-        let _lock = self.lock_solve()?;
-        self.clear_scratch()?;
+    pub fn clean(&self, lock: &EnvLock, inputs: &SolveInputs) -> Result<Vec<String>> {
+        self.owns(lock)?;
+        self.check_env_ids()?;
         let mut specs = self.gather_installed()?;
         let before = self.runtime_language_set(inputs.platform)?;
         // Keep the abi-lock pin ONLY for languages still referenced by an
@@ -759,6 +916,7 @@ impl EnvContext {
         // Force a real re-solve (never `--locked`): clean's purpose is to DROP an
         // unreferenced language, and installing the existing lock would keep it.
         let outcome = self.solve_world(&specs, inputs, false)?;
+        self.clear_scratch(lock)?;
         let dropped = if outcome.solved {
             self.record_abi_lock(inputs.lang_support.morloc_version.as_str(), inputs.lang_support)?;
             let after = self.runtime_language_set(inputs.platform)?;
@@ -769,15 +927,53 @@ impl EnvContext {
         Ok(dropped)
     }
 
-    /// Acquire the environment's exclusive solve/build lock, returning a guard
-    /// that releases on drop. The in-env agent holds this around the on-demand
-    /// `morloc init` shim build so two concurrent `morloc make`s on one env cannot
-    /// run two inits that write the same shim artifacts/markers at once. It is a
-    /// SEPARATE acquisition from `sync`'s internal lock (which is released before
-    /// the agent builds), so callers must not hold it across a `sync`/`clean`
-    /// call -- that would deadlock on the same advisory lock.
-    pub fn lock_env(&self) -> Result<Flock<File>> {
-        self.lock_solve()
+    /// The environment's lock (DEP-4). The store must exist: a build hook must
+    /// not make one for an environment that was removed.
+    /// A commit a crash interrupted is finished first (DEP-5), once the store
+    /// and the project are known to be one environment's (DEP-12).
+    pub fn lock_env(&self) -> Result<EnvLock> {
+        let lock = self.lock_env_as_is()?;
+        if self.check_env_ids().is_ok() {
+            self.finish_commit().map_err(|e| {
+                DepsError::Env(format!(
+                    "{e}; an interrupted change to the requirements store could not be \
+                     finished. Removing {} and running `mim clean --uninstalled` resets the store.",
+                    self.pending_commit_path().display()
+                ))
+            })?;
+        }
+        Ok(lock)
+    }
+
+    /// The environment's lock, with the store left exactly as found: for
+    /// removing or moving the whole environment.
+    pub fn lock_env_as_is(&self) -> Result<EnvLock> {
+        Ok(EnvLock { _flock: self.lock_solve()?, home: self.env_home.clone() })
+    }
+
+    /// The environment's lock, making its store first if it has none: for the
+    /// manager, which creates environments.
+    pub fn lock_env_creating(&self) -> Result<EnvLock> {
+        std::fs::create_dir_all(&self.env_home)
+            .map_err(|e| DepsError::Env(format!("cannot create {}: {e}", self.env_home.display())))?;
+        self.lock_env()
+    }
+}
+
+/// A spec write a sync commits once its solve succeeds: the program's slot
+/// and the slots it supersedes.
+struct Change {
+    path: PathBuf,
+    spec: EnvSpec,
+    drop: Vec<PathBuf>,
+}
+
+/// Whether `file` is still the file at `path`.
+fn is_current(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
     }
 }
 
@@ -829,6 +1025,50 @@ fn restore_or_remove(path: &Path, content: Option<&str>) -> Result<()> {
         }
         None => remove_if_present(path),
     }
+}
+
+/// Write `text` to `path` through a sibling temporary file and a rename, so a
+/// reader sees the old content or the new, never part of it.
+fn write_replacing(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| DepsError::Env(format!("cannot create {}: {e}", parent.display())))?;
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            DepsError::Env(format!("cannot write {}: {e}", path.display()))
+        })
+}
+
+/// The solve record: the declared world's digest and a digest of the manifest
+/// text that solve wrote.
+fn solved_digest(world: &str, manifest: &str) -> String {
+    let m = crate::cert::hex_lower(&Sha256::digest(manifest.as_bytes()));
+    format!("{world}\nmanifest {m}\n")
+}
+
+/// A file's trimmed content; `None` when it is absent or empty.
+fn read_trimmed(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(t) if t.trim().is_empty() => Ok(None),
+        Ok(t) => Ok(Some(t.trim().to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(DepsError::Env(format!("cannot read {}: {e}", path.display()))),
+    }
+}
+
+/// A new environment id: a digest of this process, the store path and the
+/// clock, which no other environment's id repeats.
+fn fresh_env_id(env_home: &Path) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seed = format!("{}\0{}\0{nanos}", std::process::id(), env_home.display());
+    crate::cert::hex_lower(&Sha256::digest(seed.as_bytes())[..16])
 }
 
 /// Remove a file, tolerating its absence (an uninstall, or clearing a stale lock).
@@ -884,11 +1124,14 @@ fn remove_spec_file(path: &Path) -> Result<()> {
 fn json_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_json(dir, true, &mut files)?;
-    files.sort_by(|a, b| {
-        let stem = |p: &PathBuf| p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-        stem(a).cmp(&stem(b)).then_with(|| a.cmp(b))
-    });
+    files.sort_by(spec_order);
     Ok(files)
+}
+
+/// Gather order: by program name, then by path.
+fn spec_order(a: &PathBuf, b: &PathBuf) -> std::cmp::Ordering {
+    let stem = |p: &PathBuf| p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    stem(a).cmp(&stem(b)).then_with(|| a.cmp(b))
 }
 
 /// Append the `*.json` files directly under `dir` to `out`, descending one level
@@ -912,16 +1155,11 @@ fn collect_json(dir: &Path, descend: bool, out: &mut Vec<PathBuf>) -> Result<()>
     Ok(())
 }
 
-/// Read and parse every `*.json` in `dir`, sorted for a stable order.
-fn read_specs(dir: &Path) -> Result<Vec<EnvSpec>> {
-    let files = json_paths(dir)?;
-    let mut specs = Vec::with_capacity(files.len());
-    for path in files {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| DepsError::Env(format!("cannot read {}: {e}", path.display())))?;
-        specs.push(EnvSpec::from_json(&text)?);
-    }
-    Ok(specs)
+/// Read and parse one stored spec.
+fn read_spec(path: &Path) -> Result<EnvSpec> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| DepsError::Env(format!("cannot read {}: {e}", path.display())))?;
+    EnvSpec::from_json(&text)
 }
 
 /// The `.json` file stems (program names) directly under `dir`.
@@ -962,6 +1200,10 @@ mod tests {
         )
     }
 
+    fn lk(ctx: &EnvContext) -> EnvLock {
+        ctx.lock_env_creating().unwrap()
+    }
+
     fn ctx() -> (tempfile::TempDir, EnvContext) {
         let dir = tempfile::tempdir().unwrap();
         let ctx = EnvContext::new(dir.path());
@@ -971,9 +1213,9 @@ mod tests {
     #[test]
     fn gather_unions_installed_and_scratch_in_stable_order() {
         let (_d, ctx) = ctx();
-        ctx.write_spec("bravo", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
-        ctx.write_spec("alpha", Provenance::Installed, &spec(r#"{"lang":"cpp"}"#)).unwrap();
-        ctx.write_spec("zeta", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "bravo", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "alpha", Provenance::Installed, &spec(r#"{"lang":"cpp"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "zeta", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
 
         let all = ctx.gather().unwrap();
         assert_eq!(all.len(), 3);
@@ -989,11 +1231,11 @@ mod tests {
     #[test]
     fn clear_scratch_resets_to_installed_baseline() {
         let (_d, ctx) = ctx();
-        ctx.write_spec("keep", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
-        ctx.write_spec("temp", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "keep", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "temp", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
         assert_eq!(ctx.gather().unwrap().len(), 2);
 
-        ctx.clear_scratch().unwrap();
+        ctx.clear_scratch(&lk(&ctx)).unwrap();
         let after = ctx.gather().unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].languages[0].lang, "py");
@@ -1005,8 +1247,8 @@ mod tests {
         // Two unrelated programs, both built as `nexus` (the -o default), declaring
         // different worlds. Keyed on the name alone the second erases the first, and
         // the next solve drops what the first still needs.
-        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
-        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
 
         let mut langs: Vec<String> =
             ctx.gather().unwrap().iter().map(|s| s.languages[0].lang.clone()).collect();
@@ -1022,7 +1264,7 @@ mod tests {
         // The common case: the same program rebuilt over and over. Its world is
         // unchanged, so it must not accumulate a slot per build.
         for _ in 0..5 {
-            ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
+            ctx.write_spec(&lk(&ctx), "nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
         }
         assert_eq!(ctx.gather().unwrap().len(), 1);
     }
@@ -1030,11 +1272,11 @@ mod tests {
     #[test]
     fn install_supersedes_every_scratch_world_of_that_name() {
         let (_d, ctx) = ctx();
-        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
-        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
-        ctx.write_spec("nexus", Provenance::Installed, &spec(r#"{"lang":"cpp"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "nexus", Provenance::Installed, &spec(r#"{"lang":"cpp"}"#)).unwrap();
 
-        ctx.remove_named("nexus", Provenance::Scratch).unwrap();
+        ctx.remove_named(&lk(&ctx), "nexus", Provenance::Scratch).unwrap();
         let all = ctx.gather().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].languages[0].lang, "cpp");
@@ -1045,40 +1287,12 @@ mod tests {
     }
 
     #[test]
-    fn sync_rollback_removes_only_the_slot_it_wrote() {
-        let (_d, ctx) = ctx();
-        // An earlier, good build under this name.
-        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
-        // A later build whose solve fails: `sync` rolls back exactly its own write.
-        let slot = ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
-        ctx.rollback_spec(&slot).unwrap();
-
-        let all = ctx.gather().unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].languages[0].lang, "py");
-    }
-
-    /// DEP-5: a failed re-sync of an installed program restores the spec its
-    /// last successful install recorded, in the same slot.
-    #[test]
-    fn sync_rollback_restores_the_spec_it_replaced() {
-        let (_d, ctx) = ctx();
-        ctx.write_spec("nexus", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
-        let slot = ctx.write_spec("nexus", Provenance::Installed, &spec(r#"{"lang":"r"}"#)).unwrap();
-        ctx.rollback_spec(&slot).unwrap();
-
-        let all = ctx.gather().unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].languages[0].lang, "py");
-    }
-
-    #[test]
     fn clear_scratch_drops_every_world_slot() {
         let (_d, ctx) = ctx();
-        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
-        ctx.write_spec("nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
-        ctx.write_spec("keep", Provenance::Installed, &spec(r#"{"lang":"cpp"}"#)).unwrap();
-        ctx.clear_scratch().unwrap();
+        ctx.write_spec(&lk(&ctx), "nexus", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "nexus", Provenance::Scratch, &spec(r#"{"lang":"r"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "keep", Provenance::Installed, &spec(r#"{"lang":"cpp"}"#)).unwrap();
+        ctx.clear_scratch(&lk(&ctx)).unwrap();
 
         let all = ctx.gather().unwrap();
         assert_eq!(all.len(), 1);
@@ -1095,14 +1309,14 @@ mod tests {
     #[test]
     fn write_spec_rejects_malformed_json() {
         let (_d, ctx) = ctx();
-        let r = ctx.write_spec("bad", Provenance::Scratch, "{ not json");
+        let r = ctx.write_spec(&lk(&ctx), "bad", Provenance::Scratch, "{ not json");
         assert!(r.is_err());
     }
 
     #[test]
     fn toolchain_folds_into_baseline_but_is_not_a_program() {
         let (_d, ctx) = ctx();
-        ctx.write_spec("prog", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "prog", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
         ctx.write_toolchain(&spec(r#"{"lang":"py","constraint":"==3.12"}"#)).unwrap();
 
         // the pins are part of the installed baseline (so `clean` keeps them)...
@@ -1115,7 +1329,7 @@ mod tests {
     #[test]
     fn abi_lock_gates_only_the_in_env_solve_not_the_gather() {
         let (_d, ctx) = ctx();
-        ctx.write_spec("prog", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "prog", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
         std::fs::create_dir_all(ctx.requirements_dir()).unwrap();
         std::fs::write(
             ctx.abi_lock_path(),
@@ -1197,7 +1411,7 @@ mod tests {
         // constraint that collides with an injected binder dep -- otherwise the
         // make-time solve-cache text compare fails and every build re-solves.
         let (_d, ctx) = ctx();
-        ctx.write_spec("prog", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "prog", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
         let extras = vec!["numpy>=1.20".to_string(), "nvim".to_string()];
         ctx.write_conda_extras(&extras).unwrap();
 
@@ -1313,12 +1527,12 @@ mod tests {
         let good = spec(r#"{"lang":"py"}"#);
         for name in ["../escape", "sub/child", "..", ".", ""] {
             assert!(
-                ctx.write_spec(name, Provenance::Scratch, &good).is_err(),
+                ctx.write_spec(&lk(&ctx), name, Provenance::Scratch, &good).is_err(),
                 "expected '{name}' to be rejected"
             );
         }
         // a plain name is accepted
-        assert!(ctx.write_spec("ok-name", Provenance::Scratch, &good).is_ok());
+        assert!(ctx.write_spec(&lk(&ctx), "ok-name", Provenance::Scratch, &good).is_ok());
     }
 
     #[test]
@@ -1327,6 +1541,7 @@ mod tests {
         // A pre-1 schema version is stale; the store must not accept a spec it
         // cannot understand.
         let r = ctx.write_spec(
+            &lk(&ctx),
             "old",
             Provenance::Scratch,
             r#"{"envspec_version":0,"morloc_version":"0.0.0"}"#,
@@ -1337,22 +1552,21 @@ mod tests {
     #[test]
     fn remove_and_promote_semantics() {
         let (_d, ctx) = ctx();
-        let scratch = ctx.write_spec("p", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "p", Provenance::Scratch, &spec(r#"{"lang":"py"}"#)).unwrap();
         // promote: write to installed, drop from scratch
-        ctx.write_spec("p", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
-        ctx.rollback_spec(&scratch).unwrap();
+        ctx.write_spec(&lk(&ctx), "p", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.remove_named(&lk(&ctx), "p", Provenance::Scratch).unwrap();
         assert_eq!(ctx.gather().unwrap().len(), 1);
         assert_eq!(ctx.gather_installed().unwrap().len(), 1);
         // removing a missing spec is a no-op
-        ctx.rollback_spec(&scratch).unwrap();
-        ctx.remove_named("p", Provenance::Scratch).unwrap();
+        ctx.remove_named(&lk(&ctx), "p", Provenance::Scratch).unwrap();
     }
 
     #[test]
     fn pinned_languages_reads_only_the_toolchain_spec() {
         let (_d, ctx) = ctx();
         // An installed program's languages are NOT pins (they are on-demand).
-        ctx.write_spec("prog", Provenance::Installed, &spec(r#"{"lang":"r"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "prog", Provenance::Installed, &spec(r#"{"lang":"r"}"#)).unwrap();
         assert!(ctx.pinned_languages().unwrap().is_empty());
         // The --lang toolchain spec IS the pinned baseline.
         ctx.write_toolchain(&spec(r#"{"lang":"py"},{"lang":"cpp"}"#)).unwrap();
@@ -1396,5 +1610,368 @@ mod tests {
         write_activation_cache(&path, &env);
         let read = read_activation_cache(&path).unwrap();
         assert!(read.contains(&("CC".to_string(), format!("{p}/bin/x-cc"))), "{read:?}");
+    }
+
+    /// A pixi stand-in: any install copies the manifest into the prefix as
+    /// `solved.toml`, so a test can see which manifest the prefix was solved
+    /// from; shell-hook activates that prefix.
+    fn fake_pixi(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("bin/pixi");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n\
+             for a in \"$@\"; do case \"$prev\" in --manifest-path) m=\"$a\";; esac; prev=\"$a\"; done\n\
+             d=$(dirname \"$m\"); p=\"$d/.pixi/envs/default\"\n\
+             case \"$1\" in\n\
+             install) echo x >> \"$(dirname \"$0\")/installs\";\n\
+               mkdir -p \"$p/conda-meta\" \"$p/bin\" && touch \"$p/bin/cc\" \"$p/bin/c++\" && chmod +x \"$p/bin/cc\" \"$p/bin/c++\" && cp \"$m\" \"$p/solved.toml\" && printf 'environments: {}\\n' > \"$d/pixi.lock\";;\n\
+             shell-hook) echo \"export CONDA_PREFIX='$p' CC='$p/bin/cc' CXX='$p/bin/c++'\";;\n\
+             *) exit 9;;\n\
+             esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn solved_manifest(ctx: &EnvContext) -> String {
+        std::fs::read_to_string(crate::abi::conda_prefix(&ctx.pixi_dir()).join("solved.toml")).unwrap()
+    }
+
+    fn adopted(ctx: &EnvContext) {
+        let lock = ctx.lock_env_creating().unwrap();
+        ctx.adopt_env_ids(&lock).unwrap();
+    }
+
+    fn failing_pixi(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("bin/pixi");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn installs(pixi: &Path) -> usize {
+        std::fs::read_to_string(pixi.parent().unwrap().join("installs")).map(|t| t.lines().count()).unwrap_or(0)
+    }
+
+    fn texts(specs: &[EnvSpec]) -> Vec<String> {
+        specs.iter().map(|s| s.to_json().unwrap()).collect()
+    }
+
+    /// DEP-5: a sync whose solve fails, or that dies before it commits, leaves
+    /// the store as it was, superseded scratch builds included.
+    #[test]
+    fn a_failed_solve_leaves_the_store_as_it_was() {
+        let (d, ctx) = ctx();
+        adopted(&ctx);
+        ctx.write_spec(&lk(&ctx), "nexus", Provenance::Installed, &spec(r#"{"lang":"py"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "nexus", Provenance::Scratch, &spec(r#"{"lang":"py","constraint":"3.12.*"}"#)).unwrap();
+        let pixi = failing_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        let before = texts(&ctx.gather().unwrap());
+        let lock = ctx.lock_env().unwrap();
+        let err = ctx
+            .sync(&lock, "nexus", Provenance::Installed, &spec(r#"{"lang":"py","constraint":"3.11.*"}"#), true, &inputs)
+            .unwrap_err();
+        assert!(err.to_string().contains("pixi"), "the solve itself must fail: {err}");
+        assert_eq!(texts(&ctx.gather().unwrap()), before);
+
+        assert!(ctx.clean(&lock, &inputs).is_err());
+        assert_eq!(texts(&ctx.gather().unwrap()), before, "a failed clean keeps the scratch builds");
+    }
+
+    #[test]
+    fn an_install_supersedes_the_programs_scratch_builds_once_it_solves() {
+        let (d, ctx) = ctx();
+        adopted(&ctx);
+        ctx.write_spec(&lk(&ctx), "nexus", Provenance::Scratch, &spec(r#"{"lang":"py","constraint":"3.12.*"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "other", Provenance::Scratch, &spec(r#"{"lang":"py","constraint":"3.12.*"}"#)).unwrap();
+        let pixi = fake_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        let lock = ctx.lock_env().unwrap();
+        ctx.sync(&lock, "nexus", Provenance::Installed, &spec(r#"{"lang":"py"}"#), true, &inputs).unwrap();
+        assert_eq!(texts(&ctx.gather_installed().unwrap()), texts(&[EnvSpec::from_json(&spec(r#"{"lang":"py"}"#)).unwrap()]));
+        assert_eq!(ctx.program_names().unwrap(), vec!["nexus", "other"]);
+        assert_eq!(ctx.gather_scratch().unwrap().len(), 1);
+    }
+
+    /// The world a sync solves is the one the store holds after it commits, so
+    /// the same build again takes the fast path.
+    #[test]
+    fn a_repeated_sync_takes_the_fast_path() {
+        let (d, ctx) = ctx();
+        adopted(&ctx);
+        ctx.write_spec(&lk(&ctx), "zeta", Provenance::Installed, &spec(r#"{"lang":"py","constraint":"3.12.*"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "alpha", Provenance::Scratch, &spec(r#"{"lang":"py","constraint":"3.12.*"}"#)).unwrap();
+        ctx.write_spec(&lk(&ctx), "omega", Provenance::Scratch, &spec(r#"{"lang":"py","constraint":"3.12.*"}"#)).unwrap();
+        let pixi = fake_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        let lock = ctx.lock_env().unwrap();
+        for (name, prov) in [("mid", Provenance::Scratch), ("beta", Provenance::Installed)] {
+            ctx.sync(&lock, name, prov, &spec(r#"{"lang":"py"}"#), false, &inputs).unwrap();
+            let n = installs(&pixi);
+            ctx.sync(&lock, name, prov, &spec(r#"{"lang":"py"}"#), false, &inputs).unwrap();
+            assert_eq!(installs(&pixi), n, "{name} solved again");
+        }
+    }
+
+    /// DEP-10: an immutable environment asks, writing nothing, whether a sync
+    /// would change its solved world.
+    #[test]
+    fn a_sync_says_whether_it_would_change_the_world() {
+        let (d, ctx) = ctx();
+        adopted(&ctx);
+        let pixi = fake_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        let lock = ctx.lock_env().unwrap();
+        let same = spec(r#"{"lang":"py"}"#);
+        assert!(ctx.sync_changes_world("p", Provenance::Scratch, &same, false, &inputs).unwrap());
+        ctx.sync(&lock, "p", Provenance::Scratch, &same, false, &inputs).unwrap();
+        assert!(!ctx.sync_changes_world("p", Provenance::Scratch, &same, false, &inputs).unwrap());
+        // `mim update` forgets the agent's solve record, and a frozen image does
+        // not carry it; the manifest on disk still names the solved world.
+        std::fs::remove_file(ctx.solved_digest_path()).unwrap();
+        assert!(!ctx.sync_changes_world("p", Provenance::Scratch, &same, false, &inputs).unwrap());
+        let before = texts(&ctx.gather().unwrap());
+        let moved = spec(r#"{"lang":"py","constraint":"3.11.*"}"#);
+        assert!(ctx.sync_changes_world("q", Provenance::Scratch, &moved, false, &inputs).unwrap());
+        assert_eq!(texts(&ctx.gather().unwrap()), before);
+    }
+
+    /// A scratch build made after an install of the same name is part of the
+    /// world: the install superseded only the builds before it.
+    #[test]
+    fn a_later_scratch_build_of_an_installed_program_is_in_the_world() {
+        let (d, ctx) = ctx();
+        adopted(&ctx);
+        let pixi = fake_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        ctx.write_spec(&lk(&ctx), "nexus", Provenance::Scratch, &spec(r#"{"lang":"py","constraint":"3.11.*"}"#)).unwrap();
+        let lock = ctx.lock_env().unwrap();
+        let vendored = r#"{"envspec_version":2,"morloc_version":"0","packages":{"py":[{"name":"mylib","source":"vendored","path":"/s/mylib"}]}}"#;
+        ctx.sync(&lock, "nexus", Provenance::Installed, vendored, true, &inputs).unwrap();
+        assert!(ctx.gather_scratch().unwrap().is_empty());
+
+        let later = spec(r#"{"lang":"py","constraint":"3.12.*"}"#);
+        ctx.sync(&lock, "nexus", Provenance::Scratch, &later, false, &inputs).unwrap();
+        assert_eq!(texts(&ctx.gather_scratch().unwrap()), texts(&[EnvSpec::from_json(&later).unwrap()]));
+    }
+
+    /// DEP-5: a commit a crash interrupted after its spec was written is
+    /// finished by the next lock; one interrupted before is dropped. DEP-12:
+    /// not before the ids agree, and not by a lock that takes the store as is.
+    #[test]
+    fn an_interrupted_commit_is_finished_by_the_next_lock() {
+        let (_d, ctx) = ctx();
+        let old = spec(r#"{"lang":"py","constraint":"3.11.*"}"#);
+        let new = spec(r#"{"lang":"py"}"#);
+        let note = |ctx: &EnvContext| {
+            let scratch = ctx.named_paths("nexus", Provenance::Scratch).unwrap();
+            let rel = scratch[0].strip_prefix(ctx.requirements_dir()).unwrap().display().to_string();
+            let digest = crate::cert::hex_lower(&Sha256::digest(new.as_bytes()));
+            std::fs::write(ctx.pending_commit_path(), format!("installed/nexus.json\n{digest}\n{rel}\n")).unwrap();
+        };
+
+        ctx.write_spec(&lk(&ctx), "nexus", Provenance::Scratch, &old).unwrap();
+        note(&ctx);
+        drop(lk(&ctx));
+        assert!(ctx.pending_commit_path().exists(), "no ids: the note waits");
+        adopted(&ctx);
+        drop(lk(&ctx));
+        assert_eq!(ctx.gather_scratch().unwrap().len(), 1, "the spec was never written: nothing is removed");
+        assert!(!ctx.pending_commit_path().exists());
+        let id = ctx.store_id_path();
+        std::fs::remove_file(&id).unwrap();
+
+        note(&ctx);
+        std::fs::create_dir_all(ctx.requirements_dir().join("installed")).unwrap();
+        std::fs::write(ctx.requirements_dir().join("installed/nexus.json"), &new).unwrap();
+        drop(lk(&ctx));
+        assert_eq!(ctx.gather_scratch().unwrap().len(), 1, "no ids: the store is left alone");
+        assert!(ctx.pending_commit_path().exists());
+
+        let as_is = ctx.lock_env_as_is().unwrap();
+        ctx.adopt_env_ids(&as_is).unwrap();
+        drop(as_is);
+        drop(ctx.lock_env_as_is().unwrap());
+        assert_eq!(ctx.gather_scratch().unwrap().len(), 1, "a lock taken as is finishes nothing");
+
+        drop(lk(&ctx));
+        assert!(ctx.gather_scratch().unwrap().is_empty());
+        assert!(!ctx.pending_commit_path().exists());
+    }
+
+    /// The interpreter pin follows the prefix, so a sync that fast-paths
+    /// records a pin a solved-then-interrupted sync never did.
+    #[test]
+    fn a_fast_path_records_a_missing_interpreter_pin() {
+        let (d, ctx) = ctx();
+        adopted(&ctx);
+        let pixi = fake_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        let lock = ctx.lock_env().unwrap();
+        ctx.sync(&lock, "prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), false, &inputs).unwrap();
+        let meta = crate::abi::conda_prefix(&ctx.pixi_dir()).join("conda-meta");
+        std::fs::write(meta.join("python-3.12.9-0.json"), r#"{"name":"python","version":"3.12.9"}"#).unwrap();
+        let _ = std::fs::remove_file(ctx.abi_lock_path());
+        let n = installs(&pixi);
+
+        ctx.sync(&lock, "prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), false, &inputs).unwrap();
+        assert_eq!(installs(&pixi), n, "the fixture must take the fast path");
+        assert!(ctx.has_abi_lock());
+    }
+
+    #[test]
+    fn a_lock_for_another_environment_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let a = EnvContext::new(d.path().join("a"));
+        let b = EnvContext::new(d.path().join("b"));
+        adopted(&a);
+        adopted(&b);
+        let lock_a = a.lock_env().unwrap();
+        assert!(b.adopt_env_ids(&lock_a).is_err());
+        let support = support();
+        let pixi = fake_pixi(d.path());
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        assert!(b.sync(&lock_a, "prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), false, &inputs).is_err());
+        assert!(b.clean(&lock_a, &inputs).is_err());
+        assert!(b.gather().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_the_managers_lock_creates_the_store() {
+        let d = tempfile::tempdir().unwrap();
+        let gone = EnvContext::new(d.path().join("gone"));
+        assert!(gone.lock_env().is_err());
+        assert!(!d.path().join("gone").exists());
+        assert!(gone.lock_env_creating().is_ok());
+        assert!(d.path().join("gone").is_dir());
+    }
+
+    /// DEP-4: a waiter whose lock file was removed while it waited (the
+    /// environment removed and created again) locks the file now there.
+    #[test]
+    fn a_waiter_locks_the_stores_current_lock_file() {
+        use nix::fcntl::{Flock, FlockArg};
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("env");
+        let ctx = EnvContext::new(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let opened_before = ctx.open_lock_file().unwrap();
+        std::fs::rename(&home, d.path().join("removed")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let held = ctx.lock_from(opened_before).unwrap();
+        let current = std::fs::OpenOptions::new().write(true).open(home.join(".solve.lock")).unwrap();
+        assert!(
+            Flock::lock(current, FlockArg::LockExclusiveNonblock).is_err(),
+            "the waiter must hold the lock file the store has now"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn a_manifest_changed_after_the_digest_is_solved_again() {
+        let (d, ctx) = ctx();
+        adopted(&ctx);
+        let pixi = fake_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        ctx.sync(&ctx.lock_env().unwrap(), "prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), false, &inputs).unwrap();
+        let rendered = std::fs::read_to_string(ctx.pixi_dir().join("pixi.toml")).unwrap();
+        assert_eq!(solved_manifest(&ctx), rendered);
+
+        // Another writer replaces the manifest and solves it; the recorded
+        // digest still names this world.
+        let other = "[workspace]\nname = \"other\"\n";
+        std::fs::write(ctx.pixi_dir().join("pixi.toml"), other).unwrap();
+        std::fs::write(crate::abi::conda_prefix(&ctx.pixi_dir()).join("solved.toml"), other).unwrap();
+
+        ctx.sync(&ctx.lock_env().unwrap(), "prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), false, &inputs).unwrap();
+        assert_eq!(solved_manifest(&ctx), rendered, "the unchanged world must not fast-path onto another manifest");
+    }
+
+    #[test]
+    fn a_sync_refuses_a_project_with_another_id() {
+        let d = tempfile::tempdir().unwrap();
+        let shared = d.path().join("env/pixi");
+        let env = EnvContext::new(d.path().join("env"));
+        adopted(&env);
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("pixi.toml"), "keep\n").unwrap();
+
+        // A store adopted for its own project, then pointed at the shared one.
+        let other = EnvContext::new(d.path().join("other"));
+        adopted(&other);
+        let other = EnvContext::new(d.path().join("other")).with_pixi_dir(&shared);
+
+        let pixi = fake_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        let err = other.sync(&other.lock_env().unwrap(), "prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), false, &inputs).unwrap_err();
+        assert!(err.to_string().contains("belong to different environments"), "{err}");
+        assert!(other.gather().unwrap().is_empty(), "a refused sync records no spec");
+        assert_eq!(std::fs::read_to_string(shared.join("pixi.toml")).unwrap(), "keep\n");
+        assert!(other.clean(&other.lock_env().unwrap(), &inputs).is_err());
+        assert_eq!(std::fs::read_to_string(shared.join("pixi.toml")).unwrap(), "keep\n");
+    }
+
+    #[test]
+    fn a_sync_refuses_a_missing_id() {
+        let (d, ctx) = ctx();
+        let pixi = fake_pixi(d.path());
+        let support = support();
+        let channels = crate::pixi::default_channels();
+        let inputs = SolveInputs { lang_support: &support, pixi_bin: &pixi, platform: "linux-64", channels: &channels };
+        let err = ctx.sync(&ctx.lock_env().unwrap(), "prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), false, &inputs).unwrap_err();
+        assert!(err.to_string().contains("no environment id"), "{err}");
+        assert!(ctx.gather().unwrap().is_empty());
+        assert!(!ctx.pixi_dir().join("pixi.toml").exists());
+
+        // Only the project's id: a store that was never this project's.
+        adopted(&ctx);
+        std::fs::remove_file(ctx.store_id_path()).unwrap();
+        assert!(ctx.sync(&ctx.lock_env().unwrap(), "prog", Provenance::Scratch, &spec(r#"{"lang":"py"}"#), false, &inputs).is_err());
+        assert!(ctx.clean(&ctx.lock_env().unwrap(), &inputs).is_err());
+        assert!(ctx.gather().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_manager_gives_store_and_project_one_id() {
+        let (_d, ctx) = ctx();
+        adopted(&ctx);
+        let id = std::fs::read_to_string(ctx.store_id_path()).unwrap();
+        assert!(!id.trim().is_empty());
+        assert_eq!(std::fs::read_to_string(ctx.pixi_id_path()).unwrap(), id);
+
+        // Adopting again keeps the id, and repairs a project holding another.
+        std::fs::write(ctx.pixi_id_path(), "stranger\n").unwrap();
+        adopted(&ctx);
+        assert_eq!(std::fs::read_to_string(ctx.store_id_path()).unwrap(), id);
+        assert_eq!(std::fs::read_to_string(ctx.pixi_id_path()).unwrap(), id);
+
+        // Two environments never share an id.
+        let (_e, other) = self::ctx();
+        adopted(&other);
+        assert_ne!(std::fs::read_to_string(other.store_id_path()).unwrap(), id);
     }
 }

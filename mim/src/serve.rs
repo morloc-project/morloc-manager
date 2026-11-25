@@ -27,6 +27,7 @@ pub fn serve_environment(
     extra_flags: &[String],
     shm_size: &Option<String>,
     user_env: &[(String, String)],
+    secret_env: &[(String, String)],
     command: &[String],
     mount_home: Option<&str>,
     platform: Option<Arch>,
@@ -46,12 +47,18 @@ pub fn serve_environment(
             ports,
             extra_flags,
             user_env,
+            secret_env,
             command,
         );
     }
 
     // Clean up any existing dead container with this name (silently)
     let _ = crate::container::container_remove_quiet(engine, container_name);
+    // RUN-1: a server holds no capability, so files an earlier docker run
+    // wrote as another uid must be the caller's before it can write them.
+    if engine == ContainerEngine::Docker {
+        crate::container::reclaim_if_foreign(image, std::path::Path::new(data_dir))?;
+    }
 
     if network == Some("host") {
         eprintln!(
@@ -71,20 +78,19 @@ pub fn serve_environment(
     let suffix = crate::selinux::volume_suffix(crate::selinux::detect_selinux());
     let cfg = serve_run_config(
         image, data_dir, container_name, ports, publish_host, network, extra_flags, shm_size,
-        user_env, command, mount_home, suffix, platform,
+        user_env, secret_env, command, mount_home, suffix, platform,
     )?;
 
     if verbose {
         let exe = engine_executable(engine);
-        let extra = crate::container::engine_specific_run_flags_io(engine);
-        let args = crate::container::build_run_args(engine, &extra, &cfg);
+        let args = crate::container::run_argv(engine, &cfg)?;
         let quoted: Vec<String> = args.iter().map(|a| {
             if a.contains(' ') { format!("'{a}'") } else { a.clone() }
         }).collect();
         eprintln!("[mim] {exe} {}", quoted.join(" "));
     }
 
-    let (status, _stdout, run_err) = container_run(engine, &cfg);
+    let (status, _stdout, run_err) = container_run(engine, &cfg)?;
     if !status.success() {
         // `container_run` may have left a partially-created container behind
         // (e.g., port conflict after container creation). Clean it up so the
@@ -378,6 +384,7 @@ fn serve_run_config(
     extra_flags: &[String],
     shm_size: &Option<String>,
     user_env: &[(String, String)],
+    secret_env: &[(String, String)],
     command: &[String],
     mount_home: Option<&str>,
     selinux_suffix: &str,
@@ -393,6 +400,9 @@ fn serve_run_config(
     cfg.network = network.map(str::to_string);
     let mh = CONTAINER_MORLOC_HOME;
     let (binds, volumes) = crate::base_mounts(data_dir);
+    // RUN-1: a server runs as container root under rootless docker, so it
+    // holds no capability.
+    cfg.hardened = true;
     cfg.bind_mounts = binds;
     cfg.volumes = volumes;
     // A host-mounted home shadows the env-owned one for served daemons too, so a
@@ -416,6 +426,7 @@ fn serve_run_config(
     // persistent runtime mount) is NOT marked, so on-demand works there.
     cfg.env.push(("MORLOC_IMMUTABLE".to_string(), "1".to_string()));
     cfg.env.extend(user_env.iter().cloned());
+    cfg.secret_env = secret_env.to_vec();
     cfg.command = Some(command.to_vec());
     cfg.shm_size = shm_size.clone();
     cfg.extra_flags = vec!["-d".to_string()];
@@ -450,11 +461,10 @@ pub fn validate_programs(
         cfg.platform = platform;
         if verbose {
             let exe = engine_executable(engine);
-            let extra = crate::container::engine_specific_run_flags_io(engine);
-            let args = crate::container::build_run_args(engine, &extra, &cfg);
+            let args = crate::container::run_argv(engine, &cfg)?;
             eprintln!("[mim] {exe} {}", args.join(" "));
         }
-        let (status, _stdout, stderr) = container_run_quiet(engine, &cfg);
+        let (status, _stdout, stderr) = container_run_quiet(engine, &cfg)?;
         if status.success() {
             let n = prog.commands.len();
             eprintln!("  [ok] {} ({} commands)", prog.name, n);
@@ -734,6 +744,8 @@ pub fn oci_base_env(mh: &str) -> Vec<(String, String)> {
 pub fn oci_managed_markers() -> Vec<(String, String)> {
     vec![
         ("MORLOC_ENV".to_string(), "container".to_string()),
+        // DEP-11: the environment's store, mounted from its data dir.
+        ("MORLOC_ENV_STORE".to_string(), CONTAINER_MORLOC_STATE.to_string()),
         ("MORLOC_BUILD_HOOK".to_string(), format!("{CONTAINER_RUNTIME_BIN}/mim")),
         ("MORLOC_BIN".to_string(), format!("{CONTAINER_RUNTIME_BIN}/morloc")),
         ("MORLOC_PIXI".to_string(), CONTAINER_PIXI_BIN.to_string()),
@@ -758,6 +770,7 @@ fn serve_apptainer_instance(
     ports: &[(u16, u16)],
     extra_flags: &[String],
     user_env: &[(String, String)],
+    secret_env: &[(String, String)],
     command: &[String],
 ) -> Result<()> {
     // Stop any leftover instance with this name from a previous run.
@@ -829,6 +842,7 @@ fn serve_apptainer_instance(
 
     let status = Command::new(exe)
         .args(&argv)
+        .envs(crate::container::apptainer_forwarded(secret_env))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1041,6 +1055,24 @@ mod tests {
     /// mounts, and on an SELinux host each is readable only once relabelled.
     /// The suffix the caller decides on must land on every bind mount and on
     /// no engine volume, which is engine storage and cannot be relabelled.
+    /// SERVE-4: the token of a served container is named on the engine's
+    /// command line and valued only in the engine process's environment.
+    #[test]
+    fn a_served_containers_token_is_off_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_string_lossy().to_string();
+        let secret = vec![("MORLOC_MCP_TOKEN".to_string(), "tok-123".to_string())];
+        let cmd = vec!["morloc-nexus".to_string()];
+        let cfg = serve_run_config(
+            "img", &data_dir, "n", &[(8080, 8080)], None, None, &[], &None, &[], &secret, &cmd,
+            None, "", None,
+        )
+        .unwrap();
+        let args = crate::container::build_run_args(ContainerEngine::Podman, &[], &cfg);
+        assert!(!args.iter().any(|a| a.contains("tok-123")), "{args:?}");
+        assert_eq!(crate::container::engine_process_env(ContainerEngine::Podman, &cfg), secret);
+    }
+
     #[test]
     fn a_served_container_relabels_every_bind_mount_and_no_volume() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1048,7 +1080,7 @@ mod tests {
         let cmd = vec!["morloc-nexus".to_string(), "router".to_string()];
         let cfg = serve_run_config(
             "img", &data_dir, "morloc-serve-dev", &[(8080, 8080)], None, None, &[], &None, &[],
-            &cmd, None, ":z", None,
+            &[], &cmd, None, ":z", None,
         )
         .unwrap();
         let args = crate::container::build_run_args(
@@ -1063,13 +1095,20 @@ mod tests {
             .collect();
         assert_eq!(mounts.len(), cfg.bind_mounts.len() + cfg.volumes.len(), "{args:?}");
         for (host, container) in &cfg.bind_mounts {
-            let want = format!("{host}:{container}:z");
+            let want = match container.strip_suffix(":ro") {
+                Some(target) => format!("{host}:{target}:ro,z"),
+                None => format!("{host}:{container}:z"),
+            };
             assert!(mounts.contains(&&want), "{want} missing from {mounts:?}");
         }
         for (volume, container) in &cfg.volumes {
             let want = format!("{volume}:{container}");
             assert!(mounts.contains(&&want), "{want} missing from {mounts:?}");
         }
+        // RUN-1: the server holds no capability.
+        assert!(args.iter().any(|a| a == "--cap-drop=ALL"), "{args:?}");
+        assert!(args.windows(2).any(|w| w[0] == "--security-opt" && w[1] == "no-new-privileges"));
+
         // The same env every container process gets, plus the immutability mark.
         let path = cfg.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone()).unwrap();
         assert!(path.split(':').any(|d| d == format!("{CONTAINER_MORLOC_HOME}/bin")), "{path}");

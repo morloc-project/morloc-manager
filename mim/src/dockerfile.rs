@@ -206,8 +206,7 @@ pub fn generate_deploy_dockerfile(input: &DeployDockerfileInput) -> String {
     }
     out.push_str("# Serve by default; any other command runs against the same programs\n");
     out.push_str(&format!("ENTRYPOINT [\"{ACTIVATE_WRAPPER}\"]\n"));
-    let quoted: Vec<String> = input.cmd.iter().map(|a| format!("\"{a}\"")).collect();
-    out.push_str(&format!("CMD [{}]\n", quoted.join(", ")));
+    out.push_str(&exec_form("CMD", input.cmd));
     out
 }
 
@@ -353,9 +352,18 @@ pub fn generate_slim_dockerfile(input: &SlimDockerfileInput) -> String {
     if input.cmd.is_empty() {
         return out;
     }
-    let quoted: Vec<String> = input.cmd.iter().map(|a| format!("\"{a}\"")).collect();
-    out.push_str(&format!("CMD [{}]\n", quoted.join(", ")));
+    out.push_str(&exec_form("CMD", input.cmd));
     out
+}
+
+/// An exec-form instruction: each argument a JSON string, so no argument can
+/// split, join or end the instruction.
+fn exec_form(instruction: &str, args: &[String]) -> String {
+    let quoted: Vec<String> = args
+        .iter()
+        .map(|a| serde_json::to_string(a).expect("a string serializes"))
+        .collect();
+    format!("{instruction} [{}]\n", quoted.join(", "))
 }
 
 /// Make a label value safe inside the double-quoted form. Label values are
@@ -832,6 +840,20 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         let df = deploy(&SERVE_CMD, &[], false);
         assert!(df.contains("ENV PATH=\"/opt/morloc/bin:${PATH}\""), "{df}");
         assert!(df.contains("ENV MORLOC_STATE=/opt/morloc-state"), "{df}");
+    }
+
+    /// FRZ-6: a command argument is one exec-form element whatever it holds;
+    /// a quote cannot add an argument and a newline cannot add an instruction.
+    #[test]
+    fn a_command_argument_stays_one_element() {
+        let evil = "x\", \"--eval-allow-no-auth";
+        let nl = "y\nRUN touch /pwned";
+        for df in [deploy(&["morloc-nexus", evil, nl], &[], false), slim(&["morloc-nexus", evil, nl], None, "debian")] {
+            let line = df.lines().find(|l| l.starts_with("CMD [")).unwrap();
+            let parsed: Vec<String> = serde_json::from_str(&line["CMD ".len()..]).unwrap();
+            assert_eq!(parsed, vec!["morloc-nexus", evil, nl], "{line}");
+            assert!(!df.lines().any(|l| l.starts_with("RUN touch")), "{df}");
+        }
     }
 
     #[test]

@@ -1,8 +1,10 @@
 mod arch;
 mod bridge;
 mod cert;
+mod clean;
 mod config;
 mod container;
+mod creating;
 mod demos;
 mod doctor;
 mod dockerfile;
@@ -687,11 +689,15 @@ Examples:
     #[command(after_help = "\
 Examples:
   mim stop              # stop the default environment
-  mim stop --env myenv")]
+  mim stop --env myenv
+  mim stop --forget     # drop a record mim cannot verify")]
     Stop {
         /// Environment to stop (default: the default environment)
         #[arg(long)]
         env: Option<String>,
+        /// Drop the serve record without signalling anything
+        #[arg(long)]
+        forget: bool,
     },
     /// Stream logs from a running server
     #[command(display_order = 22)]
@@ -859,6 +865,33 @@ Examples:
         #[command(subcommand)]
         action: EnvAction,
     },
+    /// Remove build caches and temporary files from an environment
+    #[command(display_order = 9)]
+    #[command(after_help = "\
+Examples:
+  mim clean                  # pool build outputs and stale temporary files
+  mim clean myenv --crates   # also the compiled crate cache
+  mim clean --uninstalled    # also forget programs built but never installed
+  mim clean --dry-run
+
+Inside an environment, cleans that environment.")]
+    Clean {
+        /// Environment name (default: the default environment)
+        name: Option<String>,
+        /// Look up the system-scope environment (when name is shadowed locally)
+        #[arg(long)]
+        system: bool,
+        /// Also remove the compiled crate cache; the next Rust build recompiles it
+        #[arg(short = 'c', long)]
+        crates: bool,
+        /// Also drop the requirements of programs built but never installed,
+        /// and re-solve the environment to its installed programs
+        #[arg(short = 'u', long)]
+        uninstalled: bool,
+        /// Print what would be removed, and remove nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List running servers
     #[command(display_order = 27)]
     #[command(after_help = "\
@@ -870,7 +903,7 @@ Examples:
     //
     // These run INSIDE a managed environment, not on the host. The morloc
     // compiler invokes `mim sync ...` as its build hook (MORLOC_BUILD_HOOK points
-    // at this binary); `clean`/`spec` are for a user in an entered shell. Hidden
+    // at this binary); `spec` is for a user in an entered shell. Hidden
     // because they are an internal contract with the compiler, not part of the
     // manager's user-facing surface. See `envagent`.
     #[command(hide = true)]
@@ -889,9 +922,6 @@ Examples:
         #[arg(long)]
         installed: bool,
     },
-    /// Resolve with only installed modules (reset the world to its baseline)
-    #[command(hide = true)]
-    Clean,
     /// Print the merged pixi manifest for the current declared world
     #[command(hide = true)]
     Spec,
@@ -1160,7 +1190,7 @@ fn emits_json(cmd: &Cmd) -> bool {
         | Cmd::Demos { .. }
         | Cmd::Env { .. }
         | Cmd::Sync { .. }
-        | Cmd::Clean
+        | Cmd::Clean { .. }
         | Cmd::Spec => false,
     }
 }
@@ -1189,7 +1219,7 @@ fn subcommand_name(cmd: &Cmd) -> &'static str {
         Cmd::Env { .. } => "env",
         Cmd::Status => "status",
         Cmd::Sync { .. } => "sync",
-        Cmd::Clean => "clean",
+        Cmd::Clean { .. } => "clean",
         Cmd::Spec => "spec",
     }
 }
@@ -1239,6 +1269,81 @@ fn resolve_env_or_default(name: Option<String>) -> Result<(String, Scope, Enviro
         }
         None => environment::resolve_default_environment(),
     }
+}
+
+/// The runtime and the compiler's state of the environment this process runs
+/// in. A native launch sets only MORLOC_HOME, which is then also the state.
+fn clean_roots(var: impl Fn(&str) -> Option<String>) -> Result<clean::Roots> {
+    let home = var("MORLOC_HOME").filter(|v| !v.is_empty()).ok_or_else(|| {
+        ManagerError::EnvError("MORLOC_HOME is not set; is this a morloc environment?".to_string())
+    })?;
+    let state = envagent::compiler_state(&var).expect("MORLOC_HOME is set");
+    Ok(clean::Roots { state, home: home.into() })
+}
+
+/// ENV-12: `mim clean`. Inside an environment it cleans that environment;
+/// on the host it runs itself inside the named one, through the environment's
+/// own agent, so both backends and every mount layout share one code path.
+fn clean_env(
+    verbose: bool,
+    name: Option<String>,
+    system: bool,
+    crates: bool,
+    uninstalled: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if std::env::var_os("MORLOC_ENV").is_some() {
+        if name.is_some() || system {
+            return Err(ManagerError::EnvError(
+                "inside an environment, `mim clean` cleans this one; drop the name".to_string(),
+            ));
+        }
+        let roots = clean_roots(|k| std::env::var(k).ok())?;
+        clean::clean_files(&roots, crates, dry_run)?;
+        if uninstalled {
+            if dry_run {
+                eprintln!("Would reset the requirements to the installed programs and re-solve.");
+            } else {
+                envagent::clean()?;
+            }
+        }
+        return Ok(());
+    }
+
+    let (env_name, scope, ec) = if system {
+        let n = name.ok_or_else(|| {
+            ManagerError::EnvError("--system needs an environment name".to_string())
+        })?;
+        let ec = cfg::read_env_config(Scope::System, &n)?;
+        (n, Scope::System, ec)
+    } else {
+        resolve_env_or_default(name)?
+    };
+    if !dry_run {
+        require_env_writable(scope, &env_name, "`mim clean`")?;
+    }
+    let mut args: Vec<String> = ["sh", "-c", "exec \"$MORLOC_BUILD_HOOK\" clean \"$@\"", "mim-clean"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for (on, flag) in [(crates, "--crates"), (uninstalled, "--uninstalled"), (dry_run, "--dry-run")] {
+        if on {
+            args.push(flag.to_string());
+        }
+    }
+    runner::run_in_env(
+        Some((env_name, scope, ec)),
+        runner::RunRequest {
+            verbose,
+            shell: false,
+            args,
+            user_env: Vec::new(),
+            engine_args: Vec::new(),
+            flagfile: None,
+            phase: Phase::Run,
+            slurm_bridge: false,
+        },
+    )
 }
 
 /// Shared body of the `run` and `shell` subcommands: resolve the target
@@ -1407,11 +1512,14 @@ pub(crate) fn locate_pixi(scope: Scope) -> Option<std::path::PathBuf> {
 /// construction rather than by remembering three vars at each call site.
 fn managed_env_vars(
     env_name: &str,
+    store: &std::path::Path,
     morloc_bin: &std::path::Path,
     build_hook: &std::path::Path,
 ) -> Vec<(String, String)> {
     vec![
         ("MORLOC_ENV".to_string(), env_name.to_string()),
+        // DEP-11: the store the build hook syncs into, whatever MORLOC_STATE is.
+        ("MORLOC_ENV_STORE".to_string(), store.display().to_string()),
         ("MORLOC_BUILD_HOOK".to_string(), build_hook.display().to_string()),
         ("MORLOC_BIN".to_string(), morloc_bin.display().to_string()),
     ]
@@ -1438,9 +1546,9 @@ fn info_env_exports(
                 .ok()
                 .and_then(|rt| rt.morloc_bin)
                 .unwrap_or_else(|| std::path::PathBuf::from("morloc"));
-            match provision::mim_agent_for_host(scope) {
-                Ok(hook) => v.extend(managed_env_vars(name, &morloc_bin, &hook)),
-                Err(_) => v.push(("MORLOC_ENV".to_string(), name.to_string())),
+            // Without an agent `run` refuses to launch, so nothing is exported.
+            if let Ok(hook) = provision::mim_agent_for_host(scope) {
+                v.extend(managed_env_vars(name, data_dir, &morloc_bin, &hook));
             }
             v.push((envagent::ENV_STRICT_CONDA.to_string(), "1".to_string()));
             if let Some(pixi) = locate_pixi(scope) {
@@ -1947,11 +2055,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 // The closure yields the env's host-mounted home (if any) so the
                 // success message can say what `rm` deliberately did NOT delete.
                 let result: Result<(Option<String>, Scope)> = (|| {
-                    let scope = if system {
-                        Scope::System
-                    } else {
-                        cfg::find_env_scope(name)?
-                    };
+                    // ENV-2: a name with files but no record is a remnant of a
+                    // failed `new`; `rm` removes it.
+                    environment::validate_env_name(name)?;
+                    let remnant_scope = if system { vec![Scope::System] } else { vec![Scope::Local, Scope::System] }
+                        .into_iter()
+                        .find(|s| creating::remnant(*s, name) != creating::Remnant::None);
+                    let found = if system { Ok(Scope::System) } else { cfg::find_env_scope(name) };
+                    if let (Err(_), Some(scope)) = (&found, remnant_scope) {
+                        if scope == Scope::System && !system {
+                            check_system_write_access()?;
+                        }
+                        creating::remove_remnant(scope, name)?;
+                        return Ok((None, scope));
+                    }
+                    let scope = found?;
                     if scope == Scope::System && !system {
                         check_system_write_access()?;
                     }
@@ -2146,14 +2264,37 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             } else {
                 Vec::new()
             };
+            // ENV-2: remnants of a failed `new`, by scope.
+            let scan = |show: bool, scope: Scope| if show { creating::list_remnants(scope) } else { Vec::new() };
+            let (local_rem, system_rem) = (scan(show_local, Scope::Local), scan(show_system, Scope::System));
+            let names = |v: &[(String, creating::Remnant)]| -> Vec<String> { v.iter().map(|(n, _)| n.clone()).collect() };
+            let described = |v: &[(String, creating::Remnant)]| -> Vec<String> {
+                v.iter()
+                    .map(|(n, r)| match r {
+                        creating::Remnant::Busy => format!("{n} (being created)"),
+                        creating::Remnant::Unreadable => format!("{n} (left by a `mim new`; cannot inspect)"),
+                        _ => format!("{n} (incomplete; `mim rm {n}` removes it)"),
+                    })
+                    .collect()
+            };
+            let (local_remnants, system_remnants) = (described(&local_rem), described(&system_rem));
 
             if json {
                 #[derive(serde::Serialize)]
                 struct LsOutput {
                     local: Vec<environment::EnvInfo>,
                     system: Vec<environment::EnvInfo>,
+                    #[serde(skip_serializing_if = "Vec::is_empty")]
+                    local_incomplete: Vec<String>,
+                    #[serde(skip_serializing_if = "Vec::is_empty")]
+                    system_incomplete: Vec<String>,
                 }
-                let output = LsOutput { local: local_envs, system: system_envs };
+                let output = LsOutput {
+                    local: local_envs,
+                    system: system_envs,
+                    local_incomplete: names(&local_rem),
+                    system_incomplete: names(&system_rem),
+                };
                 println!("{}", serde_json::to_string_pretty(&output).unwrap());
             } else {
                 let total = local_envs.len() + system_envs.len();
@@ -2176,7 +2317,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         println!("  {}{}{}", e.name, ver_mark, default_mark);
                     }
                 }
-                if total == 0 {
+                for (label, list) in [("Local", &local_remnants), ("System", &system_remnants)] {
+                    if !list.is_empty() {
+                        println!();
+                        println!("{label} remnants of a failed `mim new`:");
+                        for r in list {
+                            println!("  {r}");
+                        }
+                    }
+                }
+                if total == 0 && local_remnants.is_empty() && system_remnants.is_empty() {
                     println!("No environments found. Create one with: mim new");
                 }
             }
@@ -2760,13 +2910,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // inputs goes, so materialization solves and builds it all again. A
             // one-shot build flag is a request for a build, not for whatever the
             // marker says about the last one.
+            // DEP-4
+            let lock = adopted_env_lock(&cfg::env_data_dir(env_scope, &env_name))?;
             if reinit {
-                reset_for_reinit(env_scope, &env_name, &ec)?;
+                reset_for_reinit(&lock, env_scope, &env_name, &ec)?;
             } else if !engine_arg.is_empty() {
                 clear_materialized_marker(env_scope, &env_name, &ec);
             }
 
-            rematerialize_env(env_scope, &env_name, &[], requested, &engine_arg, verbose)?;
+            rematerialize_env(&lock, env_scope, &env_name, &[], requested, &engine_arg, verbose)?;
+            drop(lock);
             report_rematerialized(ec.backend.is_native(), &env_name);
             // Surface a broken conda extra (unresolved shared libs) LOUDLY now,
             // rather than leaving it to be discovered by running the tool.
@@ -3226,20 +3379,21 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    every later operation. (`new` needs no rollback: it persists only
             //    after a successful build.)
             if let Some(keep) = rebuild_version {
+                // DEP-4, ENV-8
+                let data_dir = cfg::env_data_dir(env_scope, &env_name);
+                let lock = adopted_env_lock(&data_dir)?;
                 let prev_ec = ec.clone();
                 let prev_inputs = cfg::read_env_inputs(env_scope, &env_name)?;
                 // Snapshot the requirements-store artifacts the rebuild's prime step
                 // overwrites (toolchain pins + conda extras) BEFORE it runs, so a
                 // failed rebuild restores them exactly -- like the cert snapshot.
-                let req_snapshot = envstore::EnvContext::new(&cfg::env_data_dir(env_scope, &env_name))
-                    .snapshot_requirements();
+                let req_snapshot = envstore::EnvContext::new(&data_dir).snapshot_requirements();
                 // The manifest and lock too: a failed rebuild has already re-solved
                 // them for the new config, and the make-time agent solves whatever
                 // lock it finds against the rolled-back store. Restoring the pair
                 // makes the next `pixi install --locked` return the prefix to the
                 // world the store describes.
-                let pixi_snapshot =
-                    snapshot_pixi_files(&cfg::env_data_dir(env_scope, &env_name).join("pixi"));
+                let pixi_snapshot = snapshot_pixi_files(&data_dir.join("pixi"));
 
                 // Each file is the env's whole list for its source; edit and
                 // re-apply to change it.
@@ -3285,8 +3439,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 }
 
                 // Rebuild at the CURRENT morloc version; `modify` never moves it.
-                match rematerialize_env(env_scope, &env_name, &[], Some(keep), &[], verbose) {
+                match rematerialize_env(&lock, env_scope, &env_name, &[], Some(keep), &[], verbose) {
                     Ok(()) => {
+                        drop(lock);
                         report_rematerialized(ec.backend.is_native(), &env_name);
                         // `modify --conda-packages` is the usual way a broken extra
                         // enters an env; warn LOUDLY now if one doesn't load.
@@ -3301,12 +3456,13 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                         // toolchain.json/extras.json.
                         let _ = cfg::write_env_config(env_scope, &env_name, &prev_ec);
                         let _ = cfg::write_env_inputs(env_scope, &env_name, &prev_inputs);
-                        restore_pixi_files(&pixi_snapshot);
-                        let _ = envstore::EnvContext::new(&cfg::env_data_dir(env_scope, &env_name))
-                            .restore_requirements(&req_snapshot);
                         if let Some(snap) = &cert_snapshot {
                             let _ = cert::restore_certs(env_scope, &env_name, snap);
                         }
+                        restore_pixi_files(&pixi_snapshot);
+                        let _ = envstore::EnvContext::new(&data_dir).restore_requirements(&req_snapshot);
+                        forget_agent_solve(env_scope, &env_name);
+                        drop(lock);
                         return Err(e);
                     }
                 }
@@ -3414,7 +3570,16 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             // silently replaced.
             if let Some(rt) = cfg::read_serve_runtime(env_scope, &env_name) {
                 let alive = match &rt.handle {
-                    Some(handle) => serve_handle_alive(handle),
+                    Some(handle) => match serve_handle_probe(handle) {
+                        container::Probe::Present => true,
+                        container::Probe::Absent => false,
+                        // SERVE-3: a server that may be alive is never joined by a second.
+                        container::Probe::Unknown(why) => {
+                            return Err(ManagerError::EnvError(format!(
+                                "cannot tell whether '{env_name}' is already serving: {why}."
+                            )))
+                        }
+                    },
                     None => match ec.backend {
                         Backend::Container(engine) => container::container_exists(
                             engine,
@@ -3464,6 +3629,7 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                 }
             };
             let user_env = collect_env_vars(&env_vars, env_file.as_deref())?;
+            refuse_serve_auth_vars(&user_env)?;
             let token = resolve_mcp_token(auth_token);
 
             // Backend-dispatched launch (container image vs detached host nexus);
@@ -3519,50 +3685,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
         }
 
         // ---- stop ----
-        Cmd::Stop { env } => {
+        Cmd::Stop { env, forget } => {
             let (env_name, env_scope, ec) = resolve_env_or_default(env)?;
             require_env_writable(env_scope, &env_name, "`mim stop`")?;
-            // Prefer the stored launch handle: it tears down the right target
-            // (native process group or container) regardless of the env's current
-            // backend, so migration / dual-backend serve never strands a server.
-            if let Some(rt) = cfg::read_serve_runtime(env_scope, &env_name) {
-                if let Some(handle) = &rt.handle {
-                    // SERVE-3: a record whose container the engine reports gone
-                    // is stale; drop it. An engine that cannot answer is not a
-                    // "gone", so that case falls through to the stop, which fails.
-                    let gone = match handle {
-                        ServeHandle::Container { engine, name } if engine.is_oci() => {
-                            container::probe(*engine, "container", name) == container::Probe::Absent
-                        }
-                        _ => false,
-                    };
-                    if gone {
-                        cfg::remove_serve_runtime(env_scope, &env_name);
-                        eprintln!("'{env_name}' was not serving; removed its stale serve record.");
-                        return Ok(());
-                    }
-                    stop_by_handle(handle, verbose)?;
-                    cfg::remove_serve_runtime(env_scope, &env_name);
-                    eprintln!("Stopped serving environment: {env_name}");
-                    return Ok(());
-                }
-            }
-            // No stored handle: fall back to the container-name probe, but only
-            // for container backends. A native env always records a handle when
-            // it serves, so one reaching here simply is not serving.
-            if let Some(engine) = ec.backend.container_engine() {
-                let container_name = serve::serve_container_name(&env_name);
-                if container::container_exists(engine, &container_name) {
-                    serve::stop_serve_container(engine, verbose, &container_name)?;
-                    cfg::remove_serve_runtime(env_scope, &env_name);
-                    eprintln!("Stopped serving environment: {env_name}");
-                    return Ok(());
-                }
-            }
-            Err(ManagerError::EnvError(format!(
-                "No serve running for environment '{env_name}'{}",
-                sudo_hint()
-            )))
+            stop_serve(env_scope, &env_name, &ec, forget, verbose)
         }
 
         // ---- logs ----
@@ -3721,7 +3847,11 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    envspec.json, which gather_env_specs picks up from then on.
             //    Keep the env's current morloc version -- installing a module must
             //    never bump the toolchain out from under it.
-            rematerialize_env(scope, &env_name, &[dry], keep_version.clone(), &[], verbose)?;
+            // DEP-4
+            rematerialize_env(
+                &adopted_env_lock(&cfg::env_data_dir(scope, &env_name))?,
+                scope, &env_name, &[dry], keep_version.clone(), &[], verbose,
+            )?;
 
             // 3. Build + install into the now-complete environment. Step 2 may
             //    have rebuilt the image, so re-read the config.
@@ -3765,7 +3895,10 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             //    Re-solve so the manager's world (lock, image, cache marker) carries
             //    them too; the pre-build solve above held them back.
             if has_py_locals {
-                rematerialize_env(scope, &env_name, &[], keep_version, &[], verbose)?;
+                rematerialize_env(
+                    &adopted_env_lock(&cfg::env_data_dir(scope, &env_name))?,
+                    scope, &env_name, &[], keep_version, &[], verbose,
+                )?;
             }
             Ok(())
         }
@@ -3838,6 +3971,9 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
                          (eval can import nothing; add modules with --allow)."
                     );
                 } else {
+                    for m in &allow {
+                        validate_allow_module(m)?;
+                    }
                     views.eval = Some(EvalCapability { allow: allow.clone() });
                     eprintln!("Enabled eval in '{env_name}', allow-list: {}.", allow.join(", "));
                 }
@@ -3960,13 +4096,14 @@ fn dispatch(verbose: bool, json: bool, cmd: Cmd) -> Result<()> {
             demos::run(list, tag, morloc_version, force)
         }
 
+        // ---- clean (ENV-12) ----
+        Cmd::Clean { name, system, crates, uninstalled, dry_run } => {
+            clean_env(verbose, name, system, crates, uninstalled, dry_run)
+        }
+
         // ---- in-environment dependency agent (hidden; run inside an env) ----
         Cmd::Sync { name, spec, root, installed } => {
             envagent::sync(&name, &spec, root.as_deref(), installed)?;
-            Ok(())
-        }
-        Cmd::Clean => {
-            envagent::clean()?;
             Ok(())
         }
         Cmd::Spec => {
@@ -4129,6 +4266,7 @@ pub(crate) fn native_run_env(
     }
 
     let data_dir = cfg::env_data_dir(env.scope, &env.name);
+    ensure_env_ids(env.scope, &env.name, &data_dir);
     let mh = data_dir.to_string_lossy().to_string();
 
     // On NixOS every conda/glibc binary runs inside the env's FHS sandbox; the
@@ -4184,7 +4322,7 @@ pub(crate) fn native_run_env(
         .morloc_bin
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("morloc"));
-    for (k, v) in managed_env_vars(&env.name, &morloc_bin, &hook) {
+    for (k, v) in managed_env_vars(&env.name, &data_dir, &morloc_bin, &hook) {
         cmd.env(k, v);
     }
     // RUN-6: a `morloc init` run inside the environment holds its tools to the
@@ -4192,7 +4330,7 @@ pub(crate) fn native_run_env(
     cmd.env(envagent::ENV_STRICT_CONDA, "1");
     // The pixi binary, so the in-env agent re-solves without rediscovering it.
     // Best-effort: pixi was already provisioned at materialize.
-    if let Ok(pixi) = provision::provision_pixi(env.scope) {
+    if let Ok(pixi) = provision::provision_pixi(&provision::Trust::for_env(env.scope, &env.name), env.scope) {
         cmd.env("MORLOC_PIXI", pixi);
     }
     for (k, v) in &req.user_env {
@@ -4338,7 +4476,7 @@ fn emit_lang_support_in_container(
         platform: target.platform(),
         ..container::RunConfig::new(base_image)
     };
-    let (status, stdout, stderr) = container::container_run_quiet(engine, &cfg);
+    let (status, stdout, stderr) = container::container_run_quiet(engine, &cfg)?;
     if !status.success() {
         return Err(ManagerError::EnvError(format!(
             "generating the language-support table in a container failed:\n{stderr}"
@@ -4559,6 +4697,7 @@ struct ResolvedRequirements {
 /// are validated against morloc's supported range here (a legible pin-time error
 /// before pixi runs).
 fn resolve_env_requirements(
+    trust: &provision::Trust,
     scope: Scope,
     program_specs: &[envspec::EnvSpec],
     lang_pins: &[(String, Option<String>)],
@@ -4603,12 +4742,20 @@ fn resolve_env_requirements(
         }
         .ok_or_else(|| {
             ManagerError::BackendUnsupported(format!(
-                "no prebuilt morloc runtime is published for this platform ({}/{})",
+                "no prebuilt morloc runtime is published for this platform ({}/{}); \
+                 use a container backend (--engine docker or podman)",
                 std::env::consts::OS,
                 std::env::consts::ARCH
             ))
         })?;
-        let (runtime_dir, version) = provision::provision_runtime(scope, &tag, triple)?;
+        let (runtime_dir, version) = provision::provision_runtime(trust, scope, &tag, triple).map_err(|e| {
+            match (e, container) {
+                (ManagerError::BackendUnsupported(m), None) => {
+                    ManagerError::BackendUnsupported(format!("{m}; use a container backend"))
+                }
+                (e, _) => e,
+            }
+        })?;
         let morloc_bin = provision::runtime_morloc_bin(&runtime_dir);
         // `container` lets the table be generated in a container when the host
         // cannot run the compiler (native passes None; it runs on the host by
@@ -4743,6 +4890,7 @@ fn build_env_requirements(
 /// `--lang` pins. Re-solving is skipped when the rendered manifest is unchanged
 /// from a prior materialization (avoids a redundant solve on every `update`).
 fn materialize_native_env(
+    lock: &envstore::EnvLock,
     scope: Scope,
     name: &str,
     program_specs: &[envspec::EnvSpec],
@@ -4755,8 +4903,9 @@ fn materialize_native_env(
     // Native runs on the host, so the compiler executes there -- no engine needed.
     // Native: the compiler runs on the host, so the base image is unused (it only
     // matters for the container lang-support fallback, which native never hits).
+    let trust = provision::Trust::for_env(scope, name);
     let mut req = resolve_env_requirements(
-        scope, program_specs, lang_pins, conda_packages, None, requested_version, local_runtime, CONTAINER_BASE_IMAGE,
+        &trust, scope, program_specs, lang_pins, conda_packages, None, requested_version, local_runtime, CONTAINER_BASE_IMAGE,
     )?;
 
     // Phase 1 of the impurity gate: a fast reject on host/vcpkg system deps that
@@ -4773,7 +4922,7 @@ fn materialize_native_env(
     // The conda prefix lives under this root and its activation feeds
     // CFLAGS/CXXFLAGS, which every C build tool word-splits.
     cfg::reject_whitespace_root(&env_dir)?;
-    prime_requirements_store(&env_dir, req.lang_spec.as_ref(), conda_packages)?;
+    prime_requirements_store(lock, &env_dir, req.lang_spec.as_ref(), conda_packages)?;
     let pixi_dir = env_dir.join("pixi");
     let manifest = pixi::render_manifest(&req.requirements);
 
@@ -4804,13 +4953,14 @@ fn materialize_native_env(
     // running executable fails with ETXTBSY and corrupts the live runtime.
     if let Some(rt) = cfg::read_serve_runtime(scope, name) {
         if let Some(handle) = &rt.handle {
-            if serve_handle_alive(handle) {
-                return Err(ManagerError::EnvError(format!(
+            refuse_unless_absent(
+                serve_handle_probe(handle),
+                format!(
                     "Cannot re-materialize native environment '{name}' while it is being \
                      served: `morloc init` would overwrite the running runtime. \
                      Run 'mim stop --env {name}' first."
-                )));
-            }
+                ),
+            )?;
         }
     }
 
@@ -4818,14 +4968,14 @@ fn materialize_native_env(
     // the solve, activation capture, and `morloc init` below all run conda ELFs
     // that need the loader it supplies. `None` on glibc-FHS Linux / macOS.
     let fhs_wrapper: Option<std::path::PathBuf> = if hostprobe::fhs_required() {
-        Some(fhs::ensure_fhs_wrapper(scope)?)
+        Some(fhs::ensure_fhs_wrapper(&provision::Trust::for_env(scope, name), scope)?)
     } else {
         None
     };
     let fhs = fhs_wrapper.as_deref();
 
     pixi::write_manifest(&pixi_dir, &manifest)?;
-    let pixi_bin = provision::provision_pixi(scope)?;
+    let pixi_bin = provision::provision_pixi(&provision::Trust::for_env(scope, name), scope)?;
     // Behind a TLS-inspection firewall, point the pixi solve at the env's
     // materialized CA bundle (host bundle = corp certs + public roots).
     let ssl_cert = cert::host_bundle_if_present(scope, name);
@@ -4957,7 +5107,7 @@ fn installed_spec(
 /// uninstall them. A program whose local source the environment no longer
 /// holds is an error naming it: a raw module-relative path must never reach a
 /// solve.
-fn seed_installed_store(env_dir: &std::path::Path) -> Result<()> {
+fn seed_installed_store(lock: &envstore::EnvLock, env_dir: &std::path::Path) -> Result<()> {
     let ctx = envstore::EnvContext::new(env_dir);
     let stored: std::collections::HashSet<String> =
         ctx.installed_program_names().unwrap_or_default().into_iter().collect();
@@ -4968,9 +5118,9 @@ fn seed_installed_store(env_dir: &std::path::Path) -> Result<()> {
         let json = std::fs::read_to_string(&path)
             .map_err(|e| ManagerError::EnvError(format!("cannot read {}: {e}", path.display())))?;
         let (spec, _) = installed_spec(env_dir, &key, &json)?;
-        ctx.write_spec(&key, envstore::Provenance::Installed, &spec.to_json()?)?;
+        ctx.write_spec(lock, &key, envstore::Provenance::Installed, &spec.to_json()?)?;
         // The install supersedes any scratch build of the same program.
-        ctx.remove_named(&key, envstore::Provenance::Scratch)?;
+        ctx.remove_named(lock, &key, envstore::Provenance::Scratch)?;
     }
     for key in stored {
         // An entry for a program the environment does not hold (its build
@@ -4981,13 +5131,13 @@ fn seed_installed_store(env_dir: &std::path::Path) -> Result<()> {
                 "Dropping the stored requirements of '{key}': it is not installed in this \
                  environment."
             );
-            ctx.remove_named(&key, envstore::Provenance::Installed)?;
+            ctx.remove_named(lock, &key, envstore::Provenance::Installed)?;
             continue;
         }
         let json = ctx.read_installed(&key)?;
         let (spec, repaired) = installed_spec(env_dir, &key, &json)?;
         if repaired {
-            ctx.write_spec(&key, envstore::Provenance::Installed, &spec.to_json()?)?;
+            ctx.write_spec(lock, &key, envstore::Provenance::Installed, &spec.to_json()?)?;
         }
     }
     Ok(())
@@ -4998,11 +5148,12 @@ fn seed_installed_store(env_dir: &std::path::Path) -> Result<()> {
 /// the env's --lang pins as its toolchain spec. Without this the in-env agent
 /// re-solves a world missing the installed programs' deps or the interpreter pins.
 fn prime_requirements_store(
+    lock: &envstore::EnvLock,
     env_dir: &std::path::Path,
     lang_spec: Option<&envspec::EnvSpec>,
     conda_extras: &[String],
 ) -> Result<()> {
-    seed_installed_store(env_dir)?;
+    seed_installed_store(lock, env_dir)?;
     let ctx = envstore::EnvContext::new(env_dir);
     if let Some(json) = lang_spec.and_then(|ls| serde_json::to_string(ls).ok()) {
         let _ = ctx.write_toolchain(&json);
@@ -5012,6 +5163,15 @@ fn prime_requirements_store(
     // without this the re-solve prunes them from the pixi prefix.
     let _ = ctx.write_conda_extras(conda_extras);
     Ok(())
+}
+
+/// IFC-5: the conda extras a dev environment stores. The in-env agent reads
+/// the compiler's lang-support table, which never names the source tree's
+/// dev-conda packages, so they ride the stored extras into its solves.
+fn dev_store_extras(conda_packages: &[String], support: &langsupport::LangSupport) -> Vec<String> {
+    let mut extras = conda_packages.to_vec();
+    extras.extend(support.dev_conda.iter().filter(|p| !conda_packages.contains(p)).cloned());
+    extras
 }
 
 /// Record the shim-ABI pin AFTER the solve (see `envstore::record_abi_lock`),
@@ -5034,9 +5194,9 @@ fn record_abi_lock_or_warn(
 /// their live path is valid only where the build ran (a container's `/work`
 /// mount is not a host path), and the in-env agent re-adds them on the next
 /// `morloc make`.
-fn gather_env_specs(scope: Scope, name: &str) -> Result<Vec<envspec::EnvSpec>> {
+fn gather_env_specs(lock: &envstore::EnvLock, scope: Scope, name: &str) -> Result<Vec<envspec::EnvSpec>> {
     let env_dir = cfg::env_data_dir(scope, name);
-    seed_installed_store(&env_dir)?;
+    seed_installed_store(lock, &env_dir)?;
     let ctx = envstore::EnvContext::new(&env_dir);
     let mut specs = ctx.gather_installed()?;
     let mut scratch = ctx.gather_scratch()?;
@@ -5087,7 +5247,9 @@ fn resolve_new_env_name(
         return Err(ManagerError::EnvError("Environment name cannot be empty".to_string()));
     }
     environment::validate_env_name(&env_name)?;
-    if cfg::env_config_path(scope, &env_name).is_file() {
+    if cfg::env_config_path(scope, &env_name).is_file()
+        || cfg::env_config_path_legacy_json(scope, &env_name).is_file()
+    {
         return Err(ManagerError::EnvError(format!(
             "Environment '{env_name}' already exists. Change it with \
              'mim modify --env {env_name} ...', or remove it first with \
@@ -5369,6 +5531,7 @@ struct SnapshotPlan {
 /// default", never a provisioning failure. The compiler treats every file the
 /// same and errors only on a genuine cross-file hash conflict.
 fn deposit_env_snapshots(
+    trust: &provision::Trust,
     env_dir: &std::path::Path,
     morloc_version: Option<&str>,
     plan: &SnapshotPlan,
@@ -5380,7 +5543,7 @@ fn deposit_env_snapshots(
     let user_overrides_default = plan.user_files.iter().any(|(b, _)| b == "stdlib.txt");
     if !plan.no_default && !user_overrides_default {
         if let Some(version) = morloc_version {
-            match provision::fetch_stdlib_snapshot(version) {
+            match provision::fetch_stdlib_snapshot(trust, version) {
                 Some(content) => files.push(("stdlib.txt".to_string(), content)),
                 None => eprintln!(
                     "warning: could not fetch the default stdlib snapshot for morloc {version} \
@@ -5468,7 +5631,7 @@ fn prompt_package_file(label: &str) -> prompt::Result<Vec<String>> {
 /// tried URL is shown on failure); if it cannot be verified (not found, offline,
 /// or GitHub unreachable) the user may re-enter, accept it anyway (provisioning
 /// surfaces the real error later), or fall back to latest.
-fn interactive_choose_version(current: Option<&str>) -> prompt::Result<Option<String>> {
+fn interactive_choose_version(current: Option<&str>, cert_bundle: Option<&str>) -> prompt::Result<Option<String>> {
     // Seed the default from the current value (when re-editing) so a bare Enter
     // keeps it; `None` (latest) shows "latest".
     let default = current.unwrap_or("latest");
@@ -5478,7 +5641,9 @@ fn interactive_choose_version(current: Option<&str>) -> prompt::Result<Option<St
         if choice.eq_ignore_ascii_case("latest") {
             return Ok(None);
         }
-        match provision::verify_release(&choice) {
+        // PROV-9: checked with the bundle the session was given.
+        let pending = cert::pending_trust(cert_bundle)?;
+        match provision::verify_release(&pending.trust, &choice) {
             Ok(tag) => {
                 eprintln!("  Found release {tag}.");
                 return Ok(Some(choice));
@@ -5968,7 +6133,7 @@ fn local_version_tag(reported_version: &str, ctx: &std::path::Path) -> Result<St
 /// to a locally-built mim to test one. A dev env is a container, so the staged
 /// binary must match the container platform, not necessarily the host.
 fn stage_dev_agent(scope: Scope, name: &str, arch: arch::Arch) -> Result<()> {
-    let src = provision::mim_for_triple(scope, arch.release_triple())?;
+    let src = provision::mim_for_triple(&provision::Trust::for_env(scope, name), scope, arch.release_triple())?;
     let dest_dir = cfg::env_data_dir(scope, name).join(DEV_BIN_SUBDIR);
     std::fs::create_dir_all(&dest_dir).map_err(|e| {
         ManagerError::EnvError(format!("cannot create {}: {e}", dest_dir.display()))
@@ -6340,7 +6505,8 @@ impl EditField {
                 }
             }
             EditField::Version => {
-                plan.requested_version = interactive_choose_version(plan.requested_version.as_deref())?
+                plan.requested_version =
+                    interactive_choose_version(plan.requested_version.as_deref(), plan.cert_bundle.as_deref())?
             }
             EditField::Scope => plan.scope = interactive_choose_scope()?,
             EditField::Langs => {
@@ -6648,10 +6814,17 @@ fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
     };
     let is_dev = dev_source.is_some();
 
-    // 1. Version. For a dev env this is the stdlib/library base.
+    // 1. CA bundle (corporate firewall), first: the version check below is a
+    //    download (PROV-9). Skipped when passed on the CLI.
+    let cert_bundle = match cli_cert_bundle {
+        Some(c) => Some(c),
+        None => interactive_choose_cert_bundle(None)?,
+    };
+
+    // 1b. Version. For a dev env this is the stdlib/library base.
     let requested_version = match cli_version {
         Some(v) => Some(v),
-        None => interactive_choose_version(None)?,
+        None => interactive_choose_version(None, cert_bundle.as_deref())?,
     };
 
     // 2. Backend. A dev env must be a container (native is greyed / rejected).
@@ -6689,12 +6862,6 @@ fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
         interactive_choose_langs(is_oci, &[])?
     } else {
         cli_lang
-    };
-
-    // 3b. CA bundle (corporate firewall). Skipped when passed on the CLI.
-    let cert_bundle = match cli_cert_bundle {
-        Some(c) => Some(c),
-        None => interactive_choose_cert_bundle(None)?,
     };
 
     // 4. System packages (container backends only). Native has no image to bake
@@ -6808,6 +6975,7 @@ fn run_new_session(input: NewSessionInput) -> prompt::Result<NewPlan> {
 /// tag this new one as the default so the first env you create is usable with
 /// bare (no `--env`) commands.
 fn finalize_new_env(
+    guard: creating::NewEnvGuard,
     scope: Scope,
     ec: &EnvironmentConfig,
     lang_pins: Vec<(String, Option<String>)>,
@@ -6815,6 +6983,7 @@ fn finalize_new_env(
 ) -> Result<()> {
     cfg::write_env_inputs(scope, &ec.name, &EnvInputs { lang_pins })?;
     cfg::write_env_config(scope, &ec.name, ec)?;
+    guard.commit()?;
     if cfg::read_active_config().is_none() {
         cfg::write_config(
             &cfg::config_path(scope),
@@ -6862,6 +7031,7 @@ fn native_new(
     snapshots: &SnapshotPlan,
 ) -> Result<()> {
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
+    let guard = creating::NewEnvGuard::begin(scope, &env_name, None)?;
 
     // Preflight + materialize the CA bundle before the solve, so the host
     // `pixi` process can trust it. Aborts on an unambiguous problem.
@@ -6876,7 +7046,9 @@ fn native_new(
     let morloc_version = if no_init {
         None
     } else {
-        materialize_native_env(scope, &env_name, &[], &lang_pins, &conda_packages, requested_version.as_deref(), local_runtime.as_deref(), verbose)?
+        let data_dir = cfg::env_data_dir(scope, &env_name);
+        let lock = adopted_env_lock(&data_dir)?;
+        materialize_native_env(&lock, scope, &env_name, &[], &lang_pins, &conda_packages, requested_version.as_deref(), local_runtime.as_deref(), verbose)?
             .parse::<Version>()
             .ok()
     };
@@ -6885,7 +7057,12 @@ fn native_new(
     // any --modules-file snapshots for on-demand resolution. Never installs
     // modules; the compiler pulls them at build time.
     let version_str = morloc_version.as_ref().map(ToString::to_string);
-    deposit_env_snapshots(&cfg::env_data_dir(scope, &env_name), version_str.as_deref(), snapshots)?;
+    deposit_env_snapshots(
+        &provision::Trust::for_env(scope, &env_name),
+        &cfg::env_data_dir(scope, &env_name),
+        version_str.as_deref(),
+        snapshots,
+    )?;
 
     let mut ec = EnvironmentConfig::new_backend(
         env_name,
@@ -6902,7 +7079,7 @@ fn native_new(
     if let Some(p) = prepared {
         p.apply_to(&mut ec);
     }
-    finalize_new_env(scope, &ec, lang_pins, make_default)
+    finalize_new_env(guard, scope, &ec, lang_pins, make_default)
 }
 
 
@@ -7065,7 +7242,7 @@ fn container_capture_env(
     if verbose {
         eprintln!("[mim] capturing in {}: {}", engine.name(), args.join(" "));
     }
-    let (status, stdout, stderr) = container::container_run_quiet(engine, &cfg);
+    let (status, stdout, stderr) = container::container_run_quiet(engine, &cfg)?;
     if !status.success() {
         return Err(ManagerError::EnvError(format!(
             "resolving requirements in the container failed:\n{}",
@@ -7164,13 +7341,13 @@ fn require_current_version(ec: &EnvironmentConfig, env_name: &str) -> Result<Str
 /// newest release; `Some(v)` = an explicit target or the env's recorded
 /// version. A literal "latest" is resolved via the release manifest (a
 /// read-only network fetch); an explicit/recorded version needs no network.
-fn resolve_target_version(requested: &Option<String>) -> Result<String> {
+fn resolve_target_version(trust: &provision::Trust, requested: &Option<String>) -> Result<String> {
     match requested {
         Some(v) if !is_latest_spec(v) => Ok(strip_v_prefix(v).to_string()),
         _ => {
             let spec = requested.clone().unwrap_or_else(resolve_release_tag);
-            let tag = provision::resolve_tag(&spec)?;
-            Ok(provision::fetch_manifest(&tag)?.version)
+            let tag = provision::resolve_tag(trust, &spec)?;
+            Ok(provision::fetch_manifest(trust, &tag)?.version)
         }
     }
 }
@@ -7211,7 +7388,7 @@ fn gate_module_compat(
     ignore: bool,
 ) -> Result<Option<String>> {
     let fdb = cfg::env_data_dir(scope, name).join("fdb");
-    let constrained: Vec<(String, String)> = freeze::scan_modules(&fdb.to_string_lossy())
+    let constrained: Vec<(String, String)> = freeze::scan_modules(&fdb.to_string_lossy())?
         .into_iter()
         .filter_map(|m| m.morloc_version.map(|c| (m.name, c)))
         .collect();
@@ -7219,7 +7396,7 @@ fn gate_module_compat(
         return Ok(None);
     }
 
-    let target = resolve_target_version(requested)?;
+    let target = resolve_target_version(&provision::Trust::for_env(scope, name), requested)?;
     if !constraint::is_numeric_version(&target) {
         eprintln!(
             "Warning: target morloc version '{target}' is not a plain numeric \
@@ -7336,13 +7513,13 @@ fn clear_materialized_marker(scope: Scope, name: &str, ec: &EnvironmentConfig) {
 /// Installed programs keep their launchers and manifests, which is what makes
 /// them persistent; a compiled pool built against the previous runtime is
 /// rebuilt by the next `morloc make`, as after any update.
-fn reset_for_reinit(scope: Scope, name: &str, ec: &EnvironmentConfig) -> Result<()> {
+fn reset_for_reinit(lock: &envstore::EnvLock, scope: Scope, name: &str, ec: &EnvironmentConfig) -> Result<()> {
     require_not_serving(scope, name, ec, format!(
         "environment '{name}' is being served; stop it first with \
          'mim stop --env {name}', then rebuild it."
     ))?;
     let data_dir = cfg::env_data_dir(scope, name);
-    discard_derived_state(&data_dir, ec.backend.container_engine())?;
+    discard_derived_state(lock, &data_dir, ec.backend.container_engine())?;
     clear_materialized_marker(scope, name, ec);
     eprintln!(
         "Discarded the solved toolchain, scratch builds and language bindings of \
@@ -7355,9 +7532,13 @@ fn reset_for_reinit(scope: Scope, name: &str, ec: &EnvironmentConfig) -> Result<
 /// the scratch specs, the interpreter pins, the solve cache, the lock, and the
 /// solved prefix (the engine volume when `engine` manages one, and any prefix
 /// tree or record mirror under the pixi project).
-fn discard_derived_state(data_dir: &std::path::Path, engine: Option<ContainerEngine>) -> Result<()> {
+fn discard_derived_state(
+    lock: &envstore::EnvLock,
+    data_dir: &std::path::Path,
+    engine: Option<ContainerEngine>,
+) -> Result<()> {
     let ctx = envstore::EnvContext::new(data_dir);
-    ctx.clear_scratch()?;
+    ctx.clear_scratch(lock)?;
     ctx.clear_abi_lock()?;
     ctx.clear_solve_cache()?;
     let pixi_dir = ctx.pixi_dir();
@@ -7413,8 +7594,23 @@ fn discard_derived_state(data_dir: &std::path::Path, engine: Option<ContainerEng
 /// they are never persisted; once the program builds, `morloc make --install`
 /// writes its real `envspec.json`, which `gather_env_specs` then picks up. The
 /// container/native solve caches make this a no-op when requirements are
-/// unchanged.
+/// unchanged. `lock` comes from `adopted_env_lock`.
 fn rematerialize_env(
+    lock: &envstore::EnvLock,
+    scope: Scope,
+    name: &str,
+    extra_specs: &[envspec::EnvSpec],
+    requested_version: Option<String>,
+    build_flags: &[String],
+    verbose: bool,
+) -> Result<()> {
+    rematerialize_world(lock, scope, name, extra_specs, requested_version, build_flags, verbose)?;
+    localdeps::sweep_store_or_warn(&envstore::EnvContext::new(cfg::env_data_dir(scope, name)));
+    Ok(())
+}
+
+fn rematerialize_world(
+    lock: &envstore::EnvLock,
     scope: Scope,
     name: &str,
     extra_specs: &[envspec::EnvSpec],
@@ -7424,7 +7620,7 @@ fn rematerialize_env(
 ) -> Result<()> {
     let ec = cfg::read_env_config(scope, name)?;
     let lang_pins = cfg::read_env_inputs(scope, name)?.lang_pins;
-    let mut specs = gather_env_specs(scope, name)?;
+    let mut specs = gather_env_specs(lock, scope, name)?;
     specs.extend_from_slice(extra_specs);
 
     // The caller decides the version policy and passes the concrete tag to
@@ -7439,10 +7635,10 @@ fn rematerialize_env(
     // the dev provisioner, updating the stdlib base.
     if let Some(dev) = ec.dev.clone() {
         let target = ec.container_target()?;
-        let stdlib = resolve_stdlib_version(effective_version)?;
+        let stdlib = resolve_stdlib_version(&provision::Trust::for_env(scope, name), effective_version)?;
         let source = std::path::PathBuf::from(&dev.source);
         let image_tag = build_dev_container_image(
-            scope, name, target, &specs, &source, &lang_pins, &ec.system_packages,
+            lock, scope, name, target, &specs, &source, &lang_pins, &ec.system_packages,
             &ec.conda_packages, &stdlib, &ec.base_image, build_flags,
         )?;
         // Re-stage the dependency agent so a newer platform-matched mim (or the
@@ -7479,7 +7675,7 @@ fn rematerialize_env(
         // actually installed (symmetric with the container path below); without
         // this a native `update` leaves a stale version that misleads `doctor`
         // and the manifest-version check.
-        let mver = materialize_native_env(scope, name, &specs, &lang_pins, &ec.conda_packages, effective_version, local_runtime.as_deref(), verbose)?;
+        let mver = materialize_native_env(lock, scope, name, &specs, &lang_pins, &ec.conda_packages, effective_version, local_runtime.as_deref(), verbose)?;
         let mut ec = ec;
         ec.morloc_version = mver.parse::<Version>().ok();
         cfg::write_env_config(scope, name, &ec)?;
@@ -7488,7 +7684,7 @@ fn rematerialize_env(
     }
 
     let (image_tag, mver) = build_requirement_derived_image(
-        scope, name, ec.container_target()?, &specs, &lang_pins, &ec.system_packages,
+        lock, scope, name, ec.container_target()?, &specs, &lang_pins, &ec.system_packages,
         &ec.conda_packages, effective_version, local_runtime.as_deref(), &ec.base_image,
         build_flags,
     )?;
@@ -7498,6 +7694,44 @@ fn rematerialize_env(
     cfg::write_env_config(scope, name, &ec)?;
     forget_agent_solve(scope, name);
     Ok(())
+}
+
+/// DEP-4: the environment's lock, held by the manager around its own solves.
+fn env_lock(data_dir: &std::path::Path) -> Result<envstore::EnvLock> {
+    Ok(envstore::EnvContext::new(data_dir).lock_env_creating()?)
+}
+
+/// DEP-4 and DEP-12: the environment's lock, with the store and the pixi
+/// project given the environment's id under it.
+fn adopted_env_lock(data_dir: &std::path::Path) -> Result<envstore::EnvLock> {
+    let lock = env_lock(data_dir)?;
+    envstore::EnvContext::new(data_dir).adopt_env_ids(&lock)?;
+    Ok(lock)
+}
+
+/// DEP-12: give the store and the pixi project the environment's id before a
+/// build in it syncs. A failure leaves the hook refusing, so it is reported
+/// with the command that records the id.
+fn ensure_env_ids(scope: Scope, name: &str, data_dir: &std::path::Path) {
+    if envstore::EnvContext::new(data_dir).check_env_ids().is_ok() {
+        return;
+    }
+    if let Err(e) = adopted_env_lock(data_dir) {
+        eprintln!("{}", env_id_warning(scope, name, data_dir, &e));
+    }
+}
+
+fn env_id_warning(scope: Scope, name: &str, data_dir: &std::path::Path, e: &ManagerError) -> String {
+    let fix = format!("mim update --env {name}");
+    let fix = match scope {
+        Scope::System => format!("ask your administrator to run 'sudo {fix}'"),
+        Scope::Local => format!("run '{fix}'"),
+    };
+    format!(
+        "mim: warning: could not record the environment id under {} ({e}); builds in \
+         '{name}' refuse until it is recorded. To record it, {fix}.",
+        data_dir.display()
+    )
 }
 
 /// Drop the in-env agent's record of its last solve after the manager has
@@ -7516,6 +7750,7 @@ fn forget_agent_solve(scope: Scope, name: &str) {
 /// generated Dockerfile into a build context, and build the image. Returns the
 /// built image tag + the provisioned morloc version.
 fn build_requirement_derived_image(
+    lock: &envstore::EnvLock,
     scope: Scope,
     name: &str,
     target: arch::ContainerTarget,
@@ -7535,8 +7770,9 @@ fn build_requirement_derived_image(
     // Pass the target so the language-support table can be generated in a
     // container when the host cannot run the compiler (NixOS/musl, or a foreign
     // architecture).
+    let trust = provision::Trust::for_env(scope, name);
     let mut req = resolve_env_requirements(
-        scope, program_specs, lang_pins, conda_packages, Some(target), requested_version,
+        &trust, scope, program_specs, lang_pins, conda_packages, Some(target), requested_version,
         local_runtime, base_image,
     )?;
 
@@ -7549,7 +7785,7 @@ fn build_requirement_derived_image(
     // the cache-hit early return: the store reflects the env's config/inputs, so a
     // re-run with an unchanged manifest still refreshes it. Idempotent writes; the
     // single writer for both the toolchain pins and the conda extras.
-    prime_requirements_store(&env_dir, req.lang_spec.as_ref(), conda_packages)?;
+    prime_requirements_store(lock, &env_dir, req.lang_spec.as_ref(), conda_packages)?;
 
     // Solve cache (mirrors the native path): skip the multi-minute solve + image
     // rebuild when the requirements AND the compiler are unchanged and the image
@@ -7563,11 +7799,12 @@ fn build_requirement_derived_image(
     let persisted_build_flags =
         cfg::read_flag_config(scope, name)?.materialize(Phase::Build, engine);
     let key = format!(
-        "{}{}{}{}base:{base_image}\narch:{arch}\n",
+        "{}{}{}{}base:{base_image}\narch:{arch}\nmim-agent: {}\n",
         cache_key(&pixi::requirement_digest(&req.requirements), &req.morloc_bin, system_packages),
         lang_installs_key_fragment(&req.lang_installs),
         cert::cache_fragment_for_env(scope, name),
         build_flags_key_fragment(&persisted_build_flags),
+        provision::agent_identity(arch.release_triple())?,
     );
     let marker = materialized_marker(scope, name, false);
     let unchanged = std::fs::read_to_string(&marker)
@@ -7590,7 +7827,7 @@ fn build_requirement_derived_image(
             .map_err(|e| ManagerError::EnvError(format!("cannot create {}: {e}", d.display())))?;
     }
     pixi::write_manifest(&pixi_host, &manifest)?;
-    let pixi_bin = provision::provision_pixi(scope)?;
+    let pixi_bin = provision::provision_pixi(&trust, scope)?;
     // The host `pixi lock` runs on the host, so it uses the host bundle (corp +
     // public roots), exactly like the native path.
     let ssl_cert = cert::host_bundle_if_present(scope, name);
@@ -7614,7 +7851,7 @@ fn build_requirement_derived_image(
     // A container runs Linux at the env's architecture; the staged mim agent must
     // match that platform, not the host's (identical to the triple
     // `provision_runtime` used above).
-    provision::stage_runtime(scope, arch.release_triple(), &req.runtime_dir, &context.join("runtime"))?;
+    provision::stage_runtime(&trust, scope, arch.release_triple(), &req.runtime_dir, &context.join("runtime"))?;
     let lang_install_names = stage_lang_installs(&context, &req.lang_installs)?;
     // Stage the corp CA into the build context (COPY-ed into the image and
     // trusted before any network build step).
@@ -8081,6 +8318,7 @@ fn materialize_container_env(
         publish_host: None,
         network: None,
         env: serve::oci_base_env(serve::CONTAINER_MORLOC_HOME),
+        secret_env: Vec::new(),
         read_only: false,
         interactive: false,
         remove_after: true,
@@ -8089,10 +8327,12 @@ fn materialize_container_env(
         command: Some(vec!["bash".to_string(), "-c".to_string(), script]),
         work_dir: Some(serve::CONTAINER_PIXI_DIR.to_string()),
         selinux_suffix: volume_suffix(detect_selinux()).to_string(),
+        label_disable: false,
+        hardened: false,
         extra_flags: Vec::new(),
         platform: target.platform(),
     };
-    let (status, _out, stderr) = crate::container::container_run(engine, &cfg);
+    let (status, _out, stderr) = crate::container::container_run(engine, &cfg)?;
     if !status.success() {
         let what = if build_runtime { "pixi install + morloc init" } else { "pixi install" };
         return Err(ManagerError::EnvError(format!(
@@ -8141,6 +8381,7 @@ fn dev_image_key(world_digest: &str, dockerfile: &str) -> String {
 /// Sibling of `build_requirement_derived_image`; diverges because there is no
 /// prebuilt compiler to download/stage and the image bakes nothing from the source.
 fn build_dev_container_image(
+    lock: &envstore::EnvLock,
     scope: Scope,
     name: &str,
     target: arch::ContainerTarget,
@@ -8234,11 +8475,11 @@ fn build_dev_container_image(
     // so a re-run with an unchanged manifest (e.g. re-adding a conda extra that was
     // already pinned) still refreshes it. Idempotent writes; the single writer for
     // both the toolchain pins and the conda extras.
-    prime_requirements_store(&env_dir, lang_spec.as_ref(), conda_packages)?;
+    prime_requirements_store(lock, &env_dir, lang_spec.as_ref(), &dev_store_extras(conda_packages, &support))?;
 
     if !(up_to_date && container::image_exists_locally(engine, &image_tag)) {
         pixi::write_manifest(&pixi_host, &manifest)?;
-        let pixi_bin = provision::provision_pixi(scope)?;
+        let pixi_bin = provision::provision_pixi(&provision::Trust::for_env(scope, name), scope)?;
         let ssl_cert = cert::host_bundle_if_present(scope, name);
         eprintln!("Solving + locking the dev environment with pixi...");
         pixi::lock(&pixi_host, &pixi_bin, ssl_cert.as_deref())?;
@@ -8529,6 +8770,7 @@ fn container_new_derived(
     }
     warn_if_emulated(target.arch);
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
+    let guard = creating::NewEnvGuard::begin(scope, &env_name, Some(engine))?;
     // The flag file goes in before the image build so its `build:` section
     // applies to the first build too.
     install_env_flagfile(scope, &env_name, flagfile)?;
@@ -8566,8 +8808,10 @@ fn container_new_derived(
     let (built_image, morloc_version) = if no_init {
         (None, None)
     } else {
+        let data_dir = cfg::env_data_dir(scope, &env_name);
+        let lock = adopted_env_lock(&data_dir)?;
         let (image, version) = build_requirement_derived_image(
-            scope, &env_name, target, &[], &lang_pins, &system_packages, &conda_packages,
+            &lock, scope, &env_name, target, &[], &lang_pins, &system_packages, &conda_packages,
             requested_version.as_deref(), local_runtime.as_deref(), &base_image, build_flags,
         )?;
         (Some(image), version.parse::<Version>().ok())
@@ -8577,7 +8821,12 @@ fn container_new_derived(
     // the env home (mounted into the container at $MORLOC_STATE) for on-demand
     // resolution; never installs modules.
     let version_str = morloc_version.as_ref().map(ToString::to_string);
-    deposit_env_snapshots(&cfg::env_data_dir(scope, &env_name), version_str.as_deref(), snapshots)?;
+    deposit_env_snapshots(
+        &provision::Trust::for_env(scope, &env_name),
+        &cfg::env_data_dir(scope, &env_name),
+        version_str.as_deref(),
+        snapshots,
+    )?;
 
     let mut ec = EnvironmentConfig::new_backend(
         env_name,
@@ -8599,17 +8848,17 @@ fn container_new_derived(
     if let Some(p) = prepared {
         p.apply_to(&mut ec);
     }
-    finalize_new_env(scope, &ec, lang_pins, make_default)
+    finalize_new_env(guard, scope, &ec, lang_pins, make_default)
 }
 
 /// The concrete stdlib/library base version for a dev env: a specific requested
 /// version verbatim (v-stripped), else the newest release tag resolved to a
 /// version number (no download -- only the tag is fetched).
-fn resolve_stdlib_version(requested: Option<&str>) -> Result<String> {
+fn resolve_stdlib_version(trust: &provision::Trust, requested: Option<&str>) -> Result<String> {
     match requested {
         Some(v) if !is_latest_spec(v) => Ok(strip_v_prefix(v).to_string()),
         _ => {
-            let tag = provision::resolve_tag(&resolve_release_tag())?;
+            let tag = provision::resolve_tag(trust, &resolve_release_tag())?;
             Ok(strip_v_prefix(&tag).to_string())
         }
     }
@@ -8654,6 +8903,7 @@ fn container_new_dev(
     // the version (matching the interactive default).
     let name = name.or_else(|| Some("dev".to_string()));
     let env_name = resolve_new_env_name(scope, name, requested_version.as_deref())?;
+    let guard = creating::NewEnvGuard::begin(scope, &env_name, Some(engine))?;
     install_env_flagfile(scope, &env_name, flagfile)?;
     // Resolve the host home before the image build, so a bad path fails fast.
     let mount_home = match &mount_home {
@@ -8678,10 +8928,12 @@ fn container_new_dev(
     let (built_image, morloc_version) = if no_init {
         (None, None)
     } else {
-        let stdlib = resolve_stdlib_version(requested_version.as_deref())?;
+        let stdlib = resolve_stdlib_version(&provision::Trust::for_env(scope, &env_name), requested_version.as_deref())?;
         // A brand-new env has no installed programs yet, so no program specs.
+        let data_dir = cfg::env_data_dir(scope, &env_name);
+        let lock = adopted_env_lock(&data_dir)?;
         let image_tag = build_dev_container_image(
-            scope, &env_name, target, &[], &source_path, &lang_pins, &system_packages,
+            &lock, scope, &env_name, target, &[], &source_path, &lang_pins, &system_packages,
             &conda_packages, &stdlib, &base_image, build_flags,
         )?;
         (Some(image_tag), stdlib.parse::<Version>().ok())
@@ -8690,7 +8942,7 @@ fn container_new_dev(
     // Deposit the default stdlib snapshot plus any --modules-file snapshots into
     // the env home (mounted into the container at $MORLOC_STATE); never installs.
     let version_str = morloc_version.as_ref().map(ToString::to_string);
-    deposit_env_snapshots(&data_dir, version_str.as_deref(), snapshots)?;
+    deposit_env_snapshots(&provision::Trust::for_env(scope, &env_name), &data_dir, version_str.as_deref(), snapshots)?;
 
     let dev = DevConfig { source };
 
@@ -8717,7 +8969,7 @@ fn container_new_dev(
     if !no_init {
         stage_dev_agent(scope, &ec.name, target.arch)?;
     }
-    finalize_new_env(scope, &ec, lang_pins, make_default)
+    finalize_new_env(guard, scope, &ec, lang_pins, make_default)
 }
 
 // ======================================================================
@@ -8729,14 +8981,35 @@ fn container_new_dev(
 enum ServeLeader {
     /// No process has this pid.
     Gone,
-    /// Our leader; a zombie has exited but not been reaped.
-    Ours { zombie: bool },
+    /// The record was written in an earlier boot.
+    OtherBoot,
     /// The pid now names a different process.
     Foreign,
+    /// Our leader; a zombie has exited but not been reaped.
+    Ours { zombie: bool },
+    /// The leader's identity cannot be read or the record lacks it.
+    Unknown(String),
 }
 
-/// The state letter and start time (fields 3 and 22) of `/proc/<pid>/stat`.
-fn proc_stat(pid: u32) -> Option<(char, u64)> {
+/// A process's state and start time as the kernel reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcStat {
+    zombie: bool,
+    start: u64,
+}
+
+/// What the system says now about a recorded leader pid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeaderNow {
+    alive: bool,
+    stat: Option<ProcStat>,
+    boot: Option<String>,
+}
+
+/// The state letter and start time in clock ticks (fields 3 and 22) of
+/// `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn proc_stat(pid: u32) -> Option<ProcStat> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The command name (field 2) may hold spaces and parens; fields resume
     // after its closing paren.
@@ -8744,43 +9017,131 @@ fn proc_stat(pid: u32) -> Option<(char, u64)> {
     let mut fields = rest.split_whitespace();
     let state = fields.next()?.chars().next()?;
     let start = fields.nth(18)?.parse().ok()?;
-    Some((state, start))
+    Some(ProcStat { zombie: state == 'Z', start })
+}
+
+/// The state and start time (microseconds since the epoch) of `pid`, from
+/// `sysctl(KERN_PROC_PID)`, which answers for any user's process. libc has no
+/// `kinfo_proc` for Darwin: its `kp_proc` begins with `p_un`, whose
+/// `p_starttime` is a 64-bit `timeval`, and `p_stat` is the byte at offset 36.
+#[cfg(target_os = "macos")]
+fn proc_stat(pid: u32) -> Option<ProcStat> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as libc::c_int];
+    let mut len: libc::size_t = 0;
+    let sysctl = |buf: *mut libc::c_void, len: &mut libc::size_t, mib: &mut [libc::c_int; 4]| unsafe {
+        libc::sysctl(mib.as_mut_ptr(), 4, buf, len, std::ptr::null_mut(), 0)
+    };
+    if sysctl(std::ptr::null_mut(), &mut len, &mut mib) != 0 || len < 40 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    if sysctl(buf.as_mut_ptr().cast(), &mut len, &mut mib) != 0 || len < 40 {
+        return None;
+    }
+    let sec = i64::from_ne_bytes(buf[0..8].try_into().ok()?);
+    let usec = i32::from_ne_bytes(buf[8..12].try_into().ok()?);
+    if sec <= 0 || usec < 0 {
+        return None;
+    }
+    Some(ProcStat {
+        zombie: u32::from(buf[36]) == libc::SZOMB,
+        start: sec as u64 * 1_000_000 + usec as u64,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn proc_stat(_pid: u32) -> Option<ProcStat> {
+    None
+}
+
+/// An id unique to this boot of the machine.
+#[cfg(target_os = "linux")]
+fn boot_id() -> Option<String> {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    Some(id.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+fn boot_id() -> Option<String> {
+    let name = std::ffi::CStr::from_bytes_with_nul(b"kern.bootsessionuuid\0").ok()?;
+    let mut buf = [0u8; 128];
+    let mut len: libc::size_t = buf.len();
+    let rc = unsafe {
+        libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if rc != 0 {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&buf[..len.min(buf.len())]);
+    Some(id.trim_end_matches('\0').trim().to_string()).filter(|s| !s.is_empty())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn boot_id() -> Option<String> {
+    None
 }
 
 /// The leader's start time, recorded in a native serve handle at launch.
-fn process_start_ticks(pid: u32) -> Option<u64> {
-    proc_stat(pid).map(|(_, start)| start)
+fn process_start(pid: u32) -> Option<u64> {
+    proc_stat(pid).map(|s| s.start)
 }
 
-/// Classify the recorded leader `pid` (with its recorded `start` time, if
-/// any). A start time decides identity; without one (an older record), the
-/// command line must name the nexus, or the `morloc-fhs` launcher that wraps
-/// it on NixOS. Without /proc (macOS) a live pid is trusted.
-fn serve_leader(pid: u32, start: Option<u64>) -> ServeLeader {
+/// The handle of a native serve whose group leader is `pid`.
+fn native_serve_handle(pid: u32) -> ServeHandle {
+    ServeHandle::Native { pid, pgid: pid, start: process_start(pid), boot: boot_id() }
+}
+
+fn leader_now(pid: u32) -> LeaderNow {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
-    if pid <= 1 || !signal_probe_alive(kill(Pid::from_raw(pid as i32), None)) {
+    let alive = pid > 1 && signal_probe_alive(kill(Pid::from_raw(pid as i32), None));
+    LeaderNow { alive, stat: proc_stat(pid), boot: boot_id() }
+}
+
+/// SERVE-3: classify a recorded leader by its start time and boot id.
+fn classify_leader(start: Option<u64>, boot: Option<&str>, now: &LeaderNow) -> ServeLeader {
+    if !now.alive {
         return ServeLeader::Gone;
     }
-    let Some((state, now_start)) = proc_stat(pid) else {
-        return ServeLeader::Ours { zombie: false };
+    if let (Some(recorded), Some(current)) = (boot, now.boot.as_deref()) {
+        if recorded != current {
+            return ServeLeader::OtherBoot;
+        }
+    }
+    let (Some(start), Some(_)) = (start, boot) else {
+        return ServeLeader::Unknown(
+            "its serve record, written by an older mim, holds no start time or boot id".to_string(),
+        );
     };
-    let zombie = state == 'Z';
-    let ours = match start {
-        Some(recorded) => recorded == now_start,
-        // A zombie's cmdline reads empty; an unreaped leader is still ours.
-        None => zombie
-            || std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|bytes| {
-                let cmd = String::from_utf8_lossy(&bytes);
-                cmd.contains("morloc-nexus") || cmd.contains("morloc-fhs")
-            }),
+    let (Some(stat), Some(_)) = (now.stat, now.boot.as_deref()) else {
+        return ServeLeader::Unknown("this system does not report its start time and boot id".to_string());
     };
-    if ours { ServeLeader::Ours { zombie } } else { ServeLeader::Foreign }
+    if stat.start == start {
+        ServeLeader::Ours { zombie: stat.zombie }
+    } else {
+        ServeLeader::Foreign
+    }
+}
+
+fn serve_leader(pid: u32, start: Option<u64>, boot: Option<&str>) -> ServeLeader {
+    classify_leader(start, boot, &leader_now(pid))
 }
 
 /// Whether a native serve is still running: its leader is ours and not a zombie.
-fn native_serve_alive(pid: u32, start: Option<u64>) -> bool {
-    serve_leader(pid, start) == ServeLeader::Ours { zombie: false }
+fn native_serve_probe(pid: u32, pgid: u32, start: Option<u64>, boot: Option<&str>) -> container::Probe {
+    match serve_leader(pid, start, boot) {
+        ServeLeader::Ours { zombie: false } => container::Probe::Present,
+        ServeLeader::Unknown(why) => container::Probe::Unknown(unknown_leader_message(pid, pgid, &why)),
+        _ => container::Probe::Absent,
+    }
+}
+
+fn unknown_leader_message(pid: u32, pgid: u32, why: &str) -> String {
+    format!(
+        "mim cannot tell whether pid {pid} (process group {pgid}) is the server it started: {why}. \
+         If that process is the server, stop it yourself; then run `mim stop --forget` to drop \
+         the record"
+    )
 }
 
 /// A hint for a serve not found: one started with sudo is root's, recorded in
@@ -8801,15 +9162,37 @@ fn signal_probe_alive(probe: nix::Result<()>) -> bool {
     matches!(probe, Ok(()) | Err(nix::errno::Errno::EPERM))
 }
 
-/// SERVE-3: stop the native serve recorded as leader `pid` of group `pgid`,
-/// unless `pid` now names a process that is not ours. Linux allocates no pid
-/// still in use as a process group id, so a reused leader pid means the
-/// recorded group is gone; a dead or zombie leader with a live group is
-/// still ours.
-fn stop_native_serve(pid: u32, pgid: u32, start: Option<u64>) -> Result<()> {
-    match serve_leader(pid, start) {
-        ServeLeader::Foreign => Ok(()),
-        ServeLeader::Gone | ServeLeader::Ours { .. } => kill_native_group(pgid),
+/// What stopping a recorded native serve did.
+#[derive(Debug, PartialEq, Eq)]
+enum NativeStop {
+    Stopped,
+    /// The record was stale; nothing was signalled. The text says why.
+    Stale(String),
+}
+
+/// SERVE-3: stop the native serve recorded as leader `pid` of group `pgid`.
+/// Only a leader proven ours is signalled, through its group; a stale record
+/// signals nothing, and an unknown leader is an error.
+fn stop_native_serve(pid: u32, pgid: u32, start: Option<u64>, boot: Option<&str>) -> Result<NativeStop> {
+    let stale = |why: &str| {
+        let mut msg = format!("its server (pid {pid}) {why}");
+        let group = nix::unistd::Pid::from_raw(-(pgid as i32));
+        if pgid > 1 && signal_probe_alive(nix::sys::signal::kill(group, None)) {
+            msg.push_str(&format!(
+                "; process group {pgid} is still alive and may hold the old server's pools \
+                 (see `ps -g {pgid}`)"
+            ));
+        }
+        Ok(NativeStop::Stale(msg))
+    };
+    match serve_leader(pid, start, boot) {
+        ServeLeader::Ours { .. } => kill_native_group(pgid).map(|()| NativeStop::Stopped),
+        ServeLeader::Gone => stale("is gone"),
+        ServeLeader::OtherBoot => {
+            Ok(NativeStop::Stale(format!("its server (pid {pid}) belonged to an earlier boot")))
+        }
+        ServeLeader::Foreign => stale("is gone and its pid names another process"),
+        ServeLeader::Unknown(why) => Err(ManagerError::EnvError(unknown_leader_message(pid, pgid, &why))),
     }
 }
 
@@ -8856,19 +9239,21 @@ fn term_outcome(pgid: u32, sent: nix::Result<()>) -> Result<()> {
 /// not the env's current backend).
 fn serve_handle_probe(handle: &ServeHandle) -> container::Probe {
     match handle {
-        ServeHandle::Native { pid, start, .. } => {
-            if native_serve_alive(*pid, *start) {
-                container::Probe::Present
-            } else {
-                container::Probe::Absent
-            }
+        ServeHandle::Native { pid, pgid, start, boot } => {
+            native_serve_probe(*pid, *pgid, *start, boot.as_deref())
         }
-        ServeHandle::Container { engine, name } => container::probe(*engine, "container", name),
+        ServeHandle::Container { engine, name } => container_serve_probe(*engine, name),
     }
 }
 
-fn serve_handle_alive(handle: &ServeHandle) -> bool {
-    serve_handle_probe(handle) == container::Probe::Present
+/// A container serve's probe; an engine that cannot answer is named as such.
+fn container_serve_probe(engine: ContainerEngine, name: &str) -> container::Probe {
+    match container::probe(engine, "container", name) {
+        container::Probe::Unknown(why) => container::Probe::Unknown(format!(
+            "the container engine did not answer ({why}). Retry where the engine is reachable"
+        )),
+        p => p,
+    }
 }
 
 /// Whether environment `name` currently has a live server, regardless of
@@ -8882,7 +9267,7 @@ fn env_serve_probe(scope: Scope, name: &str, ec: &EnvironmentConfig) -> containe
         return serve_handle_probe(handle);
     }
     match ec.backend.container_engine() {
-        Some(engine) => container::probe(engine, "container", &serve::serve_container_name(name)),
+        Some(engine) => container_serve_probe(engine, &serve::serve_container_name(name)),
         None => container::Probe::Absent,
     }
 }
@@ -8898,17 +9283,78 @@ fn refuse_unless_absent(probe: container::Probe, present: String) -> Result<()> 
     match probe {
         container::Probe::Absent => Ok(()),
         container::Probe::Present => Err(ManagerError::EnvError(present)),
-        container::Probe::Unknown(why) => Err(ManagerError::EnvError(format!(
-            "cannot tell whether a server is running: the container engine did not \
-             answer ({why}). Retry where the engine is reachable."
-        ))),
+        container::Probe::Unknown(why) => {
+            Err(ManagerError::EnvError(format!("cannot tell whether a server is running: {why}.")))
+        }
     }
+}
+
+/// `mim stop`. The stored launch handle names the target (a native process
+/// group or a container) regardless of the env's current backend, so
+/// migration or a dual-backend serve never strands a server. `forget` drops
+/// the record and signals nothing.
+fn stop_serve(scope: Scope, env_name: &str, ec: &EnvironmentConfig, forget: bool, verbose: bool) -> Result<()> {
+    let record = cfg::read_serve_runtime(scope, env_name);
+    if forget {
+        if record.is_none() {
+            return Err(ManagerError::EnvError(format!("'{env_name}' has no serve record")));
+        }
+        cfg::remove_serve_runtime(scope, env_name);
+        eprintln!("Removed the serve record of '{env_name}'; nothing was signalled.");
+        return Ok(());
+    }
+    if let Some(handle) = record.and_then(|rt| rt.handle) {
+        // SERVE-3: a stale record is dropped, and an engine that cannot answer
+        // is not a "gone", so that case falls through to the stop, which fails.
+        let stale = match &handle {
+            ServeHandle::Native { pid, pgid, start, boot } => {
+                match stop_native_serve(*pid, *pgid, *start, boot.as_deref())? {
+                    NativeStop::Stopped => None,
+                    NativeStop::Stale(why) => Some(why),
+                }
+            }
+            ServeHandle::Container { engine, name }
+                if engine.is_oci()
+                    && container::probe(*engine, "container", name) == container::Probe::Absent =>
+            {
+                Some("its container is gone".to_string())
+            }
+            ServeHandle::Container { engine, name } => {
+                serve::stop_serve_container(*engine, verbose, name)?;
+                None
+            }
+        };
+        cfg::remove_serve_runtime(scope, env_name);
+        match stale {
+            Some(why) => eprintln!("'{env_name}' was not serving: {why}. Removed its stale serve record."),
+            None => eprintln!("Stopped serving environment: {env_name}"),
+        }
+        return Ok(());
+    }
+    // No stored handle: fall back to the container-name probe, but only for
+    // container backends. A native env always records a handle when it
+    // serves, so one reaching here simply is not serving.
+    if let Some(engine) = ec.backend.container_engine() {
+        let container_name = serve::serve_container_name(env_name);
+        if container::container_exists(engine, &container_name) {
+            serve::stop_serve_container(engine, verbose, &container_name)?;
+            cfg::remove_serve_runtime(scope, env_name);
+            eprintln!("Stopped serving environment: {env_name}");
+            return Ok(());
+        }
+    }
+    Err(ManagerError::EnvError(format!(
+        "No serve running for environment '{env_name}'{}",
+        sudo_hint()
+    )))
 }
 
 /// Tear down a running serve by its stored launch handle (backend-independent).
 fn stop_by_handle(handle: &ServeHandle, verbose: bool) -> Result<()> {
     match handle {
-        ServeHandle::Native { pid, pgid, start } => stop_native_serve(*pid, *pgid, *start),
+        ServeHandle::Native { pid, pgid, start, boot } => {
+            stop_native_serve(*pid, *pgid, *start, boot.as_deref()).map(|_| ())
+        }
         ServeHandle::Container { engine, name } => {
             serve::stop_serve_container(*engine, verbose, name)
         }
@@ -8924,8 +9370,16 @@ fn recorded_running_serves() -> Vec<serve::ServeContainerInfo> {
         for env in cfg::list_env_names(scope) {
             let Some(rt) = cfg::read_serve_runtime(scope, &env) else { continue };
             let (name, status) = match &rt.handle {
-                Some(ServeHandle::Native { pid, start, .. }) if native_serve_alive(*pid, *start) => {
-                    (format!("native:{env}"), format!("running (native, pid {pid})"))
+                Some(ServeHandle::Native { pid, pgid, start, boot }) => {
+                    match native_serve_probe(*pid, *pgid, *start, boot.as_deref()) {
+                        container::Probe::Present => {
+                            (format!("native:{env}"), format!("running (native, pid {pid})"))
+                        }
+                        container::Probe::Unknown(_) => {
+                            (format!("native:{env}"), format!("unknown (native, pid {pid})"))
+                        }
+                        container::Probe::Absent => continue,
+                    }
                 }
                 Some(ServeHandle::Container { engine, name })
                     if container::container_exists(*engine, name) =>
@@ -8989,6 +9443,7 @@ fn resolve_serve_spec(
         for m in ex.viewed_modules() {
             ensure_program_installed(ec, scope, name, &m)?;
         }
+        check_eval_allow(&ex)?;
         let eval_allow = ex.eval.as_ref().map(|e| e.allow.join(","));
         Ok(ServeSpec { mcp: ex.mcp.clone(), api: ex.api.clone(), eval_allow })
     }
@@ -9063,11 +9518,12 @@ fn native_serve(
     );
     apply_activation(&mut cmd, &runtime.activation_env);
     cmd.env("MORLOC_HOME", &mh);
-    if let Some(t) = &token {
-        cmd.env("MORLOC_MCP_TOKEN", t);
-    }
     for (k, v) in user_env {
         cmd.env(k, v);
+    }
+    scrub_serve_auth(&mut cmd);
+    if let Some(t) = &token {
+        cmd.env("MORLOC_MCP_TOKEN", t);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -9103,7 +9559,7 @@ fn native_serve(
     } else {
         "127.0.0.1".to_string()
     };
-    Ok((ServeHandle::Native { pid, pgid: pid, start: process_start_ticks(pid) }, url_host))
+    Ok((native_serve_handle(pid), url_host))
 }
 
 /// The router argv of a native serve. It shares the host's network namespace,
@@ -9180,11 +9636,12 @@ pub(crate) fn container_serve(
         req.expose, req.allow_plaintext, req.allow_no_auth, req.unsafe_serve,
         req.eval_allow_no_auth, cfg!(target_os = "linux"), req.token.clone(),
     )?;
-    let mut user_env = req.user_env.clone();
+    let user_env = req.user_env.clone();
     let mut mcp_token: Option<String> = None;
+    let mut secret_env = Vec::new();
     if let Some(t) = plan.token {
         mcp_token = Some(t.clone());
-        user_env.push(("MORLOC_MCP_TOKEN".to_string(), t));
+        secret_env.push(("MORLOC_MCP_TOKEN".to_string(), t));
     }
     let mut extra_flags = flag_source(env.scope, env_name, req.flagfile.as_deref())?
         .materialize(Phase::Start, engine);
@@ -9199,7 +9656,7 @@ pub(crate) fn container_serve(
     serve::serve_environment(
         engine, req.verbose, &image, &data_dir.to_string_lossy(), &container_name,
         &[(req.host_port, req.container_port)], plan.publish_host.as_deref(), plan.network.as_deref(),
-        &extra_flags, &Some(ec.shm_size.clone()), &user_env, &plan.command,
+        &extra_flags, &Some(ec.shm_size.clone()), &user_env, &secret_env, &plan.command,
         ec.mount_home.as_deref(), platform,
     )?;
 
@@ -9337,6 +9794,7 @@ pub(crate) fn container_run_env(
     let engine = ec.engine()?;
     let image = ec.active_image().to_string();
     let data_dir = cfg::env_data_dir(env_scope, &env_name);
+    ensure_env_ids(env_scope, &env_name, &data_dir);
     let v_data_dir = data_dir.to_string_lossy().to_string();
 
     // Optional SLURM submission bridge. The handle's drop tears the
@@ -9411,28 +9869,21 @@ pub(crate) fn container_run_env(
     let is_dev = ec.dev.is_some();
     let platform = ec.oci_arch()?;
 
-    if !is_init && !suffix.is_empty() && !is_home_dir {
+    let label_disable = selinux_disables_labels(is_init, suffix, is_home_dir);
+    if !is_init && !suffix.is_empty() && !label_disable {
         selinux::validate_mount_path(&cwd)?;
-        run_with_config(
-            engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd, suffix,
-            shell, args, false, &ec.shm_size, &extra_flags, user_env,
-            bridge_mount.as_deref(), is_dev, run_home.as_deref(), platform,
-        )
-    } else {
-        let (cwd_final, skip_work_mount) = if is_home_dir && !suffix.is_empty() && !is_init {
-            eprintln!("Warning: running from home directory with SELinux; working directory mount skipped.");
-            eprintln!("Workaround: create a project subdirectory and work from there:");
-            eprintln!("  mkdir ~/myproject && cd ~/myproject");
-            (home.clone(), true)
-        } else {
-            (cwd, false)
-        };
-        run_with_config(
-            engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd_final, suffix,
-            shell, args, is_init || skip_work_mount, &ec.shm_size, &extra_flags, user_env,
-            bridge_mount.as_deref(), is_dev, run_home.as_deref(), platform,
-        )
     }
+    run_with_config(
+        engine, verbose, &env_name, &image, &v_data_dir, &home, &cwd, suffix, label_disable,
+        shell, args, is_init, &ec.shm_size, &extra_flags, user_env,
+        bridge_mount.as_deref(), is_dev, run_home.as_deref(), platform,
+    )
+}
+
+/// RUN-1: the home directory is unsafe to relabel, so a run from it under
+/// SELinux mounts it with labelling disabled for that container.
+fn selinux_disables_labels(is_init: bool, suffix: &str, is_home_dir: bool) -> bool {
+    !is_init && !suffix.is_empty() && is_home_dir
 }
 
 /// The host directory a run mounts as the container's `$HOME`, `None` for the
@@ -9508,6 +9959,7 @@ fn run_with_config(
     home: &str,
     cwd: &str,
     suffix: &str,
+    label_disable: bool,
     shell: bool,
     args: &[String],
     is_init: bool,
@@ -9566,11 +10018,10 @@ fn run_with_config(
     } else {
         serve::CONTAINER_WORK.to_string()
     };
-    // The container runs as the invoking host UID (engine_specific_run_flags_io:
-    // docker `--user`, podman `--userns=keep-id`), so the in-container
-    // environment must not assume root or a real, writable $HOME. The two
-    // engine families differ in one decisive way: Apptainer mounts the host
-    // $HOME by default, docker/podman do NOT.
+    // The container runs as the invoking host user (container::identity_flags),
+    // so the in-container environment must not assume a real, writable $HOME.
+    // The two engine families differ in one decisive way: Apptainer mounts the
+    // host $HOME by default, docker/podman do NOT.
     //
     // Apptainer: the host $HOME is present and writable, so `morloc init` can
     // symlink the freshly installed nexus/manager binaries into a morloc-owned
@@ -9676,13 +10127,14 @@ fn run_with_config(
         shm_size: Some(shm_size.to_string()),
         work_dir: Some(work_dir),
         selinux_suffix: suffix.to_string(),
+        label_disable,
         command: cmd,
         extra_flags: extra_flags.to_vec(),
         platform,
         ..RunConfig::new(image)
     };
 
-    let status = container_run_passthrough(engine, verbose, shell, &cfg);
+    let status = container_run_passthrough(engine, verbose, shell, &cfg)?;
     if status.success() {
         return Ok(());
     }
@@ -9742,6 +10194,52 @@ fn ensure_program_installed(
         )));
     }
     Ok(())
+}
+
+/// A module name as the eval allow-list holds it: the list reaches the nexus
+/// comma-joined, and the Dockerfile command of a frozen image.
+fn validate_allow_module(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ManagerError::EnvError(format!(
+            "'{name}' is not a module name (letters, digits, '-', '_' and '.', \
+             starting with a letter or digit)"
+        )))
+    }
+}
+
+/// Refuse a stored allow-list entry that is not one module name, as a views
+/// file written by hand or by an older mim may hold.
+pub(crate) fn check_eval_allow(views: &ViewSet) -> Result<()> {
+    for m in views.eval.iter().flat_map(|e| &e.allow) {
+        validate_allow_module(m)?;
+    }
+    Ok(())
+}
+
+/// The variables the nexus reads its auth from. mim sets them from its own
+/// flags only (SERVE-4, SERVE-5).
+const SERVE_AUTH_VARS: [&str; 2] = ["MORLOC_MCP_TOKEN", "MORLOC_EVAL_ALLOW_NO_AUTH"];
+
+fn refuse_serve_auth_vars(user_env: &[(String, String)]) -> Result<()> {
+    match user_env.iter().find(|(k, _)| SERVE_AUTH_VARS.contains(&k.as_str())) {
+        Some((k, _)) => Err(ManagerError::EnvError(format!(
+            "{k} cannot be given with --env-var or --env-file; pass the token with \
+             --auth-token or MORLOC_MCP_TOKEN in mim's environment, and the eval \
+             waiver with --eval-allow-no-auth"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn scrub_serve_auth(cmd: &mut Command) {
+    for k in SERVE_AUTH_VARS {
+        cmd.env_remove(k);
+    }
 }
 
 /// Resolve the MCP bearer token: an explicit `--auth-token` wins, else the
@@ -10493,8 +10991,8 @@ mod tests {
         write_py_pkg(&env.path().join("exe/prog/src/mylib"), "V=1\n");
         write_program(env.path(), "plain", NO_LOCAL);
         let ctx = envstore::EnvContext::new(env.path());
-        ctx.write_spec("prog", envstore::Provenance::Scratch, NO_LOCAL).unwrap();
-        seed_installed_store(env.path()).unwrap();
+        ctx.write_spec(&env_lock(ctx.env_home()).unwrap(), "prog", envstore::Provenance::Scratch, NO_LOCAL).unwrap();
+        seed_installed_store(&env_lock(env.path()).unwrap(), env.path()).unwrap();
 
         let ctx = envstore::EnvContext::new(env.path());
         assert_eq!(ctx.installed_program_names().unwrap(), vec!["plain", "prog"]);
@@ -10506,7 +11004,7 @@ mod tests {
         assert!(env.path().join("pixi").join(&rel).join("v.py").exists());
         assert!(!localdeps::has_py_locals(&stored));
         // Idempotent: a second pass rewrites nothing.
-        seed_installed_store(env.path()).unwrap();
+        seed_installed_store(&env_lock(env.path()).unwrap(), env.path()).unwrap();
         assert_eq!(ctx.read_installed("prog").unwrap(), stored.to_json().unwrap());
     }
 
@@ -10521,8 +11019,8 @@ mod tests {
         write_py_pkg(&env.path().join("local/prog/mylib"), "LEGACY\n");
         let ctx = envstore::EnvContext::new(env.path());
         let legacy = r#"{"envspec_version":2,"morloc_version":"0","packages":{"py":[{"name":"mylib","source":"local","path":"/opt/morloc-state/local/prog/mylib","editable":false}]}}"#;
-        ctx.write_spec("prog", envstore::Provenance::Installed, legacy).unwrap();
-        seed_installed_store(env.path()).unwrap();
+        ctx.write_spec(&env_lock(ctx.env_home()).unwrap(), "prog", envstore::Provenance::Installed, legacy).unwrap();
+        seed_installed_store(&env_lock(env.path()).unwrap(), env.path()).unwrap();
         let stored = envspec::EnvSpec::from_json(&ctx.read_installed("prog").unwrap()).unwrap();
         let rel = vendored_path(&stored);
         assert_eq!(
@@ -10539,8 +11037,8 @@ mod tests {
         let env = tempfile::tempdir().unwrap();
         write_program(env.path(), "prog", NO_LOCAL);
         let ctx = envstore::EnvContext::new(env.path());
-        ctx.write_spec("stray", envstore::Provenance::Installed, RAW_LOCAL).unwrap();
-        seed_installed_store(env.path()).unwrap();
+        ctx.write_spec(&env_lock(ctx.env_home()).unwrap(), "stray", envstore::Provenance::Installed, RAW_LOCAL).unwrap();
+        seed_installed_store(&env_lock(env.path()).unwrap(), env.path()).unwrap();
         assert_eq!(ctx.installed_program_names().unwrap(), vec!["prog"]);
     }
 
@@ -10550,7 +11048,7 @@ mod tests {
         // must not be stored, and the error names the program.
         let env = tempfile::tempdir().unwrap();
         write_program(env.path(), "prog", RAW_LOCAL);
-        let err = seed_installed_store(env.path()).unwrap_err().to_string();
+        let err = seed_installed_store(&env_lock(env.path()).unwrap(), env.path()).unwrap_err().to_string();
         assert!(err.contains("'prog'") && err.contains("mylib"), "{err}");
         let ctx = envstore::EnvContext::new(env.path());
         assert!(ctx.installed_program_names().unwrap().is_empty());
@@ -10662,8 +11160,8 @@ mod tests {
         let data_dir = tmp.path();
         let ctx = envstore::EnvContext::new(data_dir);
         let spec = r#"{"envspec_version":2,"morloc_version":"0.99.0","languages":[{"lang":"py"}]}"#;
-        ctx.write_spec("keeper", envstore::Provenance::Installed, spec).unwrap();
-        ctx.write_spec("scratchy", envstore::Provenance::Scratch, spec).unwrap();
+        ctx.write_spec(&env_lock(ctx.env_home()).unwrap(), "keeper", envstore::Provenance::Installed, spec).unwrap();
+        ctx.write_spec(&env_lock(ctx.env_home()).unwrap(), "scratchy", envstore::Provenance::Scratch, spec).unwrap();
         ctx.write_conda_extras(&["bat".to_string()]).unwrap();
         let pixi = ctx.pixi_dir();
         std::fs::create_dir_all(morloc_deps::abi::conda_prefix(&pixi).join("conda-meta")).unwrap();
@@ -10676,7 +11174,7 @@ mod tests {
         // The runtime and installed launchers are not this step's to touch.
         std::fs::create_dir_all(data_dir.join("exe/keeper")).unwrap();
 
-        discard_derived_state(data_dir, None).unwrap();
+        discard_derived_state(&env_lock(data_dir).unwrap(), data_dir, None).unwrap();
 
         assert_eq!(ctx.installed_program_names().unwrap(), vec!["keeper".to_string()]);
         assert_eq!(ctx.program_names().unwrap(), vec!["keeper".to_string()]);
@@ -10690,7 +11188,7 @@ mod tests {
         // The manifest is re-rendered by the rebuild; leaving it is harmless.
         assert!(data_dir.join("exe/keeper").is_dir());
         // Idempotent: a second discard on the emptied env is not an error.
-        discard_derived_state(data_dir, None).unwrap();
+        discard_derived_state(&env_lock(data_dir).unwrap(), data_dir, None).unwrap();
     }
 
     #[test]
@@ -11159,7 +11657,7 @@ mod tests {
             user_files: vec![("biocore.txt".to_string(), "x 111\n".to_string())],
         };
         // no_default: the default is never fetched, so this needs no network.
-        deposit_env_snapshots(dir.path(), Some("0.0.0"), &plan).unwrap();
+        deposit_env_snapshots(&provision::Trust::System, dir.path(), Some("0.0.0"), &plan).unwrap();
         let snap = dir.path().join("snapshots");
         assert_eq!(std::fs::read_to_string(snap.join("biocore.txt")).unwrap(), "x 111\n");
         assert!(!snap.join("stdlib.txt").exists());
@@ -11214,7 +11712,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // No version => the default fetch is skipped (no network), no user files.
         let plan = SnapshotPlan { no_default: false, user_files: vec![] };
-        deposit_env_snapshots(dir.path(), None, &plan).unwrap();
+        deposit_env_snapshots(&provision::Trust::System, dir.path(), None, &plan).unwrap();
         assert!(!dir.path().join("snapshots").exists());
     }
 
@@ -13296,42 +13794,72 @@ run:
         assert_eq!(container_command_status(ContainerEngine::Apptainer, exited(125)), Some(125));
     }
 
-    /// The leader classification behind every native stop: a zombie leader
-    /// is ours, and a recorded start time that differs means a reused pid.
-    #[cfg(target_os = "linux")]
+    /// SERVE-3: identity is the start time and the boot id; anything less is
+    /// Unknown, never trusted.
     #[test]
-    fn a_serve_leader_is_judged_by_its_start_time() {
+    fn a_serve_leader_is_classified_by_start_time_and_boot() {
+        let now = |alive, stat: Option<(bool, u64)>, boot: Option<&str>| LeaderNow {
+            alive,
+            stat: stat.map(|(zombie, start)| ProcStat { zombie, start }),
+            boot: boot.map(str::to_string),
+        };
+        let live = now(true, Some((false, 7)), Some("b"));
+        assert_eq!(classify_leader(Some(7), Some("b"), &live), ServeLeader::Ours { zombie: false });
+        assert_eq!(
+            classify_leader(Some(7), Some("b"), &now(true, Some((true, 7)), Some("b"))),
+            ServeLeader::Ours { zombie: true }
+        );
+        assert_eq!(classify_leader(Some(8), Some("b"), &live), ServeLeader::Foreign);
+        assert_eq!(classify_leader(Some(7), Some("a"), &live), ServeLeader::OtherBoot);
+        assert_eq!(classify_leader(Some(7), Some("b"), &now(false, None, Some("b"))), ServeLeader::Gone);
+        let unknown = |l| matches!(l, ServeLeader::Unknown(_));
+        assert!(unknown(classify_leader(None, Some("b"), &live)));
+        assert!(unknown(classify_leader(Some(7), None, &live)));
+        assert!(unknown(classify_leader(Some(7), Some("b"), &now(true, None, Some("b")))));
+        assert!(unknown(classify_leader(Some(7), Some("b"), &now(true, Some((false, 7)), None))));
+    }
+
+    /// The system's view of a real child: its identity matches the one
+    /// recorded at spawn, a zombie is still ours, and a reaped one is gone.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_spawned_serve_leader_is_recognised_as_ours() {
         use std::os::unix::process::CommandExt;
+        let boot = boot_id().expect("a boot id");
         let mut live = std::process::Command::new("sleep");
         live.arg("60").process_group(0);
         let mut live = live.spawn().unwrap();
         let pid = live.id();
-        let start = process_start_ticks(pid).unwrap();
-        assert_eq!(serve_leader(pid, Some(start)), ServeLeader::Ours { zombie: false });
-        assert_eq!(serve_leader(pid, Some(start + 1)), ServeLeader::Foreign);
+        let start = process_start(pid).expect("a start time");
+        assert_eq!(serve_leader(pid, Some(start), Some(&boot)), ServeLeader::Ours { zombie: false });
+        assert_eq!(serve_leader(pid, Some(start + 1), Some(&boot)), ServeLeader::Foreign);
+        let other = std::process::id();
+        assert_eq!(serve_leader(other, Some(start), Some(&boot)), ServeLeader::Foreign);
         let _ = live.kill();
         let _ = live.wait();
 
         let mut dead = std::process::Command::new("true").spawn().unwrap();
         let zpid = dead.id();
-        let zstart = process_start_ticks(zpid);
-        for _ in 0..100 {
-            if proc_stat(zpid).is_some_and(|(s, _)| s == 'Z') {
+        let zstart = process_start(zpid);
+        let mut zombie = false;
+        for _ in 0..200 {
+            if proc_stat(zpid).is_some_and(|s| s.zombie) {
+                zombie = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(serve_leader(zpid, None), ServeLeader::Ours { zombie: true });
-        assert_eq!(serve_leader(zpid, zstart), ServeLeader::Ours { zombie: true });
+        assert!(zombie, "the exited child never read as a zombie");
+        assert_eq!(serve_leader(zpid, zstart, Some(&boot)), ServeLeader::Ours { zombie: true });
         let _ = dead.wait();
-        assert_eq!(serve_leader(zpid, zstart), ServeLeader::Gone);
+        assert_eq!(serve_leader(zpid, zstart, Some(&boot)), ServeLeader::Gone);
     }
 
-    /// SERVE-3: a native serve record whose pid now names someone else's
-    /// process is never signalled.
-    #[cfg(target_os = "linux")]
+    /// SERVE-3: a record mim cannot verify makes `stop` refuse, naming the
+    /// pid and group, and keep the record; `start` refuses too, and nothing
+    /// is signalled. `--forget` drops the record, still signalling nothing.
     #[test]
-    fn stop_never_signals_a_process_that_reused_the_server_pid() {
+    fn stop_refuses_an_unverifiable_server_until_forgotten() {
         use std::os::unix::process::CommandExt;
         let tmp = tempfile::tempdir().unwrap();
         cfg::test_roots::set(tmp.path());
@@ -13352,14 +13880,91 @@ run:
             host: "127.0.0.1".to_string(),
             port: 9000,
             token_required: false,
-            handle: Some(ServeHandle::Native { pid, pgid: pid, start: None }),
+            handle: Some(ServeHandle::Native { pid, pgid: pid, start: None, boot: None }),
         };
         cfg::write_serve_runtime(Scope::Local, "n", &record).unwrap();
-        dispatch_args(&["mim", "stop", "--env", "n"]).unwrap();
-        let still_running = child.try_wait().unwrap().is_none();
+        let err = dispatch_args(&["mim", "stop", "--env", "n"]).unwrap_err().to_string();
+        let kept = cfg::read_serve_runtime(Scope::Local, "n").is_some();
+        let start_err = dispatch_args(&["mim", "start", "--env", "n"]).unwrap_err().to_string();
+        let alive_after_stop = child.try_wait().unwrap().is_none();
+        dispatch_args(&["mim", "stop", "--env", "n", "--forget"]).unwrap();
+        let forgotten = cfg::read_serve_runtime(Scope::Local, "n").is_none();
+        let alive_after_forget = child.try_wait().unwrap().is_none();
         let _ = child.kill();
         let _ = child.wait();
-        assert!(still_running, "stop signalled a process that is not the server");
+        assert!(err.contains(&format!("pid {pid}")) && err.contains("--forget"), "{err}");
+        assert!(start_err.contains("cannot tell") && start_err.contains("--forget"), "{start_err}");
+        assert!(kept, "a refused stop dropped the record");
+        assert!(alive_after_stop && alive_after_forget, "an unverifiable server was signalled");
+        assert!(forgotten, "--forget kept the record");
+    }
+
+    /// ENV-2: a `new` that fails after writing into the data dir (the CA
+    /// bundle here) removes everything; `ls` then lists nothing, and an
+    /// unmarked remnant is removed by `rm`.
+    #[test]
+    fn a_failed_native_new_leaves_no_remnant() {
+        let _serial = creating::tests::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        cfg::test_roots::set(tmp.path());
+        let bundle = tmp.path().join("ca.pem");
+        fs::write(&bundle, morloc_deps::cert::public_roots_pem()).unwrap();
+        let snapshots = SnapshotPlan {
+            no_default: true,
+            user_files: vec![
+                ("s.txt".to_string(), "root a\n".to_string()),
+                ("s.txt".to_string(), "root a\n".to_string()),
+            ],
+        };
+        let err = native_new(
+            Scope::Local, Some("e".to_string()), Vec::new(), Vec::new(), None, None,
+            Some(bundle.to_string_lossy().into_owned()), true, false, false, &snapshots,
+        );
+        assert!(err.is_err());
+        assert!(!cfg::env_data_dir(Scope::Local, "e").exists());
+        assert!(!cfg::env_config_dir(Scope::Local, "e").exists());
+        assert!(creating::list_remnants(Scope::Local).is_empty());
+
+        fs::create_dir_all(cfg::env_data_dir(Scope::Local, "old").join("home")).unwrap();
+        assert_eq!(creating::list_remnants(Scope::Local).len(), 1);
+        dispatch_args(&["mim", "rm", "old"]).unwrap();
+        assert!(!cfg::env_data_dir(Scope::Local, "old").exists());
+    }
+
+    /// RUN-1: under SELinux a run from the home directory mounts it with
+    /// labelling disabled, never dropping the mount; elsewhere it relabels.
+    #[test]
+    fn a_selinux_run_from_home_disables_labels() {
+        assert!(selinux_disables_labels(false, ":z", true));
+        assert!(!selinux_disables_labels(false, ":z", false));
+        assert!(!selinux_disables_labels(false, "", true));
+        assert!(!selinux_disables_labels(true, ":z", true));
+    }
+
+    /// SERVE-3: a record whose leader is gone is stale. Its process group,
+    /// still alive here, is never signalled: its id alone proves nothing.
+    #[test]
+    fn stop_never_signals_the_group_of_a_gone_leader() {
+        use std::os::unix::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("member");
+        let mut leader = std::process::Command::new("sh");
+        leader
+            .args(["-c", "sleep 60 & echo $! > \"$1\"", "sh"])
+            .arg(&pidfile)
+            .process_group(0);
+        let mut leader = leader.spawn().unwrap();
+        let pid = leader.id();
+        let start = process_start(pid);
+        leader.wait().unwrap();
+        let member: i32 = fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let member = nix::unistd::Pid::from_raw(member);
+        stop_native_serve(pid, pid, start, boot_id().as_deref()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // A signalled orphan may linger as a zombie, which answers kill(0).
+        let alive = proc_stat(member.as_raw() as u32).is_some_and(|s| !s.zombie);
+        let _ = nix::sys::signal::kill(member, nix::sys::signal::Signal::SIGKILL);
+        assert!(alive, "stop signalled the group of a leader that is gone");
     }
 
     #[test]
@@ -13423,8 +14028,8 @@ run:
     fn a_serve_record_cannot_signal_our_group_or_every_process() {
         assert!(kill_native_group(0).is_err());
         assert!(kill_native_group(1).is_err());
-        assert!(!native_serve_alive(0, None));
-        assert!(!native_serve_alive(1, None));
+        assert_eq!(serve_leader(0, Some(1), Some("b")), ServeLeader::Gone);
+        assert_eq!(serve_leader(1, Some(1), Some("b")), ServeLeader::Gone);
     }
 
     #[test]
@@ -13519,6 +14124,76 @@ run:
         let local = native_router_command("/s", 9000, &spec, false, false, false);
         assert!(local.contains(&"--eval-allow-no-auth".to_string()), "{local:?}");
         assert!(local.windows(2).any(|w| w == ["--http-host", "127.0.0.1"]), "{local:?}");
+    }
+
+    /// An eval allow-list entry is one module name: it can neither carry a
+    /// second name (the list reaches the nexus comma-joined) nor a flag.
+    #[test]
+    fn an_eval_allow_entry_is_one_module_name() {
+        for ok in ["bio", "bio-rust", "bio.seq", "root_py2"] {
+            assert!(validate_allow_module(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "a,b", "x\", \"--eval-allow-no-auth", "-x", "a b", "a\nb", "../x"] {
+            assert!(validate_allow_module(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// IFC-5: a dev environment's in-env solves, which read the compiler's
+    /// table, keep the dev-conda packages only the source tree names.
+    #[test]
+    fn a_dev_environment_stores_its_dev_conda_packages() {
+        let support = langsupport::LangSupport::from_json(
+            r#"{"schema_version":"1.0","morloc_version":"0","dev-conda":["gmp","zlib"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            dev_store_extras(&["jq".to_string()], &support),
+            vec!["jq".to_string(), "gmp".to_string(), "zlib".to_string()]
+        );
+    }
+
+    /// ENV-12: `mim clean` inside an environment cleans the compiler's state,
+    /// which a native launch leaves to MORLOC_HOME.
+    #[test]
+    fn clean_inside_a_native_environment_uses_the_compilers_state() {
+        let native = |k: &str| (k == "MORLOC_HOME").then(|| "/env/data".to_string());
+        let roots = clean_roots(native).unwrap();
+        assert_eq!(roots.state, std::path::PathBuf::from("/env/data"));
+        assert_eq!(roots.home, std::path::PathBuf::from("/env/data"));
+        let container = |k: &str| match k {
+            "MORLOC_HOME" => Some("/opt/morloc".to_string()),
+            "MORLOC_STATE" => Some("/opt/morloc-state".to_string()),
+            _ => None,
+        };
+        assert_eq!(clean_roots(container).unwrap().state, std::path::PathBuf::from("/opt/morloc-state"));
+        assert!(clean_roots(|_| None).is_err());
+    }
+
+    /// SERVE-5: a native nexus learns its auth only from mim's own flags; the
+    /// caller's shell values of the variables the nexus reads are removed.
+    #[test]
+    fn a_native_serve_drops_the_callers_auth_variables() {
+        let mut cmd = Command::new("true");
+        scrub_serve_auth(&mut cmd);
+        let removed: Vec<_> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().to_string())
+            .collect();
+        for k in SERVE_AUTH_VARS {
+            assert!(removed.iter().any(|r| r == k), "{k} not removed: {removed:?}");
+        }
+    }
+
+    /// The serve auth variables cannot be smuggled in with --env-var, where
+    /// the expose gate and the serve record would not see them.
+    #[test]
+    fn serve_auth_variables_are_refused_as_user_variables() {
+        for k in SERVE_AUTH_VARS {
+            let err = refuse_serve_auth_vars(&[(k.to_string(), "x".to_string())]).unwrap_err();
+            assert!(err.to_string().contains(k), "{err}");
+        }
+        assert!(refuse_serve_auth_vars(&[("FOO".to_string(), "x".to_string())]).is_ok());
     }
 
     /// Only a 2xx eval response is a result; a failed or refused evaluation
@@ -13620,6 +14295,34 @@ run:
         assert_eq!(environment::effective_default(), Some(("sys".to_string(), Scope::System)));
         let local = cfg::read_config::<Config>(&cfg::config_path(Scope::Local)).unwrap();
         assert_eq!(local.default_env.as_deref(), Some("sys"));
+    }
+
+    #[test]
+    fn a_missing_environment_id_names_the_command_that_records_it() {
+        let dir = std::path::Path::new("/data/e");
+        let e = ManagerError::EnvError("denied".to_string());
+        let system = env_id_warning(Scope::System, "sys", dir, &e);
+        assert!(system.contains("'sudo mim update --env sys'"), "{system}");
+        let local = env_id_warning(Scope::Local, "loc", dir, &e);
+        assert!(local.contains("'mim update --env loc'") && !local.contains("sudo"), "{local}");
+    }
+
+    /// DEP-11: every managed launch names the environment's store as the
+    /// launched process sees it.
+    #[test]
+    fn managed_launches_name_the_environments_store() {
+        let data_dir = std::path::Path::new("/data/environments/e");
+        let native = managed_env_vars("e", data_dir, std::path::Path::new("morloc"), std::path::Path::new("mim"));
+        assert!(native.contains(&("MORLOC_ENV_STORE".to_string(), data_dir.display().to_string())), "{native:?}");
+
+        let oci = serve::oci_managed_markers();
+        assert!(
+            oci.contains(&("MORLOC_ENV_STORE".to_string(), serve::CONTAINER_MORLOC_STATE.to_string())),
+            "{oci:?}"
+        );
+        // The container's store is the data dir mounted there.
+        let (binds, _) = base_mounts(&data_dir.display().to_string());
+        assert!(binds.contains(&(data_dir.display().to_string(), serve::CONTAINER_MORLOC_STATE.to_string())));
     }
 
     /// `info` lists every managed-env variable a native run exports.

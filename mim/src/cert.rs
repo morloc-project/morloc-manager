@@ -222,6 +222,41 @@ pub fn host_bundle_if_present(scope: Scope, name: &str) -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
+/// PROV-9: the trust for a download made before an environment exists, from
+/// the bundle the user named: a private temporary host bundle (it plus the
+/// public roots), deleted when this is dropped.
+pub struct PendingTrust {
+    pub trust: crate::provision::Trust,
+    path: Option<PathBuf>,
+}
+
+impl Drop for PendingTrust {
+    fn drop(&mut self) {
+        if let Some(p) = &self.path {
+            let _ = fs::remove_file(p);
+        }
+    }
+}
+
+pub fn pending_trust(src: Option<&str>) -> Result<PendingTrust> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(src) = src else {
+        return Ok(PendingTrust { trust: crate::provision::Trust::user(), path: None });
+    };
+    let report = load_report(Path::new(src)).map_err(|(e, _)| e)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = std::env::temp_dir().join(format!("mim-ca-{}-{nanos}.pem", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+        f.write_all(&cert::host_bundle_with_roots(&report))
+    };
+    write().map_err(|e| ManagerError::EnvError(format!("could not write {}: {e}", path.display())))?;
+    Ok(PendingTrust { trust: crate::provision::Trust::Bundle(path.clone()), path: Some(path) })
+}
+
 /// The recorded certificates as a rebuild cache-key fragment, derived from the
 /// materialized corp bundle. Empty when no cert bundle is configured, so it does
 /// not perturb the key for environments without one.
@@ -379,6 +414,24 @@ pub fn prepare_for_env(
 
 #[cfg(test)]
 mod tests {
+
+    /// PROV-9: before an environment exists, its downloads trust the named
+    /// bundle plus the public roots, from a private file that goes when done.
+    #[test]
+    fn a_pending_trust_is_a_private_host_bundle_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("corp.pem");
+        fs::write(&src, sample_bundle()).unwrap();
+        let pending = pending_trust(Some(&src.to_string_lossy())).unwrap();
+        let crate::provision::Trust::Bundle(path) = pending.trust.clone() else { panic!("no bundle") };
+        let body = fs::read(&path).unwrap();
+        assert!(body.ends_with(cert::public_roots_pem()));
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        drop(pending);
+        assert!(!path.exists());
+        assert!(pending_trust(Some("/nonexistent.pem")).is_err());
+    }
     use super::*;
 
     /// A real, valid multi-certificate PEM bundle (the vendored public roots).

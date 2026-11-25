@@ -773,8 +773,15 @@ pub fn install_locked(
 /// failure here is phase 2 of the impurity gate (a package conda cannot provide).
 pub fn lock(env_dir: &Path, pixi_bin: &Path, ssl_cert_file: Option<&Path>) -> Result<()> {
     let manifest = env_dir.join("pixi.toml");
-    let mut cmd = Command::new(pixi_bin);
-    cmd.arg("lock").arg("--manifest-path").arg(&manifest).stdin(Stdio::null());
+    // RUN-4: through the shared builder, which strips a caller's active conda.
+    let mut cmd = crate::sandbox::command(
+        None,
+        pixi_bin,
+        &[OsString::from("lock"), OsString::from("--manifest-path"), manifest.into()],
+        None,
+        None,
+    );
+    cmd.stdin(Stdio::null());
     apply_cert_env(&mut cmd, ssl_cert_file);
     let status = cmd
         .status()
