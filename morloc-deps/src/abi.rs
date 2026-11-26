@@ -264,6 +264,17 @@ pub fn undeclared_shim_runtimes(
         .collect()
 }
 
+/// The morloc languages (py, r) whose interpreter the prefix described by
+/// `meta_dir` holds, and so whose binding a rebuild must produce.
+pub fn prefix_shim_langs(meta_dir: &Path) -> Vec<String> {
+    let versions = abi_versions(meta_dir);
+    ABI_PACKAGES
+        .iter()
+        .filter(|(pkg, _)| versions.contains_key(*pkg))
+        .map(|(_, lang)| lang.to_string())
+        .collect()
+}
+
 /// The shim-marker filename `morloc init` writes for a morloc language code
 /// (the compiler's `DF.lsName`). `rust` has no langSetup shim (its marshaller is
 /// a cargo build), so it maps to nothing.
@@ -726,6 +737,18 @@ mod tests {
         // The unsuffixed symlink the Makefile leaves is not a binding.
         std::fs::write(tmp.path().join("opt/pymorloc"), "").unwrap();
         assert_eq!(python_shim_minor(tmp.path()), None);
+    }
+
+    #[test]
+    fn a_rebuild_must_produce_the_bindings_of_the_interpreters_the_prefix_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = tmp.path().join("conda-meta");
+        write_meta(&meta, "gcc", "14.1");
+        assert!(prefix_shim_langs(&meta).is_empty());
+        write_meta(&meta, "python", "3.13.2");
+        assert_eq!(prefix_shim_langs(&meta), vec!["py".to_string()]);
+        write_meta(&meta, "r-base", "4.4.1");
+        assert_eq!(prefix_shim_langs(&meta), vec!["py".to_string(), "r".to_string()]);
     }
 
     #[test]

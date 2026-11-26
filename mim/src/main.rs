@@ -4508,6 +4508,30 @@ fn run_native_morloc_init(
     Ok(())
 }
 
+/// IFC-10: the compiler's `morloc init --check` report for a native
+/// environment, run in init's sandbox, with its activation and home.
+fn native_bindings_check(
+    morloc_bin: &std::path::Path,
+    env_dir: &std::path::Path,
+    activation: &[(String, String)],
+    fhs_wrapper: Option<&str>,
+) -> Result<String> {
+    let args: Vec<std::ffi::OsString> = vec!["init".into(), "--check".into()];
+    let mut cmd = native_command(fhs_wrapper, morloc_bin, &args, env_dir, activation_path(activation));
+    apply_activation(&mut cmd, activation);
+    cmd.env("MORLOC_HOME", env_dir);
+    let out = cmd
+        .output()
+        .map_err(|e| ManagerError::EnvError(format!("could not run morloc init --check: {e}")))?;
+    if !out.status.success() {
+        return Err(ManagerError::EnvError(format!(
+            "morloc init --check failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 fn native_init_command(
     morloc_bin: &std::path::Path,
     env_dir: &std::path::Path,
@@ -4829,7 +4853,37 @@ fn adopt_pulled_runtimes(
 /// materialize can succeed and still leave a python program to fail at start-up
 /// with "No module named pymorloc"; this turns that into the rebuild's failure,
 /// with the init output above it saying why.
-fn check_runtime_bindings(name: &str, home: &std::path::Path, pixi_dir: &std::path::Path) -> Result<()> {
+///
+/// IFC-10: `report` is the compiler's own `morloc init --check` output, when
+/// the compiler offers it; then it alone decides, for the languages whose
+/// interpreter the prefix holds.
+fn check_runtime_bindings(
+    name: &str,
+    home: &std::path::Path,
+    pixi_dir: &std::path::Path,
+    report: Option<&str>,
+) -> Result<()> {
+    let parsed = report.and_then(|text| match envagent::parse_bindings_report(text) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            eprintln!("Warning: {e}; checking the bindings without the compiler");
+            None
+        }
+    });
+    if let Some(parsed) = parsed {
+        let langs = morloc_deps::abi::prefix_shim_langs(&morloc_deps::abi::meta_dir(pixi_dir));
+        let problems = parsed.problems(&langs);
+        if problems.is_empty() {
+            return Ok(());
+        }
+        return Err(ManagerError::EnvError(format!(
+            "environment '{name}' was rebuilt, but morloc reports its runtime or language \
+             bindings are not current:\n  {}\nThe `morloc init` output above says what \
+             happened to the build. The runtime is at {}.",
+            problems.join("\n  "),
+            home.display()
+        )));
+    }
     let defects = morloc_deps::abi::shim_defects(home, &morloc_deps::abi::meta_dir(pixi_dir));
     if defects.is_empty() {
         return Ok(());
@@ -5017,7 +5071,23 @@ fn materialize_native_env(
         fhs_wrapper.as_ref().map(|p| p.to_string_lossy()).as_deref(),
         verbose,
     )?;
-    check_runtime_bindings(name, &env_dir, &pixi_dir)?;
+    let report = if req.support.bindings_check >= 1 {
+        match native_bindings_check(
+            &req.morloc_bin,
+            &env_dir,
+            &activation,
+            fhs_wrapper.as_ref().map(|p| p.to_string_lossy()).as_deref(),
+        ) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!("Warning: {e}; checking the bindings without the compiler");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    check_runtime_bindings(name, &env_dir, &pixi_dir, report.as_deref())?;
 
     // Pin the interpreter minors the shims were just built against (see
     // record_abi_lock_or_warn). The env's pixi dir is the EnvContext default.
@@ -7895,8 +7965,26 @@ fn build_requirement_derived_image(
     // (as the host UID via keep-id), writing into the host-mounted /env and
     // MORLOC_HOME -- prefix-correct because solved at their final runtime paths.
     eprintln!("Materializing the environment (pixi install + morloc init) in a container...");
-    materialize_container_env(target, &image_tag, &env_dir, true)?;
-    check_runtime_bindings(name, &home_host, &pixi_host)?;
+    let asks = req.support.bindings_check >= 1;
+    materialize_container_env(target, &image_tag, &env_dir, true, asks)?;
+    let report = if asks {
+        let file = env_dir.join(BINDINGS_CHECK_FILE);
+        let text = std::fs::read_to_string(&file);
+        let _ = std::fs::remove_file(&file);
+        match text {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!(
+                    "Warning: cannot read the binding check {}: {e}; checking the bindings without the compiler",
+                    file.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    check_runtime_bindings(name, &home_host, &pixi_host, report.as_deref())?;
 
     // Pin the interpreter minors the shims were just built against, read from the
     // now-solved conda prefix under the env's (host-mounted) pixi dir.
@@ -8278,6 +8366,10 @@ mv "{pixi_dir}/{mirror}.new" "{pixi_dir}/{mirror}"
     )
 }
 
+/// Where the container materialize writes the compiler's `morloc init --check`
+/// report, relative to the environment's data dir (mounted as its state).
+const BINDINGS_CHECK_FILE: &str = ".bindings-check.json";
+
 /// Solve the pixi env + build the morloc runtime shims INSIDE a container,
 /// writing into the host-mounted `/env` and MORLOC_HOME. Runs as the host UID
 /// (keep-id via `container_run`), so the results are host-owned and writable by
@@ -8287,6 +8379,7 @@ fn materialize_container_env(
     image: &str,
     env_dir: &std::path::Path,
     build_runtime: bool,
+    check_bindings: bool,
 ) -> Result<()> {
     let engine = target.engine;
     let v_data_dir = env_dir.to_string_lossy().to_string();
@@ -8308,6 +8401,12 @@ fn materialize_container_env(
             "\nexport {}=1\nmorloc init -f\n",
             envagent::ENV_STRICT_CONDA
         ));
+        if check_bindings {
+            script.push_str(&format!(
+                "morloc init --check > {state}/{BINDINGS_CHECK_FILE} || rm -f {state}/{BINDINGS_CHECK_FILE}\n",
+                state = serve::CONTAINER_MORLOC_STATE
+            ));
+        }
     }
     let (bind_mounts, volumes) = base_mounts(&v_data_dir);
     let cfg = crate::container::RunConfig {
@@ -8526,7 +8625,7 @@ fn build_dev_container_image(
     // idempotent; the marker is written only on success so a failure is never skipped.
     if !up_to_date {
         eprintln!("Provisioning the dev environment (pixi install)...");
-        materialize_container_env(target, &image_tag, &env_dir, false)?;
+        materialize_container_env(target, &image_tag, &env_dir, false, false)?;
         record_abi_lock_or_warn(&env_dir, name, stdlib_version, &support);
         let _ = std::fs::write(&marker, &img_key);
     }
