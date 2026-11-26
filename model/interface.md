@@ -126,7 +126,7 @@ required), `MORLOC_ENV_STORE` (the environment's store, required; DEP-11),
 ### IFC-10 The compiler says whether its runtime and bindings are current
 Intent: ruled 2026-11-26
 Code: conforms 2026-11-26
-Tests: a_compiler_is_asked_only_when_it_offers_the_check_and_is_named, the_compilers_report_is_read_as_written, a_stale_binding_is_rebuilt_once_and_checked_again, current_bindings_run_no_init, a_binding_still_stale_after_init_is_an_error_naming_it, a_runtime_that_does_not_match_is_refused_without_rebuilding, a_binding_that_cannot_be_built_is_refused_without_rebuilding, a_compiler_that_cannot_answer_falls_back, an_immutable_environment_refuses_by_the_bindings_state, a_rebuild_is_judged_on_the_prefixs_languages_only, only_the_programs_languages_are_judged, a_program_with_no_bound_languages_asks_nothing, the_unactivated_check_leaves_the_ambient_path_alone, a_rebuild_must_produce_the_bindings_of_the_interpreters_the_prefix_holds
+Tests: a_compiler_is_asked_only_when_it_offers_the_check_and_is_named, the_compilers_report_is_read_as_written, a_stale_binding_is_rebuilt_once_and_checked_again, current_bindings_run_no_init, a_binding_still_stale_after_init_is_an_error_naming_it, a_runtime_that_does_not_match_is_refused_without_rebuilding, a_binding_that_cannot_be_built_is_refused_without_rebuilding, a_compiler_that_cannot_answer_falls_back, an_immutable_environment_refuses_by_the_bindings_state, a_rebuild_is_judged_on_the_prefixs_languages_only, only_the_programs_languages_are_judged, a_program_with_no_bound_languages_asks_nothing, the_rust_binding_is_asked_about_too, the_unactivated_check_leaves_the_ambient_path_alone, a_rebuild_must_produce_the_bindings_of_the_interpreters_the_prefix_holds
 
 A compiler whose `lang-support` carries `bindings_check` >= 1 answers
 `morloc init --check [--lang L]...` (compiler spec SHIM-2): one JSON object
@@ -137,7 +137,8 @@ compiler never, and deletes them never.
 
 - The build hook asks the compiler named by `MORLOC_BIN`, run as a build
   runs (scrubbed, the activation applied, `MORLOC_HOME` set, the hook
-  unset), for the program's languages that have a binding. A runtime that
+  unset), for the program's languages that have a binding (py, r, cpp,
+  and rust, which has no marker of mim's own). A runtime that
   is not ok is refused with `mim update --reinit`; it is never rebuilt from
   the hook. `absent` and `stale` bindings are rebuilt by one incremental
   init, after which the compiler is asked again and anything still not ok

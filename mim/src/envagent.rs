@@ -351,11 +351,12 @@ fn bindings_authority(support: &LangSupport, var: impl Fn(&str) -> Option<String
     var("MORLOC_BIN").filter(|v| !v.is_empty())
 }
 
-/// The languages of a program's pools that have a binding (py, r, cpp).
+/// The languages of a program's pools that have a binding the compiler
+/// reports on (py, r, cpp and, from the compiler, rust).
 fn shim_langs(es: &EnvSpec) -> Vec<String> {
     es.languages
         .iter()
-        .filter(|l| abi::shim_marker_name(&l.lang).is_some())
+        .filter(|l| abi::shim_marker_name(&l.lang).is_some() || l.lang == "rust")
         .map(|l| l.lang.clone())
         .collect()
 }
@@ -891,6 +892,15 @@ mod tests {
         assert_eq!(report.problems(&["r".to_string()]).len(), 1);
         assert_eq!(report.problems(&["cpp".to_string()]), vec!["cpp: not reported".to_string()]);
         assert_eq!(parse_bindings_report(TORN).unwrap().problems(&[]).len(), 1);
+    }
+
+    #[test]
+    fn the_rust_binding_is_asked_about_too() {
+        let es = EnvSpec::from_json(
+            r#"{"envspec_version":2,"morloc_version":"0","languages":[{"lang":"py"},{"lang":"rust"},{"lang":"julia"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(shim_langs(&es), vec!["py".to_string(), "rust".to_string()]);
     }
 
     #[test]
