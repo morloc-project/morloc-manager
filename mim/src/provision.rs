@@ -115,10 +115,10 @@ impl MorlocVersions {
     }
 }
 
-/// The native-install manifest attached to a release.
+/// The native-install manifest attached to a release, of the one schema
+/// `from_json` accepts.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReleaseManifest {
-    pub schema: u32,
     pub version: String,
     pub runtime_src: String,
     /// The contract/ABI versions this release emits (see `MorlocVersions`).
