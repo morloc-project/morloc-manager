@@ -82,7 +82,7 @@ Code: conforms 2026-11-15
 
 `morloc-release-manifest.json`, published with each release, holds a
 `schema` integer, the release `version`, the name of the runtime source
-archive (`rust_src`), the compiler's contract `versions` (as printed by
+archive (`runtime_src`, unpacking to `runtime/`), the compiler's contract `versions` (as printed by
 `morloc versions`: `morloc_version`, `abi_version`, `envspec_version`,
 `lang_support_schema`), a `triples` map from platform (`linux-x86_64`,
 ...) to that platform's assets (the compiler under `morloc`), and the
@@ -122,3 +122,42 @@ required), `MORLOC_ENV_STORE` (the environment's store, required; DEP-11),
 (the solver project, default `<store>/pixi`) and `MORLOC_IMMUTABLE`
 (non-empty and not `0` marks the environment immutable; DEP-10).
 `MORLOC_STATE` never chooses the store.
+
+### IFC-10 The compiler says whether its runtime and bindings are current
+Intent: ruled 2026-11-26
+Code: conforms 2026-11-26
+Tests: a_compiler_is_asked_only_when_it_offers_the_check_and_is_named, the_compilers_report_is_read_as_written, a_stale_binding_is_rebuilt_once_and_checked_again, current_bindings_run_no_init, a_binding_still_stale_after_init_is_an_error_naming_it, a_runtime_that_does_not_match_is_refused_without_rebuilding, a_binding_that_cannot_be_built_is_refused_without_rebuilding, a_compiler_that_cannot_answer_falls_back, an_immutable_environment_refuses_by_the_bindings_state, a_rebuild_is_judged_on_the_prefixs_languages_only, only_the_programs_languages_are_judged, a_program_with_no_bound_languages_asks_nothing, the_rust_binding_is_asked_about_too, the_unactivated_check_leaves_the_ambient_path_alone, a_rebuild_must_produce_the_bindings_of_the_interpreters_the_prefix_holds
+
+A compiler whose `lang-support` carries `bindings_check` >= 1 answers
+`morloc init --check [--lang L]...` (compiler spec SHIM-2): one JSON object
+on stdout, exit 0, with `runtime.ok` (and a `reason`) and, per language, a
+`state` of `ok`, `absent`, `stale`, `unavailable` or `outside-prefix`. It
+builds and writes nothing. mim reads the language markers of such a
+compiler never, and deletes them never.
+
+- The build hook asks the compiler named by `MORLOC_BIN`, run as a build
+  runs (scrubbed, the activation applied, `MORLOC_HOME` set, the hook
+  unset), for the program's languages that have a binding (py, r, cpp,
+  and rust, which has no marker of mim's own). A runtime that
+  is not ok is refused with `mim update --reinit`; it is never rebuilt from
+  the hook. `absent` and `stale` bindings are rebuilt by one incremental
+  init, after which the compiler is asked again and anything still not ok
+  is an error naming it; `unavailable` and `outside-prefix` are errors.
+- In an immutable environment the hook asks before the solve, with the
+  ambient environment unscrubbed (the image's own interpreters), and
+  refuses a binding that is not ok: `absent` with `mim modify --lang`,
+  anything else with `mim update --reinit`.
+- After a rebuild, a native environment asks as init ran; a container
+  writes the report to the data dir's `.bindings-check.json`. Only the
+  languages whose interpreter the prefix holds are judged.
+- Only the program's languages (or, after a rebuild, the prefix's) are
+  judged; one the report leaves out is not current. A program with no
+  bound language asks nothing.
+- A compiler without `bindings_check`, or one whose check fails or prints
+  no report, is handled as before: markers by existence, the interpreter
+  checks of `abi::shim_defects`, and marker deletion to force a rebuild.
+  `mim clean` keeps deleting a dropped language's marker, since that
+  fallback reads markers.
+Why: the user chose the compiler as the one authority (2026-11-26), after
+F119 showed two readers of an unspecified marker drifting apart.
+

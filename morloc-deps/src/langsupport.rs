@@ -95,6 +95,10 @@ pub struct LangSupport {
     /// Per-language entries, keyed by canonical short name (py/r/cpp/rust).
     #[serde(default)]
     pub languages: BTreeMap<String, LangEntry>,
+    /// IFC-10: the version of `morloc init --check` this compiler offers; 0
+    /// (absent) for a compiler without it.
+    #[serde(default)]
+    pub bindings_check: u32,
 }
 
 impl LangSupport {
@@ -181,6 +185,7 @@ impl LangSupport {
             dev_apt: core.dev_apt,
             dev_conda: core.dev_conda,
             languages,
+            bindings_check: 0,
         })
     }
 
@@ -265,7 +270,7 @@ mod tests {
         assert!(older.contains("newer morloc release") && !older.contains("upgrade mim"), "{older}");
     }
 
-    /// Parse the actual repo `data/lang/*.yaml` (three levels up from this crate).
+    /// Parse the actual repo `binders/*.yaml` (three levels up from this crate).
     /// This is the conformance guard: the Rust `from_source_dir` must agree with
     /// the Haskell `renderLangSupport` on the same inputs -- so it asserts the
     /// version->constraint DTO mapping, the dev-apt list, and language parsing

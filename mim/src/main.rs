@@ -21,6 +21,7 @@ mod provision;
 mod runner;
 mod selinux;
 mod serve;
+mod shellinit;
 mod types;
 
 // The dependency-resolution kernel (envspec/pixi/constraint/langsupport) lives in
@@ -171,7 +172,7 @@ environment; pass `--wizard` to be prompted for each one instead.")]
         #[arg(long, help_heading = "Advanced")]
         dev: Option<String>,
         /// Adopt a locally-built morloc runtime instead of a release. DIR must
-        /// contain a `morloc` binary and a `rust/` workspace source.
+        /// contain a `morloc` binary and a `runtime/` workspace source.
         #[arg(long = "local-runtime", value_name = "DIR", help_heading = "Advanced",
               conflicts_with_all = ["morloc_version", "dev"])]
         local_runtime: Option<String>,
@@ -4508,6 +4509,30 @@ fn run_native_morloc_init(
     Ok(())
 }
 
+/// IFC-10: the compiler's `morloc init --check` report for a native
+/// environment, run in init's sandbox, with its activation and home.
+fn native_bindings_check(
+    morloc_bin: &std::path::Path,
+    env_dir: &std::path::Path,
+    activation: &[(String, String)],
+    fhs_wrapper: Option<&str>,
+) -> Result<String> {
+    let args: Vec<std::ffi::OsString> = vec!["init".into(), "--check".into()];
+    let mut cmd = native_command(fhs_wrapper, morloc_bin, &args, env_dir, activation_path(activation));
+    apply_activation(&mut cmd, activation);
+    cmd.env("MORLOC_HOME", env_dir);
+    let out = cmd
+        .output()
+        .map_err(|e| ManagerError::EnvError(format!("could not run morloc init --check: {e}")))?;
+    if !out.status.success() {
+        return Err(ManagerError::EnvError(format!(
+            "morloc init --check failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 fn native_init_command(
     morloc_bin: &std::path::Path,
     env_dir: &std::path::Path,
@@ -4532,7 +4557,7 @@ fn native_init_command(
     cmd.env(envagent::ENV_STRICT_CONDA, "1");
     // init builds libmorloc.so + morloc-nexus from source with the env toolchain;
     // point it at the Rust workspace bundled in the provisioned runtime.
-    cmd.env("MORLOC_RUST_DIR", provision::runtime_rust_src(runtime_dir));
+    cmd.env("MORLOC_RUNTIME_DIR", provision::runtime_src_dir(runtime_dir));
     // PROV-5: link nothing into the user's own bin directory; the env's bin/
     // is on PATH in every run.
     cmd.env("MORLOC_BIN_LINK_DIR", "");
@@ -4650,6 +4675,16 @@ fn stage_lang_installs(
     Ok(names)
 }
 
+/// Stage the editor syntax files the generated Dockerfile COPYs.
+fn stage_editor_files(context: &std::path::Path) -> Result<()> {
+    shellinit::stage_editor_files(context).map_err(|e| {
+        ManagerError::EnvError(format!(
+            "cannot stage editor files into {}: {e}",
+            context.display()
+        ))
+    })
+}
+
 /// A cache-key fragment for the staged install scripts: their names AND contents,
 /// so adding/removing a script-language OR editing its install.sh rebuilds the
 /// image (the generated Dockerfile only names the scripts, it does not embed them).
@@ -4667,8 +4702,8 @@ fn lang_installs_key_fragment(langs: &[(String, String)]) -> String {
 /// container: render + lock + build an image). The requirement set is the
 /// backend-neutral IR; the pixi manifest is rendered from it at the point of use.
 struct ResolvedRequirements {
-    /// The downloaded runtime store (`runtimes/<version>/<triple>/`); its `rust/` subdir
-    /// is `morloc init`'s MORLOC_RUST_DIR.
+    /// The downloaded runtime store (`runtimes/<version>/<triple>/`); its `runtime/` subdir
+    /// is `morloc init`'s MORLOC_RUNTIME_DIR.
     runtime_dir: std::path::PathBuf,
     /// The concrete morloc version provisioned.
     version: String,
@@ -4708,7 +4743,7 @@ fn resolve_env_requirements(
     base_image: &str,
 ) -> Result<ResolvedRequirements> {
     let (runtime_dir, version, morloc_bin, support) = if let Some(local) = local_runtime {
-        // Local-runtime env: adopt the developer-assembled `{ morloc, rust/ }` dir
+        // Local-runtime env: adopt the developer-assembled `{ morloc, runtime/ }` dir
         // in place of a downloaded release -- no manifest fetch, no download, no
         // contract-version gate (the local binary supplies the lang-support schema
         // directly, and libmorloc is built from the local source, so it is coherent
@@ -4829,7 +4864,37 @@ fn adopt_pulled_runtimes(
 /// materialize can succeed and still leave a python program to fail at start-up
 /// with "No module named pymorloc"; this turns that into the rebuild's failure,
 /// with the init output above it saying why.
-fn check_runtime_bindings(name: &str, home: &std::path::Path, pixi_dir: &std::path::Path) -> Result<()> {
+///
+/// IFC-10: `report` is the compiler's own `morloc init --check` output, when
+/// the compiler offers it; then it alone decides, for the languages whose
+/// interpreter the prefix holds.
+fn check_runtime_bindings(
+    name: &str,
+    home: &std::path::Path,
+    pixi_dir: &std::path::Path,
+    report: Option<&str>,
+) -> Result<()> {
+    let parsed = report.and_then(|text| match envagent::parse_bindings_report(text) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            eprintln!("Warning: {e}; checking the bindings without the compiler");
+            None
+        }
+    });
+    if let Some(parsed) = parsed {
+        let langs = morloc_deps::abi::prefix_shim_langs(&morloc_deps::abi::meta_dir(pixi_dir));
+        let problems = parsed.problems(&langs);
+        if problems.is_empty() {
+            return Ok(());
+        }
+        return Err(ManagerError::EnvError(format!(
+            "environment '{name}' was rebuilt, but morloc reports its runtime or language \
+             bindings are not current:\n  {}\nThe `morloc init` output above says what \
+             happened to the build. The runtime is at {}.",
+            problems.join("\n  "),
+            home.display()
+        )));
+    }
     let defects = morloc_deps::abi::shim_defects(home, &morloc_deps::abi::meta_dir(pixi_dir));
     if defects.is_empty() {
         return Ok(());
@@ -5017,7 +5082,23 @@ fn materialize_native_env(
         fhs_wrapper.as_ref().map(|p| p.to_string_lossy()).as_deref(),
         verbose,
     )?;
-    check_runtime_bindings(name, &env_dir, &pixi_dir)?;
+    let report = if req.support.bindings_check >= 1 {
+        match native_bindings_check(
+            &req.morloc_bin,
+            &env_dir,
+            &activation,
+            fhs_wrapper.as_ref().map(|p| p.to_string_lossy()).as_deref(),
+        ) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!("Warning: {e}; checking the bindings without the compiler");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    check_runtime_bindings(name, &env_dir, &pixi_dir, report.as_deref())?;
 
     // Pin the interpreter minors the shims were just built against (see
     // record_abi_lock_or_warn). The env's pixi dir is the EnvContext default.
@@ -6070,7 +6151,7 @@ fn resolve_dev_source(raw: &str) -> std::result::Result<std::path::PathBuf, Stri
 }
 
 /// Resolve, validate, and canonicalize a `--local-runtime` directory: a
-/// developer-assembled runtime store of a `morloc` binary and a `rust/`
+/// developer-assembled runtime store of a `morloc` binary and a `runtime/`
 /// workspace source (typically both symlinks into a working tree), adopted in
 /// place of a downloaded release. Mirrors `resolve_dev_source`: the path is
 /// persisted as a String and re-read live on later operations, so a non-UTF-8
@@ -6089,16 +6170,16 @@ fn resolve_local_runtime(raw: &str) -> std::result::Result<std::path::PathBuf, S
         return Err(format!(
             "--local-runtime dir {} has no `morloc` binary (expected {}). Assemble the \
              dir with a `morloc` symlink to your built compiler and a `rust` symlink to \
-             the compiler's data/rust workspace.",
+             the compiler's runtime workspace.",
             abs.display(),
             morloc_bin.display()
         ));
     }
-    let cargo = provision::runtime_rust_src(&abs).join("Cargo.toml");
+    let cargo = provision::runtime_src_dir(&abs).join("Cargo.toml");
     if !cargo.is_file() {
         return Err(format!(
             "--local-runtime dir {} has no rust workspace (expected {}). Symlink `rust` \
-             to the compiler's data/rust directory.",
+             to the compiler's runtime directory.",
             abs.display(),
             cargo.display()
         ));
@@ -6325,7 +6406,7 @@ fn interactive_choose_dev() -> prompt::Result<Option<String>> {
         if choice.is_empty() {
             return Ok(None);
         }
-        // resolve_dev_source validates the tree (stack.yaml, data/lang/*, ...).
+        // resolve_dev_source validates the tree (stack.yaml, binders/*, ...).
         match resolve_dev_source(choice) {
             Ok(abs) => {
                 eprintln!("  Valid morloc source tree: {}", abs.display());
@@ -7799,9 +7880,10 @@ fn build_requirement_derived_image(
     let persisted_build_flags =
         cfg::read_flag_config(scope, name)?.materialize(Phase::Build, engine);
     let key = format!(
-        "{}{}{}{}base:{base_image}\narch:{arch}\nmim-agent: {}\n",
+        "{}{}{}{}{}base:{base_image}\narch:{arch}\nmim-agent: {}\n",
         cache_key(&pixi::requirement_digest(&req.requirements), &req.morloc_bin, system_packages),
         lang_installs_key_fragment(&req.lang_installs),
+        shellinit::editor_key_fragment(),
         cert::cache_fragment_for_env(scope, name),
         build_flags_key_fragment(&persisted_build_flags),
         provision::agent_identity(arch.release_triple())?,
@@ -7853,6 +7935,7 @@ fn build_requirement_derived_image(
     // `provision_runtime` used above).
     provision::stage_runtime(&trust, scope, arch.release_triple(), &req.runtime_dir, &context.join("runtime"))?;
     let lang_install_names = stage_lang_installs(&context, &req.lang_installs)?;
+    stage_editor_files(&context)?;
     // Stage the corp CA into the build context (COPY-ed into the image and
     // trusted before any network build step).
     let cert_file = cert::stage_into_context(scope, name, &context)?;
@@ -7895,8 +7978,26 @@ fn build_requirement_derived_image(
     // (as the host UID via keep-id), writing into the host-mounted /env and
     // MORLOC_HOME -- prefix-correct because solved at their final runtime paths.
     eprintln!("Materializing the environment (pixi install + morloc init) in a container...");
-    materialize_container_env(target, &image_tag, &env_dir, true)?;
-    check_runtime_bindings(name, &home_host, &pixi_host)?;
+    let asks = req.support.bindings_check >= 1;
+    materialize_container_env(target, &image_tag, &env_dir, true, asks)?;
+    let report = if asks {
+        let file = env_dir.join(BINDINGS_CHECK_FILE);
+        let text = std::fs::read_to_string(&file);
+        let _ = std::fs::remove_file(&file);
+        match text {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!(
+                    "Warning: cannot read the binding check {}: {e}; checking the bindings without the compiler",
+                    file.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    check_runtime_bindings(name, &home_host, &pixi_host, report.as_deref())?;
 
     // Pin the interpreter minors the shims were just built against, read from the
     // now-solved conda prefix under the env's (host-mounted) pixi dir.
@@ -8278,6 +8379,10 @@ mv "{pixi_dir}/{mirror}.new" "{pixi_dir}/{mirror}"
     )
 }
 
+/// Where the container materialize writes the compiler's `morloc init --check`
+/// report, relative to the environment's data dir (mounted as its state).
+const BINDINGS_CHECK_FILE: &str = ".bindings-check.json";
+
 /// Solve the pixi env + build the morloc runtime shims INSIDE a container,
 /// writing into the host-mounted `/env` and MORLOC_HOME. Runs as the host UID
 /// (keep-id via `container_run`), so the results are host-owned and writable by
@@ -8287,6 +8392,7 @@ fn materialize_container_env(
     image: &str,
     env_dir: &std::path::Path,
     build_runtime: bool,
+    check_bindings: bool,
 ) -> Result<()> {
     let engine = target.engine;
     let v_data_dir = env_dir.to_string_lossy().to_string();
@@ -8308,6 +8414,12 @@ fn materialize_container_env(
             "\nexport {}=1\nmorloc init -f\n",
             envagent::ENV_STRICT_CONDA
         ));
+        if check_bindings {
+            script.push_str(&format!(
+                "morloc init --check > {state}/{BINDINGS_CHECK_FILE} || rm -f {state}/{BINDINGS_CHECK_FILE}\n",
+                state = serve::CONTAINER_MORLOC_STATE
+            ));
+        }
     }
     let (bind_mounts, volumes) = base_mounts(&v_data_dir);
     let cfg = crate::container::RunConfig {
@@ -8461,8 +8573,9 @@ fn build_dev_container_image(
     let persisted_build_flags =
         cfg::read_flag_config(scope, name)?.materialize(Phase::Build, engine);
     let image_inputs = format!(
-        "{df_text}{}{}{}",
+        "{df_text}{}{}{}{}",
         lang_installs_key_fragment(&script_langs),
+        shellinit::editor_key_fragment(),
         cert::cache_fragment_for_env(scope, name),
         build_flags_key_fragment(&persisted_build_flags),
     );
@@ -8499,6 +8612,7 @@ fn build_dev_container_image(
             ManagerError::EnvError(format!("cannot write {}: {e}", df_path.display()))
         })?;
         stage_lang_installs(&context, &script_langs)?;
+        stage_editor_files(&context)?;
         // Copy the corp CA into the context so the Dockerfile's COPY resolves.
         cert::stage_into_context(scope, name, &context)?;
 
@@ -8526,7 +8640,7 @@ fn build_dev_container_image(
     // idempotent; the marker is written only on success so a failure is never skipped.
     if !up_to_date {
         eprintln!("Provisioning the dev environment (pixi install)...");
-        materialize_container_env(target, &image_tag, &env_dir, false)?;
+        materialize_container_env(target, &image_tag, &env_dir, false, false)?;
         record_abi_lock_or_warn(&env_dir, name, stdlib_version, &support);
         let _ = std::fs::write(&marker, &img_key);
     }
@@ -8578,8 +8692,14 @@ fn apply_dotfiles(
 /// the user's `~/.bashrc` and never collides with it.
 const SHELLRC_NAME: &str = ".morloc-shellrc";
 
+/// Filename, next to the rcfile, of the default bash startup file that runs when
+/// the shell's home has no `~/.bashrc`. Written fresh each launch from
+/// [`shellinit::default_bashrc`].
+const DEFAULT_BASHRC_NAME: &str = ".morloc-bashrc";
+
 /// Body of the per-launch bash rcfile for `env_name`. It first sources the
-/// standard bash init (so the user's dotfiles fully apply), then installs a
+/// standard bash init (so the user's dotfiles fully apply; with no `~/.bashrc`
+/// the default startup file next to the rcfile runs instead), then installs a
 /// `PROMPT_COMMAND` hook that prepends a bold-orange `(<env>)` tag to `PS1`.
 /// The hook (rather than a one-shot `PS1=` prepend) is what keeps the tag
 /// visible when the user's own prompt is regenerated on every render by a
@@ -8597,10 +8717,16 @@ fn shell_rcfile_body(env_name: &str) -> String {
     // forms so an existing user hook is preserved and still runs first.
     let template = r#"# mim: interactive shell for environment '__ENV__'.
 # Generated per launch -- NOT your ~/.bashrc. Sources the standard bash init so
-# your dotfiles apply, then installs a PROMPT_COMMAND hook that tags PS1.
+# your dotfiles apply (without a ~/.bashrc, mim's default next to this file),
+# then installs a PROMPT_COMMAND hook that tags PS1.
 __MORLOC_CAPTURE__
+MIM_ENV_NAME='__ENV__'
 if [ -r /etc/bash.bashrc ]; then . /etc/bash.bashrc; fi
-if [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
+if [ -r "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+elif [ -r "${BASH_SOURCE[0]%/*}/__DEFAULT__" ]; then
+  . "${BASH_SOURCE[0]%/*}/__DEFAULT__"
+fi
 __MORLOC_CHECK__
 __morloc_prompt_tag() {
   case "$PS1" in
@@ -8619,6 +8745,7 @@ unset _morloc_pc
     template
         .replace("__MORLOC_CAPTURE__", SHELL_PREFIX_CAPTURE)
         .replace("__MORLOC_CHECK__", SHELL_PREFIX_CHECK)
+        .replace("__DEFAULT__", DEFAULT_BASHRC_NAME)
         .replace("__ENV__", env_name)
 }
 
@@ -8643,9 +8770,15 @@ const SHELL_PREFIX_CHECK: &str = r#"if [ -n "$_morloc_prefix" ]; then
 fi
 unset _morloc_prefix"#;
 
-/// Write the prompt-tagging rcfile into `dir`, returning its path. Best-effort:
-/// on failure the shell just launches without the env tag.
-fn write_shell_rcfile(dir: &std::path::Path, env_name: &str) -> Option<std::path::PathBuf> {
+/// Write the prompt-tagging rcfile and the default startup file `bashrc` into
+/// `dir`, returning the rcfile's path. Best-effort: on failure the shell just
+/// launches without the env tag.
+fn write_shell_rcfile(
+    dir: &std::path::Path,
+    env_name: &str,
+    bashrc: &str,
+) -> Option<std::path::PathBuf> {
+    std::fs::write(dir.join(DEFAULT_BASHRC_NAME), bashrc).ok()?;
     let path = dir.join(SHELLRC_NAME);
     std::fs::write(&path, shell_rcfile_body(env_name)).ok()?;
     Some(path)
@@ -8715,7 +8848,12 @@ fn shell_prompt_setup(
         .file_name()
         .and_then(|s| s.to_str());
     let wired = match shell {
-        Some("bash") => write_shell_rcfile(dir, env_name).map(|rc| {
+        Some("bash") => write_shell_rcfile(
+            dir,
+            env_name,
+            &shellinit::default_bashrc(&cfg::config_dir(Scope::Local)),
+        )
+        .map(|rc| {
             (
                 vec!["--rcfile".to_string(), rc.to_string_lossy().into_owned()],
                 Vec::new(),
@@ -9941,7 +10079,7 @@ fn check_work_dir(cwd: &std::path::Path) -> Result<()> {
 /// (`<env>/dev-bin`) maps to the PATH slot the image expects
 /// (`CONTAINER_RUNTIME_BIN`). The morloc source tree itself is NOT mounted: the
 /// developer works from the host cwd (mounted at `CONTAINER_WORK`) and points
-/// `morloc init`/`make` at it via `MORLOC_RUST_DIR` themselves, so the shell is
+/// `morloc init`/`make` at it via `MORLOC_RUNTIME_DIR` themselves, so the shell is
 /// not tied to a fixed source location or a mandatory `cd`.
 fn dev_mounts(v_data_dir: &str) -> Vec<(String, String)> {
     vec![(
@@ -10097,9 +10235,9 @@ fn run_with_config(
     // compiler and stack/ghc link against (the dev image apt-installs those), which
     // would break `morloc`/`stack` invoked from the dev shell. A conda tool whose
     // own RUNPATH is broken is a packaging bug to pin/fix, not to paper over here.
-    // MORLOC_RUST_DIR is intentionally NOT set for a dev env: the source tree is
+    // MORLOC_RUNTIME_DIR is intentionally NOT set for a dev env: the source tree is
     // not mounted at a fixed path, so the developer points `morloc init`/`make`
-    // at their working copy (e.g. `MORLOC_RUST_DIR=$PWD/data/rust`) themselves.
+    // at their working copy (e.g. `MORLOC_RUNTIME_DIR=$PWD/runtime`) themselves.
     env_vars.extend(user_env.iter().cloned());
     let cmd = if shell {
         // The image ships bash; tag its prompt with the env name. The rcfile is
@@ -10107,7 +10245,8 @@ fn run_with_config(
         // CONTAINER_MORLOC_STATE, so bash reads it from that in-container path.
         // It sources the container's real bash init, so no image file is edited.
         let mut c = vec!["/bin/bash".to_string()];
-        if write_shell_rcfile(std::path::Path::new(v_data_dir), env_name).is_some() {
+        let bashrc = shellinit::default_bashrc(&cfg::config_dir(Scope::Local));
+        if write_shell_rcfile(std::path::Path::new(v_data_dir), env_name, &bashrc).is_some() {
             c.push("--rcfile".to_string());
             c.push(format!("{}/{}", serve::CONTAINER_MORLOC_STATE, SHELLRC_NAME));
         }
@@ -13443,8 +13582,8 @@ run:
         std::fs::write(root.join("morloc"), b"#!/bin/true\n").unwrap();
         assert!(resolve_local_runtime(root.to_str().unwrap()).is_err());
         // Add the rust workspace: accepted, and the path is canonicalized.
-        std::fs::create_dir_all(root.join("rust")).unwrap();
-        std::fs::write(root.join("rust").join("Cargo.toml"), b"[workspace]\n").unwrap();
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        std::fs::write(root.join("runtime").join("Cargo.toml"), b"[workspace]\n").unwrap();
         let resolved = resolve_local_runtime(root.to_str().unwrap()).unwrap();
         assert_eq!(resolved, std::fs::canonicalize(root).unwrap());
     }
@@ -14387,17 +14526,26 @@ run:
     /// is `bashrc`, starting from a prefix whose `bin` leads `PATH`; returns
     /// stderr.
     fn bash_startup_stderr(bashrc: &str) -> String {
+        bash_startup(Some(bashrc), "true").1
+    }
+
+    /// Start the generated rcfile as an interactive bash running `cmd`, with
+    /// `bashrc` as `~/.bashrc` (none when `None`) and the built-in default
+    /// startup file; returns (stdout, stderr).
+    fn bash_startup(bashrc: Option<&str>, cmd: &str) -> (String, String) {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(home.join(".bashrc"), bashrc).unwrap();
-        let rc = write_shell_rcfile(tmp.path(), "demo").unwrap();
+        if let Some(text) = bashrc {
+            std::fs::write(home.join(".bashrc"), text).unwrap();
+        }
+        let rc = write_shell_rcfile(tmp.path(), "demo", shellinit::DEFAULT_BASHRC).unwrap();
         let out = Command::new("bash")
             .arg("--rcfile")
             .arg(&rc)
             .arg("-i")
             .arg("-c")
-            .arg("true")
+            .arg(cmd)
             .env_clear()
             .env("HOME", &home)
             .env("CONDA_PREFIX", "/fake/prefix")
@@ -14405,7 +14553,25 @@ run:
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
-        String::from_utf8_lossy(&out.stderr).into_owned()
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn a_shell_without_a_bashrc_runs_the_default() {
+        let (out, err) = bash_startup(None, "printf 'PS1=%s\\n' \"$PS1\"; alias ls");
+        assert!(out.contains("morloc environment demo"), "{out}\n{err}");
+        assert!(out.contains("ls --color=auto"), "{out}\n{err}");
+        assert!(out.contains("PS1=") && out.contains("\\w"), "{out}\n{err}");
+    }
+
+    #[test]
+    fn a_users_bashrc_replaces_the_default() {
+        let (out, err) = bash_startup(Some("PS1='mine> '\n"), "printf 'PS1=%s\\n' \"$PS1\"");
+        assert!(!out.contains("morloc environment"), "{out}\n{err}");
+        assert!(out.contains("PS1=mine> "), "{out}\n{err}");
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub struct DockerfileInput<'a> {
     pub lang_installs: &'a [String],
     /// Dev environment: the compiler + Rust source are NOT baked in (they are
     /// built from a source tree at materialize time), so the
-    /// `COPY runtime/` step and the baked `MORLOC_RUST_DIR` are omitted;
+    /// `COPY runtime/` step and the baked `MORLOC_RUNTIME_DIR` are omitted;
     /// `CONTAINER_RUNTIME_BIN` becomes a mount target instead.
     pub dev: bool,
     /// Build-context-relative path to a corporate CA PEM (e.g. "certs/corp.pem"),
@@ -283,7 +283,7 @@ pub fn generate_slim_dockerfile(input: &SlimDockerfileInput) -> String {
             "COPY {cert_file} /usr/local/share/ca-certificates/morloc-corp.crt\n\n"
         ));
     }
-    out.push_str(&apt_block(input.extras, input.cert_file.is_some(), false));
+    out.push_str(&apt_block(input.extras, input.cert_file.is_some(), false, false));
     if input.cert_file.is_some() {
         out.push_str("# Trust the corporate CA across the toolchain\n");
         out.push_str("ENV");
@@ -381,14 +381,20 @@ fn escape_label(value: &str) -> String {
 /// build needs before a conda environment exists, the identity shim, and the
 /// container-only system packages. Shared by the environment image and the
 /// slim deployment image, which starts from the same base and needs the same
-/// system packages under the programs it carries.
-fn apt_block(extras: &BuildExtras, cert: bool, dev: bool) -> String {
+/// system packages under the programs it carries. `editors` adds the editors an
+/// interactive environment shell offers; the slim image has no shell user.
+fn apt_block(extras: &BuildExtras, cert: bool, dev: bool, editors: bool) -> String {
     let mut out = String::new();
     out.push_str("# Base tools + build-extras (system packages conda cannot provide)\n");
     out.push_str("RUN apt-get update \\\n");
     out.push_str(
         " && apt-get install -y --no-install-recommends ca-certificates curl libnss-wrapper",
     );
+    if editors {
+        for pkg in crate::shellinit::EDITOR_PACKAGES {
+            out.push_str(&format!(" {pkg}"));
+        }
+    }
     for pkg in &extras.system_packages {
         out.push_str(&format!(" {pkg}"));
     }
@@ -511,7 +517,12 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     // entry for the host UID under `--userns=keep-id` (which has no /etc/passwd
     // entry of its own). Its real .so path is arch-dependent, so symlink it to a
     // fixed location the entrypoint can reference.
-    out.push_str(&apt_block(input.extras, input.cert_file.is_some(), input.dev));
+    out.push_str(&apt_block(input.extras, input.cert_file.is_some(), input.dev, true));
+
+    // Morloc syntax highlighting for the editors above, staged into the build
+    // context by shellinit::stage_editor_files.
+    out.push_str("# Morloc syntax files for vim and nano\n");
+    out.push_str(&format!("COPY {}/ /\n\n", crate::shellinit::EDITOR_CONTEXT_DIR));
 
     // Point the CA env vars at the merged system bundle so later RUNs and runtime
     // processes trust the corporate CA. The bundle includes the public roots, so
@@ -551,7 +562,7 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     // conda-forge, so run the committed install.sh (staged into the build context)
     // against the base OS. Runs as root at build; the script does its own apt.
     for lang in input.lang_installs {
-        out.push_str(&format!("# {lang}: provisioned by data/lang/{lang}/install.sh\n"));
+        out.push_str(&format!("# {lang}: provisioned by binders/{lang}/install.sh\n"));
         out.push_str(&format!("COPY install-{lang}.sh /tmp/morloc-install-{lang}.sh\n"));
         out.push_str(&format!(
             "RUN bash /tmp/morloc-install-{lang}.sh && rm /tmp/morloc-install-{lang}.sh\n\n"
@@ -579,9 +590,9 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     // pools. The COPY destination is shared with the run-side PATH
     // (serve::container_path), so it comes from one constant, not a literal.
     //
-    // Dev envs skip the COPY + baked MORLOC_RUST_DIR: the developer builds the
+    // Dev envs skip the COPY + baked MORLOC_RUNTIME_DIR: the developer builds the
     // compiler from their own source checkout and installs it into
-    // CONTAINER_RUNTIME_BIN (a mount, not a baked layer), setting MORLOC_RUST_DIR
+    // CONTAINER_RUNTIME_BIN (a mount, not a baked layer), setting MORLOC_RUNTIME_DIR
     // to point at that checkout themselves. Only the PATH entry is kept here, so
     // the built compiler is found.
     let runtime_bin = crate::serve::CONTAINER_RUNTIME_BIN;
@@ -596,7 +607,7 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
         // source world-writable so that in-place write succeeds (target-dir and
         // CARGO_HOME already point at the writable state mount).
         out.push_str(&format!("RUN chmod -R a+rwX {runtime_bin}/rust\n"));
-        out.push_str(&format!("ENV MORLOC_RUST_DIR={runtime_bin}/rust\n"));
+        out.push_str(&format!("ENV MORLOC_RUNTIME_DIR={runtime_bin}/runtime\n"));
     }
     // Both variants put the compiler dir on PATH (baked COPY dest, or a mount).
     out.push_str(&format!("ENV PATH=\"{runtime_bin}:${{PATH}}\"\n"));
@@ -768,9 +779,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Base tools + build-extras (system packages conda cannot provide)
 RUN apt-get update \\
- && apt-get install -y --no-install-recommends ca-certificates curl libnss-wrapper libgl1 graphviz \\
+ && apt-get install -y --no-install-recommends ca-certificates curl libnss-wrapper vim nano libgl1 graphviz \\
  && ln -sf \"$(dpkg -L libnss-wrapper | grep -m1 '/libnss_wrapper\\.so$')\" /usr/local/lib/morloc-nss-wrapper.so \\
  && rm -rf /var/lib/apt/lists/*
+
+# Morloc syntax files for vim and nano
+COPY editor/ /
 
 # Env-owned home (symlink into the mounted state root)
 RUN mkdir -p /home && ln -sfn /opt/morloc-state/home /home/morloc
@@ -784,7 +798,7 @@ RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v0.76.2 bash \\
 # morloc compiler + rust source (from the build context)
 COPY runtime/ /opt/morloc-runtime/
 RUN chmod -R a+rwX /opt/morloc-runtime/rust
-ENV MORLOC_RUST_DIR=/opt/morloc-runtime/rust
+ENV MORLOC_RUNTIME_DIR=/opt/morloc-runtime/runtime
 ENV PATH=\"/opt/morloc-runtime:${PATH}\"
 
 # Mount points for the conda prefix + package cache volumes
@@ -910,6 +924,24 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         assert!(df.contains(&format!("COPY modules/ {state}/modules/")), "{df}");
         assert!(df.contains(&format!("ENV MORLOC_HOME={mh}")), "{df}");
         assert!(df.contains(&format!("ENV MORLOC_STATE={state}")), "{df}");
+    }
+
+    #[test]
+    fn the_slim_image_leaves_out_the_editors() {
+        let extras = BuildExtras::default();
+        let env = generate_dockerfile(&DockerfileInput {
+            base_image: "debian:bookworm-slim",
+            pixi_version: "0.76.2",
+            morloc_home: "/opt/morloc",
+            extras: &extras,
+            lang_installs: &[],
+            dev: false,
+            cert_file: None,
+        });
+        assert!(env.contains(" vim nano"), "{env}");
+        assert!(env.contains("COPY editor/ /"), "{env}");
+        let df = slim(&["morloc"], None, "debian:bookworm-slim");
+        assert!(!df.contains(" vim") && !df.contains("COPY editor/"), "{df}");
     }
 
     #[test]
@@ -1113,7 +1145,7 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
             cert_file: None,
         };
         let got = generate_dockerfile(&input);
-        assert!(got.contains("ca-certificates curl libnss-wrapper \\"));
+        assert!(got.contains("ca-certificates curl libnss-wrapper vim nano \\"));
         assert!(!got.contains("  \\")); // no dangling double space before continuation
     }
 
@@ -1154,7 +1186,7 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         let got = generate_dockerfile(&input);
         // Nothing is baked in: the compiler is built from a source tree.
         assert!(!got.contains("COPY runtime/"));
-        assert!(!got.contains("ENV MORLOC_RUST_DIR="));
+        assert!(!got.contains("ENV MORLOC_RUNTIME_DIR="));
         // But CONTAINER_RUNTIME_BIN (a mount target) is still on PATH.
         assert!(got.contains(&format!("ENV PATH=\"{}:", crate::serve::CONTAINER_RUNTIME_BIN)));
     }

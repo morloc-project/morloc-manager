@@ -294,3 +294,10 @@ with Docker Desktop for Linux it binds the VM's. Read, low confidence.
 PROV-4. A `.provisioned` stamp holding only a version predates the asset
 digests and is accepted as is, so a re-published release is detected only
 for entries provisioned since. Read.
+
+### F120 The legacy binding check misses R's minor and Python's ABI flags
+For a compiler without `bindings_check` (IFC-10), `abi::shim_defects`
+(morloc-deps/src/abi.rs) checks only that the R artifact exists, and
+`python_shim_minor` drops the free-threaded `t` from the cpython tag, so a
+cpython-313t binding passes against a regular 3.13. Compilers with the
+check are judged by the compiler.

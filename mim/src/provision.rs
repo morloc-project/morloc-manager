@@ -1,6 +1,6 @@
 //! Native-environment provisioning: fetch the version-matched morloc compiler
 //! and the rust sources from a GitHub release into `runtimes/<version>/<triple>/`, so
-//! `morloc init` (pointed at `<dir>/rust` via MORLOC_RUST_DIR) can build the
+//! `morloc init` (pointed at `<dir>/runtime` via MORLOC_RUNTIME_DIR) can build the
 //! runtime from source and set up a native environment with no container.
 //!
 //! Coherence: every piece is pulled from a SINGLE release tag, so they share a
@@ -115,12 +115,12 @@ impl MorlocVersions {
     }
 }
 
-/// The native-install manifest attached to a release.
+/// The native-install manifest attached to a release, of the one schema
+/// `from_json` accepts.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReleaseManifest {
-    pub schema: u32,
     pub version: String,
-    pub rust_src: String,
+    pub runtime_src: String,
     /// The contract/ABI versions this release emits (see `MorlocVersions`).
     pub versions: MorlocVersions,
     /// Release-triple ("linux-x86_64", ...) -> its prebuilt assets. Only triples
@@ -135,15 +135,27 @@ pub struct ReleaseManifest {
 
 impl ReleaseManifest {
     pub fn from_json(text: &str) -> Result<Self> {
-        let m: ReleaseManifest = serde_json::from_str(text)
-            .map_err(|e| ManagerError::EnvError(format!("Failed to parse {MANIFEST_ASSET}: {e}")))?;
-        if m.schema > MANIFEST_SCHEMA {
+        let parse_err = |e: serde_json::Error| ManagerError::EnvError(format!("Failed to parse {MANIFEST_ASSET}: {e}"));
+        #[derive(Deserialize)]
+        struct Header {
+            schema: u32,
+        }
+        // PROV-3: the schema is read before the fields it governs.
+        let schema = serde_json::from_str::<Header>(text).map_err(parse_err)?.schema;
+        if schema > MANIFEST_SCHEMA {
             return Err(ManagerError::EnvError(format!(
-                "{MANIFEST_ASSET} schema {} is newer than this mim supports \
-                 (up to {MANIFEST_SCHEMA}); upgrade mim.",
-                m.schema
+                "{MANIFEST_ASSET} schema {schema} is newer than this mim reads \
+                 ({MANIFEST_SCHEMA}); upgrade mim."
             )));
         }
+        if schema < MANIFEST_SCHEMA {
+            return Err(ManagerError::EnvError(format!(
+                "{MANIFEST_ASSET} schema {schema} is older than this mim reads \
+                 ({MANIFEST_SCHEMA}); pick a newer morloc release, or install this one \
+                 with an older mim."
+            )));
+        }
+        let m: ReleaseManifest = serde_json::from_str(text).map_err(parse_err)?;
         m.versions.check_supported()?;
         Ok(m)
     }
@@ -729,12 +741,12 @@ pub fn stage_mim_agent(src: &Path, runtime_bin_dir: &Path) -> Result<()> {
 }
 
 /// The Rust workspace source within a provisioned runtime store; this is
-/// `morloc init`'s MORLOC_RUST_DIR.
-pub fn runtime_rust_src(dir: &Path) -> PathBuf {
-    dir.join("rust")
+/// `morloc init`'s MORLOC_RUNTIME_DIR.
+pub fn runtime_src_dir(dir: &Path) -> PathBuf {
+    dir.join("runtime")
 }
 
-/// Extract a .tar.gz into `dest` (the rust-src tarball unpacks to `rust/`).
+/// Extract a .tar.gz into `dest` (the runtime-src tarball unpacks to `runtime/`).
 /// `--no-same-owner`: extracted files belong to the current user, not the uids
 /// recorded in the archive (restoring those fails for a non-root user, and for
 /// root inside a user namespace where the uid is unmapped).
@@ -767,8 +779,8 @@ fn stamp_text(manifest: &ReleaseManifest, assets: &TripleAssets) -> String {
         manifest.version,
         assets.morloc,
         digest(&assets.morloc),
-        manifest.rust_src,
-        digest(&manifest.rust_src)
+        manifest.runtime_src,
+        digest(&manifest.runtime_src)
     )
 }
 
@@ -794,7 +806,7 @@ pub fn fetch_manifest(trust: &Trust, tag: &str) -> Result<ReleaseManifest> {
 }
 
 /// Provision the runtime for `triple` into `runtimes/<version>/<triple>/` and
-/// return that directory (its `rust/` subdir is `morloc init`'s MORLOC_RUST_DIR). Downloads
+/// return that directory (its `runtime/` subdir is `morloc init`'s MORLOC_RUNTIME_DIR). Downloads
 /// the version-matched morloc compiler plus the rust sources; `morloc init`
 /// builds libmorloc.so, morloc-nexus, and rustmorloc locally from that source.
 /// The already-installed `mim` bootstrap is not re-fetched.
@@ -843,11 +855,11 @@ pub fn provision_runtime(
         download_asset(trust, &tag, &assets.morloc, &morloc_dest, &manifest.sha256)?;
         make_executable(&morloc_dest)?;
 
-        // Wipe any stale rust/ from an interrupted prior extraction so a
+        // Wipe any stale runtime/ from an interrupted prior extraction so a
         // re-provision never mixes old and new files.
-        let src_tar = dir.join(&manifest.rust_src);
-        download_asset(trust, &tag, &manifest.rust_src, &src_tar, &manifest.sha256)?;
-        let _ = std::fs::remove_dir_all(runtime_rust_src(&dir));
+        let src_tar = dir.join(&manifest.runtime_src);
+        download_asset(trust, &tag, &manifest.runtime_src, &src_tar, &manifest.sha256)?;
+        let _ = std::fs::remove_dir_all(runtime_src_dir(&dir));
         extract_tar_gz(&src_tar, &dir)?;
         let _ = std::fs::remove_file(&src_tar);
 
@@ -1086,14 +1098,14 @@ pub fn stage_runtime(trust: &Trust, scope: Scope, triple: &str, src: &Path, dest
     // triples match and downloads the matching release binary otherwise.
     let agent = mim_for_triple(trust, scope, triple)?;
     stage_mim_agent(&agent, dest)?;
-    let rust = runtime_rust_src(src);
+    let rust = runtime_src_dir(src);
     if !rust.is_dir() {
         return Err(ManagerError::EnvError(format!(
             "provisioned runtime is missing the rust source at {}",
             rust.display()
         )));
     }
-    copy_dir_excluding(&rust, &runtime_rust_src(dest), &["target"], false)?;
+    copy_dir_excluding(&rust, &runtime_src_dir(dest), &["target"], false)?;
     Ok(())
 }
 
@@ -1261,9 +1273,9 @@ mod tests {
     }
 
     const SAMPLE: &str = r#"{
-      "schema": 1,
+      "schema": 2,
       "version": "0.98.3",
-      "rust_src": "morloc-rust-src.tar.gz",
+      "runtime_src": "morloc-runtime-src.tar.gz",
       "versions": {
         "morloc_version": "0.98.3",
         "abi_version": 1,
@@ -1277,7 +1289,7 @@ mod tests {
       },
       "sha256": {
         "morloc-linux-x86_64": "aa",
-        "morloc-rust-src.tar.gz": "cc"
+        "morloc-runtime-src.tar.gz": "cc"
       }
     }"#;
 
@@ -1317,7 +1329,7 @@ mod tests {
     fn parses_manifest() {
         let m = ReleaseManifest::from_json(SAMPLE).unwrap();
         assert_eq!(m.version, "0.98.3");
-        assert_eq!(m.rust_src, "morloc-rust-src.tar.gz");
+        assert_eq!(m.runtime_src, "morloc-runtime-src.tar.gz");
         let a = m.assets_for("linux-x86_64").unwrap();
         assert_eq!(a.morloc, "morloc-linux-x86_64");
         assert_eq!(m.versions.envspec_version, 2);
@@ -1326,9 +1338,23 @@ mod tests {
         assert!(m.assets_for("macos-arm64").is_none());
     }
 
+    /// PROV-3: a manifest schema other than this mim's is refused by name,
+    /// with the direction of the fix, before its fields are read.
+    #[test]
+    fn a_manifest_schema_other_than_this_mims_is_refused() {
+        let older = r#"{"schema":1,"version":"0.112.0","rust_src":"morloc-rust-src.tar.gz",
+          "versions":{"morloc_version":"0.112.0","abi_version":1,"envspec_version":2,"lang_support_schema":"1.0"},
+          "triples":{},"sha256":{}}"#;
+        let e = ReleaseManifest::from_json(older).unwrap_err().to_string();
+        assert!(e.contains("schema 1 is older") && e.contains("newer morloc release"), "{e}");
+        let newer = r#"{"schema":3}"#;
+        let e = ReleaseManifest::from_json(newer).unwrap_err().to_string();
+        assert!(e.contains("schema 3 is newer") && e.contains("upgrade mim"), "{e}");
+    }
+
     #[test]
     fn rejects_future_schema() {
-        let j = r#"{"schema":999,"version":"9.9.9","rust_src":"x",
+        let j = r#"{"schema":999,"version":"9.9.9","runtime_src":"x",
           "versions":{"morloc_version":"9","abi_version":1,"envspec_version":2,"lang_support_schema":"1.0"},
           "triples":{},"sha256":{}}"#;
         assert!(ReleaseManifest::from_json(j).is_err());
@@ -1338,12 +1364,12 @@ mod tests {
     fn rejects_incompatible_contract_versions() {
         // A release whose envspec_version exceeds what this mim supports is refused
         // at manifest-parse (install) time with an actionable message.
-        let j = r#"{"schema":1,"version":"9.9.9","rust_src":"x",
+        let j = r#"{"schema":2,"version":"9.9.9","runtime_src":"x",
           "versions":{"morloc_version":"9","abi_version":1,"envspec_version":4,"lang_support_schema":"1.0"},
           "triples":{},"sha256":{}}"#;
         assert!(ReleaseManifest::from_json(j).is_err());
         // A newer lang-support MAJOR is likewise refused.
-        let k = r#"{"schema":1,"version":"9.9.9","rust_src":"x",
+        let k = r#"{"schema":2,"version":"9.9.9","runtime_src":"x",
           "versions":{"morloc_version":"9","abi_version":1,"envspec_version":2,"lang_support_schema":"2.0"},
           "triples":{},"sha256":{}}"#;
         assert!(ReleaseManifest::from_json(k).is_err());
@@ -1434,7 +1460,7 @@ mod tests {
     fn manifest_requires_sha256() {
         let vers = r#""versions":{"morloc_version":"1","abi_version":1,"envspec_version":2,"lang_support_schema":"1.0"}"#;
         let j = format!(
-            r#"{{"schema":1,"version":"1.0.0","rust_src":"r",{vers},"triples":{{}},
+            r#"{{"schema":2,"version":"1.0.0","runtime_src":"r",{vers},"triples":{{}},
           "sha256":{{"morloc-linux-x86_64":"abc123"}}}}"#
         );
         let m = ReleaseManifest::from_json(&j).unwrap();
@@ -1445,7 +1471,7 @@ mod tests {
         // The digest map is mandatory: a manifest omitting it is refused rather
         // than silently installing unverified downloads.
         let no_digests =
-            format!(r#"{{"schema":1,"version":"1.0.0","rust_src":"r",{vers},"triples":{{}}}}"#);
+            format!(r#"{{"schema":2,"version":"1.0.0","runtime_src":"r",{vers},"triples":{{}}}}"#);
         assert!(ReleaseManifest::from_json(&no_digests).is_err());
     }
 
