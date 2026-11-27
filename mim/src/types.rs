@@ -313,7 +313,7 @@ pub struct DevConfig {
 }
 
 /// Local-runtime configuration. Its PRESENCE marks an environment that adopts a
-/// developer-assembled runtime directory (`{ morloc, rust/ }`) in place of a
+/// developer-assembled runtime directory (`{ morloc, runtime/ }`) in place of a
 /// downloaded release (`EnvironmentConfig::is_local_runtime`): the manager
 /// substitutes `source` for the `runtimes/<version>/` store it would otherwise
 /// provision, so mim itself can be tested against a locally-built compiler
@@ -325,7 +325,7 @@ pub struct DevConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalRuntimeConfig {
     /// Canonical host path to the runtime directory containing a `morloc` binary
-    /// and a `rust/` workspace source (typically both symlinks into the
+    /// and a `runtime/` workspace source (typically both symlinks into the
     /// developer's working tree). Re-read live on every `modify`/`update`.
     pub source: String,
 }

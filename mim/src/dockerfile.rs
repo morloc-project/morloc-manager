@@ -39,7 +39,7 @@ pub struct DockerfileInput<'a> {
     pub lang_installs: &'a [String],
     /// Dev environment: the compiler + Rust source are NOT baked in (they are
     /// built from a source tree at materialize time), so the
-    /// `COPY runtime/` step and the baked `MORLOC_RUST_DIR` are omitted;
+    /// `COPY runtime/` step and the baked `MORLOC_RUNTIME_DIR` are omitted;
     /// `CONTAINER_RUNTIME_BIN` becomes a mount target instead.
     pub dev: bool,
     /// Build-context-relative path to a corporate CA PEM (e.g. "certs/corp.pem"),
@@ -562,7 +562,7 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     // conda-forge, so run the committed install.sh (staged into the build context)
     // against the base OS. Runs as root at build; the script does its own apt.
     for lang in input.lang_installs {
-        out.push_str(&format!("# {lang}: provisioned by data/lang/{lang}/install.sh\n"));
+        out.push_str(&format!("# {lang}: provisioned by binders/{lang}/install.sh\n"));
         out.push_str(&format!("COPY install-{lang}.sh /tmp/morloc-install-{lang}.sh\n"));
         out.push_str(&format!(
             "RUN bash /tmp/morloc-install-{lang}.sh && rm /tmp/morloc-install-{lang}.sh\n\n"
@@ -590,9 +590,9 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     // pools. The COPY destination is shared with the run-side PATH
     // (serve::container_path), so it comes from one constant, not a literal.
     //
-    // Dev envs skip the COPY + baked MORLOC_RUST_DIR: the developer builds the
+    // Dev envs skip the COPY + baked MORLOC_RUNTIME_DIR: the developer builds the
     // compiler from their own source checkout and installs it into
-    // CONTAINER_RUNTIME_BIN (a mount, not a baked layer), setting MORLOC_RUST_DIR
+    // CONTAINER_RUNTIME_BIN (a mount, not a baked layer), setting MORLOC_RUNTIME_DIR
     // to point at that checkout themselves. Only the PATH entry is kept here, so
     // the built compiler is found.
     let runtime_bin = crate::serve::CONTAINER_RUNTIME_BIN;
@@ -607,7 +607,7 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
         // source world-writable so that in-place write succeeds (target-dir and
         // CARGO_HOME already point at the writable state mount).
         out.push_str(&format!("RUN chmod -R a+rwX {runtime_bin}/rust\n"));
-        out.push_str(&format!("ENV MORLOC_RUST_DIR={runtime_bin}/rust\n"));
+        out.push_str(&format!("ENV MORLOC_RUNTIME_DIR={runtime_bin}/runtime\n"));
     }
     // Both variants put the compiler dir on PATH (baked COPY dest, or a mount).
     out.push_str(&format!("ENV PATH=\"{runtime_bin}:${{PATH}}\"\n"));
@@ -798,7 +798,7 @@ RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v0.76.2 bash \\
 # morloc compiler + rust source (from the build context)
 COPY runtime/ /opt/morloc-runtime/
 RUN chmod -R a+rwX /opt/morloc-runtime/rust
-ENV MORLOC_RUST_DIR=/opt/morloc-runtime/rust
+ENV MORLOC_RUNTIME_DIR=/opt/morloc-runtime/runtime
 ENV PATH=\"/opt/morloc-runtime:${PATH}\"
 
 # Mount points for the conda prefix + package cache volumes
@@ -1186,7 +1186,7 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         let got = generate_dockerfile(&input);
         // Nothing is baked in: the compiler is built from a source tree.
         assert!(!got.contains("COPY runtime/"));
-        assert!(!got.contains("ENV MORLOC_RUST_DIR="));
+        assert!(!got.contains("ENV MORLOC_RUNTIME_DIR="));
         // But CONTAINER_RUNTIME_BIN (a mount target) is still on PATH.
         assert!(got.contains(&format!("ENV PATH=\"{}:", crate::serve::CONTAINER_RUNTIME_BIN)));
     }

@@ -524,7 +524,7 @@ fn language_artifacts(lang: &str) -> Vec<(&'static str, bool)> {
         ],
         // The R binding is a single shared lib (no `lib/R` dir).
         "r" => vec![("lib/librmorloc.so", false)],
-        // Rust readiness = the workspace source (MORLOC_RUST_DIR); the rlibs are
+        // Rust readiness = the workspace source (MORLOC_RUNTIME_DIR); the rlibs are
         // compiled on demand, not prebuilt.
         "rust" => vec![("rust", true)],
         _ => vec![],

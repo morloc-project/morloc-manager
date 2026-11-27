@@ -784,7 +784,7 @@ fn links_leaving(dir: &Path, root: &Path) -> Result<Vec<PathBuf>> {
 /// them: the C/C++ headers (with a precompiled header that is most of the
 /// runtime's weight) and the Rust source libmorloc and the nexus were built
 /// from. A slim image leaves them out.
-const RUNTIME_BUILD_INPUTS: [&str; 2] = ["include", "rust"];
+const RUNTIME_BUILD_INPUTS: [&str; 2] = ["include", "runtime"];
 
 /// Stage `runtime/` without its build inputs. The exclusion is by top-level
 /// name only: a directory called `include` deeper in the tree is a binding's
@@ -1611,7 +1611,7 @@ mod tests {
             "runtime/lib/libmorloc.so",
             "runtime/opt/pymorloc/include/x.h",
             "runtime/include/morloc.h",
-            "runtime/rust/Cargo.toml",
+            "runtime/runtime/Cargo.toml",
         ] {
             let p = root.path().join(rel);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();

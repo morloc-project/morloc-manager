@@ -270,7 +270,7 @@ mod tests {
         assert!(older.contains("newer morloc release") && !older.contains("upgrade mim"), "{older}");
     }
 
-    /// Parse the actual repo `data/lang/*.yaml` (three levels up from this crate).
+    /// Parse the actual repo `binders/*.yaml` (three levels up from this crate).
     /// This is the conformance guard: the Rust `from_source_dir` must agree with
     /// the Haskell `renderLangSupport` on the same inputs -- so it asserts the
     /// version->constraint DTO mapping, the dev-apt list, and language parsing

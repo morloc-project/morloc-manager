@@ -29,9 +29,9 @@ pub fn lang_schema_version() -> String {
     format!("{LANG_SCHEMA_MAJOR}.{LANG_SCHEMA_MINOR}")
 }
 
-/// `morloc-release-manifest.json` `schema` (integer): the highest manifest schema
-/// this build understands.
-pub const MANIFEST_SCHEMA: u32 = 1;
+/// `morloc-release-manifest.json` `schema` (integer): the one manifest schema
+/// this build reads (IFC-6).
+pub const MANIFEST_SCHEMA: u32 = 2;
 
 /// The morloc C ABI version this build expects. Not checked: libmorloc is built
 /// from the compiler's own source at `morloc init`, so a runtime is

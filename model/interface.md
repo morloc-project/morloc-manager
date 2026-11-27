@@ -82,7 +82,7 @@ Code: conforms 2026-11-15
 
 `morloc-release-manifest.json`, published with each release, holds a
 `schema` integer, the release `version`, the name of the runtime source
-archive (`rust_src`), the compiler's contract `versions` (as printed by
+archive (`runtime_src`, unpacking to `runtime/`), the compiler's contract `versions` (as printed by
 `morloc versions`: `morloc_version`, `abi_version`, `envspec_version`,
 `lang_support_schema`), a `triples` map from platform (`linux-x86_64`,
 ...) to that platform's assets (the compiler under `morloc`), and the

@@ -21,10 +21,10 @@ never a warning.
 ### PROV-3 A release whose contracts this mim cannot read is refused at once
 Intent: proposed
 Code: conforms 2026-10-09
-Tests: the_gate_refuses_every_contract_version_the_parsers_reject
+Tests: the_gate_refuses_every_contract_version_the_parsers_reject, a_manifest_schema_other_than_this_mims_is_refused
 
-Before anything is installed, each contract version in the release manifest
-is compared with what this mim reads. A version mim cannot read, newer or
+Before anything is installed, the manifest's own `schema` and each contract
+version in it are compared with what this mim reads. A version mim cannot read, newer or
 older, is refused with the direction of the fix (upgrade mim, or pick
 another release).
 

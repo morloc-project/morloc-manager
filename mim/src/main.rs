@@ -172,7 +172,7 @@ environment; pass `--wizard` to be prompted for each one instead.")]
         #[arg(long, help_heading = "Advanced")]
         dev: Option<String>,
         /// Adopt a locally-built morloc runtime instead of a release. DIR must
-        /// contain a `morloc` binary and a `rust/` workspace source.
+        /// contain a `morloc` binary and a `runtime/` workspace source.
         #[arg(long = "local-runtime", value_name = "DIR", help_heading = "Advanced",
               conflicts_with_all = ["morloc_version", "dev"])]
         local_runtime: Option<String>,
@@ -4557,7 +4557,7 @@ fn native_init_command(
     cmd.env(envagent::ENV_STRICT_CONDA, "1");
     // init builds libmorloc.so + morloc-nexus from source with the env toolchain;
     // point it at the Rust workspace bundled in the provisioned runtime.
-    cmd.env("MORLOC_RUST_DIR", provision::runtime_rust_src(runtime_dir));
+    cmd.env("MORLOC_RUNTIME_DIR", provision::runtime_src_dir(runtime_dir));
     // PROV-5: link nothing into the user's own bin directory; the env's bin/
     // is on PATH in every run.
     cmd.env("MORLOC_BIN_LINK_DIR", "");
@@ -4702,8 +4702,8 @@ fn lang_installs_key_fragment(langs: &[(String, String)]) -> String {
 /// container: render + lock + build an image). The requirement set is the
 /// backend-neutral IR; the pixi manifest is rendered from it at the point of use.
 struct ResolvedRequirements {
-    /// The downloaded runtime store (`runtimes/<version>/<triple>/`); its `rust/` subdir
-    /// is `morloc init`'s MORLOC_RUST_DIR.
+    /// The downloaded runtime store (`runtimes/<version>/<triple>/`); its `runtime/` subdir
+    /// is `morloc init`'s MORLOC_RUNTIME_DIR.
     runtime_dir: std::path::PathBuf,
     /// The concrete morloc version provisioned.
     version: String,
@@ -4743,7 +4743,7 @@ fn resolve_env_requirements(
     base_image: &str,
 ) -> Result<ResolvedRequirements> {
     let (runtime_dir, version, morloc_bin, support) = if let Some(local) = local_runtime {
-        // Local-runtime env: adopt the developer-assembled `{ morloc, rust/ }` dir
+        // Local-runtime env: adopt the developer-assembled `{ morloc, runtime/ }` dir
         // in place of a downloaded release -- no manifest fetch, no download, no
         // contract-version gate (the local binary supplies the lang-support schema
         // directly, and libmorloc is built from the local source, so it is coherent
@@ -6151,7 +6151,7 @@ fn resolve_dev_source(raw: &str) -> std::result::Result<std::path::PathBuf, Stri
 }
 
 /// Resolve, validate, and canonicalize a `--local-runtime` directory: a
-/// developer-assembled runtime store of a `morloc` binary and a `rust/`
+/// developer-assembled runtime store of a `morloc` binary and a `runtime/`
 /// workspace source (typically both symlinks into a working tree), adopted in
 /// place of a downloaded release. Mirrors `resolve_dev_source`: the path is
 /// persisted as a String and re-read live on later operations, so a non-UTF-8
@@ -6170,16 +6170,16 @@ fn resolve_local_runtime(raw: &str) -> std::result::Result<std::path::PathBuf, S
         return Err(format!(
             "--local-runtime dir {} has no `morloc` binary (expected {}). Assemble the \
              dir with a `morloc` symlink to your built compiler and a `rust` symlink to \
-             the compiler's data/rust workspace.",
+             the compiler's runtime workspace.",
             abs.display(),
             morloc_bin.display()
         ));
     }
-    let cargo = provision::runtime_rust_src(&abs).join("Cargo.toml");
+    let cargo = provision::runtime_src_dir(&abs).join("Cargo.toml");
     if !cargo.is_file() {
         return Err(format!(
             "--local-runtime dir {} has no rust workspace (expected {}). Symlink `rust` \
-             to the compiler's data/rust directory.",
+             to the compiler's runtime directory.",
             abs.display(),
             cargo.display()
         ));
@@ -6406,7 +6406,7 @@ fn interactive_choose_dev() -> prompt::Result<Option<String>> {
         if choice.is_empty() {
             return Ok(None);
         }
-        // resolve_dev_source validates the tree (stack.yaml, data/lang/*, ...).
+        // resolve_dev_source validates the tree (stack.yaml, binders/*, ...).
         match resolve_dev_source(choice) {
             Ok(abs) => {
                 eprintln!("  Valid morloc source tree: {}", abs.display());
@@ -10079,7 +10079,7 @@ fn check_work_dir(cwd: &std::path::Path) -> Result<()> {
 /// (`<env>/dev-bin`) maps to the PATH slot the image expects
 /// (`CONTAINER_RUNTIME_BIN`). The morloc source tree itself is NOT mounted: the
 /// developer works from the host cwd (mounted at `CONTAINER_WORK`) and points
-/// `morloc init`/`make` at it via `MORLOC_RUST_DIR` themselves, so the shell is
+/// `morloc init`/`make` at it via `MORLOC_RUNTIME_DIR` themselves, so the shell is
 /// not tied to a fixed source location or a mandatory `cd`.
 fn dev_mounts(v_data_dir: &str) -> Vec<(String, String)> {
     vec![(
@@ -10235,9 +10235,9 @@ fn run_with_config(
     // compiler and stack/ghc link against (the dev image apt-installs those), which
     // would break `morloc`/`stack` invoked from the dev shell. A conda tool whose
     // own RUNPATH is broken is a packaging bug to pin/fix, not to paper over here.
-    // MORLOC_RUST_DIR is intentionally NOT set for a dev env: the source tree is
+    // MORLOC_RUNTIME_DIR is intentionally NOT set for a dev env: the source tree is
     // not mounted at a fixed path, so the developer points `morloc init`/`make`
-    // at their working copy (e.g. `MORLOC_RUST_DIR=$PWD/data/rust`) themselves.
+    // at their working copy (e.g. `MORLOC_RUNTIME_DIR=$PWD/runtime`) themselves.
     env_vars.extend(user_env.iter().cloned());
     let cmd = if shell {
         // The image ships bash; tag its prompt with the env name. The rcfile is
@@ -13582,8 +13582,8 @@ run:
         std::fs::write(root.join("morloc"), b"#!/bin/true\n").unwrap();
         assert!(resolve_local_runtime(root.to_str().unwrap()).is_err());
         // Add the rust workspace: accepted, and the path is canonicalized.
-        std::fs::create_dir_all(root.join("rust")).unwrap();
-        std::fs::write(root.join("rust").join("Cargo.toml"), b"[workspace]\n").unwrap();
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        std::fs::write(root.join("runtime").join("Cargo.toml"), b"[workspace]\n").unwrap();
         let resolved = resolve_local_runtime(root.to_str().unwrap()).unwrap();
         assert_eq!(resolved, std::fs::canonicalize(root).unwrap());
     }

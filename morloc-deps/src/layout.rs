@@ -11,12 +11,12 @@ use std::path::{Path, PathBuf};
 
 /// Haskell compiler build config (presence marks a plausible morloc source).
 pub const STACK_YAML: &str = "stack.yaml";
-/// The Rust workspace, `morloc init`'s `MORLOC_RUST_DIR`.
-pub const RUST_DIR: &str = "data/rust";
+/// The runtime workspace, `morloc init`'s `MORLOC_RUNTIME_DIR`.
+pub const RUST_DIR: &str = "runtime";
 /// The core toolchain requirements (pixi `toolchain` + the dev-only `dev-apt`).
-pub const CORE_REQUIREMENTS: &str = "data/lang/requirements.yaml";
-/// Per-language requirements live at `data/lang/<lang>/requirements.yaml`.
-pub const LANG_DIR: &str = "data/lang";
+pub const CORE_REQUIREMENTS: &str = "binders/requirements.yaml";
+/// Per-language requirements live at `binders/<lang>/requirements.yaml`.
+pub const LANG_DIR: &str = "binders";
 
 /// The languages provisioned via conda (a per-language `requirements.yaml`),
 /// matching the compiler's `DataFiles.requirementsFiles`. Keep in lockstep.
