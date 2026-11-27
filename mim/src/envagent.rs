@@ -996,7 +996,7 @@ mod tests {
         .unwrap();
         assert_eq!(hook.ctx.env_home(), store.as_path());
         assert_eq!(hook.ctx.pixi_dir(), pixi);
-        assert_eq!(hook.foreign_state.as_deref(), Some(private.as_path()));
+        assert_eq!(hook.foreign_state, Some(private.canonicalize().unwrap()));
 
         // The environment's own state, spelled differently, is not foreign.
         let spelled = d.path().join("private/../env");
