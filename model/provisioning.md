@@ -87,3 +87,12 @@ recorded so drift is reported. A download that belongs to no environment
 honours the user's `CURL_CA_BUNDLE` or `SSL_CERT_FILE`; `demos` uses the
 default environment's bundle; an interactive `new` asks for the bundle
 before the version, whose check is a download.
+
+### PROV-10 An environment image carries editors that highlight morloc
+Intent: proposed
+Code: conforms 2026-11-27
+Tests: generates_expected_dockerfile, the_slim_image_leaves_out_the_editors, editor_files_are_staged_at_their_image_paths, editor_files_carry_both_morloc_syntaxes
+
+The environment image installs vim and nano with morloc syntax files at
+their system paths. The files' contents are an input of the image under
+PROV-7. A slim deployment image carries neither.

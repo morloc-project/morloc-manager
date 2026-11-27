@@ -1,0 +1,44 @@
+# Default bash startup file for `mim shell`.
+#
+# mim runs this file when the environment's home has no ~/.bashrc.
+# This copy lives at ~/.config/morloc/bashrc on the host. Edit it there and
+# every environment picks up the change at its next `mim shell`. Delete it
+# to get mim's built-in default back. To use your own startup file in a
+# container environment, give it a ~/.bashrc (mim new --dotfiles DIR).
+
+case $- in
+  *i*) ;;
+  *) return ;;
+esac
+
+HISTCONTROL=ignoreboth
+HISTSIZE=1000
+HISTFILESIZE=2000
+shopt -s histappend checkwinsize
+
+if command -v dircolors >/dev/null 2>&1; then
+  eval "$(dircolors -b)"
+fi
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
+alias fgrep='grep -F --color=auto'
+alias egrep='grep -E --color=auto'
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+
+if [ -r /usr/share/bash-completion/bash_completion ]; then
+  . /usr/share/bash-completion/bash_completion
+fi
+
+# mim adds the orange (environment) tag in front of this prompt.
+PS1='\[\033[1;34m\]\w\[\033[0m\] \$ '
+
+if [ -n "${MIM_ENV_NAME-}" ]; then
+  _mim_version="$(morloc --version 2>/dev/null)"
+  printf 'morloc environment %s%s\n' "$MIM_ENV_NAME" "${_mim_version:+ (morloc $_mim_version)}"
+  printf '  morloc -h    compiler help\n'
+  printf '  exit         leave the environment\n'
+  printf 'Docs: https://morloc-project.github.io/docs/\n\n'
+  unset _mim_version
+fi

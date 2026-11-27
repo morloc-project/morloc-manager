@@ -73,3 +73,15 @@ files; it warns when they moved `CONDA_PREFIX` or dropped the prefix's
 `bin` from `PATH`, and when the record names a compiler that is not a
 program in the prefix or came from a capture that ran the scripts twice;
 `update` then captures again even when the requirements are unchanged.
+
+### RUN-7 An interactive shell without a bashrc gets mim's default
+Intent: proposed
+Code: conforms 2026-11-27
+Tests: a_shell_without_a_bashrc_runs_the_default, a_users_bashrc_replaces_the_default, the_default_bashrc_is_seeded_for_editing, an_edited_default_bashrc_is_used
+
+A bash `shell` sources the system bash init, then the home's `~/.bashrc`
+when it has one and mim's default startup file otherwise. The default
+colors `ls` and `grep`, sets a short prompt behind the environment tag,
+and prints a greeting naming the environment and its morloc version. The
+user's copy of the default is `bashrc` in mim's config dir, written from
+the built-in on first use and read on every launch.

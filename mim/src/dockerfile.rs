@@ -283,7 +283,7 @@ pub fn generate_slim_dockerfile(input: &SlimDockerfileInput) -> String {
             "COPY {cert_file} /usr/local/share/ca-certificates/morloc-corp.crt\n\n"
         ));
     }
-    out.push_str(&apt_block(input.extras, input.cert_file.is_some(), false));
+    out.push_str(&apt_block(input.extras, input.cert_file.is_some(), false, false));
     if input.cert_file.is_some() {
         out.push_str("# Trust the corporate CA across the toolchain\n");
         out.push_str("ENV");
@@ -381,14 +381,20 @@ fn escape_label(value: &str) -> String {
 /// build needs before a conda environment exists, the identity shim, and the
 /// container-only system packages. Shared by the environment image and the
 /// slim deployment image, which starts from the same base and needs the same
-/// system packages under the programs it carries.
-fn apt_block(extras: &BuildExtras, cert: bool, dev: bool) -> String {
+/// system packages under the programs it carries. `editors` adds the editors an
+/// interactive environment shell offers; the slim image has no shell user.
+fn apt_block(extras: &BuildExtras, cert: bool, dev: bool, editors: bool) -> String {
     let mut out = String::new();
     out.push_str("# Base tools + build-extras (system packages conda cannot provide)\n");
     out.push_str("RUN apt-get update \\\n");
     out.push_str(
         " && apt-get install -y --no-install-recommends ca-certificates curl libnss-wrapper",
     );
+    if editors {
+        for pkg in crate::shellinit::EDITOR_PACKAGES {
+            out.push_str(&format!(" {pkg}"));
+        }
+    }
     for pkg in &extras.system_packages {
         out.push_str(&format!(" {pkg}"));
     }
@@ -511,7 +517,12 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
     // entry for the host UID under `--userns=keep-id` (which has no /etc/passwd
     // entry of its own). Its real .so path is arch-dependent, so symlink it to a
     // fixed location the entrypoint can reference.
-    out.push_str(&apt_block(input.extras, input.cert_file.is_some(), input.dev));
+    out.push_str(&apt_block(input.extras, input.cert_file.is_some(), input.dev, true));
+
+    // Morloc syntax highlighting for the editors above, staged into the build
+    // context by shellinit::stage_editor_files.
+    out.push_str("# Morloc syntax files for vim and nano\n");
+    out.push_str(&format!("COPY {}/ /\n\n", crate::shellinit::EDITOR_CONTEXT_DIR));
 
     // Point the CA env vars at the merged system bundle so later RUNs and runtime
     // processes trust the corporate CA. The bundle includes the public roots, so
@@ -768,9 +779,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Base tools + build-extras (system packages conda cannot provide)
 RUN apt-get update \\
- && apt-get install -y --no-install-recommends ca-certificates curl libnss-wrapper libgl1 graphviz \\
+ && apt-get install -y --no-install-recommends ca-certificates curl libnss-wrapper vim nano libgl1 graphviz \\
  && ln -sf \"$(dpkg -L libnss-wrapper | grep -m1 '/libnss_wrapper\\.so$')\" /usr/local/lib/morloc-nss-wrapper.so \\
  && rm -rf /var/lib/apt/lists/*
+
+# Morloc syntax files for vim and nano
+COPY editor/ /
 
 # Env-owned home (symlink into the mounted state root)
 RUN mkdir -p /home && ln -sfn /opt/morloc-state/home /home/morloc
@@ -910,6 +924,24 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         assert!(df.contains(&format!("COPY modules/ {state}/modules/")), "{df}");
         assert!(df.contains(&format!("ENV MORLOC_HOME={mh}")), "{df}");
         assert!(df.contains(&format!("ENV MORLOC_STATE={state}")), "{df}");
+    }
+
+    #[test]
+    fn the_slim_image_leaves_out_the_editors() {
+        let extras = BuildExtras::default();
+        let env = generate_dockerfile(&DockerfileInput {
+            base_image: "debian:bookworm-slim",
+            pixi_version: "0.76.2",
+            morloc_home: "/opt/morloc",
+            extras: &extras,
+            lang_installs: &[],
+            dev: false,
+            cert_file: None,
+        });
+        assert!(env.contains(" vim nano"), "{env}");
+        assert!(env.contains("COPY editor/ /"), "{env}");
+        let df = slim(&["morloc"], None, "debian:bookworm-slim");
+        assert!(!df.contains(" vim") && !df.contains("COPY editor/"), "{df}");
     }
 
     #[test]
@@ -1113,7 +1145,7 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
             cert_file: None,
         };
         let got = generate_dockerfile(&input);
-        assert!(got.contains("ca-certificates curl libnss-wrapper \\"));
+        assert!(got.contains("ca-certificates curl libnss-wrapper vim nano \\"));
         assert!(!got.contains("  \\")); // no dangling double space before continuation
     }
 

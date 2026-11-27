@@ -21,6 +21,7 @@ mod provision;
 mod runner;
 mod selinux;
 mod serve;
+mod shellinit;
 mod types;
 
 // The dependency-resolution kernel (envspec/pixi/constraint/langsupport) lives in
@@ -4674,6 +4675,16 @@ fn stage_lang_installs(
     Ok(names)
 }
 
+/// Stage the editor syntax files the generated Dockerfile COPYs.
+fn stage_editor_files(context: &std::path::Path) -> Result<()> {
+    shellinit::stage_editor_files(context).map_err(|e| {
+        ManagerError::EnvError(format!(
+            "cannot stage editor files into {}: {e}",
+            context.display()
+        ))
+    })
+}
+
 /// A cache-key fragment for the staged install scripts: their names AND contents,
 /// so adding/removing a script-language OR editing its install.sh rebuilds the
 /// image (the generated Dockerfile only names the scripts, it does not embed them).
@@ -7869,9 +7880,10 @@ fn build_requirement_derived_image(
     let persisted_build_flags =
         cfg::read_flag_config(scope, name)?.materialize(Phase::Build, engine);
     let key = format!(
-        "{}{}{}{}base:{base_image}\narch:{arch}\nmim-agent: {}\n",
+        "{}{}{}{}{}base:{base_image}\narch:{arch}\nmim-agent: {}\n",
         cache_key(&pixi::requirement_digest(&req.requirements), &req.morloc_bin, system_packages),
         lang_installs_key_fragment(&req.lang_installs),
+        shellinit::editor_key_fragment(),
         cert::cache_fragment_for_env(scope, name),
         build_flags_key_fragment(&persisted_build_flags),
         provision::agent_identity(arch.release_triple())?,
@@ -7923,6 +7935,7 @@ fn build_requirement_derived_image(
     // `provision_runtime` used above).
     provision::stage_runtime(&trust, scope, arch.release_triple(), &req.runtime_dir, &context.join("runtime"))?;
     let lang_install_names = stage_lang_installs(&context, &req.lang_installs)?;
+    stage_editor_files(&context)?;
     // Stage the corp CA into the build context (COPY-ed into the image and
     // trusted before any network build step).
     let cert_file = cert::stage_into_context(scope, name, &context)?;
@@ -8560,8 +8573,9 @@ fn build_dev_container_image(
     let persisted_build_flags =
         cfg::read_flag_config(scope, name)?.materialize(Phase::Build, engine);
     let image_inputs = format!(
-        "{df_text}{}{}{}",
+        "{df_text}{}{}{}{}",
         lang_installs_key_fragment(&script_langs),
+        shellinit::editor_key_fragment(),
         cert::cache_fragment_for_env(scope, name),
         build_flags_key_fragment(&persisted_build_flags),
     );
@@ -8598,6 +8612,7 @@ fn build_dev_container_image(
             ManagerError::EnvError(format!("cannot write {}: {e}", df_path.display()))
         })?;
         stage_lang_installs(&context, &script_langs)?;
+        stage_editor_files(&context)?;
         // Copy the corp CA into the context so the Dockerfile's COPY resolves.
         cert::stage_into_context(scope, name, &context)?;
 
@@ -8677,8 +8692,14 @@ fn apply_dotfiles(
 /// the user's `~/.bashrc` and never collides with it.
 const SHELLRC_NAME: &str = ".morloc-shellrc";
 
+/// Filename, next to the rcfile, of the default bash startup file that runs when
+/// the shell's home has no `~/.bashrc`. Written fresh each launch from
+/// [`shellinit::default_bashrc`].
+const DEFAULT_BASHRC_NAME: &str = ".morloc-bashrc";
+
 /// Body of the per-launch bash rcfile for `env_name`. It first sources the
-/// standard bash init (so the user's dotfiles fully apply), then installs a
+/// standard bash init (so the user's dotfiles fully apply; with no `~/.bashrc`
+/// the default startup file next to the rcfile runs instead), then installs a
 /// `PROMPT_COMMAND` hook that prepends a bold-orange `(<env>)` tag to `PS1`.
 /// The hook (rather than a one-shot `PS1=` prepend) is what keeps the tag
 /// visible when the user's own prompt is regenerated on every render by a
@@ -8696,10 +8717,16 @@ fn shell_rcfile_body(env_name: &str) -> String {
     // forms so an existing user hook is preserved and still runs first.
     let template = r#"# mim: interactive shell for environment '__ENV__'.
 # Generated per launch -- NOT your ~/.bashrc. Sources the standard bash init so
-# your dotfiles apply, then installs a PROMPT_COMMAND hook that tags PS1.
+# your dotfiles apply (without a ~/.bashrc, mim's default next to this file),
+# then installs a PROMPT_COMMAND hook that tags PS1.
 __MORLOC_CAPTURE__
+MIM_ENV_NAME='__ENV__'
 if [ -r /etc/bash.bashrc ]; then . /etc/bash.bashrc; fi
-if [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
+if [ -r "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+elif [ -r "${BASH_SOURCE[0]%/*}/__DEFAULT__" ]; then
+  . "${BASH_SOURCE[0]%/*}/__DEFAULT__"
+fi
 __MORLOC_CHECK__
 __morloc_prompt_tag() {
   case "$PS1" in
@@ -8718,6 +8745,7 @@ unset _morloc_pc
     template
         .replace("__MORLOC_CAPTURE__", SHELL_PREFIX_CAPTURE)
         .replace("__MORLOC_CHECK__", SHELL_PREFIX_CHECK)
+        .replace("__DEFAULT__", DEFAULT_BASHRC_NAME)
         .replace("__ENV__", env_name)
 }
 
@@ -8742,9 +8770,15 @@ const SHELL_PREFIX_CHECK: &str = r#"if [ -n "$_morloc_prefix" ]; then
 fi
 unset _morloc_prefix"#;
 
-/// Write the prompt-tagging rcfile into `dir`, returning its path. Best-effort:
-/// on failure the shell just launches without the env tag.
-fn write_shell_rcfile(dir: &std::path::Path, env_name: &str) -> Option<std::path::PathBuf> {
+/// Write the prompt-tagging rcfile and the default startup file `bashrc` into
+/// `dir`, returning the rcfile's path. Best-effort: on failure the shell just
+/// launches without the env tag.
+fn write_shell_rcfile(
+    dir: &std::path::Path,
+    env_name: &str,
+    bashrc: &str,
+) -> Option<std::path::PathBuf> {
+    std::fs::write(dir.join(DEFAULT_BASHRC_NAME), bashrc).ok()?;
     let path = dir.join(SHELLRC_NAME);
     std::fs::write(&path, shell_rcfile_body(env_name)).ok()?;
     Some(path)
@@ -8814,7 +8848,12 @@ fn shell_prompt_setup(
         .file_name()
         .and_then(|s| s.to_str());
     let wired = match shell {
-        Some("bash") => write_shell_rcfile(dir, env_name).map(|rc| {
+        Some("bash") => write_shell_rcfile(
+            dir,
+            env_name,
+            &shellinit::default_bashrc(&cfg::config_dir(Scope::Local)),
+        )
+        .map(|rc| {
             (
                 vec!["--rcfile".to_string(), rc.to_string_lossy().into_owned()],
                 Vec::new(),
@@ -10206,7 +10245,8 @@ fn run_with_config(
         // CONTAINER_MORLOC_STATE, so bash reads it from that in-container path.
         // It sources the container's real bash init, so no image file is edited.
         let mut c = vec!["/bin/bash".to_string()];
-        if write_shell_rcfile(std::path::Path::new(v_data_dir), env_name).is_some() {
+        let bashrc = shellinit::default_bashrc(&cfg::config_dir(Scope::Local));
+        if write_shell_rcfile(std::path::Path::new(v_data_dir), env_name, &bashrc).is_some() {
             c.push("--rcfile".to_string());
             c.push(format!("{}/{}", serve::CONTAINER_MORLOC_STATE, SHELLRC_NAME));
         }
@@ -14486,17 +14526,26 @@ run:
     /// is `bashrc`, starting from a prefix whose `bin` leads `PATH`; returns
     /// stderr.
     fn bash_startup_stderr(bashrc: &str) -> String {
+        bash_startup(Some(bashrc), "true").1
+    }
+
+    /// Start the generated rcfile as an interactive bash running `cmd`, with
+    /// `bashrc` as `~/.bashrc` (none when `None`) and the built-in default
+    /// startup file; returns (stdout, stderr).
+    fn bash_startup(bashrc: Option<&str>, cmd: &str) -> (String, String) {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(home.join(".bashrc"), bashrc).unwrap();
-        let rc = write_shell_rcfile(tmp.path(), "demo").unwrap();
+        if let Some(text) = bashrc {
+            std::fs::write(home.join(".bashrc"), text).unwrap();
+        }
+        let rc = write_shell_rcfile(tmp.path(), "demo", shellinit::DEFAULT_BASHRC).unwrap();
         let out = Command::new("bash")
             .arg("--rcfile")
             .arg(&rc)
             .arg("-i")
             .arg("-c")
-            .arg("true")
+            .arg(cmd)
             .env_clear()
             .env("HOME", &home)
             .env("CONDA_PREFIX", "/fake/prefix")
@@ -14504,7 +14553,25 @@ run:
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
-        String::from_utf8_lossy(&out.stderr).into_owned()
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn a_shell_without_a_bashrc_runs_the_default() {
+        let (out, err) = bash_startup(None, "printf 'PS1=%s\\n' \"$PS1\"; alias ls");
+        assert!(out.contains("morloc environment demo"), "{out}\n{err}");
+        assert!(out.contains("ls --color=auto"), "{out}\n{err}");
+        assert!(out.contains("PS1=") && out.contains("\\w"), "{out}\n{err}");
+    }
+
+    #[test]
+    fn a_users_bashrc_replaces_the_default() {
+        let (out, err) = bash_startup(Some("PS1='mine> '\n"), "printf 'PS1=%s\\n' \"$PS1\"");
+        assert!(!out.contains("morloc environment"), "{out}\n{err}");
+        assert!(out.contains("PS1=mine> "), "{out}\n{err}");
     }
 
     #[test]

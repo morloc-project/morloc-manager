@@ -1,0 +1,63 @@
+## morloc syntax highlighting for nano
+syntax morloc "\.loc$"
+comment "--"
+
+# capitalized names: types and constructors
+color green "\<[A-Z][A-Za-z0-9_]*\>"
+
+# effect annotations: <IO>, <IO, Error>
+color brightgreen "<[A-Z][A-Za-z0-9_]*(,[[:space:]]*[A-Z][A-Za-z0-9_]*)*>"
+
+# reserved keywords
+color yellow "\<(module|import|export|source|from|as|where)\>"
+color yellow "\<(type|newtype|data|record|object|deriving)\>"
+color yellow "\<(class|instance|effect|escapable)\>"
+color yellow "\<(infixl|infixr|infix)\>"
+color yellow "\<(match|let|in|do)\>"
+
+# reserved literal words
+color brightmagenta "\<(True|False|Null|Inf|NaN)\>"
+
+# numbers: int, float, scientific, hex, octal, binary
+color magenta "\<[0-9]+(\.[0-9]+)?([Ee][+-]?[0-9]+)?\>"
+color magenta "\<0([Xx][0-9A-Fa-f]+|[Oo][0-7]+|[Bb][01]+)\>"
+
+# intrinsics a program may write; an @ after a name is a label, not one
+color brightred "(^|[^]A-Za-z0-9_`")}>.])@(save|savej|load|read|datafile)\>"
+color brightred "(^|[^]A-Za-z0-9_`")}>.])@(show|hash|eq|le|schema|typeof)\>"
+color brightred "(^|[^]A-Za-z0-9_`")}>.])@(version|compiled|lang)\>"
+color brightred "(^|[^]A-Za-z0-9_`")}>.])@(open|close|fschema|flen|tell)\>"
+color brightred "(^|[^]A-Za-z0-9_`")}>.])@(stream|streamLayout|next|collect)\>"
+color brightred "(^|[^]A-Za-z0-9_`")}>.])@(write|append|concat|flush)\>"
+color brightred "(^|[^]A-Za-z0-9_`")}>.])@(stdin|stdout|stderr|throw|try)\>"
+
+# pragma
+color cyan "%inline\>"
+
+# strings
+color yellow ""([^"\\]|\\.)*""
+color yellow "`[^`]+`"
+color yellow start=""""" end="""""
+color yellow start="'''" end="'''"
+
+# escapes and #{...} interpolation
+color brightyellow "\\[nrtbfv0'"#\\]"
+color brightyellow "\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})"
+color brightred "#\{[^}]*\}"
+
+# comments and docstrings
+color lightblack "--.*"
+color blue "--'.*"
+color lightblack start="\{-" end="-\}"
+color brightyellow "(TODO|FIXME|NOTE):|XXX"
+
+# docstring directives the compiler accepts; anything else stays plain
+color brightcyan "--'[[:space:]]*@(name|many|stdin|unroll|default)([[:space:]]|$)"
+color brightcyan "--'[[:space:]]*@(metavar|arg|true|false|return)([[:space:]]|$)"
+color brightcyan "--'[[:space:]]*@(source|form|list\.source|list\.form)([[:space:]]|$)"
+color brightcyan "--'[[:space:]]*@(with|render|parse|mime|epilogue)([[:space:]]|$)"
+color brightcyan "--'[[:space:]]*@(check|list\.check)\.path([[:space:]]|$)"
+color brightcyan "--'[[:space:]]*@rsize([[:space:]]|$)"
+
+# repaint the docstring marker that the directive rules above colored
+color blue "--'"
