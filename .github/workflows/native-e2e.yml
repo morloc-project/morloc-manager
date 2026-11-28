@@ -56,9 +56,16 @@ jobs:
         env:
           SHELL: ${{ matrix.shell }}
         run: |
-          PATH=$(printf %s "$PATH" | tr ':' '\n' | grep -v '/\.cargo/bin' | paste -sd: -)
-          export PATH
-          if command -v cargo; then echo "a host cargo is still on PATH" >&2; exit 1; fi
+          clean=
+          IFS=: read -ra dirs <<< "$PATH"
+          for d in "${dirs[@]}"; do
+            [ -x "$d/cargo" ] || [ -x "$d/rustc" ] || [ -x "$d/rustup" ] && continue
+            clean=${clean:+$clean:}$d
+          done
+          export PATH=$clean
+          for t in cargo rustc rustup; do
+            if command -v "$t"; then echo "a host $t is still on PATH" >&2; exit 1; fi
+          done
           bash ci/native-e2e.sh "$RUNNER_TEMP/e2e"
 
       - name: Upload logs on failure

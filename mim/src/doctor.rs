@@ -524,9 +524,9 @@ fn language_artifacts(lang: &str) -> Vec<(&'static str, bool)> {
         ],
         // The R binding is a single shared lib (no `lib/R` dir).
         "r" => vec![("lib/librmorloc.so", false)],
-        // Rust readiness = the workspace source (MORLOC_RUNTIME_DIR); the rlibs are
+        // Rust readiness = the runtime source init persists; the rlibs are
         // compiled on demand, not prebuilt.
-        "rust" => vec![("rust", true)],
+        "rust" => vec![("runtime", true)],
         _ => vec![],
     }
 }
@@ -1827,6 +1827,25 @@ mod native_health_tests {
         let mut c2 = Counts::new(true);
         check_runtime_artifacts(&mut c2, root, &[]);
         assert_eq!(c2.fail, 1, "missing cpp artifact fails");
+    }
+
+    /// Rust readiness is the runtime source `morloc init` persists at
+    /// `$MORLOC_HOME/runtime`.
+    #[test]
+    fn rust_is_ready_when_the_persisted_runtime_source_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("include/mlccpptypes")).unwrap();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        std::fs::write(root.join("include/mlccpptypes/x.hpp"), "").unwrap();
+        std::fs::write(root.join("lib/libcppmorloc.a"), "").unwrap();
+        std::fs::write(root.join("include/cppmorloc.hpp"), "").unwrap();
+        std::fs::write(root.join("runtime/Cargo.toml"), "").unwrap();
+
+        let mut c = Counts::new(true);
+        check_runtime_artifacts(&mut c, root, &["rust".to_string()]);
+        assert_eq!(c.fail, 0, "{:?}", c.checks.iter().map(|k| &k.message).collect::<Vec<_>>());
     }
 
     #[test]

@@ -1098,14 +1098,14 @@ pub fn stage_runtime(trust: &Trust, scope: Scope, triple: &str, src: &Path, dest
     // triples match and downloads the matching release binary otherwise.
     let agent = mim_for_triple(trust, scope, triple)?;
     stage_mim_agent(&agent, dest)?;
-    let rust = runtime_src_dir(src);
-    if !rust.is_dir() {
+    let runtime_src = runtime_src_dir(src);
+    if !runtime_src.is_dir() {
         return Err(ManagerError::EnvError(format!(
-            "provisioned runtime is missing the rust source at {}",
-            rust.display()
+            "provisioned runtime is missing the runtime source at {}",
+            runtime_src.display()
         )));
     }
-    copy_dir_excluding(&rust, &runtime_src_dir(dest), &["target"], false)?;
+    copy_dir_excluding(&runtime_src, &runtime_src_dir(dest), &["target"], false)?;
     Ok(())
 }
 

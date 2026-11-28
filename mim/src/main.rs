@@ -6165,12 +6165,14 @@ fn resolve_local_runtime(raw: &str) -> std::result::Result<std::path::PathBuf, S
             abs.display()
         ));
     }
+    let src_name = provision::runtime_src_dir(std::path::Path::new(""));
+    let src_name = src_name.display();
     let morloc_bin = provision::runtime_morloc_bin(&abs);
     if !morloc_bin.is_file() {
         return Err(format!(
             "--local-runtime dir {} has no `morloc` binary (expected {}). Assemble the \
-             dir with a `morloc` symlink to your built compiler and a `rust` symlink to \
-             the compiler's runtime workspace.",
+             dir with a `morloc` symlink to your built compiler and a `{src_name}` symlink to \
+             the compiler's runtime/ directory.",
             abs.display(),
             morloc_bin.display()
         ));
@@ -6178,8 +6180,8 @@ fn resolve_local_runtime(raw: &str) -> std::result::Result<std::path::PathBuf, S
     let cargo = provision::runtime_src_dir(&abs).join("Cargo.toml");
     if !cargo.is_file() {
         return Err(format!(
-            "--local-runtime dir {} has no rust workspace (expected {}). Symlink `rust` \
-             to the compiler's runtime directory.",
+            "--local-runtime dir {} has no runtime workspace (expected {}). Make a \
+             `{src_name}` symlink to the compiler's runtime/ directory.",
             abs.display(),
             cargo.display()
         ));
@@ -13578,14 +13580,28 @@ run:
         let root = dir.path();
         // Missing morloc binary: rejected.
         assert!(resolve_local_runtime(root.to_str().unwrap()).is_err());
-        // Add morloc but no rust workspace: still rejected.
+        // Add morloc but no runtime workspace: still rejected.
         std::fs::write(root.join("morloc"), b"#!/bin/true\n").unwrap();
         assert!(resolve_local_runtime(root.to_str().unwrap()).is_err());
-        // Add the rust workspace: accepted, and the path is canonicalized.
+        // Add the runtime workspace: accepted, and the path is canonicalized.
         std::fs::create_dir_all(root.join("runtime")).unwrap();
         std::fs::write(root.join("runtime").join("Cargo.toml"), b"[workspace]\n").unwrap();
         let resolved = resolve_local_runtime(root.to_str().unwrap()).unwrap();
         assert_eq!(resolved, std::fs::canonicalize(root).unwrap());
+    }
+
+    /// The repair each refusal suggests builds the layout the check accepts.
+    #[test]
+    fn resolve_local_runtime_advice_names_the_directory_it_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let src = provision::runtime_src_dir(std::path::Path::new(""));
+        let want = format!("`{}` symlink", src.display());
+        let no_bin = resolve_local_runtime(root.to_str().unwrap()).unwrap_err();
+        assert!(no_bin.contains(&want), "{no_bin}");
+        std::fs::write(root.join("morloc"), b"#!/bin/true\n").unwrap();
+        let no_src = resolve_local_runtime(root.to_str().unwrap()).unwrap_err();
+        assert!(no_src.contains(&want), "{no_src}");
     }
 
     #[test]

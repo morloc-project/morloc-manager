@@ -1624,7 +1624,7 @@ mod tests {
         // Only the top-level build inputs go; a binding's own include dir stays.
         assert!(ctx.join("runtime/opt/pymorloc/include/x.h").is_file());
         assert!(!ctx.join("runtime/include").exists());
-        assert!(!ctx.join("runtime/rust").exists());
+        assert!(!ctx.join("runtime/runtime").exists());
     }
 
     /// The lists the Dockerfile consumes: NUL-separated paths (a path may hold

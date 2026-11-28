@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 /// Haskell compiler build config (presence marks a plausible morloc source).
 pub const STACK_YAML: &str = "stack.yaml";
 /// The runtime workspace, `morloc init`'s `MORLOC_RUNTIME_DIR`.
-pub const RUST_DIR: &str = "runtime";
+pub const RUNTIME_SRC_DIR: &str = "runtime";
 /// The core toolchain requirements (pixi `toolchain` + the dev-only `dev-apt`).
 pub const CORE_REQUIREMENTS: &str = "binders/requirements.yaml";
 /// Per-language requirements live at `binders/<lang>/requirements.yaml`.
@@ -49,9 +49,9 @@ pub fn validate_source(source: &Path) -> Result<(), String> {
             ));
         }
     }
-    if !source.join(RUST_DIR).join("Cargo.toml").is_file() {
+    if !source.join(RUNTIME_SRC_DIR).join("Cargo.toml").is_file() {
         return Err(format!(
-            "{} is not a morloc source tree (missing {RUST_DIR}/Cargo.toml)",
+            "{} is not a morloc source tree (missing {RUNTIME_SRC_DIR}/Cargo.toml)",
             source.display()
         ));
     }

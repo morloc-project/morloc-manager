@@ -606,8 +606,10 @@ pub fn generate_dockerfile(input: &DockerfileInput) -> String {
         // which writes Cargo.lock next to the workspace manifest. Make the Rust
         // source world-writable so that in-place write succeeds (target-dir and
         // CARGO_HOME already point at the writable state mount).
-        out.push_str(&format!("RUN chmod -R a+rwX {runtime_bin}/rust\n"));
-        out.push_str(&format!("ENV MORLOC_RUNTIME_DIR={runtime_bin}/runtime\n"));
+        let src = crate::provision::runtime_src_dir(std::path::Path::new(runtime_bin));
+        let src = src.display();
+        out.push_str(&format!("RUN chmod -R a+rwX {src}\n"));
+        out.push_str(&format!("ENV MORLOC_RUNTIME_DIR={src}\n"));
     }
     // Both variants put the compiler dir on PATH (baked COPY dest, or a mount).
     out.push_str(&format!("ENV PATH=\"{runtime_bin}:${{PATH}}\"\n"));
@@ -797,7 +799,7 @@ RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v0.76.2 bash \\
 
 # morloc compiler + rust source (from the build context)
 COPY runtime/ /opt/morloc-runtime/
-RUN chmod -R a+rwX /opt/morloc-runtime/rust
+RUN chmod -R a+rwX /opt/morloc-runtime/runtime
 ENV MORLOC_RUNTIME_DIR=/opt/morloc-runtime/runtime
 ENV PATH=\"/opt/morloc-runtime:${PATH}\"
 
@@ -1169,6 +1171,28 @@ ENTRYPOINT [\"/usr/local/bin/morloc-activate\"]
         let install_at = got.find("morloc-install-futhark.sh").unwrap();
         let pixi_at = got.find("pixi.sh/install.sh").unwrap();
         assert!(install_at < pixi_at);
+    }
+
+    /// `morloc init` writes beside the runtime source, so the step that makes
+    /// it writable names the directory init is pointed at, and both name where
+    /// the staged release keeps that source.
+    #[test]
+    fn the_runtime_source_made_writable_is_the_one_init_builds() {
+        let extras = BuildExtras::default();
+        let input = DockerfileInput {
+            base_image: "debian:bookworm-slim",
+            pixi_version: "0.76.2",
+            morloc_home: "/opt/morloc",
+            extras: &extras,
+            lang_installs: &[],
+            dev: false,
+            cert_file: None,
+        };
+        let got = generate_dockerfile(&input);
+        let src = crate::provision::runtime_src_dir(std::path::Path::new(crate::serve::CONTAINER_RUNTIME_BIN));
+        let src = src.display();
+        assert!(got.contains(&format!("RUN chmod -R a+rwX {src}\n")), "{got}");
+        assert!(got.contains(&format!("ENV MORLOC_RUNTIME_DIR={src}\n")), "{got}");
     }
 
     #[test]
